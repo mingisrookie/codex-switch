@@ -9,6 +9,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::codex_paths::resolve_user_codex_paths;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupManifest {
@@ -26,19 +28,34 @@ pub struct BackupFile {
     pub sha256: String,
 }
 
-pub fn create_backup(home: &Path, destination_root: &Path, reason: &str) -> Result<BackupManifest, String> {
+pub fn create_backup(
+    home: &Path,
+    destination_root: &Path,
+    reason: &str,
+) -> Result<BackupManifest, String> {
+    let paths = resolve_user_codex_paths(home);
     let backup_dir = destination_root.join(format!("{}-{reason}", timestamp_millis()?));
-    fs::create_dir_all(&backup_dir).map_err(|error| format!("failed to create backup dir: {error}"))?;
+    fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("failed to create backup dir: {error}"))?;
 
     let mut files = Vec::new();
-    for relative in [
-        "auth.json",
-        "config.toml",
-        "state_5.sqlite",
-        "state_5.sqlite-wal",
-        "state_5.sqlite-shm",
+    for (source, relative) in [
+        (home.join("auth.json"), PathBuf::from("auth.json")),
+        (home.join("config.toml"), PathBuf::from("config.toml")),
+        (paths.state_db.clone(), PathBuf::from("state_5.sqlite")),
+        (
+            paths.state_db.with_file_name("state_5.sqlite-wal"),
+            PathBuf::from("state_5.sqlite-wal"),
+        ),
+        (
+            paths.state_db.with_file_name("state_5.sqlite-shm"),
+            PathBuf::from("state_5.sqlite-shm"),
+        ),
+        (
+            paths.session_index.clone(),
+            PathBuf::from("session_index.jsonl"),
+        ),
     ] {
-        let source = home.join(relative);
         if !source.exists() {
             continue;
         }
@@ -57,7 +74,8 @@ pub fn create_backup(home: &Path, destination_root: &Path, reason: &str) -> Resu
 
 fn copy_with_hash(source: &Path, target: &Path) -> Result<BackupFile, String> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("failed to create backup parent: {error}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create backup parent: {error}"))?;
     }
     fs::copy(source, target).map_err(|error| format!("failed to copy backup file: {error}"))?;
     let bytes = fs::metadata(target)
@@ -101,7 +119,8 @@ fn write_sessions_manifest(home: &Path, backup_dir: &Path) -> Result<(), String>
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| format!("failed to hash backup file: {error}"))?;
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("failed to hash backup file: {error}"))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -139,7 +158,11 @@ mod tests {
         fs::write(home.path().join("state_5.sqlite"), "sqlite").unwrap();
         fs::write(home.path().join("state_5.sqlite-wal"), "wal").unwrap();
         fs::create_dir_all(home.path().join("sessions/2026/06/23")).unwrap();
-        fs::write(home.path().join("sessions/2026/06/23/rollout.jsonl"), "{}\n").unwrap();
+        fs::write(
+            home.path().join("sessions/2026/06/23/rollout.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
         let backup_root = tempdir().unwrap();
 
         let manifest = create_backup(home.path(), backup_root.path(), "switch").unwrap();

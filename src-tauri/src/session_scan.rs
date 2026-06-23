@@ -10,6 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::codex_paths::resolve_user_codex_paths;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadRecord {
@@ -47,8 +49,9 @@ pub struct SyncDryRun {
 }
 
 pub fn scan_sessions(home: &Path) -> Result<SessionInventory, String> {
-    let threads = scan_threads(&home.join("state_5.sqlite"))?;
-    let session_files = scan_session_files(&home.join("sessions"))?;
+    let paths = resolve_user_codex_paths(home);
+    let threads = scan_threads(&paths.state_db)?;
+    let session_files = scan_session_files(&paths.sessions_dir)?;
 
     Ok(SessionInventory {
         home: home.to_path_buf(),
@@ -145,7 +148,8 @@ fn scan_session_files(path: &Path) -> Result<Vec<SessionFileRecord>, String> {
 }
 
 fn extract_session_id(path: &Path) -> Result<Option<String>, String> {
-    let file = fs::File::open(path).map_err(|error| format!("failed to open session jsonl: {error}"))?;
+    let file =
+        fs::File::open(path).map_err(|error| format!("failed to open session jsonl: {error}"))?;
     for line in BufReader::new(file).lines().take(25) {
         let line = line.map_err(|error| format!("failed to read session jsonl: {error}"))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -201,14 +205,20 @@ mod tests {
             r#"{"type":"session_meta","timestamp":"2026-06-23T00:00:00Z","payload":{"id":"thread-a"}}"#,
         )
         .unwrap();
-        create_state_db(&home.join("state_5.sqlite"), &[("thread-a", session_path.to_str().unwrap())]);
+        create_state_db(
+            &home.join("state_5.sqlite"),
+            &[("thread-a", session_path.to_str().unwrap())],
+        );
 
         let inventory = scan_sessions(home).unwrap();
 
         assert_eq!(inventory.thread_count, 1);
         assert_eq!(inventory.session_jsonl_count, 1);
         assert_eq!(inventory.threads[0].id, "thread-a");
-        assert_eq!(inventory.session_files[0].session_id.as_deref(), Some("thread-a"));
+        assert_eq!(
+            inventory.session_files[0].session_id.as_deref(),
+            Some("thread-a")
+        );
     }
 
     #[test]
@@ -219,7 +229,10 @@ mod tests {
             &source_temp.path().join("state_5.sqlite"),
             &[("thread-a", "a.jsonl"), ("thread-b", "b.jsonl")],
         );
-        create_state_db(&target_temp.path().join("state_5.sqlite"), &[("thread-a", "a.jsonl")]);
+        create_state_db(
+            &target_temp.path().join("state_5.sqlite"),
+            &[("thread-a", "a.jsonl")],
+        );
 
         let source = scan_sessions(source_temp.path()).unwrap();
         let target = scan_sessions(target_temp.path()).unwrap();

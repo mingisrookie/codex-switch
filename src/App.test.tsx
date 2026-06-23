@@ -37,6 +37,7 @@ describe('App runtime switch UI', () => {
     return {
       codexHome: {
         root: 'C:\\Users\\alice\\.codex',
+        sqliteHome: 'C:\\Users\\alice\\.codex',
         authJson: { path: 'auth.json', exists: true, bytes: 4525 },
         configToml: { path: 'config.toml', exists: true, bytes: 6585 },
         stateDb: { path: 'state_5.sqlite', exists: true, bytes: 12496896 },

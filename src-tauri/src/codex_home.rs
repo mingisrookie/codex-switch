@@ -7,6 +7,8 @@ use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::codex_paths::resolve_user_codex_paths;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStatus {
@@ -27,6 +29,7 @@ pub struct AuthSummary {
 #[serde(rename_all = "camelCase")]
 pub struct CodexHomeStatus {
     pub root: PathBuf,
+    pub sqlite_home: PathBuf,
     pub auth_json: FileStatus,
     pub config_toml: FileStatus,
     pub state_db: FileStatus,
@@ -38,9 +41,10 @@ pub struct CodexHomeStatus {
 }
 
 pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
+    let paths = resolve_user_codex_paths(home);
     let auth_path = home.join("auth.json");
     let config_path = home.join("config.toml");
-    let sessions_path = home.join("sessions");
+    let sessions_path = &paths.sessions_dir;
 
     let auth_summary = if auth_path.exists() {
         Some(summarize_auth(&auth_path)?)
@@ -50,21 +54,23 @@ pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
 
     Ok(CodexHomeStatus {
         root: home.to_path_buf(),
+        sqlite_home: paths.sqlite_home,
         auth_json: file_status(&auth_path),
         config_toml: file_status(&config_path),
-        state_db: file_status(&home.join("state_5.sqlite")),
-        logs_db: file_status(&home.join("logs_2.sqlite")),
+        state_db: file_status(&paths.state_db),
+        logs_db: file_status(&paths.logs_db),
         codex_dev_db: file_status(&home.join("sqlite").join("codex-dev.db")),
-        sessions_dir: file_status(&sessions_path),
-        session_jsonl_count: count_session_jsonl(&sessions_path),
+        sessions_dir: file_status(sessions_path),
+        session_jsonl_count: count_session_jsonl(sessions_path),
         auth_summary,
     })
 }
 
 pub fn summarize_auth(path: &Path) -> Result<AuthSummary, String> {
-    let raw = fs::read_to_string(path).map_err(|error| format!("failed to read auth.json: {error}"))?;
-    let value: Value =
-        serde_json::from_str(&raw).map_err(|error| format!("failed to parse auth.json: {error}"))?;
+    let raw =
+        fs::read_to_string(path).map_err(|error| format!("failed to read auth.json: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("failed to parse auth.json: {error}"))?;
 
     let Some(object) = value.as_object() else {
         return Err("auth.json must be a JSON object".to_string());
@@ -143,8 +149,12 @@ model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
         assert!(status.auth_json.exists);
         assert!(status.config_toml.exists);
         assert!(status.state_db.exists);
+        assert_eq!(status.sqlite_home, home);
         assert_eq!(status.session_jsonl_count, 1);
-        assert_eq!(status.auth_summary.unwrap().auth_mode.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            status.auth_summary.unwrap().auth_mode.as_deref(),
+            Some("chatgpt")
+        );
     }
 
     #[test]
@@ -160,7 +170,9 @@ model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
         let summary = summarize_auth(&auth).unwrap();
 
         assert_eq!(summary.auth_mode.as_deref(), Some("apikey"));
-        assert!(summary.top_level_keys.contains(&"OPENAI_API_KEY".to_string()));
+        assert!(summary
+            .top_level_keys
+            .contains(&"OPENAI_API_KEY".to_string()));
         assert!(summary.has_tokens_object);
     }
 }

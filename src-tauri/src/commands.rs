@@ -7,7 +7,9 @@ use std::{
 use crate::{
     backup::{create_backup as create_backup_snapshot, BackupManifest},
     codex_home::{scan_codex_home as scan_home, CodexHomeStatus},
-    process_control::{close_codex_processes as close_codex, list_codex_processes as list_processes, CodexProcess},
+    process_control::{
+        close_codex_processes as close_codex, list_codex_processes as list_processes, CodexProcess,
+    },
     profile_store::{ApiProfileInput, ProfileKind, ProfileMetadata, ProfileStore},
     runtime_store::{RelayRuntimeInput, RuntimeMetadata, RuntimeStore},
     runtime_switcher::{switch_runtime_files, sync_home_with_shared, RuntimeSwitchResult},
@@ -46,7 +48,10 @@ pub fn scan_sessions(path: Option<String>) -> Result<SessionInventory, String> {
 }
 
 #[tauri::command]
-pub fn dry_run_sync(source_paths: Vec<String>, target_path: Option<String>) -> Result<SyncDryRun, String> {
+pub fn dry_run_sync(
+    source_paths: Vec<String>,
+    target_path: Option<String>,
+) -> Result<SyncDryRun, String> {
     let mut sources = Vec::new();
     for source_path in source_paths {
         sources.push(scan_session_inventory(&PathBuf::from(source_path))?);
@@ -56,8 +61,16 @@ pub fn dry_run_sync(source_paths: Vec<String>, target_path: Option<String>) -> R
 }
 
 #[tauri::command]
-pub fn create_backup(destination_root: String, reason: String, path: Option<String>) -> Result<BackupManifest, String> {
-    create_backup_snapshot(&resolve_codex_home(path), &PathBuf::from(destination_root), &reason)
+pub fn create_backup(
+    destination_root: String,
+    reason: String,
+    path: Option<String>,
+) -> Result<BackupManifest, String> {
+    create_backup_snapshot(
+        &resolve_codex_home(path),
+        &PathBuf::from(destination_root),
+        &reason,
+    )
 }
 
 #[tauri::command]
@@ -66,7 +79,11 @@ pub fn list_profiles() -> Result<Vec<ProfileMetadata>, String> {
 }
 
 #[tauri::command]
-pub fn import_current_profile(name: String, kind: ProfileKind, path: Option<String>) -> Result<ProfileMetadata, String> {
+pub fn import_current_profile(
+    name: String,
+    kind: ProfileKind,
+    path: Option<String>,
+) -> Result<ProfileMetadata, String> {
     ProfileStore::default()?.import_current_profile(&name, kind, &resolve_codex_home(path))
 }
 
@@ -86,7 +103,10 @@ pub fn import_plus_runtime(path: Option<String>) -> Result<RuntimeMetadata, Stri
 }
 
 #[tauri::command]
-pub fn upsert_relay_runtime(input: RelayRuntimeInput, path: Option<String>) -> Result<RuntimeMetadata, String> {
+pub fn upsert_relay_runtime(
+    input: RelayRuntimeInput,
+    path: Option<String>,
+) -> Result<RuntimeMetadata, String> {
     RuntimeStore::default()?.upsert_relay(input, &resolve_codex_home(path))
 }
 
@@ -107,11 +127,19 @@ pub fn switch_profile(profile_id: String, path: Option<String>) -> Result<Switch
         return Err("Codex is still running; close it before switching profiles".to_string());
     }
     let backup_root = default_backup_root()?;
-    switch_profile_files(&ProfileStore::default()?, &profile_id, &resolve_codex_home(path), &backup_root)
+    switch_profile_files(
+        &ProfileStore::default()?,
+        &profile_id,
+        &resolve_codex_home(path),
+        &backup_root,
+    )
 }
 
 #[tauri::command]
-pub fn switch_runtime(runtime_id: String, path: Option<String>) -> Result<RuntimeSwitchResult, String> {
+pub fn switch_runtime(
+    runtime_id: String,
+    path: Option<String>,
+) -> Result<RuntimeSwitchResult, String> {
     let processes = list_processes()?;
     let backup_root = default_backup_root()?;
     let shared_home = default_shared_sessions_root()?;
@@ -133,7 +161,10 @@ pub fn sync_all_sessions(path: Option<String>) -> Result<SessionSyncResult, Stri
 }
 
 #[tauri::command]
-pub fn sync_sessions_from_paths(source_paths: Vec<String>, target_path: Option<String>) -> Result<SessionSyncResult, String> {
+pub fn sync_sessions_from_paths(
+    source_paths: Vec<String>,
+    target_path: Option<String>,
+) -> Result<SessionSyncResult, String> {
     let processes = list_processes()?;
     let backup_root = default_backup_root()?;
     sync_sessions_from_paths_guarded(source_paths, target_path, &processes, &backup_root)
@@ -181,7 +212,9 @@ fn default_backup_root() -> Result<PathBuf, String> {
 
 fn default_shared_sessions_root() -> Result<PathBuf, String> {
     let appdata = std::env::var_os("APPDATA").ok_or_else(|| "APPDATA is not set".to_string())?;
-    Ok(PathBuf::from(appdata).join("codex-switch").join("shared-sessions"))
+    Ok(PathBuf::from(appdata)
+        .join("codex-switch")
+        .join("shared-sessions"))
 }
 
 fn switch_runtime_guarded(
@@ -215,7 +248,10 @@ fn sync_sessions_from_paths_guarded(
     }
     let target = resolve_codex_home(target_path);
     create_backup_snapshot(&target, backup_root, "sync-sessions")?;
-    let sources = source_paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let sources = source_paths
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     sync_sessions(&sources, &target)
 }
 
@@ -240,8 +276,8 @@ mod tests {
     use crate::runtime_store::{RelayRuntimeInput, RuntimeStore, RELAY_RUNTIME_ID};
 
     use super::{
-        default_codex_home_from_env, resolve_codex_home, switch_runtime_guarded, sync_all_sessions_guarded,
-        sync_sessions_from_paths_guarded, CodexProcess,
+        default_codex_home_from_env, resolve_codex_home, switch_runtime_guarded,
+        sync_all_sessions_guarded, sync_sessions_from_paths_guarded, CodexProcess,
     };
 
     #[test]
@@ -252,7 +288,10 @@ mod tests {
             Some(std::ffi::OsString::from(r"C:\Users\ignored")),
         );
 
-        assert_eq!(codex_home, std::path::PathBuf::from(r"C:\Users\alice").join(".codex"));
+        assert_eq!(
+            codex_home,
+            std::path::PathBuf::from(r"C:\Users\alice").join(".codex")
+        );
     }
 
     #[test]
@@ -282,9 +321,18 @@ mod tests {
         )
         .unwrap();
         for id in threads {
+            let rollout = home
+                .join("sessions/2026/06/23")
+                .join(format!("rollout-{id}.jsonl"));
+            fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+            fs::write(
+                &rollout,
+                format!(r#"{{"type":"session_meta","payload":{{"id":"{id}"}}}}"#),
+            )
+            .unwrap();
             conn.execute(
-                "INSERT INTO threads (id, rollout_path, updated_at, updated_at_ms) VALUES (?1, NULL, 1, 1000)",
-                [id],
+                "INSERT INTO threads (id, rollout_path, updated_at, updated_at_ms) VALUES (?1, ?2, 1, 1000)",
+                (id, rollout.to_string_lossy().to_string()),
             )
             .unwrap();
         }
@@ -331,7 +379,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.inserted_threads, 1);
-        let backup_dir = fs::read_dir(backup_root.path()).unwrap().next().unwrap().unwrap().path();
+        let backup_dir = fs::read_dir(backup_root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         assert!(backup_dir.join("auth.json").exists());
         assert!(backup_dir.join("config.toml").exists());
         assert!(backup_dir.join("state_5.sqlite").exists());
@@ -343,7 +396,11 @@ mod tests {
         let store_root = tempdir().unwrap();
         let backup_root = tempdir().unwrap();
         let shared = tempdir().unwrap();
-        fs::write(home.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#).unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
+        )
+        .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
         create_threads_db(home.path(), &["thread-a"]);
         let store = RuntimeStore::new(store_root.path().join("runtimes"));
@@ -371,7 +428,9 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("Codex is still running"));
-        assert!(fs::read_to_string(home.path().join("auth.json")).unwrap().contains("fake-plus"));
+        assert!(fs::read_to_string(home.path().join("auth.json"))
+            .unwrap()
+            .contains("fake-plus"));
         assert_eq!(fs::read_dir(backup_root.path()).unwrap().count(), 0);
     }
 
@@ -394,15 +453,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.inserted_threads, 2);
-        let backup_dir = fs::read_dir(backup_root.path()).unwrap().next().unwrap().unwrap().path();
+        let backup_dir = fs::read_dir(backup_root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let backup_conn = Connection::open(backup_dir.join("state_5.sqlite")).unwrap();
         let backup_thread_b_count: i64 = backup_conn
-            .query_row("SELECT COUNT(*) FROM threads WHERE id = 'thread-b'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'thread-b'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(backup_thread_b_count, 0);
         let live_conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
         let live_thread_b_count: i64 = live_conn
-            .query_row("SELECT COUNT(*) FROM threads WHERE id = 'thread-b'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'thread-b'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(live_thread_b_count, 1);
     }

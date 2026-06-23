@@ -1,8 +1,9 @@
 pub mod backup;
 pub mod codex_home;
+pub mod codex_paths;
+mod commands;
 pub mod config_patch;
 pub mod crypto;
-mod commands;
 pub mod process_control;
 pub mod profile_store;
 pub mod redaction;

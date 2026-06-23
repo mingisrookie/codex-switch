@@ -12,6 +12,7 @@ export type AuthSummary = {
 
 export type CodexHomeStatus = {
   root: string;
+  sqliteHome: string;
   authJson: FileStatus;
   configToml: FileStatus;
   stateDb: FileStatus;

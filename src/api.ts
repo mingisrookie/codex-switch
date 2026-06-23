@@ -51,6 +51,7 @@ function fallbackDashboard(): DashboardData {
   return {
     codexHome: {
       root: codexHome,
+      sqliteHome: codexHome,
       authJson: { path: 'auth.json', exists: false, bytes: null },
       configToml: { path: 'config.toml', exists: false, bytes: null },
       stateDb: { path: 'state_5.sqlite', exists: false, bytes: null },

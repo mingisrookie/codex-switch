@@ -86,7 +86,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   }
 
   async function handleConfigureRelay() {
-    const baseUrl = window.prompt('中转站 Base URL', relayRuntime?.baseUrl ?? 'https://www.lcming951.com/v1');
+    const baseUrl = window.prompt('中转站 Base URL', relayRuntime?.baseUrl ?? 'https://your-relay.example.com/v1');
     if (!baseUrl) return;
     const model = window.prompt('模型', relayRuntime?.model ?? plusRuntime?.model ?? 'gpt-5.5') || 'gpt-5.5';
     const apiKey = window.prompt('API Key（只加密保存，不展示）', '');
