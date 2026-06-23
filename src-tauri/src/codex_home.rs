@@ -130,7 +130,7 @@ mod tests {
         fs::write(
             home.join("config.toml"),
             r#"model = "gpt-5.5"
-model_instructions_file = "C:\\Users\\admin\\.codex\\instruction.md"
+model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
 "#,
         )
         .unwrap();

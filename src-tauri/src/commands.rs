@@ -1,5 +1,8 @@
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     backup::{create_backup as create_backup_snapshot, BackupManifest},
@@ -20,7 +23,7 @@ use crate::{
 pub struct AppStatus {
     pub app_name: &'static str,
     pub phase: &'static str,
-    pub codex_home: &'static str,
+    pub codex_home: PathBuf,
 }
 
 #[tauri::command]
@@ -28,7 +31,7 @@ pub fn get_app_status() -> AppStatus {
     AppStatus {
         app_name: "Codex Switch",
         phase: "MVP scaffold",
-        codex_home: r"C:\Users\admin\.codex",
+        codex_home: default_codex_home(),
     }
 }
 
@@ -137,8 +140,38 @@ pub fn sync_sessions_from_paths(source_paths: Vec<String>, target_path: Option<S
 }
 
 fn resolve_codex_home(path: Option<String>) -> PathBuf {
-    path.map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\admin\.codex"))
+    path.filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_codex_home)
+}
+
+fn default_codex_home() -> PathBuf {
+    default_codex_home_from_env(
+        std::env::var_os("CODEX_HOME"),
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn default_codex_home_from_env(
+    codex_home: Option<OsString>,
+    user_profile: Option<OsString>,
+    home: Option<OsString>,
+) -> PathBuf {
+    if let Some(path) = non_empty_os(codex_home) {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = non_empty_os(user_profile) {
+        return PathBuf::from(path).join(".codex");
+    }
+    if let Some(path) = non_empty_os(home) {
+        return PathBuf::from(path).join(".codex");
+    }
+    PathBuf::from(".codex")
+}
+
+fn non_empty_os(value: Option<OsString>) -> Option<OsString> {
+    value.filter(|item| !item.to_string_lossy().trim().is_empty())
 }
 
 fn default_backup_root() -> Result<PathBuf, String> {
@@ -206,7 +239,40 @@ mod tests {
 
     use crate::runtime_store::{RelayRuntimeInput, RuntimeStore, RELAY_RUNTIME_ID};
 
-    use super::{switch_runtime_guarded, sync_all_sessions_guarded, sync_sessions_from_paths_guarded, CodexProcess};
+    use super::{
+        default_codex_home_from_env, resolve_codex_home, switch_runtime_guarded, sync_all_sessions_guarded,
+        sync_sessions_from_paths_guarded, CodexProcess,
+    };
+
+    #[test]
+    fn resolves_default_codex_home_from_environment_without_hardcoded_user() {
+        let codex_home = default_codex_home_from_env(
+            None,
+            Some(std::ffi::OsString::from(r"C:\Users\alice")),
+            Some(std::ffi::OsString::from(r"C:\Users\ignored")),
+        );
+
+        assert_eq!(codex_home, std::path::PathBuf::from(r"C:\Users\alice").join(".codex"));
+    }
+
+    #[test]
+    fn codex_home_environment_overrides_user_profile_default() {
+        let codex_home = default_codex_home_from_env(
+            Some(std::ffi::OsString::from(r"D:\portable-codex")),
+            Some(std::ffi::OsString::from(r"C:\Users\alice")),
+            None,
+        );
+
+        assert_eq!(codex_home, std::path::PathBuf::from(r"D:\portable-codex"));
+    }
+
+    #[test]
+    fn explicit_path_overrides_environment_default() {
+        let temp = tempdir().unwrap();
+        let resolved = resolve_codex_home(Some(temp.path().to_string_lossy().to_string()));
+
+        assert_eq!(resolved, temp.path());
+    }
 
     fn create_threads_db(home: &std::path::Path, threads: &[&str]) {
         let conn = Connection::open(home.join("state_5.sqlite")).unwrap();

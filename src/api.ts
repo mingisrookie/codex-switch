@@ -46,9 +46,11 @@ export function syncAllSessions() {
 }
 
 function fallbackDashboard(): DashboardData {
+  const codexHome = '%USERPROFILE%\\.codex';
+
   return {
     codexHome: {
-      root: 'C:\\Users\\admin\\.codex',
+      root: codexHome,
       authJson: { path: 'auth.json', exists: false, bytes: null },
       configToml: { path: 'config.toml', exists: false, bytes: null },
       stateDb: { path: 'state_5.sqlite', exists: false, bytes: null },
@@ -59,7 +61,7 @@ function fallbackDashboard(): DashboardData {
       authSummary: null,
     },
     sessions: {
-      home: 'C:\\Users\\admin\\.codex',
+      home: codexHome,
       threadCount: 0,
       sessionJsonlCount: 0,
       threads: [],

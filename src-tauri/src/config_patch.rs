@@ -120,7 +120,7 @@ mod tests {
     fn patches_login_bound_fields_while_preserving_global_config() {
         let base = r#"
 model = "gpt-5.5"
-model_instructions_file = "C:\\Users\\admin\\.codex\\instruction.md"
+model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
 
 [features]
 fast_mode = true
@@ -143,7 +143,7 @@ guardian_approval = true
         assert!(plan.changed_keys.contains(&"model_provider".to_string()));
         assert!(plan.patched_toml.contains("model = \"gpt-5.4-mini\""));
         assert!(plan.patched_toml.contains("model_provider = \"direct-account\""));
-        assert!(plan.patched_toml.contains("model_instructions_file = \"C:\\\\Users\\\\admin\\\\.codex\\\\instruction.md\""));
+        assert!(plan.patched_toml.contains("model_instructions_file = \"C:\\\\Users\\\\alice\\\\.codex\\\\instruction.md\""));
         assert!(plan.patched_toml.contains("fast_mode = true"));
         assert!(plan.patched_toml.contains("[model_providers.direct-account]"));
         assert!(plan.patched_toml.contains("base_url = \"https://api.openai.com/v1\""));

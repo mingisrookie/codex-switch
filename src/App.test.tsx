@@ -36,7 +36,7 @@ describe('App runtime switch UI', () => {
   function dashboardData(): DashboardData {
     return {
       codexHome: {
-        root: 'C:\\Users\\admin\\.codex',
+        root: 'C:\\Users\\alice\\.codex',
         authJson: { path: 'auth.json', exists: true, bytes: 4525 },
         configToml: { path: 'config.toml', exists: true, bytes: 6585 },
         stateDb: { path: 'state_5.sqlite', exists: true, bytes: 12496896 },
@@ -51,7 +51,7 @@ describe('App runtime switch UI', () => {
         },
       },
       sessions: {
-        home: 'C:\\Users\\admin\\.codex',
+        home: 'C:\\Users\\alice\\.codex',
         threadCount: 429,
         sessionJsonlCount: 200,
         threads: [],
