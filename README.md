@@ -1,8 +1,29 @@
+<div align="center">
+
 # Codex Switch
 
-Codex Switch 是一个 Windows 桌面小工具，用来在 **Codex 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步。
+**把 Codex 账号态与 API 中转站态做成可备份、可切换、可同步的本地运行态工作台。**
 
-![Codex Switch 截图](docs/assets/screenshot.png)
+保存当前账号登录态；配置一个 OpenAI-compatible API 中转站；切换时自动备份 `auth.json` / `config.toml`；会话通过 SQLite + JSONL 合并到共享会话池。
+
+[快速使用](#快速使用) · [下载 Release](https://github.com/mingisrookie/codex-switch/releases/latest) · [安全说明](#安全说明) · [开发](#开发)
+
+![release](https://img.shields.io/badge/release-v0.1.0-f97316)
+![license](https://img.shields.io/badge/license-MIT-16a34a)
+![platform](https://img.shields.io/badge/platform-Windows-2563eb)
+![stack](https://img.shields.io/badge/Tauri-2.x-24c8db)
+![runtime](https://img.shields.io/badge/Codex-runtime-111827)
+
+<br />
+<br />
+
+<img src="docs/assets/screenshot.png" alt="Codex Switch 截图" width="920" />
+
+</div>
+
+## 项目定位
+
+Codex Switch 是一个 Windows 桌面小工具，用来在 **Codex 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步。
 
 ## 能做什么
 
