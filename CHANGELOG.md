@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.4 - 2026-06-30
+
+### Changed
+
+- 会话管理表格的批量操作下拉移到工具条右侧，选择入口更明显。
+- 会话列表改为紧凑行高：只展示单行标题并省略超长文本，不再把长会话 ID 作为第二行显示。
+
+### Verified
+
+- `npm test -- --run`
+- `npm run typecheck`
+- `npm run build`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `npm run tauri -- build`
+
 ## v0.1.3 - 2026-06-30
 
 ### Added

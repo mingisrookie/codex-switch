@@ -152,39 +152,44 @@ export function SessionManagementPage({
 
         <section className="session-table-card">
           <div className="session-selection-toolbar" aria-label="批量选择">
-            <label className="select-all-box">
-              <input
-                type="checkbox"
-                checked={allVisibleSelected}
-                onChange={toggleVisibleSelection}
+            <div className="selection-left">
+              <label className="select-all-box">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={toggleVisibleSelection}
+                  disabled={busy || sessions.length === 0}
+                  aria-label="全选当前列表"
+                />
+                <span>全选当前列表</span>
+              </label>
+              <button onClick={selectVisible} disabled={busy || sessions.length === 0}>
+                全选
+              </button>
+              <button onClick={invertVisibleSelection} disabled={busy || sessions.length === 0}>
+                反选
+              </button>
+            </div>
+            <label className="bulk-select-field">
+              <span>选择操作</span>
+              <select
+                className="session-bulk-select"
+                defaultValue=""
+                onChange={(event) => {
+                  handleBulkAction(event.target.value);
+                  event.target.value = '';
+                }}
                 disabled={busy || sessions.length === 0}
-                aria-label="全选当前列表"
-              />
-              <span>全选当前列表</span>
+                aria-label="选择操作"
+              >
+                <option value="" disabled>
+                  批量选择
+                </option>
+                <option value="select-visible">全选当前列表</option>
+                <option value="invert-visible">反选当前列表</option>
+                <option value="clear">清空选择</option>
+              </select>
             </label>
-            <select
-              className="session-bulk-select"
-              defaultValue=""
-              onChange={(event) => {
-                handleBulkAction(event.target.value);
-                event.target.value = '';
-              }}
-              disabled={busy || sessions.length === 0}
-              aria-label="批量选择操作"
-            >
-              <option value="" disabled>
-                批量选择
-              </option>
-              <option value="select-visible">全选当前列表</option>
-              <option value="invert-visible">反选当前列表</option>
-              <option value="clear">清空选择</option>
-            </select>
-            <button onClick={selectVisible} disabled={busy || sessions.length === 0}>
-              全选
-            </button>
-            <button onClick={invertVisibleSelection} disabled={busy || sessions.length === 0}>
-              反选
-            </button>
           </div>
           <div className="session-table-head">
             <span />
@@ -254,14 +259,15 @@ function SessionRow({
   selected: boolean;
   onToggle: () => void;
 }) {
+  const displayTitle = session.title || session.preview || '未命名会话';
+
   return (
-    <label className={`session-row ${selected ? 'selected' : ''}`}>
+    <label className={`session-row ${selected ? 'selected' : ''}`} title={session.id}>
       <span>
         <input type="checkbox" checked={selected} onChange={onToggle} aria-label={`选择 ${session.id}`} />
       </span>
-      <span>
-        <strong>{session.title || session.preview || session.id}</strong>
-        <small>{session.id}</small>
+      <span className="session-title-cell">
+        <strong title={displayTitle}>{displayTitle}</strong>
       </span>
       <span className={`pill ${session.archived ? 'orange' : 'teal'}`}>
         {session.archived ? '已归档' : '未归档'}

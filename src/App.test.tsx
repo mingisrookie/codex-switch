@@ -248,6 +248,20 @@ describe('App runtime switch UI', () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+
+    const bulkSelect = screen.getByLabelText('选择操作');
+    expect(bulkSelect).toBeTruthy();
+    expect(screen.queryByText('thread-visible')).toBeNull();
+    expect(screen.queryByText('thread-archived')).toBeNull();
+
+    fireEvent.change(bulkSelect, { target: { value: 'select-visible' } });
+    expect((screen.getByLabelText('选择 thread-visible') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText('选择 thread-archived') as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.change(bulkSelect, { target: { value: 'clear' } });
+    expect((screen.getByLabelText('选择 thread-visible') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByLabelText('选择 thread-archived') as HTMLInputElement).checked).toBe(false);
+
     fireEvent.click(screen.getByLabelText('全选当前列表'));
 
     expect((screen.getByLabelText('选择 thread-visible') as HTMLInputElement).checked).toBe(true);
