@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.3 - 2026-06-30
+
+### Added
+
+- 新增顶部“会话管理”页，与“运行态”页分离，保持现有浅色 Codex Switch UI 风格。
+- 会话管理默认合并展示当前 Codex Home 与 `%APPDATA%\codex-switch\shared-sessions`，来源标记为“本机 / 共享池 / 两边都有”。
+- 会话表格左上角新增全选框、批量选择下拉和全选 / 反选按钮，修正表格列宽导致的更新时间截断问题。
+- 支持删除所选会话：删除前备份当前 Codex Home 与 shared-sessions，随后硬删除两边的 SQLite thread、相关边表、JSONL 正文和 `session_index.jsonl`。
+- 支持恢复可见：只更新当前 Codex Home 的归档字段，不立即强制同步。
+
+### Changed
+
+- 已归档会话默认跳过同步，不自动删除、不清理 shared-sessions，也不会从共享池复活回当前 Codex Home。
+- 同一会话 ID 同时存在于当前 Codex Home 和 shared-sessions 时，当前 Codex Home 的标题、更新时间、provider 和归档状态优先。
+- 删除未归档会话必须二次确认；删除已归档会话走备份后的安全硬删除，不额外弹二次确认。
+
+### Verified
+
+- `npm test -- --run`
+- `npm run typecheck`
+- `npm run build`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `npm run tauri -- build`
+- 临时 adversarial Rust 集成测试：4 passed
+
 ## v0.1.2 - 2026-06-23
 
 ### Fixed

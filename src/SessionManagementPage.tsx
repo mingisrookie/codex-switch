@@ -30,6 +30,9 @@ export function SessionManagementPage({
   const selectedSessions = inventory.sessions.filter((session) => selectedIds.has(session.id));
   const selectedArchived = selectedSessions.filter((session) => session.archived).length;
   const selectedUnarchived = selectedSessions.length - selectedArchived;
+  const visibleIds = sessions.map((session) => session.id);
+  const allVisibleSelected =
+    visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
 
   function toggleSession(id: string) {
     setSelectedIds((current) => {
@@ -47,8 +50,48 @@ export function SessionManagementPage({
     setSelectedIds(new Set(sessions.map((session) => session.id)));
   }
 
+  function toggleVisibleSelection() {
+    if (allVisibleSelected) {
+      setSelectedIds((current) => {
+        const next = new Set(current);
+        for (const id of visibleIds) {
+          next.delete(id);
+        }
+        return next;
+      });
+      return;
+    }
+    selectVisible();
+  }
+
+  function invertVisibleSelection() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      for (const id of visibleIds) {
+        if (next.has(id)) {
+          next.delete(id);
+        } else {
+          next.add(id);
+        }
+      }
+      return next;
+    });
+  }
+
   function clearSelected() {
     setSelectedIds(new Set());
+  }
+
+  function handleBulkAction(action: string) {
+    if (action === 'select-visible') {
+      selectVisible();
+    }
+    if (action === 'invert-visible') {
+      invertVisibleSelection();
+    }
+    if (action === 'clear') {
+      clearSelected();
+    }
   }
 
   function deleteSelected() {
@@ -91,9 +134,6 @@ export function SessionManagementPage({
           <button className="primary-button" onClick={onSync} disabled={busy}>
             立即同步
           </button>
-          <button className="ghost-button inline" onClick={selectVisible} disabled={busy || sessions.length === 0}>
-            选择当前列表
-          </button>
         </div>
       </section>
 
@@ -111,8 +151,43 @@ export function SessionManagementPage({
         </aside>
 
         <section className="session-table-card">
+          <div className="session-selection-toolbar" aria-label="批量选择">
+            <label className="select-all-box">
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={toggleVisibleSelection}
+                disabled={busy || sessions.length === 0}
+                aria-label="全选当前列表"
+              />
+              <span>全选当前列表</span>
+            </label>
+            <select
+              className="session-bulk-select"
+              defaultValue=""
+              onChange={(event) => {
+                handleBulkAction(event.target.value);
+                event.target.value = '';
+              }}
+              disabled={busy || sessions.length === 0}
+              aria-label="批量选择操作"
+            >
+              <option value="" disabled>
+                批量选择
+              </option>
+              <option value="select-visible">全选当前列表</option>
+              <option value="invert-visible">反选当前列表</option>
+              <option value="clear">清空选择</option>
+            </select>
+            <button onClick={selectVisible} disabled={busy || sessions.length === 0}>
+              全选
+            </button>
+            <button onClick={invertVisibleSelection} disabled={busy || sessions.length === 0}>
+              反选
+            </button>
+          </div>
           <div className="session-table-head">
-            <span>选择</span>
+            <span />
             <span>会话</span>
             <span>状态</span>
             <span>来源</span>

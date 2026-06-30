@@ -40,12 +40,14 @@ git remote -v
 - 更新已有 PR。
 - 在自己的 PR 下补充说明。
 - 在权限允许且用户明确授权时，合并自己的 PR。
+- 用户明确要求更新 release、tag 或发布资产。
 
 不适用于：
 
 - 当前目录不是 Git 仓库时强行执行 Git/PR 流程。
 - 没有看代码上下文就靠猜测生成 PR 结论。
 - 用户没有明确授权时擅自合并、关闭 PR 或删除远端分支。
+- 用户没有明确授权时擅自创建 tag、覆盖 release 资产或发布新版本。
 
 ## 仓库硬性规则
 
@@ -125,6 +127,57 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
 合并成功后必须验证 PR 状态和本地目标分支是否更新，不能把“同步 PR 分支”和“合并 PR 到目标分支”混为一谈。
 
+### 阶段 7：Release 发布
+
+用户明确要求更新 release 时，必须基于真实命令输出执行：
+
+1. 确认当前分支、远端、GitHub CLI 登录和工作区状态：
+
+   ```bash
+   git status --short --branch
+   git remote -v
+   gh auth status
+   gh release list --limit 10
+   ```
+
+2. 同步版本号，至少检查并更新：
+
+   - `package.json`
+   - `package-lock.json`
+   - `src-tauri/Cargo.toml`
+   - `src-tauri/Cargo.lock`
+   - `src-tauri/tauri.conf.json`
+   - `README.md` release badge / 下载说明
+   - `CHANGELOG.md`
+   - 受影响的根目录长期文档
+
+3. 发布前必须重新验证：
+
+   ```bash
+   npm test -- --run
+   npm run typecheck
+   npm run build
+   cargo test --manifest-path src-tauri/Cargo.toml
+   npm run tauri -- build
+   ```
+
+4. tag 和 release 必须指向已提交、已推送的 commit。不得用脏工作区产物发布。
+
+5. 上传 release asset 前确认真实文件存在，例如：
+
+   ```bash
+   Test-Path src-tauri\target\release\codex-switch.exe
+   ```
+
+6. 创建或更新 GitHub Release 后必须验证：
+
+   ```bash
+   gh release view <tag> --json tagName,name,isLatest,url,assets
+   git ls-remote --tags origin <tag>
+   ```
+
+Release 文案必须说明用户可见变化、风险/兼容性和本次验证命令，不得用空泛“更新 release”替代。
+
 ## 最终反馈必须说明
 
 1. 当前分支与工作区状态。
@@ -133,6 +186,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 4. PR 编号、链接和目标分支。
 5. 是否提交、提交号是什么。
 6. 是否推送、推送到哪个分支。
-7. 运行过哪些测试或检查；如果没跑，要明确说明。
-8. 是否已经合并；如果已合并，要说明合并目标、PR 状态和合并提交。
-9. 未完成项、阻塞或风险。
+7. 是否创建或更新 Release；Release tag、链接和资产名称是什么。
+8. 运行过哪些测试或检查；如果没跑，要明确说明。
+9. 是否已经合并；如果已合并，要说明合并目标、PR 状态和合并提交。
+10. 未完成项、阻塞或风险。

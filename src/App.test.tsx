@@ -243,4 +243,19 @@ describe('App runtime switch UI', () => {
       expect(apiMocks.restoreSessionsVisible).toHaveBeenCalledWith(['thread-archived']);
     });
   });
+
+  it('supports select-all and invert controls in session management', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+    fireEvent.click(screen.getByLabelText('全选当前列表'));
+
+    expect((screen.getByLabelText('选择 thread-visible') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText('选择 thread-archived') as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: '反选' }));
+
+    expect((screen.getByLabelText('选择 thread-visible') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByLabelText('选择 thread-archived') as HTMLInputElement).checked).toBe(false);
+  });
 });

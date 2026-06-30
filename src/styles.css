@@ -635,13 +635,70 @@ h2 {
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.92);
   overflow: hidden;
+  min-width: 0;
+}
+
+.session-table-card:focus,
+.session-table-card:focus-visible,
+.session-table-card:focus-within {
+  outline: 0;
+}
+
+.session-selection-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e2e7f0;
+  background: #fbf8f2;
+}
+
+.select-all-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px solid #8bd0d4;
+  border-radius: 12px;
+  background: #e8fafa;
+  color: #06494f;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.select-all-box input,
+.session-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: #0a928b;
+}
+
+.session-bulk-select,
+.session-selection-toolbar button {
+  min-height: 34px;
+  border: 1px solid #cfd8e6;
+  border-radius: 12px;
+  background: #fff;
+  color: #06172f;
+  font-weight: 800;
+}
+
+.session-bulk-select {
+  max-width: 150px;
+  padding: 0 10px;
+}
+
+.session-selection-toolbar button {
+  padding: 0 12px;
+  cursor: pointer;
 }
 
 .session-table-head,
 .session-row {
   display: grid;
-  grid-template-columns: 64px minmax(220px, 1fr) 88px 96px 150px;
-  gap: 14px;
+  grid-template-columns: 46px minmax(0, 1fr) 88px 78px 116px;
+  gap: 10px;
   align-items: center;
 }
 
@@ -658,6 +715,10 @@ h2 {
   border-bottom: 1px solid #edf1f6;
   color: #31425c;
   cursor: pointer;
+}
+
+.session-row > span {
+  min-width: 0;
 }
 
 .session-row.selected {
@@ -683,9 +744,12 @@ h2 {
   word-break: break-all;
 }
 
-.session-row input {
-  width: 18px;
-  height: 18px;
+.session-row > span:last-child,
+.session-table-head > span:last-child {
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .compact-meta {
