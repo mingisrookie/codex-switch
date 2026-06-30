@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -17,6 +17,11 @@ use crate::codex_paths::resolve_user_codex_paths;
 pub struct ThreadRecord {
     pub id: String,
     pub rollout_path: Option<String>,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub model_provider: Option<String>,
+    pub archived: bool,
+    pub archived_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub updated_at_ms: Option<i64>,
 }
@@ -100,22 +105,89 @@ fn scan_threads(path: &Path) -> Result<Vec<ThreadRecord>, String> {
 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("failed to open state_5.sqlite read-only: {error}"))?;
+    let columns = table_columns(&conn, "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(Vec::new());
+    }
+    let select = format!("SELECT {} FROM threads", columns.join(", "));
     let mut statement = conn
-        .prepare("SELECT id, rollout_path, updated_at, updated_at_ms FROM threads ORDER BY updated_at_ms DESC, updated_at DESC")
+        .prepare(&select)
         .map_err(|error| format!("failed to prepare threads query: {error}"))?;
     let rows = statement
         .query_map([], |row| {
-            Ok(ThreadRecord {
-                id: row.get(0)?,
-                rollout_path: row.get(1)?,
-                updated_at: row.get(2)?,
-                updated_at_ms: row.get(3)?,
-            })
+            let mut values = std::collections::HashMap::new();
+            for (index, column) in columns.iter().enumerate() {
+                values.insert(column.clone(), row.get::<usize, SqlValue>(index)?);
+            }
+            Ok(thread_from_values(values))
         })
         .map_err(|error| format!("failed to query threads: {error}"))?;
 
+    let mut threads = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read threads: {error}"))?;
+    threads.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+    Ok(threads)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("failed to inspect table {table}: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<usize, String>(1))
+        .map_err(|error| format!("failed to read table columns: {error}"))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("failed to read threads: {error}"))
+        .map_err(|error| format!("failed to collect table columns: {error}"))
+}
+
+fn thread_from_values(values: std::collections::HashMap<String, SqlValue>) -> ThreadRecord {
+    ThreadRecord {
+        id: text_value(values.get("id")).unwrap_or_default(),
+        rollout_path: text_value(values.get("rollout_path")),
+        title: text_value(values.get("title")),
+        preview: text_value(values.get("preview")),
+        model_provider: text_value(values.get("model_provider")),
+        archived: truthy_value(values.get("archived")),
+        archived_at: integer_value(values.get("archived_at")),
+        updated_at: integer_value(values.get("updated_at")),
+        updated_at_ms: integer_value(values.get("updated_at_ms")),
+    }
+}
+
+fn text_value(value: Option<&SqlValue>) -> Option<String> {
+    match value {
+        Some(SqlValue::Text(value)) if !value.is_empty() => Some(value.clone()),
+        Some(SqlValue::Integer(value)) => Some(value.to_string()),
+        Some(SqlValue::Real(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn integer_value(value: Option<&SqlValue>) -> Option<i64> {
+    match value {
+        Some(SqlValue::Integer(value)) => Some(*value),
+        Some(SqlValue::Real(value)) => Some(*value as i64),
+        Some(SqlValue::Text(value)) => value.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn truthy_value(value: Option<&SqlValue>) -> bool {
+    match value {
+        Some(SqlValue::Integer(value)) => *value != 0,
+        Some(SqlValue::Real(value)) => *value != 0.0,
+        Some(SqlValue::Text(value)) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes")
+        }
+        _ => false,
+    }
 }
 
 fn scan_session_files(path: &Path) -> Result<Vec<SessionFileRecord>, String> {

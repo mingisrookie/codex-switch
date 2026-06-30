@@ -3,19 +3,22 @@ import type {
   CodexHomeStatus,
   CodexProcess,
   DashboardData,
+  ManagedSessionInventory,
   RelayRuntimeInput,
   RuntimeMetadata,
+  SessionMutationResult,
   SessionInventory,
 } from './types';
 
 export async function loadDashboard(): Promise<DashboardData> {
   try {
-    const [codexHome, sessions, runtimes] = await Promise.all([
+    const [codexHome, sessions, managedSessions, runtimes] = await Promise.all([
       invoke<CodexHomeStatus>('scan_codex_home'),
       invoke<SessionInventory>('scan_sessions'),
+      invoke<ManagedSessionInventory>('scan_managed_sessions'),
       invoke<RuntimeMetadata[]>('list_runtimes'),
     ]);
-    return { codexHome, sessions, runtimes };
+    return { codexHome, sessions, managedSessions, runtimes };
   } catch {
     return fallbackDashboard();
   }
@@ -45,6 +48,14 @@ export function syncAllSessions() {
   return invoke('sync_all_sessions');
 }
 
+export function deleteManagedSessions(ids: string[], confirmUnarchived: boolean) {
+  return invoke<SessionMutationResult>('delete_managed_sessions', { ids, confirmUnarchived });
+}
+
+export function restoreSessionsVisible(ids: string[]) {
+  return invoke<SessionMutationResult>('restore_sessions_visible', { ids });
+}
+
 function fallbackDashboard(): DashboardData {
   const codexHome = '%USERPROFILE%\\.codex';
 
@@ -67,6 +78,13 @@ function fallbackDashboard(): DashboardData {
       sessionJsonlCount: 0,
       threads: [],
       sessionFiles: [],
+    },
+    managedSessions: {
+      currentHome: codexHome,
+      sharedHome: '%APPDATA%\\codex-switch\\shared-sessions',
+      totalCount: 0,
+      archivedCount: 0,
+      sessions: [],
     },
     runtimes: [],
   };

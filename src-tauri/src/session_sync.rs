@@ -21,6 +21,7 @@ pub struct SessionSyncResult {
     pub copied_session_files: usize,
     pub duplicate_threads: usize,
     pub skipped_missing_session_files: usize,
+    pub skipped_archived_threads: usize,
     pub merged_session_index_entries: usize,
 }
 
@@ -149,8 +150,9 @@ fn sync_session_roots(
                 .execute_batch("COMMIT")
                 .map_err(|error| format!("failed to commit session sync transaction: {error}"))?;
             for source_root in source_roots {
+                let allowlist = syncable_session_ids(source_root)?;
                 result.merged_session_index_entries +=
-                    merge_session_index(source_root, &target_root)?;
+                    merge_session_index(source_root, &target_root, &allowlist)?;
             }
             Ok(result)
         }
@@ -171,10 +173,13 @@ fn sync_sessions_in_transaction(
     let mut copied_session_files = 0;
     let mut duplicate_threads = 0;
     let mut skipped_missing_session_files = 0;
+    let mut skipped_archived_threads = 0;
 
     for source_root in source_roots {
         let source_conn = open_source_conn(source_root)?;
-        let source_threads = read_source_threads(source_root, source_conn.as_ref())?;
+        let (source_threads, skipped_archived) =
+            read_source_threads(source_root, source_conn.as_ref())?;
+        skipped_archived_threads += skipped_archived;
         let candidate_ids = source_threads
             .iter()
             .map(|thread| thread.id.clone())
@@ -223,6 +228,7 @@ fn sync_sessions_in_transaction(
         copied_session_files,
         duplicate_threads,
         skipped_missing_session_files,
+        skipped_archived_threads,
         merged_session_index_entries: 0,
     })
 }
@@ -239,18 +245,23 @@ fn open_source_conn(source_root: &SyncRoot) -> Result<Option<Connection>, String
 fn read_source_threads(
     source_root: &SyncRoot,
     source_conn: Option<&Connection>,
-) -> Result<Vec<SourceThread>, String> {
+) -> Result<(Vec<SourceThread>, usize), String> {
     let source_rows = if let Some(conn) = source_conn {
         read_source_thread_rows(conn)?
     } else {
         HashMap::new()
     };
     let mut threads = Vec::new();
+    let mut skipped_archived = 0;
     for (session_file, meta) in read_session_files(source_root)? {
         if meta.id.trim().is_empty() {
             continue;
         }
         let row = source_rows.get(&meta.id);
+        if row.is_some_and(|row| source_row_is_archived(row)) {
+            skipped_archived += 1;
+            continue;
+        }
         threads.push(SourceThread {
             id: meta.id.clone(),
             values_by_column: row
@@ -260,7 +271,29 @@ fn read_source_threads(
             meta,
         });
     }
-    Ok(threads)
+    Ok((threads, skipped_archived))
+}
+
+fn syncable_session_ids(source_root: &SyncRoot) -> Result<HashSet<String>, String> {
+    let source_conn = open_source_conn(source_root)?;
+    let (threads, _) = read_source_threads(source_root, source_conn.as_ref())?;
+    Ok(threads.into_iter().map(|thread| thread.id).collect())
+}
+
+fn source_row_is_archived(row: &SourceRow) -> bool {
+    archived_value_is_true(row.values_by_column.get("archived"))
+}
+
+fn archived_value_is_true(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Integer(value)) => *value != 0,
+        Some(Value::Real(value)) => *value != 0.0,
+        Some(Value::Text(value)) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes")
+        }
+        _ => false,
+    }
 }
 
 fn read_source_thread_rows(conn: &Connection) -> Result<HashMap<String, SourceRow>, String> {
@@ -350,15 +383,34 @@ fn count_db_rows_without_session_file(
     if !table_exists(conn, "threads")? {
         return Ok(0);
     }
+    let columns = table_columns(conn, "threads")?;
+    let has_archived = columns.iter().any(|column| column == "archived");
+    let select = if has_archived {
+        "SELECT id, archived FROM threads"
+    } else {
+        "SELECT id FROM threads"
+    };
     let mut statement = conn
-        .prepare("SELECT id FROM threads")
+        .prepare(select)
         .map_err(|error| format!("failed to prepare missing session query: {error}"))?;
     let rows = statement
-        .query_map([], |row| row.get::<usize, String>(0))
+        .query_map([], |row| {
+            let id = row.get::<usize, String>(0)?;
+            let archived = if has_archived {
+                Some(row.get::<usize, Value>(1)?)
+            } else {
+                None
+            };
+            Ok((id, archived))
+        })
         .map_err(|error| format!("failed to query missing sessions: {error}"))?;
     let mut missing = 0;
     for row in rows {
-        let id = row.map_err(|error| format!("failed to read missing session row: {error}"))?;
+        let (id, archived) =
+            row.map_err(|error| format!("failed to read missing session row: {error}"))?;
+        if archived_value_is_true(archived.as_ref()) {
+            continue;
+        }
         if !candidate_ids.contains(&id) {
             missing += 1;
         }
@@ -656,7 +708,11 @@ fn rewrite_session_metadata_provider(path: &Path, provider_id: &str) -> Result<(
     Ok(())
 }
 
-fn merge_session_index(source_root: &SyncRoot, target_root: &SyncRoot) -> Result<usize, String> {
+fn merge_session_index(
+    source_root: &SyncRoot,
+    target_root: &SyncRoot,
+    allowlist: &HashSet<String>,
+) -> Result<usize, String> {
     if !source_root.session_index.exists() {
         return Ok(0);
     }
@@ -676,6 +732,12 @@ fn merge_session_index(source_root: &SyncRoot, target_root: &SyncRoot) -> Result
         .collect::<HashSet<_>>();
     let mut appended = Vec::new();
     for line in source.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(id) = session_index_line_id(line) else {
+            continue;
+        };
+        if !allowlist.contains(&id) {
+            continue;
+        }
         if seen.insert(line.to_string()) {
             appended.push(line.to_string());
         }
@@ -694,6 +756,16 @@ fn merge_session_index(source_root: &SyncRoot, target_root: &SyncRoot) -> Result
     fs::write(&target_root.session_index, output)
         .map_err(|error| format!("failed to write session_index.jsonl: {error}"))?;
     Ok(appended.len())
+}
+
+fn session_index_line_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<JsonValue>(line).ok()?;
+    value
+        .get("id")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("sessionId"))
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn copy_dependent_rows(
@@ -1075,6 +1147,68 @@ mod tests {
                 .unwrap()
                 .contains("thread_name")
         );
+    }
+
+    #[test]
+    fn skips_archived_threads_and_session_index_entries() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let active_jsonl = source
+            .path()
+            .join("sessions/2026/06/23/rollout-active.jsonl");
+        let archived_jsonl = source
+            .path()
+            .join("sessions/2026/06/23/rollout-archived.jsonl");
+        fs::create_dir_all(active_jsonl.parent().unwrap()).unwrap();
+        fs::write(
+            &active_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-active"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &archived_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-archived"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("session_index.jsonl"),
+            "{\"id\":\"thread-active\"}\n{\"id\":\"thread-archived\"}\n",
+        )
+        .unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[
+                ("thread-active", active_jsonl.to_str().unwrap()),
+                ("thread-archived", archived_jsonl.to_str().unwrap()),
+            ],
+        );
+        let conn = Connection::open(source.path().join("state_5.sqlite")).unwrap();
+        conn.execute("ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 0", [])
+            .unwrap();
+        conn.execute("UPDATE threads SET archived = 1 WHERE id = 'thread-archived'", [])
+            .unwrap();
+        create_db(&target.path().join("state_5.sqlite"), &[]);
+
+        let result = sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        assert_eq!(result.inserted_threads, 1);
+        assert_eq!(result.skipped_archived_threads, 1);
+        assert!(!target
+            .path()
+            .join("sessions/2026/06/23/rollout-archived.jsonl")
+            .exists());
+        let target_index = fs::read_to_string(target.path().join("session_index.jsonl")).unwrap();
+        assert!(target_index.contains("thread-active"));
+        assert!(!target_index.contains("thread-archived"));
+        let target_conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let archived_count: i64 = target_conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'thread-archived'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_count, 0);
     }
 
     #[test]

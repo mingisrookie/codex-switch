@@ -9,6 +9,8 @@ const apiMocks = vi.hoisted(() => ({
   closeCodexProcesses: vi.fn(),
   switchRuntime: vi.fn(),
   syncAllSessions: vi.fn(),
+  deleteManagedSessions: vi.fn(),
+  restoreSessionsVisible: vi.fn(),
 }));
 
 vi.mock('./api', () => ({
@@ -19,6 +21,8 @@ vi.mock('./api', () => ({
   closeCodexProcesses: apiMocks.closeCodexProcesses,
   switchRuntime: apiMocks.switchRuntime,
   syncAllSessions: apiMocks.syncAllSessions,
+  deleteManagedSessions: apiMocks.deleteManagedSessions,
+  restoreSessionsVisible: apiMocks.restoreSessionsVisible,
 }));
 
 import App from './App';
@@ -58,6 +62,40 @@ describe('App runtime switch UI', () => {
         threads: [],
         sessionFiles: [],
       },
+      managedSessions: {
+        currentHome: 'C:\\Users\\alice\\.codex',
+        sharedHome: 'C:\\Users\\alice\\AppData\\Roaming\\codex-switch\\shared-sessions',
+        totalCount: 2,
+        archivedCount: 1,
+        sessions: [
+          {
+            id: 'thread-visible',
+            title: '当前会话',
+            preview: null,
+            modelProvider: 'openai',
+            updatedAt: 1,
+            updatedAtMs: 1000,
+            archived: false,
+            archivedAt: null,
+            scope: 'both',
+            current: null,
+            shared: null,
+          },
+          {
+            id: 'thread-archived',
+            title: '归档会话',
+            preview: null,
+            modelProvider: 'openai',
+            updatedAt: 2,
+            updatedAtMs: 2000,
+            archived: true,
+            archivedAt: 2000,
+            scope: 'shared',
+            current: null,
+            shared: null,
+          },
+        ],
+      },
       runtimes: [
         {
           id: 'plus',
@@ -86,7 +124,7 @@ describe('App runtime switch UI', () => {
 
     expect(screen.getByText('CODEX SWITCH')).toBeTruthy();
     expect(screen.getByRole('heading', { name: 'Codex 运行态切换' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: '会话同步' })).toBeNull();
+    expect(screen.getByRole('button', { name: '会话管理' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: '设置' })).toBeNull();
     expect(await screen.findByText('Codex 账号态')).toBeTruthy();
     expect(screen.getByText('API 中转站态')).toBeTruthy();
@@ -157,6 +195,52 @@ describe('App runtime switch UI', () => {
       expect(apiMocks.syncAllSessions).toHaveBeenCalled();
       expect(apiMocks.closeCodexProcesses).not.toHaveBeenCalled();
       expect(apiMocks.listCodexProcesses).not.toHaveBeenCalled();
+    });
+  });
+
+  it('switches to session management without rendering exclude-sync action', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+
+    expect(screen.getByRole('heading', { name: '会话管理' })).toBeTruthy();
+    expect(screen.getByText('当前会话')).toBeTruthy();
+    expect(screen.getByText('归档会话')).toBeTruthy();
+    expect(screen.getByText('两边都有')).toBeTruthy();
+    expect(screen.getAllByText('共享池').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: '排除同步' })).toBeNull();
+  });
+
+  it('requires confirmation before deleting unarchived sessions', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+    fireEvent.click(screen.getByLabelText('选择 thread-visible'));
+    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+
+    await waitFor(() => {
+      expect(window.confirm).toHaveBeenCalled();
+      expect(apiMocks.deleteManagedSessions).toHaveBeenCalledWith(['thread-visible'], true);
+    });
+  });
+
+  it('deletes archived sessions without extra confirmation and restores visibility', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+    fireEvent.click(screen.getByLabelText('选择 thread-archived'));
+    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+
+    await waitFor(() => {
+      expect(confirm).not.toHaveBeenCalled();
+      expect(apiMocks.deleteManagedSessions).toHaveBeenCalledWith(['thread-archived'], false);
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '恢复可见' }));
+    await waitFor(() => {
+      expect(apiMocks.restoreSessionsVisible).toHaveBeenCalledWith(['thread-archived']);
     });
   });
 });

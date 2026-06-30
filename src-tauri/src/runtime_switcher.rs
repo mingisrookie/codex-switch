@@ -68,6 +68,8 @@ pub fn sync_home_with_shared(
         duplicate_threads: to_shared.duplicate_threads + from_shared.duplicate_threads,
         skipped_missing_session_files: to_shared.skipped_missing_session_files
             + from_shared.skipped_missing_session_files,
+        skipped_archived_threads: to_shared.skipped_archived_threads
+            + from_shared.skipped_archived_threads,
         merged_session_index_entries: to_shared.merged_session_index_entries
             + from_shared.merged_session_index_entries,
     })

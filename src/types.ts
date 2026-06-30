@@ -26,6 +26,11 @@ export type CodexHomeStatus = {
 export type ThreadRecord = {
   id: string;
   rolloutPath: string | null;
+  title: string | null;
+  preview: string | null;
+  modelProvider: string | null;
+  archived: boolean;
+  archivedAt: number | null;
   updatedAt: number | null;
   updatedAtMs: number | null;
 };
@@ -47,7 +52,51 @@ export type SessionInventory = {
 export type DashboardData = {
   codexHome: CodexHomeStatus;
   sessions: SessionInventory;
+  managedSessions: ManagedSessionInventory;
   runtimes: RuntimeMetadata[];
+};
+
+export type ManagedSessionScope = 'current' | 'shared' | 'both' | 'unknown';
+
+export type ManagedSessionLocation = {
+  home: string;
+  rolloutPath: string | null;
+  sessionFile: string | null;
+  archived: boolean;
+  archivedAt: number | null;
+  updatedAt: number | null;
+  updatedAtMs: number | null;
+};
+
+export type ManagedSessionRecord = {
+  id: string;
+  title: string | null;
+  preview: string | null;
+  modelProvider: string | null;
+  updatedAt: number | null;
+  updatedAtMs: number | null;
+  archived: boolean;
+  archivedAt: number | null;
+  scope: ManagedSessionScope;
+  current: ManagedSessionLocation | null;
+  shared: ManagedSessionLocation | null;
+};
+
+export type ManagedSessionInventory = {
+  currentHome: string;
+  sharedHome: string;
+  totalCount: number;
+  archivedCount: number;
+  sessions: ManagedSessionRecord[];
+};
+
+export type SessionMutationResult = {
+  selectedCount: number;
+  backups: unknown[];
+  deletedThreads: number;
+  deletedSessionFiles: number;
+  removedSessionIndexEntries: number;
+  restoredThreads: number;
 };
 
 export type RuntimeKind = 'plus' | 'relay';

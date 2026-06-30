@@ -9,6 +9,7 @@ pub mod profile_store;
 pub mod redaction;
 pub mod runtime_store;
 pub mod runtime_switcher;
+pub mod session_manager;
 pub mod session_scan;
 pub mod session_sync;
 pub mod switcher;
@@ -19,6 +20,7 @@ pub fn run() {
             commands::get_app_status,
             commands::scan_codex_home,
             commands::scan_sessions,
+            commands::scan_managed_sessions,
             commands::dry_run_sync,
             commands::create_backup,
             commands::list_profiles,
@@ -32,7 +34,9 @@ pub fn run() {
             commands::switch_profile,
             commands::switch_runtime,
             commands::sync_sessions_from_paths,
-            commands::sync_all_sessions
+            commands::sync_all_sessions,
+            commands::delete_managed_sessions,
+            commands::restore_sessions_visible
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Switch");

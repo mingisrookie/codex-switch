@@ -16,6 +16,11 @@ use crate::{
     session_scan::{
         build_sync_dry_run, scan_sessions as scan_session_inventory, SessionInventory, SyncDryRun,
     },
+    session_manager::{
+        delete_managed_sessions as delete_sessions, restore_sessions_visible as restore_visible,
+        scan_managed_sessions as scan_managed_session_inventory, ManagedSessionInventory,
+        SessionMutationResult,
+    },
     session_sync::{sync_sessions, SessionSyncResult},
     switcher::{switch_profile_files, SwitchResult},
 };
@@ -45,6 +50,12 @@ pub fn scan_codex_home(path: Option<String>) -> Result<CodexHomeStatus, String> 
 #[tauri::command]
 pub fn scan_sessions(path: Option<String>) -> Result<SessionInventory, String> {
     scan_session_inventory(&resolve_codex_home(path))
+}
+
+#[tauri::command]
+pub fn scan_managed_sessions(path: Option<String>) -> Result<ManagedSessionInventory, String> {
+    let shared_home = default_shared_sessions_root()?;
+    scan_managed_session_inventory(&resolve_codex_home(path), &shared_home)
 }
 
 #[tauri::command]
@@ -158,6 +169,32 @@ pub fn sync_all_sessions(path: Option<String>) -> Result<SessionSyncResult, Stri
     let backup_root = default_backup_root()?;
     let shared_home = default_shared_sessions_root()?;
     sync_all_sessions_guarded(path, &[], &backup_root, &shared_home)
+}
+
+#[tauri::command]
+pub fn delete_managed_sessions(
+    ids: Vec<String>,
+    confirm_unarchived: bool,
+    path: Option<String>,
+) -> Result<SessionMutationResult, String> {
+    let backup_root = default_backup_root()?;
+    let shared_home = default_shared_sessions_root()?;
+    delete_sessions(
+        &resolve_codex_home(path),
+        &shared_home,
+        &backup_root,
+        &ids,
+        confirm_unarchived,
+    )
+}
+
+#[tauri::command]
+pub fn restore_sessions_visible(
+    ids: Vec<String>,
+    path: Option<String>,
+) -> Result<SessionMutationResult, String> {
+    let backup_root = default_backup_root()?;
+    restore_visible(&resolve_codex_home(path), &backup_root, &ids)
 }
 
 #[tauri::command]
