@@ -118,6 +118,25 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 
 不能只改一个调用点就声称完成。
 
+### 1.4 本地高风险写操作合同
+
+涉及 live Codex Home、shared-sessions、运行态凭据或工具备份的 mutation，必须按以下顺序设计和审查：
+
+```text
+preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
+                                      \-> rollback -> verify rollback -> terminal status
+```
+
+- 切换、删除、恢复可见和完整恢复必须在后端写入前再次确认 Codex 已关闭；只有独立会话同步允许热写入。
+- 关闭态 mutation 可能影响 current/shared 两根时，必须在写入前分别创建完整、已验证快照；任一根部分成功后另一根失败，必须补偿恢复两根。
+- 热同步允许 Codex 运行，是上述规则的显式例外：失败时恢复工具内部 shared 根，但不得用操作前快照覆盖可能已产生并发变化的 live current Home；必须保留并回报 current 安全备份供人工恢复。
+- 文件写入、复制和 JSONL 重写统一走 `file_ops` 原子操作；不得直接 `fs::write` 覆盖 live 文件。
+- 所有会修改运行态、凭据、current/shared 或备份目标的 command 必须共用 mutation guard：进程内 try-lock + Windows 独占 `mutation.lock` 文件句柄；新增入口不得绕过同进程/跨进程串行化。
+- 当前没有备份 retention/prune；任何清理策略必须先定义保留周期、容量上限、在用/安全快照保护与用户确认，不能在列表扫描或其他无关流程中静默删除。
+- SQLite 备份必须使用 SQLite Online Backup API；不得把直接复制 WAL/SHM 当成一致性快照。
+- 工具自有备份 payload 必须全部 DPAPI 加密，并记录大小和 SHA-256；恢复前必须校验 manifest 和 payload，恢复后执行必要的解析/`quick_check`。
+- 成功回执必须包含可关联的 operation ID、备份引用、计数、回滚终态和警告。命令完成后必须释放 UI busy，Dashboard 刷新走后台 best-effort；操作成功后的刷新失败必须与 mutation 失败分开表达，操作失败后的刷新失败不得覆盖原错误。
+
 ## 2. 新增功能接入规范
 
 ### 2.1 新增配置项
@@ -131,6 +150,21 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 ### 2.3 新增 provider / 外部集成
 
 优先使用稳定协议接口。只有目标来源没有协议能力、必须依赖页面操作时，才新增浏览器或 UI 自动化分支。新增 provider 必须补齐配置、调度、错误处理、状态落盘、文档和测试。
+
+本项目当前运行态是固定的 `plus`（Codex 账号内部兼容 ID）和 `relay` 两槽位。扩展为任意账号池属于产品范围变化，必须先更新 PRD，不能仅通过循环 UI 或复用 legacy profile command 偷渡。
+
+Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTP(S) Base URL。API Key 只能通过 password 表单进入，首次必填、后续空值表示保留，不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key。
+
+内置 Skill 接入必须使用编译期固定 ID、固定文件 allowlist、来源/版本/hash manifest 和后端推导目标；不得让前端传任意下载 URL、源路径、目标路径或文件名。Skill 状态必须区分 missing/current/update available/local drift/unmanaged/invalid，未知目录和本地修改不得静默覆盖。安装/更新属于关闭态 mutation，必须共用 mutation guard、同卷 stage、完整旧目录备份、原子激活、后置 hash 验证、崩溃 journal 恢复和 typed receipt。
+
+Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后端校验，非 loopback HTTP 拒绝；Key 使用 password 输入、首次必填、后续空值保留，只能以 Windows DPAPI 密文保存。安装包、Skill 文件、非敏感 config、日志、回执、错误和测试产物均不得包含真实 Key；PowerShell helper 的 DPAPI 格式必须用跨 Rust/Windows PowerShell 契约测试验证。
+
+### 2.4 前后端状态与回执
+
+- Dashboard 数据必须按领域建模为 `loading | ready | error`；某个 Tauri command 失败时保留该域错误，禁止替换成空数组、零计数或绿色安全状态。
+- 写操作门禁必须依赖真实文件/SQLite/运行态域，而不是“页面加载完成”或“文件路径存在”。
+- 运行态的“已保存”“当前激活”“最近验证”是三个独立概念；只有 `confidence = exact` 可标记当前并跳过切换，`mode` 只能提示重新应用。
+- 跨层 mutation 返回 typed receipt；新增/修改字段时必须同步 Rust serde、`src/types.ts`、`src/api.ts`、UI 展示和契约测试。
 
 ## 3. 测试规范
 
@@ -146,6 +180,26 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 - 改核心逻辑：运行项目当前真实回归命令；如果清单、README、长期文档、CI 配置和实际可运行命令冲突，以当前实际可运行命令为准，并说明证据。
 - 改文档-only：至少做文档内容、链接和乱码检查。
 - 测试失败时不得提交；除非用户明确要求保留失败状态用于排查，否则必须先修复。
+
+### 3.3 本项目发布门禁
+
+当前 Windows release 至少执行：
+
+```powershell
+npm test -- --run
+npm run typecheck
+npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+npm run tauri -- build
+```
+
+- `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建和 Rust fmt/clippy/test；CI 文件存在不等于本轮已通过。
+- 备份、切换、双根同步/删除/恢复等高风险变化必须有临时目录或临时 `CODEX_HOME` 测试，至少覆盖幂等、故障注入和回滚终态。
+- Skill 安装测试必须使用临时 `CODEX_HOME` / `APPDATA`，覆盖 clean install、幂等 current、未知目录/漂移确认、旧目录备份、URL 拒绝、Key 密文与空 Key 保留；vendored PowerShell/Python 至少做语法解析，并验证 Rust DPAPI 密文可被 Windows PowerShell 读取。
+- 发布回执必须区分已运行、未运行和被环境阻断的检查；不得把局部测试写成“全量通过”。
+- 敏感扫描和中文乱码检查是发布门禁，不得被普通单元测试替代。
 
 ## 4. 文档更新规范
 
@@ -173,6 +227,8 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 6. 我修改的中文内容是否无可见乱码？
 7. 我有没有新增不必要的兼容分支、兜底分支或旧逻辑？
 8. 我有没有保护敏感文件，不回显真实 token、密码、API Key 或账号明细？
+9. 我有没有把 scan failure 误当成空数据，或把 mode-only 误当成 exact？
+10. mutation 是否完整覆盖备份、后置校验、补偿恢复、typed receipt 和操作记录？
 
 ## 7. 完成标准
 

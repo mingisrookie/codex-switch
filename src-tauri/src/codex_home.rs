@@ -5,9 +5,8 @@ use std::{
 
 use serde::Serialize;
 use serde_json::Value;
-use walkdir::WalkDir;
 
-use crate::codex_paths::resolve_user_codex_paths;
+use crate::{codex_paths::resolve_user_codex_paths, file_ops::walk_jsonl_files};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -41,7 +40,7 @@ pub struct CodexHomeStatus {
 }
 
 pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
-    let paths = resolve_user_codex_paths(home);
+    let paths = resolve_user_codex_paths(home)?;
     let auth_path = home.join("auth.json");
     let config_path = home.join("config.toml");
     let sessions_path = &paths.sessions_dir;
@@ -61,7 +60,7 @@ pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
         logs_db: file_status(&paths.logs_db),
         codex_dev_db: file_status(&home.join("sqlite").join("codex-dev.db")),
         sessions_dir: file_status(sessions_path),
-        session_jsonl_count: count_session_jsonl(sessions_path),
+        session_jsonl_count: count_session_jsonl(sessions_path)?,
         auth_summary,
     })
 }
@@ -98,22 +97,11 @@ fn file_status(path: &Path) -> FileStatus {
     }
 }
 
-fn count_session_jsonl(sessions_path: &Path) -> usize {
+fn count_session_jsonl(sessions_path: &Path) -> Result<usize, String> {
     if !sessions_path.exists() {
-        return 0;
+        return Ok(0);
     }
-
-    WalkDir::new(sessions_path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        })
-        .count()
+    Ok(walk_jsonl_files(sessions_path)?.len())
 }
 
 #[cfg(test)]

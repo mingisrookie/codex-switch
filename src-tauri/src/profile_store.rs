@@ -51,7 +51,7 @@ impl ProfileStore {
         Self { root }
     }
 
-    pub fn default() -> Result<Self, String> {
+    pub fn from_default_root() -> Result<Self, String> {
         Ok(Self::new(default_store_root()?))
     }
 
@@ -66,7 +66,9 @@ impl ProfileStore {
         }
 
         let mut profiles = Vec::new();
-        for entry in fs::read_dir(profiles_root).map_err(|error| format!("failed to read profiles: {error}"))? {
+        for entry in fs::read_dir(profiles_root)
+            .map_err(|error| format!("failed to read profiles: {error}"))?
+        {
             let entry = entry.map_err(|error| format!("failed to read profile entry: {error}"))?;
             let meta_path = entry.path().join("profile.json");
             if meta_path.exists() {
@@ -85,10 +87,16 @@ impl ProfileStore {
     ) -> Result<ProfileMetadata, String> {
         let auth_path = codex_home.join("auth.json");
         let config_path = codex_home.join("config.toml");
-        let auth_bytes = fs::read(&auth_path).map_err(|error| format!("failed to read auth.json: {error}"))?;
+        let auth_bytes =
+            fs::read(&auth_path).map_err(|error| format!("failed to read auth.json: {error}"))?;
         let auth_mode = serde_json::from_slice::<serde_json::Value>(&auth_bytes)
             .ok()
-            .and_then(|value| value.get("auth_mode").and_then(serde_json::Value::as_str).map(str::to_string));
+            .and_then(|value| {
+                value
+                    .get("auth_mode")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
         let profile = ProfileMetadata {
             id: make_profile_id(name)?,
             name: name.to_string(),
@@ -100,7 +108,8 @@ impl ProfileStore {
             last_used_at_ms: None,
         };
         let dir = self.profile_dir(&profile.id);
-        fs::create_dir_all(&dir).map_err(|error| format!("failed to create profile dir: {error}"))?;
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("failed to create profile dir: {error}"))?;
         fs::write(dir.join("auth.enc"), protect(&auth_bytes)?)
             .map_err(|error| format!("failed to write encrypted auth: {error}"))?;
         if config_path.exists() {
@@ -123,7 +132,8 @@ impl ProfileStore {
             last_used_at_ms: None,
         };
         let dir = self.profile_dir(&profile.id);
-        fs::create_dir_all(&dir).map_err(|error| format!("failed to create profile dir: {error}"))?;
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("failed to create profile dir: {error}"))?;
         let auth = api_auth_json(input.env_key.as_str(), input.api_key.as_deref())?;
         fs::write(dir.join("auth.enc"), protect(&auth)?)
             .map_err(|error| format!("failed to write encrypted auth: {error}"))?;
@@ -160,14 +170,20 @@ impl ProfileStore {
 
 fn api_auth_json(env_key: &str, api_key: Option<&str>) -> Result<Vec<u8>, String> {
     let mut auth = serde_json::Map::new();
-    auth.insert("auth_mode".to_string(), serde_json::Value::String("apikey".to_string()));
+    auth.insert(
+        "auth_mode".to_string(),
+        serde_json::Value::String("apikey".to_string()),
+    );
     if let Some(api_key) = api_key.map(str::trim).filter(|api_key| !api_key.is_empty()) {
         auth.insert(
             "OPENAI_API_KEY".to_string(),
             serde_json::Value::String(api_key.to_string()),
         );
         if env_key != "OPENAI_API_KEY" {
-            auth.insert(env_key.to_string(), serde_json::Value::String(api_key.to_string()));
+            auth.insert(
+                env_key.to_string(),
+                serde_json::Value::String(api_key.to_string()),
+            );
         }
     } else {
         auth.insert("OPENAI_API_KEY".to_string(), serde_json::Value::Null);
@@ -188,7 +204,8 @@ fn write_profile_metadata(path: &Path, profile: &ProfileMetadata) -> Result<(), 
 }
 
 fn read_profile_metadata(path: &Path) -> Result<ProfileMetadata, String> {
-    let raw = fs::read_to_string(path).map_err(|error| format!("failed to read profile metadata: {error}"))?;
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read profile metadata: {error}"))?;
     serde_json::from_str(&raw).map_err(|error| format!("failed to parse profile metadata: {error}"))
 }
 
@@ -203,7 +220,10 @@ fn make_profile_id(name: &str) -> Result<String, String> {
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
         .collect::<String>();
     let prefix = if slug.is_empty() { "profile" } else { &slug };
-    Ok(format!("{prefix}-{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]))
+    Ok(format!(
+        "{prefix}-{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    ))
 }
 
 fn timestamp_millis() -> Result<u128, String> {
@@ -224,7 +244,11 @@ mod tests {
     #[test]
     fn imports_current_profile_with_encrypted_auth() {
         let home = tempdir().unwrap();
-        fs::write(home.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake"}}"#).unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake"}}"#,
+        )
+        .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
         let store_root = tempdir().unwrap();
         let store = ProfileStore::new(store_root.path().to_path_buf());
@@ -235,7 +259,10 @@ mod tests {
 
         let auth_enc = fs::read(store.profile_dir(&profile.id).join("auth.enc")).unwrap();
         assert!(!String::from_utf8_lossy(&auth_enc).contains("access_token"));
-        assert_eq!(store.load_auth_plaintext(&profile.id).unwrap(), fs::read(home.path().join("auth.json")).unwrap());
+        assert_eq!(
+            store.load_auth_plaintext(&profile.id).unwrap(),
+            fs::read(home.path().join("auth.json")).unwrap()
+        );
         assert_eq!(store.list_profiles().unwrap().len(), 1);
     }
 
@@ -256,7 +283,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(profile.kind, ProfileKind::ApiProvider);
-        let overlay = fs::read_to_string(store.profile_dir(&profile.id).join("config-overlay.toml")).unwrap();
+        let overlay =
+            fs::read_to_string(store.profile_dir(&profile.id).join("config-overlay.toml")).unwrap();
         assert!(overlay.contains("model_provider = \"direct-account\""));
         assert!(overlay.contains("base_url = \"https://api.openai.com/v1\""));
     }

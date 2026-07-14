@@ -1,18 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    io::{BufRead, BufReader},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{types::Value, Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
-use crate::codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths};
+use crate::{
+    codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
+    file_ops::{atomic_copy, atomic_rewrite, walk_jsonl_files},
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +82,8 @@ pub fn sync_sessions(
         &sources,
         root_from_paths(local_codex_paths(target_home)),
         None,
+        true,
+        false,
     )
 }
 
@@ -96,6 +100,8 @@ pub fn sync_sessions_for_provider(
         &sources,
         root_from_paths(local_codex_paths(target_home)),
         Some(provider_id),
+        true,
+        true,
     )
 }
 
@@ -104,9 +110,11 @@ pub fn sync_user_home_to_shared(
     shared_home: &Path,
 ) -> Result<SessionSyncResult, String> {
     sync_session_roots(
-        &[root_from_paths(resolve_user_codex_paths(codex_home))],
+        &[root_from_paths(resolve_user_codex_paths(codex_home)?)],
         root_from_paths(local_codex_paths(shared_home)),
         None,
+        true,
+        false,
     )
 }
 
@@ -117,8 +125,24 @@ pub fn sync_shared_to_user_home(
 ) -> Result<SessionSyncResult, String> {
     sync_session_roots(
         &[root_from_paths(local_codex_paths(shared_home))],
-        root_from_paths(resolve_user_codex_paths(codex_home)),
+        root_from_paths(resolve_user_codex_paths(codex_home)?),
         Some(provider_id),
+        true,
+        true,
+    )
+}
+
+pub fn sync_shared_to_user_home_hot(
+    shared_home: &Path,
+    codex_home: &Path,
+    provider_id: &str,
+) -> Result<SessionSyncResult, String> {
+    sync_session_roots(
+        &[root_from_paths(local_codex_paths(shared_home))],
+        root_from_paths(resolve_user_codex_paths(codex_home)?),
+        Some(provider_id),
+        false,
+        false,
     )
 }
 
@@ -135,20 +159,39 @@ fn sync_session_roots(
     source_roots: &[SyncRoot],
     target_root: SyncRoot,
     provider_id: Option<&str>,
+    allow_existing_replacement: bool,
+    rewrite_existing_provider: bool,
 ) -> Result<SessionSyncResult, String> {
     let target_conn = Connection::open(&target_root.state_db)
         .map_err(|error| format!("failed to open target state_5.sqlite: {error}"))?;
     target_conn
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("failed to set target SQLite timeout: {error}"))?;
+    target_conn
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("failed to start session sync transaction: {error}"))?;
 
-    let result =
-        sync_sessions_in_transaction(source_roots, &target_root, &target_conn, provider_id);
+    let result = sync_sessions_in_transaction(
+        source_roots,
+        &target_root,
+        &target_conn,
+        provider_id,
+        allow_existing_replacement,
+        rewrite_existing_provider,
+    );
     match result {
         Ok(mut result) => {
             target_conn
                 .execute_batch("COMMIT")
                 .map_err(|error| format!("failed to commit session sync transaction: {error}"))?;
+            let quick_check: String = target_conn
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|error| format!("failed to verify target state_5.sqlite: {error}"))?;
+            if quick_check != "ok" {
+                return Err(format!(
+                    "target state_5.sqlite failed quick_check: {quick_check}"
+                ));
+            }
             for source_root in source_roots {
                 let allowlist = syncable_session_ids(source_root)?;
                 result.merged_session_index_entries +=
@@ -168,6 +211,8 @@ fn sync_sessions_in_transaction(
     target_root: &SyncRoot,
     target_conn: &Connection,
     provider_id: Option<&str>,
+    allow_existing_replacement: bool,
+    rewrite_existing_provider: bool,
 ) -> Result<SessionSyncResult, String> {
     let mut inserted_threads = 0;
     let mut copied_session_files = 0;
@@ -188,14 +233,28 @@ fn sync_sessions_in_transaction(
             count_db_rows_without_session_file(source_conn.as_ref(), &candidate_ids)?;
 
         for thread in source_threads {
-            let copied_rollout = copy_rollout_file(target_root, &thread)?;
+            let copied_rollout =
+                copy_rollout_file(target_root, &thread, allow_existing_replacement)?;
+            if let Some(provider_id) = provider_id {
+                if rewrite_existing_provider || copied_rollout.copied {
+                    rewrite_session_metadata_provider(
+                        Path::new(&copied_rollout.path),
+                        provider_id,
+                    )?;
+                }
+            }
             if thread_exists(target_conn, &thread.id)? {
                 duplicate_threads += 1;
+                let provider_for_thread = if rewrite_existing_provider || copied_rollout.copied {
+                    provider_id
+                } else {
+                    None
+                };
                 update_existing_thread(
                     target_conn,
                     &thread.id,
                     Some(copied_rollout.path.as_str()),
-                    provider_id,
+                    provider_for_thread,
                 )?;
                 if copied_rollout.copied {
                     copied_session_files += 1;
@@ -218,11 +277,6 @@ fn sync_sessions_in_transaction(
         }
     }
 
-    if let Some(provider_id) = provider_id {
-        normalize_thread_providers(target_conn, provider_id)?;
-        normalize_session_metadata_provider(target_root, provider_id)?;
-    }
-
     Ok(SessionSyncResult {
         inserted_threads,
         copied_session_files,
@@ -237,9 +291,11 @@ fn open_source_conn(source_root: &SyncRoot) -> Result<Option<Connection>, String
     if !source_root.state_db.exists() {
         return Ok(None);
     }
-    Connection::open_with_flags(&source_root.state_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map(Some)
-        .map_err(|error| format!("failed to open source state_5.sqlite: {error}"))
+    let conn = Connection::open_with_flags(&source_root.state_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("failed to open source state_5.sqlite: {error}"))?;
+    conn.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("failed to set source SQLite timeout: {error}"))?;
+    Ok(Some(conn))
 }
 
 fn read_source_threads(
@@ -258,7 +314,7 @@ fn read_source_threads(
             continue;
         }
         let row = source_rows.get(&meta.id);
-        if row.is_some_and(|row| source_row_is_archived(row)) {
+        if row.is_some_and(source_row_is_archived) {
             skipped_archived += 1;
             continue;
         }
@@ -346,19 +402,7 @@ fn read_session_files(source_root: &SyncRoot) -> Result<Vec<(PathBuf, SessionMet
     if !source_root.sessions_dir.exists() {
         return Ok(Vec::new());
     }
-    let mut files = WalkDir::new(&source_root.sessions_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        })
-        .map(|entry| entry.into_path())
-        .collect::<Vec<_>>();
-    files.sort();
+    let files = walk_jsonl_files(&source_root.sessions_dir)?;
 
     let mut output = Vec::new();
     let mut seen = HashSet::new();
@@ -438,12 +482,16 @@ fn insert_thread(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "INSERT OR IGNORE INTO threads ({}) VALUES ({})",
+        "INSERT INTO threads ({}) VALUES ({})",
         columns.join(", "),
         placeholders
     );
-    conn.execute(&sql, rusqlite::params_from_iter(values))
+    let inserted = conn
+        .execute(&sql, rusqlite::params_from_iter(values))
         .map_err(|error| format!("failed to insert target thread: {error}"))?;
+    if inserted != 1 {
+        return Err(format!("target thread insert affected {inserted} rows"));
+    }
     Ok(())
 }
 
@@ -495,7 +543,12 @@ fn thread_value_for_target_column(
             Value::Null
         }
         _ if column.default_value.is_some() || !column.not_null => Value::Null,
-        _ => Value::Text(String::new()),
+        _ => {
+            return Err(format!(
+                "unsupported threads schema: required column {} has no known value or default",
+                column.name
+            ))
+        }
     };
     Ok(value)
 }
@@ -540,31 +593,87 @@ fn update_existing_thread(
     Ok(())
 }
 
-fn copy_rollout_file(target_root: &SyncRoot, thread: &SourceThread) -> Result<RolloutCopy, String> {
+fn copy_rollout_file(
+    target_root: &SyncRoot,
+    thread: &SourceThread,
+    allow_existing_replacement: bool,
+) -> Result<RolloutCopy, String> {
     let relative = rollout_relative_path(&thread.session_file);
     let mut target_path = target_root.root.join(relative);
-    if target_path.exists() && sha256_file(&thread.session_file)? != sha256_file(&target_path)? {
-        let stem = target_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("rollout")
-            .to_string();
-        target_path.set_file_name(format!("{stem}-imported.jsonl"));
-    }
     let mut copied = false;
-    if !target_path.exists() {
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create target session dir: {error}"))?;
+    if target_path.exists() {
+        let source_hash = sha256_file(&thread.session_file)?;
+        let target_hash = sha256_file(&target_path)?;
+        if source_hash != target_hash {
+            let source_len = fs::metadata(&thread.session_file)
+                .map_err(|error| format!("failed to inspect source session jsonl: {error}"))?
+                .len();
+            let target_len = fs::metadata(&target_path)
+                .map_err(|error| format!("failed to inspect target session jsonl: {error}"))?
+                .len();
+            if source_len > target_len && file_is_prefix(&target_path, &thread.session_file)? {
+                if allow_existing_replacement {
+                    atomic_copy(&thread.session_file, &target_path)?;
+                    copied = true;
+                }
+            } else if !(target_len > source_len
+                && file_is_prefix(&thread.session_file, &target_path)?)
+            {
+                let stem = target_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("rollout")
+                    .to_string();
+                let hash_suffix = source_hash
+                    .iter()
+                    .take(6)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                target_path.set_file_name(format!("{stem}-imported-{hash_suffix}.jsonl"));
+                if !target_path.exists() {
+                    atomic_copy(&thread.session_file, &target_path)?;
+                    copied = true;
+                }
+            }
         }
-        fs::copy(&thread.session_file, &target_path)
-            .map_err(|error| format!("failed to copy session jsonl: {error}"))?;
+    } else {
+        atomic_copy(&thread.session_file, &target_path)?;
         copied = true;
     }
     Ok(RolloutCopy {
         path: target_path.to_string_lossy().to_string(),
         copied,
     })
+}
+
+fn file_is_prefix(shorter: &Path, longer: &Path) -> Result<bool, String> {
+    let mut shorter = fs::File::open(shorter)
+        .map_err(|error| format!("failed to open prefix candidate: {error}"))?;
+    let mut longer = fs::File::open(longer)
+        .map_err(|error| format!("failed to open session candidate: {error}"))?;
+    let mut short_buffer = [0_u8; 64 * 1024];
+    let mut long_buffer = [0_u8; 64 * 1024];
+    loop {
+        let short_read = shorter
+            .read(&mut short_buffer)
+            .map_err(|error| format!("failed to read prefix candidate: {error}"))?;
+        if short_read == 0 {
+            return Ok(true);
+        }
+        let mut offset = 0;
+        while offset < short_read {
+            let long_read = longer
+                .read(&mut long_buffer[offset..short_read])
+                .map_err(|error| format!("failed to read session candidate: {error}"))?;
+            if long_read == 0 {
+                return Ok(false);
+            }
+            offset += long_read;
+        }
+        if short_buffer[..short_read] != long_buffer[..short_read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn rollout_relative_path(source_path: &Path) -> PathBuf {
@@ -627,85 +736,61 @@ fn session_file_meta(path: &Path) -> Result<Option<SessionMeta>, String> {
     Ok(None)
 }
 
-fn normalize_thread_providers(conn: &Connection, provider_id: &str) -> Result<(), String> {
-    if !table_columns(conn, "threads")?
-        .iter()
-        .any(|column| column == "model_provider")
-    {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE threads SET model_provider = ?1 WHERE model_provider IS NULL OR model_provider <> ?1",
-        [provider_id],
-    )
-    .map_err(|error| format!("failed to normalize thread providers: {error}"))?;
-    Ok(())
-}
-
-fn normalize_session_metadata_provider(
-    target_root: &SyncRoot,
-    provider_id: &str,
-) -> Result<(), String> {
-    if !target_root.sessions_dir.exists() {
-        return Ok(());
-    }
-    for entry in WalkDir::new(&target_root.sessions_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if entry.file_type().is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        {
-            rewrite_session_metadata_provider(entry.path(), provider_id)?;
-        }
-    }
-    Ok(())
-}
-
 fn rewrite_session_metadata_provider(path: &Path, provider_id: &str) -> Result<(), String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read session jsonl: {error}"))?;
-    let mut changed = false;
-    let mut output = String::with_capacity(raw.len());
-    for line in raw.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.trim_end_matches(['\r', '\n']);
-        let mut rewritten = None;
-        if body.contains("session_meta") {
-            if let Ok(mut value) = serde_json::from_str::<JsonValue>(body) {
-                if value.get("type").and_then(JsonValue::as_str) == Some("session_meta") {
-                    if let Some(payload) =
-                        value.get_mut("payload").and_then(JsonValue::as_object_mut)
-                    {
-                        if payload.get("model_provider").and_then(JsonValue::as_str)
-                            != Some(provider_id)
+    if session_file_meta(path)?.and_then(|meta| meta.model_provider)
+        == Some(provider_id.to_string())
+    {
+        return Ok(());
+    }
+    let source_path = path.to_path_buf();
+    atomic_rewrite(path, |output| {
+        let source = fs::File::open(&source_path)
+            .map_err(|error| format!("failed to open session jsonl for rewrite: {error}"))?;
+        let mut reader = BufReader::new(source);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("failed to read session jsonl: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            let body = line.trim_end_matches(['\r', '\n']);
+            let mut rewritten = None;
+            if body.contains("session_meta") {
+                if let Ok(mut value) = serde_json::from_str::<JsonValue>(body) {
+                    if value.get("type").and_then(JsonValue::as_str) == Some("session_meta") {
+                        if let Some(payload) =
+                            value.get_mut("payload").and_then(JsonValue::as_object_mut)
                         {
                             payload.insert(
                                 "model_provider".to_string(),
                                 JsonValue::String(provider_id.to_string()),
                             );
-                            changed = true;
+                            rewritten = Some(serde_json::to_string(&value).map_err(|error| {
+                                format!("failed to serialize session metadata: {error}")
+                            })?);
                         }
-                        rewritten = Some(serde_json::to_string(&value).map_err(|error| {
-                            format!("failed to serialize session metadata: {error}")
-                        })?);
                     }
                 }
             }
+            output
+                .write_all(rewritten.as_deref().unwrap_or(body).as_bytes())
+                .map_err(|error| format!("failed to write session jsonl rewrite: {error}"))?;
+            output
+                .write_all(ending.as_bytes())
+                .map_err(|error| format!("failed to write session jsonl ending: {error}"))?;
         }
-        output.push_str(rewritten.as_deref().unwrap_or(body));
-        if has_newline {
-            output.push('\n');
-        }
-    }
-    if changed {
-        fs::write(path, output)
-            .map_err(|error| format!("failed to write session jsonl: {error}"))?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn merge_session_index(
@@ -716,45 +801,82 @@ fn merge_session_index(
     if !source_root.session_index.exists() {
         return Ok(0);
     }
-    let source = fs::read_to_string(&source_root.session_index)
-        .map_err(|error| format!("failed to read session_index.jsonl: {error}"))?;
-    if source.trim().is_empty() {
-        return Ok(0);
-    }
     if let Some(parent) = target_root.session_index.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create session index parent: {error}"))?;
     }
-    let target = fs::read_to_string(&target_root.session_index).unwrap_or_default();
-    let mut seen = target
-        .lines()
-        .map(ToOwned::to_owned)
-        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut target_needs_newline = false;
+    if target_root.session_index.exists() {
+        let mut target = fs::File::open(&target_root.session_index)
+            .map_err(|error| format!("failed to open target session_index.jsonl: {error}"))?;
+        let length = target
+            .metadata()
+            .map_err(|error| format!("failed to inspect target session_index.jsonl: {error}"))?
+            .len();
+        if length > 0 {
+            target
+                .seek(SeekFrom::End(-1))
+                .map_err(|error| format!("failed to seek target session_index.jsonl: {error}"))?;
+            let mut last = [0_u8; 1];
+            target.read_exact(&mut last).map_err(|error| {
+                format!("failed to inspect target session_index.jsonl ending: {error}")
+            })?;
+            target_needs_newline = last[0] != b'\n';
+            target
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| format!("failed to rewind target session_index.jsonl: {error}"))?;
+        }
+        for line in BufReader::new(target).lines() {
+            let line = line
+                .map_err(|error| format!("failed to read target session_index.jsonl: {error}"))?;
+            seen.insert(line);
+        }
+    }
+
+    let source = fs::File::open(&source_root.session_index)
+        .map_err(|error| format!("failed to open source session_index.jsonl: {error}"))?;
     let mut appended = Vec::new();
-    for line in source.lines().filter(|line| !line.trim().is_empty()) {
-        let Some(id) = session_index_line_id(line) else {
+    for line in BufReader::new(source).lines() {
+        let line =
+            line.map_err(|error| format!("failed to read source session_index.jsonl: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(id) = session_index_line_id(&line) else {
             continue;
         };
         if !allowlist.contains(&id) {
             continue;
         }
-        if seen.insert(line.to_string()) {
-            appended.push(line.to_string());
+        if seen.insert(line.clone()) {
+            appended.push(line);
         }
     }
     if appended.is_empty() {
         return Ok(0);
     }
-    let mut output = target;
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
+    let mut output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target_root.session_index)
+        .map_err(|error| {
+            format!("failed to open target session_index.jsonl for append: {error}")
+        })?;
+    let mut encoded = Vec::new();
+    if target_needs_newline {
+        encoded.push(b'\n');
     }
     for line in &appended {
-        output.push_str(line);
-        output.push('\n');
+        encoded.extend_from_slice(line.as_bytes());
+        encoded.push(b'\n');
     }
-    fs::write(&target_root.session_index, output)
-        .map_err(|error| format!("failed to write session_index.jsonl: {error}"))?;
+    output
+        .write_all(&encoded)
+        .map_err(|error| format!("failed to append session_index.jsonl: {error}"))?;
+    output
+        .sync_data()
+        .map_err(|error| format!("failed to sync session_index.jsonl: {error}"))?;
     Ok(appended.len())
 }
 
@@ -873,8 +995,20 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
 }
 
 fn sha256_file(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = fs::read(path).map_err(|error| format!("failed to read file for hash: {error}"))?;
-    Ok(Sha256::digest(bytes).to_vec())
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("failed to open file for hash: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read file for hash: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_vec())
 }
 
 fn file_modified_millis(path: &Path) -> Option<i64> {
@@ -902,8 +1036,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        sync_sessions, sync_sessions_for_provider, sync_shared_to_user_home,
-        sync_user_home_to_shared,
+        merge_session_index, root_from_paths, sync_sessions, sync_sessions_for_provider,
+        sync_shared_to_user_home, sync_shared_to_user_home_hot, sync_user_home_to_shared,
     };
 
     fn create_db(path: &std::path::Path, threads: &[(&str, &str)]) {
@@ -1150,6 +1284,36 @@ mod tests {
     }
 
     #[test]
+    fn appending_session_index_repairs_a_missing_trailing_newline() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        fs::write(
+            source.path().join("session_index.jsonl"),
+            "{\"id\":\"thread-b\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            target.path().join("session_index.jsonl"),
+            "{\"id\":\"thread-a\"}",
+        )
+        .unwrap();
+        let source_root = root_from_paths(crate::codex_paths::local_codex_paths(source.path()));
+        let target_root = root_from_paths(crate::codex_paths::local_codex_paths(target.path()));
+
+        let appended = merge_session_index(
+            &source_root,
+            &target_root,
+            &std::collections::HashSet::from(["thread-b".to_string()]),
+        )
+        .unwrap();
+
+        assert_eq!(appended, 1);
+        let index = fs::read_to_string(target.path().join("session_index.jsonl")).unwrap();
+        assert_eq!(index.lines().count(), 2);
+        assert!(index.contains("thread-a\"}\n{\"id\":\"thread-b"));
+    }
+
+    #[test]
     fn skips_archived_threads_and_session_index_entries() {
         let source = tempdir().unwrap();
         let target = tempdir().unwrap();
@@ -1183,10 +1347,16 @@ mod tests {
             ],
         );
         let conn = Connection::open(source.path().join("state_5.sqlite")).unwrap();
-        conn.execute("ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 0", [])
-            .unwrap();
-        conn.execute("UPDATE threads SET archived = 1 WHERE id = 'thread-archived'", [])
-            .unwrap();
+        conn.execute(
+            "ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 0",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE threads SET archived = 1 WHERE id = 'thread-archived'",
+            [],
+        )
+        .unwrap();
         create_db(&target.path().join("state_5.sqlite"), &[]);
 
         let result = sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
@@ -1250,6 +1420,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn updates_a_stale_target_when_the_source_is_a_strictly_growing_jsonl() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let relative = "sessions/2026/07/13/rollout-thread-growing.jsonl";
+        let source_jsonl = source.path().join(relative);
+        let target_jsonl = target.path().join(relative);
+        fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(target_jsonl.parent().unwrap()).unwrap();
+        let first = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-growing"}}"#,
+            "\n",
+        );
+        fs::write(&target_jsonl, first).unwrap();
+        fs::write(
+            &source_jsonl,
+            format!(
+                "{first}{}\n",
+                r#"{"type":"response_item","payload":{"text":"new tail"}}"#
+            ),
+        )
+        .unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[("thread-growing", source_jsonl.to_str().unwrap())],
+        );
+        create_db(
+            &target.path().join("state_5.sqlite"),
+            &[("thread-growing", target_jsonl.to_str().unwrap())],
+        );
+
+        let result = sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        assert_eq!(result.copied_session_files, 1);
+        assert!(fs::read_to_string(&target_jsonl)
+            .unwrap()
+            .contains("new tail"));
+    }
+
+    #[test]
+    fn divergent_versions_use_content_hashes_instead_of_one_stale_imported_file() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let relative = "sessions/2026/07/13/rollout-thread-conflict.jsonl";
+        let source_jsonl = source.path().join(relative);
+        let target_jsonl = target.path().join(relative);
+        fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(target_jsonl.parent().unwrap()).unwrap();
+        fs::write(
+            &target_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-conflict","source":"target"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &source_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-conflict","source":"source-one"}}"#,
+        )
+        .unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[("thread-conflict", source_jsonl.to_str().unwrap())],
+        );
+        create_db(
+            &target.path().join("state_5.sqlite"),
+            &[("thread-conflict", target_jsonl.to_str().unwrap())],
+        );
+
+        sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+        fs::write(
+            &source_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-conflict","source":"source-two"}}"#,
+        )
+        .unwrap();
+        sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        let imported = fs::read_dir(target_jsonl.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-imported-"))
+            .count();
+        assert_eq!(imported, 2);
+    }
+
+    #[test]
+    fn hot_sync_does_not_rewrite_an_existing_live_jsonl_for_provider_changes() {
+        let shared = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let relative = "sessions/2026/07/13/rollout-thread-hot.jsonl";
+        let shared_jsonl = shared.path().join(relative);
+        let home_jsonl = home.path().join(relative);
+        fs::create_dir_all(shared_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(home_jsonl.parent().unwrap()).unwrap();
+        fs::write(
+            &shared_jsonl,
+            r#"{"type":"session_meta","payload":{"id":"thread-hot","model_provider":"openai_custom"}}"#,
+        )
+        .unwrap();
+        let live_bytes =
+            br#"{"type":"session_meta","payload":{"id":"thread-hot","model_provider":"openai"}}"#;
+        fs::write(&home_jsonl, live_bytes).unwrap();
+        create_db(
+            &shared.path().join("state_5.sqlite"),
+            &[("thread-hot", shared_jsonl.to_str().unwrap())],
+        );
+        create_db(
+            &home.path().join("state_5.sqlite"),
+            &[("thread-hot", home_jsonl.to_str().unwrap())],
+        );
+
+        sync_shared_to_user_home_hot(shared.path(), home.path(), "openai").unwrap();
+
+        assert_eq!(fs::read(&home_jsonl).unwrap(), live_bytes);
     }
 
     fn set_provider(home: &std::path::Path, provider: &str) {

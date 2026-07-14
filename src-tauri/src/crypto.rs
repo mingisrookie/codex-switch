@@ -30,7 +30,8 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
         return Err("CryptProtectData failed".to_string());
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
         LocalFree(output.pbData.cast());
     }
@@ -42,7 +43,9 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::{
         Foundation::LocalFree,
-        Security::Cryptography::{CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
+        Security::Cryptography::{
+            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
     };
 
     let input = CRYPT_INTEGER_BLOB {
@@ -69,7 +72,8 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
         return Err("CryptUnprotectData failed".to_string());
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
         LocalFree(output.pbData.cast());
     }

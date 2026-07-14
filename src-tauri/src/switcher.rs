@@ -28,8 +28,10 @@ pub fn switch_profile_files(
 
     let auth_path = codex_home.join("auth.json");
     let tmp_auth = codex_home.join("auth.json.codex-switch.tmp");
-    fs::write(&tmp_auth, auth).map_err(|error| format!("failed to write temporary auth.json: {error}"))?;
-    fs::rename(&tmp_auth, &auth_path).map_err(|error| format!("failed to replace auth.json: {error}"))?;
+    fs::write(&tmp_auth, auth)
+        .map_err(|error| format!("failed to write temporary auth.json: {error}"))?;
+    fs::rename(&tmp_auth, &auth_path)
+        .map_err(|error| format!("failed to replace auth.json: {error}"))?;
 
     let config_path = codex_home.join("config.toml");
     let mut changed_config_keys = Vec::new();
@@ -56,7 +58,10 @@ fn overlay_from_toml(raw: &str) -> Result<ConfigOverlay, String> {
     let value = raw
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format!("failed to parse config overlay: {error}"))?;
-    let model = value.get("model").and_then(toml_edit::Item::as_str).map(str::to_string);
+    let model = value
+        .get("model")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_string);
     let model_provider = value
         .get("model_provider")
         .and_then(toml_edit::Item::as_str)
@@ -95,7 +100,7 @@ fn overlay_from_toml(raw: &str) -> Result<ConfigOverlay, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use tempfile::tempdir;
 
@@ -106,7 +111,11 @@ mod tests {
     #[test]
     fn replaces_auth_and_patches_config_with_backup() {
         let home = tempdir().unwrap();
-        fs::write(home.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-old"}}"#).unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-old"}}"#,
+        )
+        .unwrap();
         fs::write(
             home.path().join("config.toml"),
             "model = \"gpt-5.5\"\nmodel_instructions_file = \"C:\\\\Users\\\\admin\\\\.codex\\\\instruction.md\"\n",
@@ -127,10 +136,21 @@ mod tests {
         assert_eq!(profile.kind, ProfileKind::ApiProvider);
         let backup_root = tempdir().unwrap();
 
-        let result = switch_profile_files(&store, &profile.id, home.path(), backup_root.path()).unwrap();
+        let result =
+            switch_profile_files(&store, &profile.id, home.path(), backup_root.path()).unwrap();
 
-        assert!(result.backup.backup_dir.join("auth.json").exists());
-        assert!(fs::read_to_string(home.path().join("auth.json")).unwrap().contains("\"auth_mode\":\"apikey\""));
+        let auth_backup = result
+            .backup
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new("auth.json"))
+            .expect("auth.json must be present in the encrypted backup manifest");
+        assert!(auth_backup.encrypted);
+        assert!(auth_backup.backup_path.exists());
+        assert!(!result.backup.backup_dir.join("auth.json").exists());
+        assert!(fs::read_to_string(home.path().join("auth.json"))
+            .unwrap()
+            .contains("\"auth_mode\":\"apikey\""));
         let config = fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert!(config.contains("model = \"gpt-5.4-mini\""));
         assert!(config.contains("model_instructions_file"));

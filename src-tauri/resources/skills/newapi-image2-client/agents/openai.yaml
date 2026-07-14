@@ -1,0 +1,4 @@
+interface:
+  display_name: "New API Image2 Client"
+  short_description: "Teach agents to call gpt-image-2 through lcming951 New API."
+  default_prompt: "Use this skill to generate or edit images through https://api.lcming951.com/v1 with the user's New API key."

@@ -1,0 +1,5 @@
+{
+  "source": "User-provided local grok-search skill",
+  "reviewedAt": "2026-07-14",
+  "integration": "Codex Switch removes host-specific paths and configuration, and supplies user-managed URL and DPAPI credentials."
+}

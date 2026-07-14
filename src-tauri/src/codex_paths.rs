@@ -19,15 +19,15 @@ pub struct CodexPaths {
     pub session_index: PathBuf,
 }
 
-pub fn resolve_user_codex_paths(codex_home: &Path) -> CodexPaths {
+pub fn resolve_user_codex_paths(codex_home: &Path) -> Result<CodexPaths, String> {
     let cwd = env::current_dir().unwrap_or_else(|_| codex_home.to_path_buf());
     let sqlite_home = resolve_sqlite_home(
         codex_home,
-        read_config_sqlite_home(codex_home),
+        read_config_sqlite_home(codex_home)?,
         env::var_os("CODEX_SQLITE_HOME"),
         &cwd,
     );
-    build_paths(codex_home, &sqlite_home)
+    Ok(build_paths(codex_home, &sqlite_home))
 }
 
 pub fn local_codex_paths(codex_home: &Path) -> CodexPaths {
@@ -46,14 +46,25 @@ fn build_paths(codex_home: &Path, sqlite_home: &Path) -> CodexPaths {
     }
 }
 
-fn read_config_sqlite_home(codex_home: &Path) -> Option<PathBuf> {
-    let raw = fs::read_to_string(codex_home.join("config.toml")).ok()?;
-    let doc = DocumentMut::from_str(&raw).ok()?;
-    let value = doc.get("sqlite_home")?.as_str()?.trim();
+fn read_config_sqlite_home(codex_home: &Path) -> Result<Option<PathBuf>, String> {
+    let raw = match fs::read_to_string(codex_home.join("config.toml")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read config.toml: {error}")),
+    };
+    let doc = DocumentMut::from_str(&raw)
+        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    let Some(item) = doc.get("sqlite_home") else {
+        return Ok(None);
+    };
+    let value = item
+        .as_str()
+        .ok_or_else(|| "config.toml sqlite_home must be a string".to_string())?
+        .trim();
     if value.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(PathBuf::from(value))
+        Ok(Some(PathBuf::from(value)))
     }
 }
 
@@ -102,7 +113,7 @@ mod tests {
         )
         .unwrap();
 
-        let paths = resolve_user_codex_paths(home.path());
+        let paths = resolve_user_codex_paths(home.path()).unwrap();
 
         assert_eq!(paths.sqlite_home, sqlite_home.path());
         assert_eq!(paths.state_db, sqlite_home.path().join("state_5.sqlite"));
@@ -131,5 +142,15 @@ mod tests {
 
         assert_eq!(paths.sqlite_home, home.path());
         assert_eq!(paths.state_db, home.path().join("state_5.sqlite"));
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_instead_of_falling_back_to_the_wrong_database() {
+        let home = tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "sqlite_home = [broken\n").unwrap();
+
+        let error = resolve_user_codex_paths(home.path()).unwrap_err();
+
+        assert!(error.contains("config.toml"));
     }
 }

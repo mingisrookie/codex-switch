@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.1.5 - 2026-07-14
+
+### Changed
+
+- 当前产品合同收敛为固定的一个 Codex 账号槽位和一个 API 中转站槽位；运行态分别展示已保存、精确激活/模式匹配和最近验证状态。
+- 运行态配置改为基于 live `config.toml` 应用 overlay，只修改模型/service tier/provider 绑定，保护 `model_instructions_file`、MCP、项目等全局配置；只有精确匹配才视为无需切换。
+- Dashboard 改为七个数据域独立加载/报错（含操作历史）；每个动作只依赖自身必要域，Codex Home 损坏时仍可验证已保存 relay 和恢复已验证备份，session 扫描失败时不误禁用仅依赖 managed inventory 的删除/恢复可见。
+- 操作完成后的 Dashboard 刷新改为后台 best-effort；命令结束即释放 busy，刷新失败不会反转已完成操作或持续锁住按钮。
+- 后端应用状态从已退役的 `MVP scaffold` 标记更新为 `hardened-mvp`，避免诊断接口继续误报脚手架阶段。
+- 会话同步增加双向 dry-run 和 typed receipt；热同步不重写已存在的 live JSONL，关闭 Codex 的切换流程才允许流式原子修正 provider 元数据。
+- 会话管理增加搜索、排序、每页 50 条、跨页选择和部分选中状态；所有硬删除统一要求确认，成功后清理已处理选择。
+- 顶部新增独立“技能”页；技能状态只在首次进入时懒加载，不并入现有 Dashboard 七域。
+
+### Security
+
+- 所有工具备份载荷统一使用 Windows DPAPI 加密并记录 SHA-256/大小；SQLite 改用 Online Backup API，不再直接复制 WAL/SHM。
+- 切换和删除具备 current/shared 双根快照、后置校验和失败补偿；热同步失败只恢复 shared-sessions，并保留 live current Home 及其安全备份，避免覆盖并发变化；完整恢复限制为受管来源且先创建目标安全快照。
+- mutation guard 增加 Windows 独占 lock-file 句柄，在进程内 try-lock 之外阻止第二个 Codex Switch 进程并发写同一受管状态。
+- 文件写入/复制/JSONL 重写统一走同目录临时文件 + sync + 原子替换；Windows 使用 write-through replace。
+- API 中转站增加 Base URL 严格校验、原生可访问 `<dialog>`、password 输入、空 Key 保留已存凭据和 `/models` 连接验证；保存失败保留本次 Key 便于重试，成功/取消后销毁；10 秒超时、禁止重定向且错误不回显 Key/响应正文。
+- 新增结构化脱敏操作记录 `%APPDATA%\codex-switch\logs\operations.jsonl`，记录操作 ID、动作、阶段、终态、备份引用和计数；Dashboard 可查看最近操作及关联备份路径。
+- Tauri 生产 CSP 收敛到 self/Tauri IPC；开发态仅为本机 Vite HMR 与开发样式开放额外权限。
+- Image2 / Grok 的用户 Key 通过受控 password 表单进入 Rust 后端，只以 Windows DPAPI 密文保存；空 Key 更新保留旧密文，明文不进入 Skill、配置、UI 状态、操作记录或回执。
+- Skill 安装限定两个固定 ID 和编译期 allowlist；要求绝对 `CODEX_HOME`、Codex 关闭和全局 mutation guard，拒绝 link/junction/reparse path、未确认的未知目录与本地漂移，覆盖前保留完整目录备份，并用原子 transaction journal 在进程中断后恢复目录 swap。
+
+### Added
+
+- 新增最近已验证备份列表和按 `sourceRoot` 恢复入口；列表只对最近 5 个候选做 payload 大小/SHA-256 强校验，恢复时再次强校验，并对 SQLite 执行 `PRAGMA quick_check`。
+- 新增统一操作回执面板，展示操作 ID、备份数量、计数、回滚终态和警告。
+- 新增 Windows GitHub Actions 质量门禁：前端测试/类型检查/构建，以及 Rust fmt、clippy `-D warnings` 和测试。
+- 内置 `newapi-image2-client`：来源锁定到用户提供 ZIP 的 SHA-256 基线，默认使用 `https://api.lcming951.com/v1`、`gpt-image-2` 和 Images API，并增加 DPAPI 配置读取的 PowerShell generate/edit helper。
+- 内置可分发 `grok-search`：移除本机路径、endpoint 和私有配置，由最终用户填写 URL/Key，默认模型为 `grok-4.5`，支持 Web/X 搜索。
+- 新增 Skill 安装/更新/配置 typed receipt、受管 manifest/hash 漂移检测和 Windows PowerShell DPAPI 跨运行时契约测试。
+
+### Verified
+
+- `npm test -- --run`
+- `npm run typecheck`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `npm run tauri -- build`
+
+### Known limitations
+
+- 当前没有自动 backup retention/prune；受管加密备份会持续累积，后续需要独立设计保留周期、容量上限和安全清理入口。
+
 ## v0.1.4 - 2026-06-30
 
 ### Changed

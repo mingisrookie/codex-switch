@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 
 [lib]
@@ -15,10 +15,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 toml_edit = "0.23"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["backup", "bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sha2 = "0.10"
 walkdir = "2"
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory"] }
+base64 = "0.22"
+url = "2"
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tempfile = "3"

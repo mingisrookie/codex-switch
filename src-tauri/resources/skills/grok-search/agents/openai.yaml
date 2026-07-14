@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok 搜索"
+  short_description: "用 Grok 4.5 搜索 Web 与 X，并返回可核验来源"
+  default_prompt: "Use $grok-search to research this question with current Web and X sources."
+policy:
+  allow_implicit_invocation: true

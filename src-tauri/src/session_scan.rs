@@ -8,9 +8,11 @@ use std::{
 use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
-use walkdir::WalkDir;
 
-use crate::codex_paths::resolve_user_codex_paths;
+use crate::{
+    codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
+    file_ops::walk_jsonl_files,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +56,15 @@ pub struct SyncDryRun {
 }
 
 pub fn scan_sessions(home: &Path) -> Result<SessionInventory, String> {
-    let paths = resolve_user_codex_paths(home);
+    let paths = resolve_user_codex_paths(home)?;
+    scan_sessions_with_paths(home, &paths)
+}
+
+pub fn scan_sessions_local(home: &Path) -> Result<SessionInventory, String> {
+    scan_sessions_with_paths(home, &local_codex_paths(home))
+}
+
+fn scan_sessions_with_paths(home: &Path, paths: &CodexPaths) -> Result<SessionInventory, String> {
     let threads = scan_threads(&paths.state_db)?;
     let session_files = scan_session_files(&paths.sessions_dir)?;
 
@@ -78,11 +88,22 @@ pub fn build_sync_dry_run(sources: &[SessionInventory], target: &SessionInventor
     let mut new_threads = 0;
 
     for source in sources {
-        for thread in &source.threads {
-            if !source_ids.insert(thread.id.as_str()) {
+        let archived_ids = source
+            .threads
+            .iter()
+            .filter(|thread| thread.archived)
+            .map(|thread| thread.id.as_str())
+            .collect::<HashSet<_>>();
+        for session_id in source
+            .session_files
+            .iter()
+            .filter_map(|file| file.session_id.as_deref())
+            .filter(|session_id| !archived_ids.contains(session_id))
+        {
+            if !source_ids.insert(session_id) {
                 continue;
             }
-            if target_ids.contains(thread.id.as_str()) {
+            if target_ids.contains(session_id) {
                 duplicate_threads += 1;
             } else {
                 new_threads += 1;
@@ -195,18 +216,9 @@ fn scan_session_files(path: &Path) -> Result<Vec<SessionFileRecord>, String> {
         return Ok(Vec::new());
     }
 
-    WalkDir::new(path)
+    walk_jsonl_files(path)?
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        })
-        .map(|entry| {
-            let path = entry.into_path();
+        .map(|path| {
             let bytes = fs::metadata(&path)
                 .map_err(|error| format!("failed to stat session jsonl: {error}"))?
                 .len();
@@ -248,7 +260,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::{build_sync_dry_run, scan_sessions};
+    use super::{build_sync_dry_run, scan_sessions, scan_sessions_local};
 
     fn create_state_db(path: &std::path::Path, rows: &[(&str, &str)]) {
         let conn = Connection::open(path).unwrap();
@@ -264,6 +276,16 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn create_session_jsonl(home: &std::path::Path, id: &str) {
+        let path = home.join(format!("sessions/2026/07/13/rollout-{id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{id}"}}}}"#),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -305,6 +327,8 @@ mod tests {
             &target_temp.path().join("state_5.sqlite"),
             &[("thread-a", "a.jsonl")],
         );
+        create_session_jsonl(source_temp.path(), "thread-a");
+        create_session_jsonl(source_temp.path(), "thread-b");
 
         let source = scan_sessions(source_temp.path()).unwrap();
         let target = scan_sessions(target_temp.path()).unwrap();
@@ -314,5 +338,92 @@ mod tests {
         assert_eq!(dry_run.duplicate_threads, 1);
         assert_eq!(dry_run.source_threads, 2);
         assert_eq!(dry_run.target_threads, 1);
+    }
+
+    #[test]
+    fn dry_run_excludes_archived_threads_that_sync_will_skip() {
+        let source_temp = tempdir().unwrap();
+        let target_temp = tempdir().unwrap();
+        create_state_db(
+            &source_temp.path().join("state_5.sqlite"),
+            &[("thread-active", "a.jsonl"), ("thread-archived", "b.jsonl")],
+        );
+        let conn = Connection::open(source_temp.path().join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 0",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE threads SET archived = 1 WHERE id = 'thread-archived'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        create_session_jsonl(source_temp.path(), "thread-active");
+        create_session_jsonl(source_temp.path(), "thread-archived");
+        create_state_db(&target_temp.path().join("state_5.sqlite"), &[]);
+
+        let source = scan_sessions(source_temp.path()).unwrap();
+        let target = scan_sessions(target_temp.path()).unwrap();
+        let dry_run = build_sync_dry_run(&[source], &target);
+
+        assert_eq!(dry_run.source_threads, 1);
+        assert_eq!(dry_run.new_threads, 1);
+    }
+
+    #[test]
+    fn dry_run_uses_the_same_jsonl_first_eligibility_as_real_sync() {
+        let source_temp = tempdir().unwrap();
+        let target_temp = tempdir().unwrap();
+        create_state_db(
+            &source_temp.path().join("state_5.sqlite"),
+            &[("thread-db-only", "missing.jsonl")],
+        );
+        let jsonl_only = source_temp
+            .path()
+            .join("sessions/2026/07/13/rollout-thread-jsonl-only.jsonl");
+        fs::create_dir_all(jsonl_only.parent().unwrap()).unwrap();
+        fs::write(
+            &jsonl_only,
+            r#"{"type":"session_meta","payload":{"id":"thread-jsonl-only"}}"#,
+        )
+        .unwrap();
+        create_state_db(
+            &target_temp.path().join("state_5.sqlite"),
+            &[("thread-db-only", "existing.jsonl")],
+        );
+
+        let source = scan_sessions(source_temp.path()).unwrap();
+        let target = scan_sessions(target_temp.path()).unwrap();
+        let dry_run = build_sync_dry_run(&[source], &target);
+
+        assert_eq!(dry_run.source_threads, 1);
+        assert_eq!(dry_run.new_threads, 1);
+        assert_eq!(dry_run.duplicate_threads, 0);
+    }
+
+    #[test]
+    fn local_session_scan_ignores_user_sqlite_home_bindings() {
+        let shared = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        fs::write(
+            shared.path().join("config.toml"),
+            format!("sqlite_home = \"{}\"\n", external.path().display()).replace('\\', "\\\\"),
+        )
+        .unwrap();
+        create_state_db(
+            &shared.path().join("state_5.sqlite"),
+            &[("thread-local", "local.jsonl")],
+        );
+        create_state_db(
+            &external.path().join("state_5.sqlite"),
+            &[("thread-external", "external.jsonl")],
+        );
+
+        let inventory = scan_sessions_local(shared.path()).unwrap();
+
+        assert_eq!(inventory.thread_count, 1);
+        assert_eq!(inventory.threads[0].id, "thread-local");
     }
 }

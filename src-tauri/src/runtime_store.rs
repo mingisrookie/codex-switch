@@ -6,9 +6,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use toml_edit::{value, DocumentMut, Item, Table};
 
-use crate::crypto::{protect, unprotect};
+use crate::{
+    crypto::{protect, unprotect},
+    file_ops::{atomic_copy, atomic_write},
+};
 
 pub const PLUS_RUNTIME_ID: &str = "plus";
 pub const RELAY_RUNTIME_ID: &str = "relay";
@@ -23,6 +27,24 @@ pub enum RuntimeKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum RuntimeConfidence {
+    Exact,
+    Mode,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub active_runtime_id: Option<String>,
+    pub confidence: RuntimeConfidence,
+    pub auth_mode: Option<String>,
+    pub model_provider: Option<String>,
+    pub detected_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeMetadata {
     pub id: String,
     pub name: String,
@@ -30,7 +52,10 @@ pub struct RuntimeMetadata {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub created_at_ms: u128,
+    #[serde(default)]
     pub last_used_at_ms: Option<u128>,
+    #[serde(default)]
+    pub last_verified_at_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +72,12 @@ pub struct RuntimeFiles {
     pub config_toml: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayConnection {
+    pub base_url: String,
+    pub api_key: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
     root: PathBuf,
@@ -57,7 +88,7 @@ impl RuntimeStore {
         Self { root }
     }
 
-    pub fn default() -> Result<Self, String> {
+    pub fn from_default_root() -> Result<Self, String> {
         Ok(Self::new(default_store_root()?.join("runtimes")))
     }
 
@@ -70,20 +101,34 @@ impl RuntimeStore {
         for id in [PLUS_RUNTIME_ID, RELAY_RUNTIME_ID] {
             let meta_path = self.runtime_dir(id).join("runtime.json");
             if meta_path.exists() {
-                runtimes.push(read_metadata(&meta_path)?);
+                runtimes.push(self.load_metadata(id)?);
             }
         }
         Ok(runtimes)
     }
 
-    pub fn import_plus_from_home(&self, codex_home: &Path) -> Result<RuntimeMetadata, String> {
+    pub fn import_plus_from_home(
+        &self,
+        codex_home: &Path,
+        confirm_overwrite: bool,
+    ) -> Result<RuntimeMetadata, String> {
         let auth = fs::read(codex_home.join("auth.json"))
             .map_err(|error| format!("failed to read plus auth.json: {error}"))?;
+        if auth_mode_from_bytes(&auth)?.as_deref() != Some("chatgpt") {
+            return Err("当前 auth.json 不是 Codex 账号登录态，不能保存到账号槽位".to_string());
+        }
         let config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read plus config.toml: {error}"))?;
-        let created_at_ms = self
-            .load_metadata(PLUS_RUNTIME_ID)
-            .ok()
+        let config_overlay = account_config_overlay(&config)?;
+        let existing = self.load_metadata(PLUS_RUNTIME_ID).ok();
+        if existing.is_some() && !confirm_overwrite {
+            return Err("账号槽位已存在，请确认覆盖后重试".to_string());
+        }
+        if existing.is_some() {
+            self.archive_runtime(PLUS_RUNTIME_ID)?;
+        }
+        let created_at_ms = existing
+            .as_ref()
             .map(|metadata| metadata.created_at_ms)
             .unwrap_or(timestamp_millis()?);
         let metadata = RuntimeMetadata {
@@ -94,19 +139,38 @@ impl RuntimeStore {
             model: read_model_from_config(&config),
             created_at_ms,
             last_used_at_ms: None,
+            last_verified_at_ms: Some(timestamp_millis()?),
         };
-        self.write_runtime(&metadata, &auth, &config)?;
+        self.write_runtime(&metadata, &auth, &config_overlay)?;
         Ok(metadata)
     }
 
-    pub fn upsert_relay(&self, input: RelayRuntimeInput, codex_home: &Path) -> Result<RuntimeMetadata, String> {
+    pub fn upsert_relay(
+        &self,
+        input: RelayRuntimeInput,
+        codex_home: &Path,
+    ) -> Result<RuntimeMetadata, String> {
         let normalized_base_url = normalize_base_url(&input.base_url)?;
-        let base_config = fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
-        let config_toml = relay_config_template(&base_config, &normalized_base_url, &input.model)?;
-        let auth = relay_auth_json(&input.api_key)?;
-        let created_at_ms = self
-            .load_metadata(RELAY_RUNTIME_ID)
-            .ok()
+        let model = input.model.trim();
+        if model.is_empty() {
+            return Err("relay model is required".to_string());
+        }
+        let base_config = fs::read_to_string(codex_home.join("config.toml"))
+            .map_err(|error| format!("failed to read live config.toml: {error}"))?;
+        let config_toml = relay_config_template(&base_config, &normalized_base_url, model)?;
+        let existing = self.load_metadata(RELAY_RUNTIME_ID).ok();
+        let auth = if input.api_key.trim().is_empty() {
+            self.load_runtime_files(RELAY_RUNTIME_ID)
+                .map_err(|_| "relay API key is required for the first save".to_string())?
+                .auth_json
+        } else {
+            relay_auth_json(&input.api_key)?
+        };
+        if auth_mode_from_bytes(&auth)?.as_deref() != Some("apikey") {
+            return Err("stored relay credentials are invalid".to_string());
+        }
+        let created_at_ms = existing
+            .as_ref()
             .map(|metadata| metadata.created_at_ms)
             .unwrap_or(timestamp_millis()?);
         let metadata = RuntimeMetadata {
@@ -114,15 +178,17 @@ impl RuntimeStore {
             name: "API 中转站".to_string(),
             kind: RuntimeKind::Relay,
             base_url: Some(normalized_base_url),
-            model: Some(input.model),
+            model: Some(model.to_string()),
             created_at_ms,
-            last_used_at_ms: None,
+            last_used_at_ms: existing.and_then(|metadata| metadata.last_used_at_ms),
+            last_verified_at_ms: None,
         };
         self.write_runtime(&metadata, &auth, &config_toml)?;
         Ok(metadata)
     }
 
     pub fn load_runtime_files(&self, runtime_id: &str) -> Result<RuntimeFiles, String> {
+        validate_runtime_id(runtime_id)?;
         let dir = self.runtime_dir(runtime_id);
         let encrypted = fs::read(dir.join("auth.enc"))
             .map_err(|error| format!("failed to read runtime auth: {error}"))?;
@@ -136,17 +202,144 @@ impl RuntimeStore {
     }
 
     pub fn load_metadata(&self, runtime_id: &str) -> Result<RuntimeMetadata, String> {
-        read_metadata(&self.runtime_dir(runtime_id).join("runtime.json"))
+        validate_runtime_id(runtime_id)?;
+        let metadata = read_metadata(&self.runtime_dir(runtime_id).join("runtime.json"))?;
+        let expected_kind = if runtime_id == PLUS_RUNTIME_ID {
+            RuntimeKind::Plus
+        } else {
+            RuntimeKind::Relay
+        };
+        if metadata.id != runtime_id || metadata.kind != expected_kind {
+            return Err(format!(
+                "runtime metadata does not match the fixed {runtime_id} slot"
+            ));
+        }
+        Ok(metadata)
     }
 
-    fn write_runtime(&self, metadata: &RuntimeMetadata, auth_json: &[u8], config_toml: &str) -> Result<(), String> {
+    pub fn detect_active_runtime(&self, codex_home: &Path) -> Result<RuntimeStatus, String> {
+        let live_auth = fs::read(codex_home.join("auth.json"))
+            .map_err(|error| format!("failed to read live auth.json: {error}"))?;
+        let live_config = fs::read_to_string(codex_home.join("config.toml"))
+            .map_err(|error| format!("failed to read live config.toml: {error}"))?;
+        let auth_mode = auth_mode_from_bytes(&live_auth)?;
+        let model_provider = config_string(&live_config, "model_provider")?;
+
+        for runtime in self.list_runtimes()? {
+            let files = self.load_runtime_files(&runtime.id)?;
+            if json_equivalent(&live_auth, &files.auth_json)?
+                && runtime_binding_matches(&runtime, &live_config)?
+            {
+                return Ok(RuntimeStatus {
+                    active_runtime_id: Some(runtime.id),
+                    confidence: RuntimeConfidence::Exact,
+                    auth_mode,
+                    model_provider,
+                    detected_at_ms: timestamp_millis()?,
+                });
+            }
+        }
+
+        let active_runtime_id = match (auth_mode.as_deref(), model_provider.as_deref()) {
+            (Some("chatgpt"), provider) if provider != Some(RELAY_PROVIDER_ID) => {
+                Some(PLUS_RUNTIME_ID.to_string())
+            }
+            (Some("apikey"), Some(RELAY_PROVIDER_ID)) => Some(RELAY_RUNTIME_ID.to_string()),
+            _ => None,
+        };
+        let confidence = if active_runtime_id.is_some() {
+            RuntimeConfidence::Mode
+        } else {
+            RuntimeConfidence::Unknown
+        };
+        Ok(RuntimeStatus {
+            active_runtime_id,
+            confidence,
+            auth_mode,
+            model_provider,
+            detected_at_ms: timestamp_millis()?,
+        })
+    }
+
+    pub fn mark_used(&self, runtime_id: &str) -> Result<RuntimeMetadata, String> {
+        let mut metadata = self.load_metadata(runtime_id)?;
+        let now = timestamp_millis()?;
+        metadata.last_used_at_ms = Some(now);
+        metadata.last_verified_at_ms = Some(now);
+        write_metadata(
+            &self.runtime_dir(runtime_id).join("runtime.json"),
+            &metadata,
+        )?;
+        Ok(metadata)
+    }
+
+    pub fn mark_verified(&self, runtime_id: &str) -> Result<RuntimeMetadata, String> {
+        let mut metadata = self.load_metadata(runtime_id)?;
+        metadata.last_verified_at_ms = Some(timestamp_millis()?);
+        write_metadata(
+            &self.runtime_dir(runtime_id).join("runtime.json"),
+            &metadata,
+        )?;
+        Ok(metadata)
+    }
+
+    pub fn load_relay_connection(&self) -> Result<RelayConnection, String> {
+        let metadata = self.load_metadata(RELAY_RUNTIME_ID)?;
+        let base_url = metadata
+            .base_url
+            .ok_or_else(|| "relay base URL is missing".to_string())?;
+        let auth = serde_json::from_slice::<JsonValue>(
+            &self.load_runtime_files(RELAY_RUNTIME_ID)?.auth_json,
+        )
+        .map_err(|error| format!("failed to parse stored relay auth: {error}"))?;
+        let api_key = auth
+            .get("OPENAI_API_KEY")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "stored relay API key is missing".to_string())?
+            .to_string();
+        Ok(RelayConnection { base_url, api_key })
+    }
+
+    fn archive_runtime(&self, runtime_id: &str) -> Result<(), String> {
+        let runtime_dir = self.runtime_dir(runtime_id);
+        if !runtime_dir.exists() {
+            return Ok(());
+        }
+        let history_dir = runtime_dir
+            .join("history")
+            .join(format!("{}", timestamp_millis()?));
+        fs::create_dir_all(&history_dir)
+            .map_err(|error| format!("failed to create runtime history: {error}"))?;
+        for name in ["auth.enc", "config.toml", "runtime.json"] {
+            let source = runtime_dir.join(name);
+            if source.is_file() {
+                atomic_copy(&source, &history_dir.join(name))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_runtime(
+        &self,
+        metadata: &RuntimeMetadata,
+        auth_json: &[u8],
+        config_toml: &str,
+    ) -> Result<(), String> {
         let dir = self.runtime_dir(&metadata.id);
-        fs::create_dir_all(&dir).map_err(|error| format!("failed to create runtime dir: {error}"))?;
-        fs::write(dir.join("auth.enc"), protect(auth_json)?)
-            .map_err(|error| format!("failed to write encrypted runtime auth: {error}"))?;
-        fs::write(dir.join("config.toml"), config_toml)
-            .map_err(|error| format!("failed to write runtime config: {error}"))?;
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("failed to create runtime dir: {error}"))?;
+        atomic_write(&dir.join("auth.enc"), &protect(auth_json)?)?;
+        atomic_write(&dir.join("config.toml"), config_toml.as_bytes())?;
         write_metadata(&dir.join("runtime.json"), metadata)
+    }
+}
+
+fn validate_runtime_id(runtime_id: &str) -> Result<(), String> {
+    if matches!(runtime_id, PLUS_RUNTIME_ID | RELAY_RUNTIME_ID) {
+        Ok(())
+    } else {
+        Err("unsupported runtime id; expected plus or relay".to_string())
     }
 }
 
@@ -160,16 +353,39 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("relay base URL is required".to_string());
     }
+    if trimmed.contains("://")
+        && !trimmed.starts_with("http://")
+        && !trimmed.starts_with("https://")
+    {
+        return Err("invalid relay base URL".to_string());
+    }
     let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
     };
-    if with_scheme.ends_with("/v1") {
-        Ok(with_scheme)
-    } else {
-        Ok(format!("{with_scheme}/v1"))
+    let mut parsed =
+        reqwest::Url::parse(&with_scheme).map_err(|_| "invalid relay base URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("invalid relay base URL".to_string());
     }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("relay base URL must not contain credentials, query, or fragment".to_string());
+    }
+    let path = parsed.path().trim_end_matches('/');
+    let normalized_path = if path.ends_with("/v1") {
+        path.to_string()
+    } else if path.is_empty() {
+        "/v1".to_string()
+    } else {
+        format!("{path}/v1")
+    };
+    parsed.set_path(&normalized_path);
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
 fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
@@ -185,12 +401,11 @@ fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
 }
 
 fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Result<String, String> {
-    let mut doc = if base_config.trim().is_empty() {
-        DocumentMut::new()
-    } else {
+    if !base_config.trim().is_empty() {
         DocumentMut::from_str(base_config)
-            .map_err(|error| format!("failed to parse config.toml: {error}"))?
-    };
+            .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    }
+    let mut doc = DocumentMut::new();
 
     doc["model"] = value(model);
     doc["model_provider"] = value(RELAY_PROVIDER_ID);
@@ -210,7 +425,22 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
     Ok(doc.to_string())
 }
 
-fn provider_table_mut<'a>(doc: &'a mut DocumentMut, provider: &str) -> Result<&'a mut Table, String> {
+fn account_config_overlay(config: &str) -> Result<String, String> {
+    let source = DocumentMut::from_str(config)
+        .map_err(|error| format!("failed to parse plus config.toml: {error}"))?;
+    let mut overlay = DocumentMut::new();
+    for key in ["model", "service_tier"] {
+        if let Some(value) = source.get(key).and_then(Item::as_str) {
+            overlay[key] = toml_edit::value(value);
+        }
+    }
+    Ok(overlay.to_string())
+}
+
+fn provider_table_mut<'a>(
+    doc: &'a mut DocumentMut,
+    provider: &str,
+) -> Result<&'a mut Table, String> {
     let providers = doc
         .entry("model_providers")
         .or_insert_with(|| Item::Table(Table::new()));
@@ -230,17 +460,22 @@ fn read_model_from_config(config: &str) -> Option<String> {
     config
         .parse::<toml_edit::DocumentMut>()
         .ok()
-        .and_then(|doc| doc.get("model").and_then(toml_edit::Item::as_str).map(str::to_string))
+        .and_then(|doc| {
+            doc.get("model")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn write_metadata(path: &Path, metadata: &RuntimeMetadata) -> Result<(), String> {
     let json = serde_json::to_string_pretty(metadata)
         .map_err(|error| format!("failed to serialize runtime metadata: {error}"))?;
-    fs::write(path, json).map_err(|error| format!("failed to write runtime metadata: {error}"))
+    atomic_write(path, json.as_bytes())
 }
 
 fn read_metadata(path: &Path) -> Result<RuntimeMetadata, String> {
-    let raw = fs::read_to_string(path).map_err(|error| format!("failed to read runtime metadata: {error}"))?;
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read runtime metadata: {error}"))?;
     serde_json::from_str(&raw).map_err(|error| format!("failed to parse runtime metadata: {error}"))
 }
 
@@ -251,23 +486,68 @@ fn timestamp_millis() -> Result<u128, String> {
         .map_err(|error| format!("system clock before unix epoch: {error}"))
 }
 
+fn auth_mode_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
+    let value: JsonValue = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse auth.json: {error}"))?;
+    Ok(value
+        .get("auth_mode")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string))
+}
+
+fn json_equivalent(left: &[u8], right: &[u8]) -> Result<bool, String> {
+    let left: JsonValue = serde_json::from_slice(left)
+        .map_err(|error| format!("failed to parse live auth.json: {error}"))?;
+    let right: JsonValue = serde_json::from_slice(right)
+        .map_err(|error| format!("failed to parse stored auth.json: {error}"))?;
+    Ok(left == right)
+}
+
+fn config_string(config: &str, key: &str) -> Result<Option<String>, String> {
+    let doc = DocumentMut::from_str(config)
+        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    Ok(doc.get(key).and_then(Item::as_str).map(str::to_string))
+}
+
+fn runtime_binding_matches(runtime: &RuntimeMetadata, live_config: &str) -> Result<bool, String> {
+    let live_provider = config_string(live_config, "model_provider")?;
+    let live_model = config_string(live_config, "model")?;
+    let provider_matches = match runtime.kind {
+        RuntimeKind::Plus => live_provider.as_deref() != Some(RELAY_PROVIDER_ID),
+        RuntimeKind::Relay => live_provider.as_deref() == Some(RELAY_PROVIDER_ID),
+    };
+    Ok(provider_matches
+        && runtime
+            .model
+            .as_deref()
+            .is_none_or(|model| live_model.as_deref() == Some(model)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use tempfile::tempdir;
 
-    use super::{RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID};
+    use super::{RuntimeConfidence, RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID};
 
     #[test]
     fn imports_plus_runtime_as_encrypted_auth_and_full_config() {
         let home = tempdir().unwrap();
-        fs::write(home.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#).unwrap();
-        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\nmodel_instructions_file = \"global\"\n").unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "model = \"gpt-5.5\"\nmodel_instructions_file = \"global\"\n",
+        )
+        .unwrap();
         let root = tempdir().unwrap();
         let store = RuntimeStore::new(root.path().join("runtimes"));
 
-        let metadata = store.import_plus_from_home(home.path()).unwrap();
+        let metadata = store.import_plus_from_home(home.path(), false).unwrap();
 
         assert_eq!(metadata.id, PLUS_RUNTIME_ID);
         assert_eq!(metadata.kind, RuntimeKind::Plus);
@@ -275,14 +555,20 @@ mod tests {
         let encrypted = fs::read(store.runtime_dir(PLUS_RUNTIME_ID).join("auth.enc")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("fake-plus"));
         let files = store.load_runtime_files(PLUS_RUNTIME_ID).unwrap();
-        assert!(String::from_utf8(files.auth_json).unwrap().contains("fake-plus"));
-        assert!(files.config_toml.contains("model_instructions_file"));
+        assert!(String::from_utf8(files.auth_json)
+            .unwrap()
+            .contains("fake-plus"));
+        assert!(!files.config_toml.contains("model_instructions_file"));
     }
 
     #[test]
     fn upserts_single_relay_runtime_with_normalized_url_and_encrypted_key() {
         let home = tempdir().unwrap();
-        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\nmodel_instructions_file = \"global\"\n").unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "model = \"gpt-5.5\"\nmodel_instructions_file = \"global\"\n",
+        )
+        .unwrap();
         let root = tempdir().unwrap();
         let store = RuntimeStore::new(root.path().join("runtimes"));
 
@@ -299,28 +585,258 @@ mod tests {
 
         assert_eq!(metadata.id, RELAY_RUNTIME_ID);
         assert_eq!(metadata.kind, RuntimeKind::Relay);
-        assert_eq!(metadata.base_url.as_deref(), Some("https://relay.example.com/v1"));
+        assert_eq!(
+            metadata.base_url.as_deref(),
+            Some("https://relay.example.com/v1")
+        );
         let encrypted = fs::read(store.runtime_dir(RELAY_RUNTIME_ID).join("auth.enc")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("sk-fake-relay"));
-        let stored_config = fs::read_to_string(store.runtime_dir(RELAY_RUNTIME_ID).join("config.toml")).unwrap();
+        let stored_config =
+            fs::read_to_string(store.runtime_dir(RELAY_RUNTIME_ID).join("config.toml")).unwrap();
         assert!(!stored_config.contains("sk-fake-relay"));
         let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
         let auth = String::from_utf8(files.auth_json).unwrap();
         assert!(auth.contains("\"auth_mode\":\"apikey\""));
         assert!(auth.contains("sk-fake-relay"));
-        assert!(files.config_toml.contains("model_provider = \"openai_custom\""));
-        assert!(files.config_toml.contains("[model_providers.openai_custom]"));
+        assert!(files
+            .config_toml
+            .contains("model_provider = \"openai_custom\""));
+        assert!(files
+            .config_toml
+            .contains("[model_providers.openai_custom]"));
         assert!(files.config_toml.contains("name = \"openai_custom\""));
         assert!(files.config_toml.contains("wire_api = \"responses\""));
         assert!(files.config_toml.contains("supports_websockets = false"));
         assert!(files.config_toml.contains("request_max_retries = 6"));
         assert!(files.config_toml.contains("stream_max_retries = 3"));
-        assert!(files.config_toml.contains("stream_idle_timeout_ms = 180000"));
+        assert!(files
+            .config_toml
+            .contains("stream_idle_timeout_ms = 180000"));
         assert!(!files.config_toml.contains("env_key ="));
         assert!(!files.config_toml.contains("api_key ="));
         assert!(!files.config_toml.contains("goal ="));
-        assert!(files.config_toml.contains("base_url = \"https://relay.example.com/v1\""));
-        assert!(files.config_toml.contains("model_instructions_file"));
+        assert!(files
+            .config_toml
+            .contains("base_url = \"https://relay.example.com/v1\""));
+        assert!(!files.config_toml.contains("model_instructions_file"));
         assert_eq!(store.list_runtimes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relay_update_with_blank_key_preserves_the_encrypted_credential() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-preserved".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: String::new(),
+                    model: "new".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        let connection = store.load_relay_connection().unwrap();
+        assert_eq!(connection.api_key, "sk-preserved");
+        assert_eq!(
+            store
+                .load_metadata(RELAY_RUNTIME_ID)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn runtime_overlays_do_not_persist_unrelated_live_global_sections() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"plus"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            concat!(
+                "model = \"gpt-5.5\"\n",
+                "model_instructions_file = \"private-global\"\n",
+                "[features]\nfast_mode = true\n",
+                "[mcp_servers.private]\ncommand = \"private-command\"\n",
+            ),
+        )
+        .unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+
+        store.import_plus_from_home(home.path(), false).unwrap();
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "relay.example.com".to_string(),
+                    api_key: "sk-test".to_string(),
+                    model: "relay-model".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        for runtime_id in [PLUS_RUNTIME_ID, RELAY_RUNTIME_ID] {
+            let config = store.load_runtime_files(runtime_id).unwrap().config_toml;
+            assert!(!config.contains("private-global"));
+            assert!(!config.contains("private-command"));
+            assert!(!config.contains("[features]"));
+        }
+    }
+
+    #[test]
+    fn relay_url_rejects_credentials_query_and_non_http_schemes() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        for url in [
+            "https://user:password@relay.example.com/v1",
+            "https://relay.example.com/v1?api_key=secret",
+            "file:///tmp/relay",
+        ] {
+            let error = store
+                .upsert_relay(
+                    super::RelayRuntimeInput {
+                        base_url: url.to_string(),
+                        api_key: "sk-test".to_string(),
+                        model: "gpt".to_string(),
+                    },
+                    home.path(),
+                )
+                .unwrap_err();
+            assert!(error.contains("relay base URL") || error.contains("invalid"));
+            assert!(!error.contains("password"));
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn account_import_rejects_relay_auth_and_requires_confirmation_before_overwrite() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake-relay"}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+
+        let error = store.import_plus_from_home(home.path(), false).unwrap_err();
+        assert!(error.contains("账号登录态"));
+
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first"}}"#,
+        )
+        .unwrap();
+        store.import_plus_from_home(home.path(), false).unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"second"}}"#,
+        )
+        .unwrap();
+
+        let error = store.import_plus_from_home(home.path(), false).unwrap_err();
+        assert!(error.contains("确认覆盖"));
+        store.import_plus_from_home(home.path(), true).unwrap();
+        assert!(store
+            .runtime_dir(PLUS_RUNTIME_ID)
+            .join("history")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+    }
+
+    #[test]
+    fn detects_exact_and_mode_only_active_runtime_without_exposing_credentials() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first"}}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+
+        let exact = store.detect_active_runtime(home.path()).unwrap();
+        assert_eq!(exact.active_runtime_id.as_deref(), Some(PLUS_RUNTIME_ID));
+        assert_eq!(exact.confidence, RuntimeConfidence::Exact);
+
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"refreshed"}}"#,
+        )
+        .unwrap();
+        let refreshed = store.detect_active_runtime(home.path()).unwrap();
+        assert_eq!(
+            refreshed.active_runtime_id.as_deref(),
+            Some(PLUS_RUNTIME_ID)
+        );
+        assert_eq!(refreshed.confidence, RuntimeConfidence::Mode);
+    }
+
+    #[test]
+    fn rejects_runtime_ids_outside_the_fixed_slots_before_reading_files() {
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("auth.enc"),
+            crate::crypto::protect(br#"{"auth_mode":"chatgpt"}"#).unwrap(),
+        )
+        .unwrap();
+        fs::write(outside.join("config.toml"), "model = \"outside\"\n").unwrap();
+
+        let error = store.load_runtime_files("../outside").unwrap_err();
+
+        assert!(error.contains("unsupported runtime id"), "{error}");
+    }
+
+    #[test]
+    fn rejects_metadata_that_does_not_match_its_fixed_slot() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake"}}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"gpt\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+        let metadata_path = store.runtime_dir(PLUS_RUNTIME_ID).join("runtime.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["id"] = serde_json::Value::String(RELAY_RUNTIME_ID.to_string());
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let error = store.load_metadata(PLUS_RUNTIME_ID).unwrap_err();
+
+        assert!(error.contains("does not match"), "{error}");
     }
 }
