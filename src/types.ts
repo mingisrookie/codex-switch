@@ -64,6 +64,21 @@ export type DashboardData = {
   operations: DomainState<OperationRecord[]>;
 };
 
+export type AppStatus = {
+  appName: string;
+  version: string;
+  phase: string;
+  codexHome: string;
+};
+
+export type UpdateCheckResult = {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseNotes: string | null;
+  checkedAtMs: number;
+};
+
 export type ManagedSessionScope = 'current' | 'shared' | 'both' | 'unknown';
 
 export type ManagedSessionLocation = {

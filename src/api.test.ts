@@ -5,11 +5,14 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 import {
+  checkForUpdates,
   deleteManagedSessions,
+  getAppStatus,
   importPlusRuntime,
   installSkill,
   listSkills,
   loadDashboard,
+  openUpdatePage,
   saveSkillConfig,
 } from './api';
 
@@ -60,6 +63,18 @@ describe('dashboard API', () => {
     await importPlusRuntime(true);
 
     expect(invoke).toHaveBeenCalledWith('import_plus_runtime', { confirmOverwrite: true });
+  });
+
+  it('uses fixed commands for app version, update checks, and the release page', async () => {
+    invoke.mockResolvedValue(undefined);
+
+    await getAppStatus();
+    await checkForUpdates();
+    await openUpdatePage();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_app_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'check_for_updates');
+    expect(invoke).toHaveBeenNthCalledWith(3, 'open_update_page');
   });
 
   it('passes the hard-delete confirmation under the backend confirmed field', async () => {

@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(windows)]
 use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -8,6 +9,7 @@ pub struct CodexProcess {
     pub pid: u32,
 }
 
+#[cfg(windows)]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
     let output = Command::new("tasklist")
         .args(["/FO", "CSV", "/NH"])
@@ -20,6 +22,12 @@ pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Ok(parse_tasklist_csv(&stdout))
 }
 
+#[cfg(not(windows))]
+pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    Err("Codex process control is not supported on this platform".to_string())
+}
+
+#[cfg(windows)]
 pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
     let processes = list_codex_processes()?;
     for process in &processes {
@@ -28,6 +36,11 @@ pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
             .output();
     }
     Ok(processes)
+}
+
+#[cfg(not(windows))]
+pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    Err("Codex process control is not supported on this platform".to_string())
 }
 
 pub fn parse_tasklist_csv(text: &str) -> Vec<CodexProcess> {

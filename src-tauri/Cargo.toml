@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [lib]
@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
 toml_edit = "0.23"
 rusqlite = { version = "0.37", features = ["backup", "bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -21,6 +22,9 @@ sha2 = "0.10"
 walkdir = "2"
 base64 = "0.22"
 url = "2"
+semver = "1"
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
 
 [dev-dependencies]

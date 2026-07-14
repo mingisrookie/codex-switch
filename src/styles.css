@@ -108,6 +108,24 @@ button:disabled {
   background: rgba(255, 255, 255, 0.72);
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.topbar-actions .ghost-button {
+  margin-left: 0;
+}
+
+.topbar-version {
+  color: #62708a;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .ghost-button.inline {
   margin-left: 0;
 }
@@ -252,6 +270,47 @@ h1 {
   border-radius: 18px;
   background: rgba(255, 111, 111, 0.14);
   color: #8a1826;
+}
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  margin: 18px 0 0;
+  padding: 18px 20px;
+  border: 1px solid #efb37f;
+  border-radius: 18px;
+  background: #fff5eb;
+  color: #63320d;
+  box-shadow: 0 12px 28px rgba(122, 62, 16, 0.08);
+}
+
+.update-banner h2,
+.update-banner .eyebrow {
+  margin: 0;
+}
+
+.update-banner h2 {
+  margin-top: 4px;
+  font-size: 20px;
+}
+
+.update-notes {
+  display: -webkit-box;
+  max-width: 760px;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: #704421;
+  white-space: pre-line;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.update-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
 }
 
 .operation-result {
@@ -1311,6 +1370,11 @@ h2 {
     flex-direction: column;
   }
 
+  .update-banner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .receipt-items {
     justify-content: flex-start;
   }
@@ -1348,9 +1412,20 @@ h2 {
     gap: 18px;
   }
 
-  .topbar > .ghost-button {
-    grid-column: 3;
-    grid-row: 1;
+  .topbar-actions {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .topbar-version {
+    margin-right: auto;
+  }
+
+  .update-actions {
+    width: 100%;
+    flex-wrap: wrap;
   }
 
   .backup-list {

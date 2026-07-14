@@ -17,11 +17,15 @@ pub mod session_scan;
 pub mod session_sync;
 pub mod skill_manager;
 pub mod switcher;
+pub mod update_check;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
+            commands::check_for_updates,
+            commands::open_update_page,
             commands::scan_codex_home,
             commands::scan_sessions,
             commands::scan_managed_sessions,

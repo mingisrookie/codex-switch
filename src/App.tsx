@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  checkForUpdates as defaultCheckForUpdates,
   closeCodexProcesses,
   deleteManagedSessions,
   dryRunAllSessions,
   importPlusRuntime,
+  getAppStatus as defaultGetAppStatus,
   listCodexProcesses,
   loadDashboard as defaultLoadDashboard,
   loadingDashboard,
+  openUpdatePage as defaultOpenUpdatePage,
   restoreBackup,
   restoreSessionsVisible,
   switchRuntime,
@@ -29,6 +32,7 @@ import type {
   OperationRecord,
   SessionMutationResult,
   SessionSyncResult,
+  UpdateCheckResult,
 } from './types';
 
 type AppProps = { loadDashboard?: () => Promise<DashboardData> };
@@ -42,7 +46,14 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   const [relayDialogOpen, setRelayDialogOpen] = useState(false);
   const [relaySubmitError, setRelaySubmitError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<'runtime' | 'sessions' | 'skills'>('runtime');
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const loadRequestId = useRef(0);
+  const startupCheckStarted = useRef(false);
+  const updateCheckInFlight = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,6 +63,15 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
       .catch((reason: unknown) => { if (!cancelled && requestId === loadRequestId.current) setError(errorMessage(reason)); });
     return () => { cancelled = true; };
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (startupCheckStarted.current) return;
+    startupCheckStarted.current = true;
+    void defaultGetAppStatus()
+      .then((status) => setAppVersion(status.version))
+      .catch(() => undefined);
+    void runUpdateCheck(false);
+  }, []);
 
   const codexHome = readyData(data.codexHome);
   const sessions = readyData(data.sessions);
@@ -84,6 +104,33 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
     void refresh().catch((reason: unknown) => {
       if (requestId === loadRequestId.current) onFailure?.(reason);
     });
+  }
+
+  async function runUpdateCheck(reportFailure: boolean) {
+    if (updateCheckInFlight.current) return;
+    updateCheckInFlight.current = true;
+    setUpdateChecking(true);
+    if (reportFailure) setUpdateError(null);
+    try {
+      const result = await defaultCheckForUpdates();
+      setAppVersion(result.currentVersion);
+      setUpdateResult(result);
+      setUpdateError(null);
+    } catch (reason) {
+      if (reportFailure) setUpdateError(errorMessage(reason));
+    } finally {
+      updateCheckInFlight.current = false;
+      setUpdateChecking(false);
+    }
+  }
+
+  async function handleOpenUpdatePage() {
+    setUpdateError(null);
+    try {
+      await defaultOpenUpdatePage();
+    } catch (reason) {
+      setUpdateError(errorMessage(reason));
+    }
   }
 
   async function runAction<T>(
@@ -221,6 +268,16 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   }
 
   const domainErrors = dashboardErrors(data);
+  const updateVisible = Boolean(
+    updateResult?.updateAvailable && dismissedUpdateVersion !== updateResult.latestVersion,
+  );
+  const versionStatus = updateResult
+    ? updateResult.updateAvailable
+      ? `v${updateResult.currentVersion} · 发现 v${updateResult.latestVersion}`
+      : `v${updateResult.currentVersion} · 已是最新版`
+    : appVersion
+      ? `v${appVersion}`
+      : '版本读取中';
 
   return (
     <main className="app-shell">
@@ -231,12 +288,38 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
           <button aria-current={activePage === 'sessions' ? 'page' : undefined} className={`topbar-tab ${activePage === 'sessions' ? 'active' : ''}`} onClick={() => setActivePage('sessions')}>会话管理</button>
           <button aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}>技能</button>
         </nav>
-        {activePage !== 'skills' ? <button className="ghost-button" onClick={() => {
-          setError(null);
-          refreshInBackground((reason) => setError(errorMessage(reason)));
-        }} disabled={busy !== null}>刷新</button> : null}
+        <div className="topbar-actions">
+          <span className="topbar-version" aria-live="polite">{versionStatus}</span>
+          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking}>
+            {updateChecking ? '检查中...' : '检查更新'}
+          </button>
+          {activePage !== 'skills' ? <button className="ghost-button" onClick={() => {
+            setError(null);
+            refreshInBackground((reason) => setError(errorMessage(reason)));
+          }} disabled={busy !== null}>刷新</button> : null}
+        </div>
       </header>
 
+      {updateVisible && updateResult ? (
+        <section className="update-banner" aria-label="发现新版本" aria-live="polite">
+          <div>
+            <p className="eyebrow">发现正式版本 v{updateResult.latestVersion}</p>
+            <h2>Codex Switch 可以更新了</h2>
+            {updateResult.releaseNotes ? <p className="update-notes">{updateResult.releaseNotes}</p> : null}
+          </div>
+          <div className="update-actions">
+            <button className="warm-button" onClick={() => void handleOpenUpdatePage()}>前往下载</button>
+            <button
+              className="ghost-button inline"
+              aria-label="关闭更新提示"
+              onClick={() => setDismissedUpdateVersion(updateResult.latestVersion)}
+            >
+              关闭
+            </button>
+          </div>
+        </section>
+      ) : null}
+      {updateError ? <p className="error-banner" role="alert"><strong>更新检查：</strong><span>{updateError}</span></p> : null}
       {activePage !== 'skills' ? domainErrors.map(({ domain, message }) => (
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}

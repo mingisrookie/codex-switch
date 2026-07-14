@@ -45,6 +45,7 @@ use crate::{
         install_skill_at, list_skills_at, save_skill_config_at, SkillConfigInput, SkillId,
         SkillMutationReceipt, SkillStatus,
     },
+    update_check::{check_latest_release, open_release_page, UpdateCheckResult},
 };
 
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -59,6 +60,7 @@ struct MutationGuard {
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
     pub app_name: &'static str,
+    pub version: &'static str,
     pub phase: &'static str,
     pub codex_home: PathBuf,
 }
@@ -112,9 +114,22 @@ struct HotSyncCompensation {
 pub fn get_app_status() -> AppStatus {
     AppStatus {
         app_name: "Codex Switch",
+        version: env!("CARGO_PKG_VERSION"),
         phase: "hardened-mvp",
         codex_home: default_codex_home(),
     }
+}
+
+#[tauri::command]
+pub async fn check_for_updates() -> Result<UpdateCheckResult, String> {
+    tauri::async_runtime::spawn_blocking(check_latest_release)
+        .await
+        .map_err(|_| "update check worker failed".to_string())?
+}
+
+#[tauri::command]
+pub fn open_update_page(app: tauri::AppHandle) -> Result<(), String> {
+    open_release_page(&app)
 }
 
 #[tauri::command]
@@ -953,6 +968,7 @@ mod tests {
     #[test]
     fn app_status_does_not_report_the_retired_scaffold_phase() {
         assert_eq!(get_app_status().phase, "hardened-mvp");
+        assert_eq!(get_app_status().version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

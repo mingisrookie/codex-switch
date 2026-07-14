@@ -81,19 +81,13 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let mut bytes = b"DEV-NON-WINDOWS-ONLY:".to_vec();
-    bytes.extend(plaintext.iter().rev());
-    Ok(bytes)
+pub fn protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("credential encryption is not supported on this platform".to_string())
 }
 
 #[cfg(not(windows))]
-pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    let prefix = b"DEV-NON-WINDOWS-ONLY:";
-    if !ciphertext.starts_with(prefix) {
-        return Err("invalid non-Windows development ciphertext".to_string());
-    }
-    Ok(ciphertext[prefix.len()..].iter().rev().copied().collect())
+pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("credential encryption is not supported on this platform".to_string())
 }
 
 #[cfg(test)]
@@ -101,6 +95,7 @@ mod tests {
     use super::{protect, unprotect};
 
     #[test]
+    #[cfg(windows)]
     fn protects_and_unprotects_bytes() {
         let secret = b"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"fake\"}}";
 
@@ -109,5 +104,14 @@ mod tests {
 
         let decrypted = unprotect(&encrypted).unwrap();
         assert_eq!(decrypted, secret);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn rejects_credentials_without_a_platform_keystore() {
+        assert!(protect(b"secret").unwrap_err().contains("not supported"));
+        assert!(unprotect(b"ciphertext")
+            .unwrap_err()
+            .contains("not supported"));
     }
 }

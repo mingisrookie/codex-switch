@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.6 - 2026-07-14
+
+### Added
+
+- 每次启动后台检查本仓库最新正式 GitHub Release，按 SemVer 判断是否存在新版；提供手动“检查更新”和非阻塞新版横幅。
+- 新版横幅显示版本与限长更新说明，可关闭本次提示，并通过固定后端命令打开本仓库 Releases 下载页。
+- 新增更新元数据异常、超大响应、恶意外部 URL、draft/prerelease、非法版本、并发检查、离线和前端 XSS 文本渲染测试。
+- 新增跨平台准备度审计，明确 macOS/Linux 的路径、密钥库、进程、锁、Skill runtime 和 CI 迁移边界。
+
+### Security
+
+- GitHub 请求设置 8 秒超时、禁止重定向并限制 release metadata 为 256 KiB；错误不回显响应正文。
+- 下载入口不采用 GitHub 响应中的任意 URL，只允许后端打开固定仓库 Releases 页面。
+- 非 Windows 凭据保护不再使用可逆开发占位；缺少平台密钥库时明确拒绝，避免未来误构建形成假安全。
+
+### Changed
+
+- `windows-sys` 收敛为 Windows target 依赖，进程控制与 release GUI subsystem 显式标注 Windows 边界；当前发布目标仍只有 Windows x64 便携 EXE。
+
+### Verified
+
+- `npm test -- --run`（49 项）
+- `npm run typecheck`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path src-tauri/Cargo.toml`（83 项单元测试 + 6 项 Skill 合同测试；1 项 live 网络测试默认 ignored）
+- `cargo test live_github_release_contract_is_compatible --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture`
+- `npm run tauri -- build`
+- 临时 `CODEX_HOME` / `APPDATA` 启动 release EXE，确认进程存活、窗口标题为 `Codex Switch`、产品版本为 `0.1.6`，随后清理临时目录。
+
 ## v0.1.5 - 2026-07-14
 
 ### Changed

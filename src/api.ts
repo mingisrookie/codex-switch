@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
+  AppStatus,
   CodexHomeStatus,
   CodexProcess,
   DashboardData,
@@ -19,7 +20,20 @@ import type {
   SkillId,
   SkillMutationReceipt,
   SkillStatus,
+  UpdateCheckResult,
 } from './types';
+
+export function getAppStatus() {
+  return invoke<AppStatus>('get_app_status');
+}
+
+export function checkForUpdates() {
+  return invoke<UpdateCheckResult>('check_for_updates');
+}
+
+export function openUpdatePage() {
+  return invoke<void>('open_update_page');
+}
 
 export async function loadDashboard(): Promise<DashboardData> {
   const [codexHome, sessions, managedSessions, runtimes, runtimeStatus, backups, operations] =

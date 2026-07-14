@@ -1,8 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DashboardData } from './types';
 
 const apiMocks = vi.hoisted(() => ({
+  getAppStatus: vi.fn(),
+  checkForUpdates: vi.fn(),
+  openUpdatePage: vi.fn(),
   importPlusRuntime: vi.fn(),
   upsertRelayRuntime: vi.fn(),
   verifyRelayRuntime: vi.fn(),
@@ -119,6 +123,15 @@ describe('App release-hardening UI', () => {
     }
     apiMocks.listCodexProcesses.mockResolvedValue([]);
     apiMocks.listSkills.mockResolvedValue([]);
+    apiMocks.getAppStatus.mockResolvedValue({
+      appName: 'Codex Switch', version: '0.1.5', phase: 'hardened-mvp',
+      codexHome: 'C:\\Users\\alice\\.codex',
+    });
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.5', updateAvailable: false,
+      releaseNotes: null,
+      checkedAtMs: 10,
+    });
     apiMocks.importPlusRuntime.mockResolvedValue({
       id: 'plus', name: 'Codex 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
       createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
@@ -132,6 +145,77 @@ describe('App release-hardening UI', () => {
       toCurrent: { sourceThreads: 400, targetThreads: 429, newThreads: 1, duplicateThreads: 399 },
     });
     vi.restoreAllMocks();
+  });
+
+  it('checks once on startup without blocking the dashboard', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    expect(await screen.findByRole('article', { name: 'Codex 账号态' })).toBeTruthy();
+    await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('v0.1.5 · 已是最新版')).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '发现新版本' })).toBeNull();
+  });
+
+  it('does not duplicate the startup check during React StrictMode effect replay', async () => {
+    render(<StrictMode><App loadDashboard={() => Promise.resolve(dashboardData())} /></StrictMode>);
+
+    await screen.findByRole('article', { name: 'Codex 账号态' });
+    await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
+  });
+
+  it('shows a dismissible non-blocking update banner and opens the fixed release page', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: '<img src=x onerror=alert(1)> 安全修复',
+      checkedAtMs: 10,
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const banner = await screen.findByRole('region', { name: '发现新版本' });
+    expect(within(banner).getByText('<img src=x onerror=alert(1)> 安全修复')).toBeTruthy();
+    fireEvent.click(within(banner).getByRole('button', { name: '前往下载' }));
+    await waitFor(() => expect(apiMocks.openUpdatePage).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(within(banner).getByRole('button', { name: '关闭更新提示' }));
+    expect(screen.queryByRole('region', { name: '发现新版本' })).toBeNull();
+    expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps startup failures silent but reports a manual check failure', async () => {
+    apiMocks.checkForUpdates
+      .mockRejectedValueOnce(new Error('startup offline'))
+      .mockRejectedValueOnce(new Error('manual offline'));
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
+    const button = screen.getByRole('button', { name: '检查更新' }) as HTMLButtonElement;
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(screen.queryByText('startup offline')).toBeNull();
+
+    fireEvent.click(button);
+    expect(await screen.findByText('manual offline')).toBeTruthy();
+    expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(2);
+  });
+
+  it('disables manual checks while the startup check is pending', async () => {
+    const pending = deferred<{
+      currentVersion: string; latestVersion: string; updateAvailable: boolean;
+      releaseNotes: null; checkedAtMs: number;
+    }>();
+    apiMocks.checkForUpdates.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const button = await screen.findByRole('button', { name: '检查中...' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1);
+
+    pending.resolve({
+      currentVersion: '0.1.5', latestVersion: '0.1.5', updateAvailable: false,
+      releaseNotes: null,
+      checkedAtMs: 10,
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: '检查更新' })).toBeTruthy());
   });
 
   it('renders saved, current, and verified as separate runtime states', async () => {
