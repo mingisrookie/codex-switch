@@ -5,6 +5,8 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, TryLockError},
+    thread,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -45,7 +47,10 @@ use crate::{
         install_skill_at, list_skills_at, save_skill_config_at, SkillConfigInput, SkillId,
         SkillMutationReceipt, SkillStatus,
     },
-    update_check::{check_latest_release, open_release_page, UpdateCheckResult},
+    update_check::{check_latest_release, UpdateCheckResult},
+    update_install::{
+        install_latest_update, startup_update_notice, UpdateInstallReceipt, UpdateStartupNotice,
+    },
 };
 
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -128,8 +133,20 @@ pub async fn check_for_updates() -> Result<UpdateCheckResult, String> {
 }
 
 #[tauri::command]
-pub fn open_update_page(app: tauri::AppHandle) -> Result<(), String> {
-    open_release_page(&app)
+pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceipt, String> {
+    let receipt = tauri::async_runtime::spawn_blocking(install_latest_update)
+        .await
+        .map_err(|_| "update installer worker failed".to_string())??;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        app.exit(0);
+    });
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub fn get_update_startup_notice() -> Option<UpdateStartupNotice> {
+    startup_update_notice()
 }
 
 #[tauri::command]

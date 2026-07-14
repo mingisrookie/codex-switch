@@ -8,11 +8,12 @@ import {
   checkForUpdates,
   deleteManagedSessions,
   getAppStatus,
+  getUpdateStartupNotice,
   importPlusRuntime,
+  installUpdate,
   installSkill,
   listSkills,
   loadDashboard,
-  openUpdatePage,
   saveSkillConfig,
 } from './api';
 
@@ -65,16 +66,18 @@ describe('dashboard API', () => {
     expect(invoke).toHaveBeenCalledWith('import_plus_runtime', { confirmOverwrite: true });
   });
 
-  it('uses fixed commands for app version, update checks, and the release page', async () => {
+  it('uses fixed commands for app version, update checks, and installation', async () => {
     invoke.mockResolvedValue(undefined);
 
     await getAppStatus();
     await checkForUpdates();
-    await openUpdatePage();
+    await installUpdate();
+    await getUpdateStartupNotice();
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'get_app_status');
     expect(invoke).toHaveBeenNthCalledWith(2, 'check_for_updates');
-    expect(invoke).toHaveBeenNthCalledWith(3, 'open_update_page');
+    expect(invoke).toHaveBeenNthCalledWith(3, 'install_update');
+    expect(invoke).toHaveBeenNthCalledWith(4, 'get_update_startup_notice');
   });
 
   it('passes the hard-delete confirmation under the backend confirmed field', async () => {

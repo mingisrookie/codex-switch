@@ -6,10 +6,11 @@ import {
   dryRunAllSessions,
   importPlusRuntime,
   getAppStatus as defaultGetAppStatus,
+  getUpdateStartupNotice as defaultGetUpdateStartupNotice,
+  installUpdate as defaultInstallUpdate,
   listCodexProcesses,
   loadDashboard as defaultLoadDashboard,
   loadingDashboard,
-  openUpdatePage as defaultOpenUpdatePage,
   restoreBackup,
   restoreSessionsVisible,
   switchRuntime,
@@ -49,7 +50,10 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateNotice, setUpdateNotice] = useState<string | null>(null);
+  const [startupUpdateError, setStartupUpdateError] = useState<string | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const loadRequestId = useRef(0);
   const startupCheckStarted = useRef(false);
@@ -69,6 +73,12 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
     startupCheckStarted.current = true;
     void defaultGetAppStatus()
       .then((status) => setAppVersion(status.version))
+      .catch(() => undefined);
+    void defaultGetUpdateStartupNotice()
+      .then((notice) => {
+        if (notice?.status === 'updated') setUpdateNotice('更新完成，已启动新版本。');
+        if (notice?.status === 'rolledBack') setStartupUpdateError('更新启动失败，已恢复并重新启动旧版本。');
+      })
       .catch(() => undefined);
     void runUpdateCheck(false);
   }, []);
@@ -124,12 +134,17 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
     }
   }
 
-  async function handleOpenUpdatePage() {
+  async function handleInstallUpdate() {
+    if (updateInstalling) return;
+    setUpdateInstalling(true);
     setUpdateError(null);
+    setUpdateNotice(null);
     try {
-      await defaultOpenUpdatePage();
+      const result = await defaultInstallUpdate();
+      setUpdateNotice(`v${result.toVersion} 已下载并校验，正在重启完成更新…`);
     } catch (reason) {
       setUpdateError(errorMessage(reason));
+      setUpdateInstalling(false);
     }
   }
 
@@ -290,8 +305,8 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
         </nav>
         <div className="topbar-actions">
           <span className="topbar-version" aria-live="polite">{versionStatus}</span>
-          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking}>
-            {updateChecking ? '检查中...' : '检查更新'}
+          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking || updateInstalling}>
+            {updateChecking ? '检查中...' : updateInstalling ? '更新中...' : '检查更新'}
           </button>
           {activePage !== 'skills' ? <button className="ghost-button" onClick={() => {
             setError(null);
@@ -301,17 +316,20 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
       </header>
 
       {updateVisible && updateResult ? (
-        <section className="update-banner" aria-label="发现新版本" aria-live="polite">
+        <section className="update-banner" aria-label="发现新版本" aria-live="polite" aria-busy={updateInstalling}>
           <div>
             <p className="eyebrow">发现正式版本 v{updateResult.latestVersion}</p>
             <h2>Codex Switch 可以更新了</h2>
             {updateResult.releaseNotes ? <p className="update-notes">{updateResult.releaseNotes}</p> : null}
           </div>
           <div className="update-actions">
-            <button className="warm-button" onClick={() => void handleOpenUpdatePage()}>前往下载</button>
+            <button className="warm-button" onClick={() => void handleInstallUpdate()} disabled={updateInstalling}>
+              {updateInstalling ? '正在下载并安装…' : '立即更新'}
+            </button>
             <button
               className="ghost-button inline"
               aria-label="关闭更新提示"
+              disabled={updateInstalling}
               onClick={() => setDismissedUpdateVersion(updateResult.latestVersion)}
             >
               关闭
@@ -319,7 +337,9 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
           </div>
         </section>
       ) : null}
-      {updateError ? <p className="error-banner" role="alert"><strong>更新检查：</strong><span>{updateError}</span></p> : null}
+      {updateNotice ? <p className="busy-banner" role="status" aria-live="polite">{updateNotice}</p> : null}
+      {startupUpdateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{startupUpdateError}</span></p> : null}
+      {updateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{updateError}</span></p> : null}
       {activePage !== 'skills' ? domainErrors.map(({ domain, message }) => (
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}

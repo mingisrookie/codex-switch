@@ -79,6 +79,18 @@ export type UpdateCheckResult = {
   checkedAtMs: number;
 };
 
+export type UpdateInstallReceipt = {
+  fromVersion: string;
+  toVersion: string;
+  downloadedBytes: number;
+  sha256: string;
+  restarting: boolean;
+};
+
+export type UpdateStartupNotice = {
+  status: 'updated' | 'rolledBack';
+};
+
 export type ManagedSessionScope = 'current' | 'shared' | 'both' | 'unknown';
 
 export type ManagedSessionLocation = {

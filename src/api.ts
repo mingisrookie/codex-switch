@@ -21,6 +21,8 @@ import type {
   SkillMutationReceipt,
   SkillStatus,
   UpdateCheckResult,
+  UpdateInstallReceipt,
+  UpdateStartupNotice,
 } from './types';
 
 export function getAppStatus() {
@@ -31,8 +33,12 @@ export function checkForUpdates() {
   return invoke<UpdateCheckResult>('check_for_updates');
 }
 
-export function openUpdatePage() {
-  return invoke<void>('open_update_page');
+export function installUpdate() {
+  return invoke<UpdateInstallReceipt>('install_update');
+}
+
+export function getUpdateStartupNotice() {
+  return invoke<UpdateStartupNotice | null>('get_update_startup_notice');
 }
 
 export async function loadDashboard(): Promise<DashboardData> {

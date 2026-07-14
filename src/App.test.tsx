@@ -5,8 +5,9 @@ import type { DashboardData } from './types';
 
 const apiMocks = vi.hoisted(() => ({
   getAppStatus: vi.fn(),
+  getUpdateStartupNotice: vi.fn(),
   checkForUpdates: vi.fn(),
-  openUpdatePage: vi.fn(),
+  installUpdate: vi.fn(),
   importPlusRuntime: vi.fn(),
   upsertRelayRuntime: vi.fn(),
   verifyRelayRuntime: vi.fn(),
@@ -123,6 +124,7 @@ describe('App release-hardening UI', () => {
     }
     apiMocks.listCodexProcesses.mockResolvedValue([]);
     apiMocks.listSkills.mockResolvedValue([]);
+    apiMocks.getUpdateStartupNotice.mockResolvedValue(null);
     apiMocks.getAppStatus.mockResolvedValue({
       appName: 'Codex Switch', version: '0.1.5', phase: 'hardened-mvp',
       codexHome: 'C:\\Users\\alice\\.codex',
@@ -163,7 +165,7 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
   });
 
-  it('shows a dismissible non-blocking update banner and opens the fixed release page', async () => {
+  it('shows a dismissible non-blocking update banner and installs with one click', async () => {
     apiMocks.checkForUpdates.mockResolvedValue({
       currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
       releaseNotes: '<img src=x onerror=alert(1)> 安全修复',
@@ -173,12 +175,42 @@ describe('App release-hardening UI', () => {
 
     const banner = await screen.findByRole('region', { name: '发现新版本' });
     expect(within(banner).getByText('<img src=x onerror=alert(1)> 安全修复')).toBeTruthy();
-    fireEvent.click(within(banner).getByRole('button', { name: '前往下载' }));
-    await waitFor(() => expect(apiMocks.openUpdatePage).toHaveBeenCalledTimes(1));
+    apiMocks.installUpdate.mockResolvedValue({
+      fromVersion: '0.1.5', toVersion: '0.1.6', downloadedBytes: 100,
+      sha256: 'a'.repeat(64), restarting: true,
+    });
+    fireEvent.click(within(banner).getByRole('button', { name: '立即更新' }));
+    await waitFor(() => expect(apiMocks.installUpdate).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('v0.1.6 已下载并校验，正在重启完成更新…')).toBeTruthy();
+    expect((within(banner).getByRole('button', { name: '正在下载并安装…' }) as HTMLButtonElement).disabled).toBe(true);
 
-    fireEvent.click(within(banner).getByRole('button', { name: '关闭更新提示' }));
-    expect(screen.queryByRole('region', { name: '发现新版本' })).toBeNull();
+    expect((within(banner).getByRole('button', { name: '关闭更新提示' }) as HTMLButtonElement).disabled).toBe(true);
     expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the update available for retry when installation fails', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    apiMocks.installUpdate.mockRejectedValue(new Error('digest mismatch'));
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const install = await screen.findByRole('button', { name: '立即更新' });
+    fireEvent.click(install);
+    expect(await screen.findByText('digest mismatch')).toBeTruthy();
+    await waitFor(() => expect((screen.getByRole('button', { name: '立即更新' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it('shows completion and rollback notices from the restarted process', async () => {
+    apiMocks.getUpdateStartupNotice.mockResolvedValue({ status: 'updated' });
+    const { unmount } = render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    expect(await screen.findByText('更新完成，已启动新版本。')).toBeTruthy();
+    unmount();
+
+    apiMocks.getUpdateStartupNotice.mockResolvedValue({ status: 'rolledBack' });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    expect(await screen.findByText('更新启动失败，已恢复并重新启动旧版本。')).toBeTruthy();
   });
 
   it('keeps startup failures silent but reports a manual check failure', async () => {

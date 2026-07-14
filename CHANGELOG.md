@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.7 - 2026-07-14
+
+### 新增
+
+- 更新提示改为“一键更新”：自动下载仓库最新稳定 Release 的固定 `codex-switch.exe` 资产，校验大小与 GitHub SHA-256 digest 后自动重启安装。
+- 当前 EXE 会复制自身作为临时 updater helper；helper 完成旧进程等待、同目录 replacement、旧 EXE 备份、原子切换和新版本启动确认。
+- 新版本启动失败时自动恢复并重启旧 EXE；成功或回滚状态会在重启后的界面中明确显示。
+
+### 安全与兼容性
+
+- 下载地址由固定仓库和已验证稳定版 tag 推导，只允许 HTTPS GitHub 与受控 GitHub Release 资产重定向。
+- 拒绝缺失/重复资产、非法大小、缺失或非法 digest、URL 漂移、超限下载、SHA-256 不匹配和并发安装。
+- debug 构建不执行真实自更新；Windows 文件替换封装在独立平台模块，当前仍只发布 Windows x64 便携 EXE。
+- Tauri 构建入口会重映射工作区/用户目录并剥离 release 符号，避免发布 EXE 携带构建机绝对路径。
+- v0.1.6 不包含 updater，升级到 v0.1.7 需要最后一次手动替换；v0.1.7 之后支持应用内一键更新。
+
+### 验证
+
+- `npm test -- --run`（51 项）以及 `npm run typecheck`、`npm run build`。
+- `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（93 项单元测试 + 6 项 Skill 合同测试）。
+- 显式运行 live GitHub Release EXE 下载与 SHA-256 校验测试。
+- 在隔离临时目录执行真实 helper 演练：成功覆盖/重启/清理通过；无效新 EXE 触发恢复旧 EXE、重启和清理通过。
+- 完整 Tauri release 构建和临时 `CODEX_HOME` / `APPDATA` EXE 启动冒烟通过，窗口标题和产品版本为 `Codex Switch` / `0.1.7`。
+
 ## v0.1.6 - 2026-07-14
 
 ### Added

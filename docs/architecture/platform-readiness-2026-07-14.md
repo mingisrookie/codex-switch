@@ -8,7 +8,7 @@
 
 当前架构不是“换一个 target 就能完整运行”的全平台应用，但核心数据处理已有可复用基础。会话扫描、SQLite 合并、TOML patch、版本检查和大部分文件路径逻辑使用标准 Rust；真正阻塞 macOS/Linux 产品化的是凭据密钥库、进程控制、应用数据目录、跨进程锁和内置 Skill runtime。
 
-本轮更新检查采用平台中立实现，不新增 Windows shell、`APPDATA` 或路径分隔符依赖。同步完成三项低成本边界收紧：
+更新发现继续采用平台中立实现，不新增 Windows shell、`APPDATA` 或路径分隔符依赖；一键安装单独收敛在 Windows 平台模块，避免把 Windows EXE 替换语义泄漏到 Release 解析和 UI。同步完成三项低成本边界收紧：
 
 1. `windows-sys` 改为仅 Windows target 依赖。
 2. 非 Windows 凭据加密不再使用可逆开发占位，改为明确拒绝，避免未来误发布形成假安全。
@@ -18,7 +18,8 @@
 
 | 领域 | 当前状态 | 未来 macOS/Linux 所需工作 | 本轮处理 |
 | --- | --- | --- | --- |
-| 更新检查 | 平台中立 Rust HTTP + SemVer，Tauri opener 打开固定 Release 页 | 增加对应平台构建验证即可 | 已满足边界 |
+| 更新检查 | 平台中立 Rust HTTP + SemVer，固定仓库元数据 | 增加对应平台构建验证即可 | 已满足边界 |
+| 一键安装 | `update_install` 固定 Windows EXE 资产、helper readiness、同卷替换与回滚 | macOS/Linux 分别实现签名包校验、替换/安装和重启策略 | Windows 已实现，平台边界明确 |
 | 会话扫描/同步 | `Path`、rusqlite、serde 和标准文件 API 为主 | 用非 Windows Codex 实际目录/schema 做合同验证 | 保持现状 |
 | 原子文件替换 | Windows `MoveFileExW`，非 Windows 使用同文件系统 `rename` | 增加 macOS/Linux 崩溃与覆盖语义测试 | 已有平台分支 |
 | 凭据/备份加密 | Windows DPAPI | macOS Keychain、Linux Secret Service 或统一安全密钥抽象；需要迁移格式和能力探测 | 非 Windows 明确拒绝 |
@@ -31,7 +32,8 @@
 
 ## 证据位置
 
-- `src-tauri/src/update_check.rs`：固定仓库、SemVer、响应大小上限、禁止重定向、稳定版校验和固定下载页。
+- `src-tauri/src/update_check.rs`：固定仓库、SemVer、响应大小上限、禁止重定向和稳定版校验。
+- `src-tauri/src/update_install.rs`：平台中立资产合同与 Windows-only EXE helper 替换边界；非 Windows 明确 unsupported。
 - `src-tauri/src/crypto.rs`：Windows DPAPI 与非 Windows unsupported 边界。
 - `src-tauri/src/process_control.rs`：Windows 进程控制边界。
 - `src-tauri/src/file_ops.rs`：Windows write-through replace 与非 Windows rename。
@@ -57,7 +59,7 @@
 
 - CI 增加 macOS/Linux 的 `cargo check`、测试和 Tauri 构建。
 - 用真实 Codex Desktop/CLI 数据验证目录、SQLite schema、会话 JSONL 和进程名。
-- 再决定 DMG/AppImage/deb 等分发、签名和自动更新策略；完成前不对外宣称支持。
+- 再决定 DMG/AppImage/deb 等分发、签名和自动更新策略；不得直接复用 Windows EXE helper 语义，完成前不对外宣称支持。
 
 ## 当前产品边界
 

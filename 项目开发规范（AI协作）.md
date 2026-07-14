@@ -171,8 +171,10 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - 当前唯一发布目标是 Windows x64 便携 EXE；没有对应目标编译和运行证据前，不得宣称支持 macOS/Linux。
 - 与平台无关的新模块默认不得直接读取 `APPDATA`、调用 Windows shell 或拼接反斜杠路径；平台能力必须收敛到独立模块、target dependency 或 `cfg` 边界。
 - 凭据保护、进程控制、跨进程锁和 Skill runtime 属于平台能力。缺少安全实现时必须明确拒绝，禁止用可逆占位伪装可用。
-- 固定仓库更新检查属于外部只读集成：后端固定 endpoint 和下载页，设置超时/响应上限、禁止重定向、验证稳定 SemVer，错误不得回显响应正文；前端不得传任意仓库或下载 URL。
+- 固定仓库更新检查属于外部只读集成：后端固定 endpoint，设置超时/响应上限、禁止元数据重定向、验证稳定 SemVer，错误不得回显响应正文；前端不得传任意仓库或下载 URL。
 - 启动更新检查必须与 Dashboard 七域解耦并保持非阻塞；应用不是常驻工具，不新增后台服务或运行中轮询。
+- Windows 单文件自更新必须只接受唯一固定名称的 Release EXE，要求 GitHub SHA-256 digest，按元数据大小和全量流式 hash 双重验证；下载 URL 从固定仓库和已验证 tag 推导，只允许 HTTPS GitHub Release 资产重定向。当前 EXE 复制为同版本 helper，父进程只能在 helper 完成计划/路径/hash/进程句柄预检并写入 readiness 后退出。
+- EXE 替换必须在目标目录同卷完成：先写 replacement 并复核 hash，再备份旧 EXE、激活 replacement、启动确认；启动失败恢复旧 EXE并重新启动。staging 只能是系统临时目录下固定前缀的直接子目录，清理入口不得接受任意路径。debug 和非 Windows 构建必须明确拒绝真实安装。
 
 ## 3. 测试规范
 

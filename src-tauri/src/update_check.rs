@@ -11,11 +11,8 @@ use std::{
     sync::{Mutex, MutexGuard, TryLockError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri_plugin_opener::OpenerExt;
-
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/mingisrookie/codex-switch/releases/latest";
-const RELEASE_PAGE_URL: &str = "https://github.com/mingisrookie/codex-switch/releases/latest";
 const MAX_RELEASE_BYTES: usize = 256 * 1024;
 const MAX_NOTES_CHARS: usize = 800;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -32,15 +29,37 @@ pub struct UpdateCheckResult {
     pub checked_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct GithubAsset {
+    pub name: String,
+    pub size: u64,
+    pub digest: Option<String>,
+    pub browser_download_url: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
     draft: bool,
     prerelease: bool,
     body: Option<String>,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseCandidate {
+    pub tag_name: String,
+    pub version: Version,
+    pub release_notes: Option<String>,
+    pub assets: Vec<GithubAsset>,
 }
 
 pub fn check_latest_release() -> Result<UpdateCheckResult, String> {
+    let candidate = fetch_latest_release()?;
+    evaluate_candidate(&candidate, env!("CARGO_PKG_VERSION"), timestamp_millis())
+}
+
+pub(crate) fn fetch_latest_release() -> Result<ReleaseCandidate, String> {
     let _guard = acquire_update_check()?;
     let client = Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -57,14 +76,7 @@ pub fn check_latest_release() -> Result<UpdateCheckResult, String> {
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .map_err(|_| "failed to reach GitHub while checking for updates".to_string())?;
-    let payload = read_release_response(response)?;
-    evaluate_release_payload(&payload, env!("CARGO_PKG_VERSION"), timestamp_millis())
-}
-
-pub fn open_release_page(app: &tauri::AppHandle) -> Result<(), String> {
-    app.opener()
-        .open_url(RELEASE_PAGE_URL, None::<&str>)
-        .map_err(|_| "failed to open the update download page".to_string())
+    parse_release_payload(&read_release_response(response)?)
 }
 
 fn acquire_update_check() -> Result<MutexGuard<'static, ()>, String> {
@@ -106,11 +118,17 @@ fn read_release_response(mut response: Response) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+#[cfg(test)]
 fn evaluate_release_payload(
     payload: &[u8],
     current_version: &str,
     checked_at_ms: u64,
 ) -> Result<UpdateCheckResult, String> {
+    let candidate = parse_release_payload(payload)?;
+    evaluate_candidate(&candidate, current_version, checked_at_ms)
+}
+
+fn parse_release_payload(payload: &[u8]) -> Result<ReleaseCandidate, String> {
     if payload.len() > MAX_RELEASE_BYTES {
         return Err("GitHub release metadata is too large".to_string());
     }
@@ -120,8 +138,6 @@ fn evaluate_release_payload(
         return Err("GitHub latest release is not a stable release".to_string());
     }
 
-    let current = Version::parse(current_version)
-        .map_err(|_| "current application version is invalid".to_string())?;
     let tag = release
         .tag_name
         .strip_prefix('v')
@@ -129,15 +145,31 @@ fn evaluate_release_payload(
         .unwrap_or(&release.tag_name);
     let latest =
         Version::parse(tag).map_err(|_| "GitHub latest release version is invalid".to_string())?;
-    if !latest.pre.is_empty() {
+    if !latest.pre.is_empty() || !latest.build.is_empty() {
         return Err("GitHub latest release is not a stable release".to_string());
     }
 
+    Ok(ReleaseCandidate {
+        tag_name: release.tag_name,
+        version: latest,
+        release_notes: summarize_notes(release.body.as_deref()),
+        assets: release.assets,
+    })
+}
+
+fn evaluate_candidate(
+    candidate: &ReleaseCandidate,
+    current_version: &str,
+    checked_at_ms: u64,
+) -> Result<UpdateCheckResult, String> {
+    let current = Version::parse(current_version)
+        .map_err(|_| "current application version is invalid".to_string())?;
+
     Ok(UpdateCheckResult {
         current_version: current.to_string(),
-        latest_version: latest.to_string(),
-        update_available: latest > current,
-        release_notes: summarize_notes(release.body.as_deref()),
+        latest_version: candidate.version.to_string(),
+        update_available: candidate.version > current,
+        release_notes: candidate.release_notes.clone(),
         checked_at_ms,
     })
 }
@@ -165,7 +197,7 @@ fn timestamp_millis() -> u64 {
 mod tests {
     use super::{
         acquire_update_check, evaluate_release_payload, MAX_NOTES_CHARS, MAX_RELEASE_BYTES,
-        RELEASE_PAGE_URL, UPDATE_CHECK_LOCK,
+        UPDATE_CHECK_LOCK,
     };
 
     fn release(tag: &str, draft: bool, prerelease: bool, body: &str) -> Vec<u8> {
@@ -174,6 +206,7 @@ mod tests {
             "draft": draft,
             "prerelease": prerelease,
             "body": body,
+            "assets": [],
             "html_url": "https://attacker.example.invalid/fake-download"
         })
         .to_string()
@@ -181,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_a_newer_stable_semver_and_uses_the_fixed_release_page() {
+    fn detects_a_newer_stable_semver() {
         let result =
             evaluate_release_payload(&release("v0.1.6", false, false, "Fixes"), "0.1.5", 42)
                 .unwrap();
@@ -189,10 +222,6 @@ mod tests {
         assert!(result.update_available);
         assert_eq!(result.current_version, "0.1.5");
         assert_eq!(result.latest_version, "0.1.6");
-        assert_eq!(
-            RELEASE_PAGE_URL,
-            "https://github.com/mingisrookie/codex-switch/releases/latest"
-        );
         assert_eq!(result.checked_at_ms, 42);
     }
 
@@ -213,6 +242,7 @@ mod tests {
             release("v0.1.6", true, false, ""),
             release("v0.1.6", false, true, ""),
             release("v0.1.6-rc.1", false, false, ""),
+            release("v0.1.6+unsigned", false, false, ""),
         ] {
             let error = evaluate_release_payload(&payload, "0.1.5", 1).unwrap_err();
             assert!(error.contains("not a stable release"), "{error}");
@@ -281,9 +311,5 @@ mod tests {
         let result = super::check_latest_release().unwrap();
         assert!(!result.current_version.is_empty());
         assert!(!result.latest_version.is_empty());
-        assert_eq!(
-            RELEASE_PAGE_URL,
-            "https://github.com/mingisrookie/codex-switch/releases/latest"
-        );
     }
 }
