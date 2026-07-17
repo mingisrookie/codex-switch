@@ -102,6 +102,16 @@ struct SkillTransaction {
     target: PathBuf,
     stage: PathBuf,
     backup: Option<PathBuf>,
+    #[serde(default)]
+    phase: SkillTransactionPhase,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+enum SkillTransactionPhase {
+    #[default]
+    Prepared,
+    BackupCreated,
 }
 
 struct SkillPackage {
@@ -242,11 +252,12 @@ pub fn install_skill_at(
             .join(&operation_id)
             .join(package.folder_name)
     });
-    let transaction = SkillTransaction {
+    let mut transaction = SkillTransaction {
         skill_id,
         target: target.clone(),
         stage: stage.clone(),
         backup: backup.clone(),
+        phase: SkillTransactionPhase::Prepared,
     };
     write_skill_transaction(codex_home, package, &transaction)?;
     if let Err(error) = write_package(&stage, package) {
@@ -264,6 +275,8 @@ pub fn install_skill_at(
         reject_reparse_tree(parent)?;
         fs::rename(&target, path)
             .map_err(|error| format!("failed to move the existing skill into backup: {error}"))?;
+        transaction.phase = SkillTransactionPhase::BackupCreated;
+        write_skill_transaction(codex_home, package, &transaction)?;
     }
 
     if let Err(error) = fs::rename(&stage, &target) {
@@ -278,7 +291,6 @@ pub fn install_skill_at(
             "failed to activate the staged skill: {error}; {suffix}"
         ));
     }
-
     let verified = scan_skill(codex_home, appdata, package)
         .map(|status| status.state == SkillState::Current)
         .unwrap_or(false);
@@ -340,8 +352,18 @@ pub fn recover_skill_transaction_at(codex_home: &Path, skill_id: SkillId) -> Res
         return Ok(true);
     }
 
+    let existing_backup = transaction.backup.as_deref().filter(|path| path.exists());
+    if transaction.phase == SkillTransactionPhase::Prepared && existing_backup.is_none() {
+        // The swap never started. In particular, keep an existing unmanaged or
+        // drifted target instead of deleting user data merely because staging
+        // or journal cleanup was interrupted.
+        remove_directory_if_present(&transaction.stage)?;
+        clear_skill_transaction(codex_home, package)?;
+        return Ok(true);
+    }
+
     remove_directory_if_present(&transaction.target)?;
-    if let Some(backup) = transaction.backup.as_deref().filter(|path| path.exists()) {
+    if let Some(backup) = existing_backup {
         reject_reparse_tree(backup)?;
         fs::rename(backup, &transaction.target)
             .map_err(|error| format!("failed to recover the previous skill directory: {error}"))?;

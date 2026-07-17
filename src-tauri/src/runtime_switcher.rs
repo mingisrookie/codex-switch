@@ -153,14 +153,18 @@ fn switch_runtime_files_internal(
         .map_err(|message| RuntimeSwitchFailure::new(message, vec![current_backup.clone()]))?;
     let backups = vec![current_backup.clone(), shared_backup.clone()];
 
+    #[cfg(not(test))]
+    if !crate::process_control::list_codex_processes()
+        .map_err(|message| RuntimeSwitchFailure::new(message, backups.clone()))?
+        .is_empty()
+    {
+        return Err(RuntimeSwitchFailure::new(
+            "Codex started during switch preflight; close it and retry before files are changed"
+                .to_string(),
+            backups,
+        ));
+    }
     let applied = (|| {
-        #[cfg(not(test))]
-        if !crate::process_control::list_codex_processes()?.is_empty() {
-            return Err(
-                "Codex started during switch preflight; close it and retry before files are changed"
-                    .to_string(),
-            );
-        }
         ensure_shared_sessions(codex_home, shared_home)?;
         let to_shared = sync_user_home_to_shared(codex_home, shared_home)?;
         atomic_write(&codex_home.join("auth.json"), &runtime_files.auth_json)?;

@@ -4,7 +4,10 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard, TryLockError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard, TryLockError,
+    },
     thread,
     time::Duration,
 };
@@ -53,12 +56,72 @@ use crate::{
     },
 };
 
-static MUTATION_LOCK: Mutex<()> = Mutex::new(());
+static MUTATION_COORDINATOR: MutationCoordinator = MutationCoordinator::new();
 
 #[derive(Debug)]
-struct MutationGuard {
-    _process_guard: MutexGuard<'static, ()>,
-    _lock_file: File,
+struct MutationCoordinator {
+    process_lock: Mutex<()>,
+    shutdown_pending: AtomicBool,
+    shutdown_lock_file: Mutex<Option<File>>,
+}
+
+impl MutationCoordinator {
+    const fn new() -> Self {
+        Self {
+            process_lock: Mutex::new(()),
+            shutdown_pending: AtomicBool::new(false),
+            shutdown_lock_file: Mutex::new(None),
+        }
+    }
+
+    fn acquire<'a>(&'a self, lock_path: &Path) -> Result<MutationGuard<'a>, String> {
+        if self.shutdown_pending.load(Ordering::Acquire) {
+            return Err(mutation_busy_error());
+        }
+        let process_guard = match self.process_lock.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(mutation_busy_error()),
+            Err(TryLockError::Poisoned(error)) => Ok(error.into_inner()),
+        }?;
+        if self.shutdown_pending.load(Ordering::Acquire) {
+            return Err(mutation_busy_error());
+        }
+        let lock_file = open_mutation_lock_file(lock_path)?;
+        Ok(MutationGuard {
+            coordinator: self,
+            _process_guard: process_guard,
+            lock_file: Some(lock_file),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MutationGuard<'a> {
+    coordinator: &'a MutationCoordinator,
+    _process_guard: MutexGuard<'a, ()>,
+    lock_file: Option<File>,
+}
+
+impl MutationGuard<'_> {
+    fn hold_until_process_exit(mut self) {
+        let lock_file = self
+            .lock_file
+            .take()
+            .expect("mutation guard must own its lock file");
+        let mut shutdown_lock_file = self
+            .coordinator
+            .shutdown_lock_file
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *shutdown_lock_file = Some(lock_file);
+        self.coordinator
+            .shutdown_pending
+            .store(true, Ordering::Release);
+    }
+}
+
+fn mutation_busy_error() -> String {
+    "another Codex Switch mutation is already in progress".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -134,9 +197,16 @@ pub async fn check_for_updates() -> Result<UpdateCheckResult, String> {
 
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceipt, String> {
-    let receipt = tauri::async_runtime::spawn_blocking(install_latest_update)
-        .await
-        .map_err(|_| "update installer worker failed".to_string())??;
+    let receipt = tauri::async_runtime::spawn_blocking(|| {
+        let mutation_guard = acquire_mutation_lock()?;
+        let result = install_latest_update();
+        if result.is_ok() {
+            mutation_guard.hold_until_process_exit();
+        }
+        result
+    })
+    .await
+    .map_err(|_| "update installer worker failed".to_string())??;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
         app.exit(0);
@@ -650,24 +720,13 @@ fn operation_log() -> Result<OperationLog, String> {
     Ok(OperationLog::from_appdata(&appdata_root()?))
 }
 
-fn acquire_mutation_lock() -> Result<MutationGuard, String> {
+fn acquire_mutation_lock() -> Result<MutationGuard<'static>, String> {
     let lock_path = appdata_root()?.join("codex-switch").join("mutation.lock");
     acquire_mutation_lock_at(&lock_path)
 }
 
-fn acquire_mutation_lock_at(lock_path: &Path) -> Result<MutationGuard, String> {
-    let process_guard = match MUTATION_LOCK.try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(TryLockError::WouldBlock) => {
-            Err("another Codex Switch mutation is already in progress".to_string())
-        }
-        Err(TryLockError::Poisoned(error)) => Ok(error.into_inner()),
-    }?;
-    let lock_file = open_mutation_lock_file(lock_path)?;
-    Ok(MutationGuard {
-        _process_guard: process_guard,
-        _lock_file: lock_file,
-    })
+fn acquire_mutation_lock_at(lock_path: &Path) -> Result<MutationGuard<'static>, String> {
+    MUTATION_COORDINATOR.acquire(lock_path)
 }
 
 fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
@@ -976,7 +1035,7 @@ mod tests {
 
     use super::{
         acquire_mutation_lock_at, compensate_failed_hot_sync, default_codex_home_from_env,
-        get_app_status, record_result_to_log, validate_backup_selection,
+        get_app_status, record_result_to_log, validate_backup_selection, MutationCoordinator,
     };
 
     #[cfg(windows)]
@@ -999,6 +1058,25 @@ mod tests {
 
         drop(first);
         assert!(acquire_mutation_lock_at(&lock_path).is_ok());
+    }
+
+    #[test]
+    fn successful_update_lock_enters_shutdown_pending_while_failure_releases() {
+        let root = tempdir().unwrap();
+        let lock_path = root.path().join("mutation.lock");
+        let coordinator = MutationCoordinator::new();
+
+        let failed_attempt = coordinator.acquire(&lock_path).unwrap();
+        drop(failed_attempt);
+        assert!(coordinator.acquire(&lock_path).is_ok());
+
+        let successful_attempt = coordinator.acquire(&lock_path).unwrap();
+        successful_attempt.hold_until_process_exit();
+        let error = coordinator.acquire(&lock_path).unwrap_err();
+        assert!(error.contains("already in progress"), "{error}");
+
+        #[cfg(windows)]
+        assert!(open_mutation_lock_file(&lock_path).is_err());
     }
 
     #[test]

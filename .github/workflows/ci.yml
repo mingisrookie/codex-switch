@@ -11,20 +11,20 @@ jobs:
   quality:
     name: Windows quality gate
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: rustfmt, clippy
 
@@ -46,8 +46,31 @@ jobs:
 
       - name: Run Rust lint checks
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Rust tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Build portable release executable
+        run: npm run tauri -- build
+
+      - name: Verify release contract
+        run: npm run check:release
+
+      - name: Verify PE product version
+        shell: pwsh
+        run: |
+          $expected = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $actual = (Get-Item src-tauri/target/release/codex-switch.exe).VersionInfo.ProductVersion
+          if ($actual -ne $expected) {
+            throw "PE ProductVersion $actual does not match package version $expected"
+          }
+
+      - name: Upload verified executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-switch-${{ github.sha }}
+          path: src-tauri/target/release/codex-switch.exe
+          if-no-files-found: error
+          retention-days: 14

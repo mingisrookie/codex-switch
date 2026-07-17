@@ -272,6 +272,7 @@ fn recovers_an_interrupted_directory_swap_before_the_next_install() {
             "target": target,
             "stage": stage,
             "backup": backup,
+            "phase": "backupCreated",
         }))
         .unwrap(),
     )
@@ -279,6 +280,46 @@ fn recovers_an_interrupted_directory_swap_before_the_next_install() {
 
     assert!(recover_skill_transaction_at(codex_home.path(), SkillId::GrokSearch).unwrap());
     assert!(target.join("SKILL.md").exists());
+    assert!(!stage.exists());
+    assert!(!journal.exists());
+}
+
+#[test]
+fn recovery_before_backup_preserves_the_existing_skill_directory() {
+    let codex_home = tempdir().unwrap();
+    let target = codex_home.path().join("skills/grok-search");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("user-custom.txt"), "must survive").unwrap();
+    let stage = codex_home
+        .path()
+        .join("skills/.codex-switch-stage-pre-backup-crash");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("partial.txt"), "partial").unwrap();
+    let backup = codex_home
+        .path()
+        .join(".codex-switch/skill-backups/pre-backup-crash/grok-search");
+    let journal = codex_home
+        .path()
+        .join(".codex-switch/skill-transactions/grok-search.json");
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "skillId": "grokSearch",
+            "target": target,
+            "stage": stage,
+            "backup": backup,
+            "phase": "prepared",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(recover_skill_transaction_at(codex_home.path(), SkillId::GrokSearch).unwrap());
+    assert_eq!(
+        fs::read_to_string(target.join("user-custom.txt")).unwrap(),
+        "must survive"
+    );
     assert!(!stage.exists());
     assert!(!journal.exists());
 }

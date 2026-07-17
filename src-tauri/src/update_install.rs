@@ -27,9 +27,13 @@ const UPDATE_PLAN_SCHEMA: u32 = 1;
 const APPLY_UPDATE_ARG: &str = "--codex-switch-apply-update";
 const UPDATE_COMPLETE_ARG: &str = "--codex-switch-update-complete";
 const UPDATE_ROLLED_BACK_ARG: &str = "--codex-switch-update-rolled-back";
+const STARTUP_ACK_NAME: &str = "startup-ack";
+const STARTUP_ACK_ATTEMPTS: usize = 150;
+const STARTUP_ACK_INTERVAL: Duration = Duration::from_millis(100);
 
 static UPDATE_INSTALL_STARTED: Mutex<bool> = Mutex::new(false);
 static STARTUP_NOTICE: OnceLock<Option<UpdateStartupNotice>> = OnceLock::new();
+static STARTUP_CONTEXT: OnceLock<Option<StartupUpdateContext>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +51,7 @@ pub struct UpdateStartupNotice {
     pub status: UpdateStartupStatus,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UpdateStartupStatus {
     Updated,
@@ -74,10 +78,27 @@ struct ValidatedAsset {
     download_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupUpdateContext {
+    status: UpdateStartupStatus,
+    staging_dir: PathBuf,
+    ack_path: PathBuf,
+    ack_payload: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchStatus {
     Updated,
     RolledBack,
+}
+
+impl LaunchStatus {
+    fn startup_status(self) -> UpdateStartupStatus {
+        match self {
+            Self::Updated => UpdateStartupStatus::Updated,
+            Self::RolledBack => UpdateStartupStatus::RolledBack,
+        }
+    }
 }
 
 pub fn install_latest_update() -> Result<UpdateInstallReceipt, String> {
@@ -114,21 +135,118 @@ pub fn process_startup_update_args() -> Option<i32> {
         });
     }
 
-    let notice = if args.len() == 3 && args[1] == UPDATE_COMPLETE_ARG {
-        schedule_staging_cleanup(PathBuf::from(&args[2]));
-        Some(UpdateStartupNotice {
-            status: UpdateStartupStatus::Updated,
-        })
-    } else if args.len() == 3 && args[1] == UPDATE_ROLLED_BACK_ARG {
-        schedule_staging_cleanup(PathBuf::from(&args[2]));
-        Some(UpdateStartupNotice {
-            status: UpdateStartupStatus::RolledBack,
-        })
-    } else {
-        None
-    };
+    let context = startup_context_from_args(&args, &env::current_exe().ok()?);
+    let notice = context.as_ref().map(|context| UpdateStartupNotice {
+        status: context.status,
+    });
+    let _ = STARTUP_CONTEXT.set(context);
     let _ = STARTUP_NOTICE.set(notice);
     None
+}
+
+pub fn acknowledge_update_startup() -> Result<(), String> {
+    let Some(context) = STARTUP_CONTEXT.get().cloned().flatten() else {
+        return Ok(());
+    };
+    write_startup_ack(&context)?;
+    schedule_staging_cleanup(context.staging_dir);
+    Ok(())
+}
+
+fn startup_context_from_args(
+    args: &[std::ffi::OsString],
+    current_exe: &Path,
+) -> Option<StartupUpdateContext> {
+    if args.len() != 3 {
+        return None;
+    }
+    let status = if args[1] == UPDATE_COMPLETE_ARG {
+        UpdateStartupStatus::Updated
+    } else if args[1] == UPDATE_ROLLED_BACK_ARG {
+        UpdateStartupStatus::RolledBack
+    } else {
+        return None;
+    };
+    validate_startup_context(Path::new(&args[2]), status, current_exe).ok()
+}
+
+fn validate_startup_context(
+    staging_dir: &Path,
+    status: UpdateStartupStatus,
+    current_exe: &Path,
+) -> Result<StartupUpdateContext, String> {
+    let staging_dir = canonical_staging_dir(staging_dir)?;
+    let plan_path = staging_dir.join("update-plan.json");
+    let plan: UpdatePlan = serde_json::from_slice(
+        &fs::read(&plan_path).map_err(|_| "the update startup plan is missing".to_string())?,
+    )
+    .map_err(|_| "the update startup plan is invalid".to_string())?;
+    if plan.schema_version != UPDATE_PLAN_SCHEMA {
+        return Err("the update startup plan schema is unsupported".to_string());
+    }
+    let planned_staging = canonical_staging_dir(&plan.staging_dir)?;
+    if !paths_equal(&planned_staging, &staging_dir) {
+        return Err("the update startup staging directory does not match the plan".to_string());
+    }
+    let target = fs::canonicalize(&plan.target_exe)
+        .map_err(|_| "the updated executable is missing".to_string())?;
+    let running = fs::canonicalize(current_exe)
+        .map_err(|_| "the restarted executable is invalid".to_string())?;
+    if !paths_equal(&target, &running) {
+        return Err("the restarted executable does not match the update plan".to_string());
+    }
+    let helper = fs::canonicalize(&plan.helper_exe)
+        .map_err(|_| "the update helper is missing during startup".to_string())?;
+    let staged = fs::canonicalize(&plan.staged_exe)
+        .map_err(|_| "the staged update is missing during startup".to_string())?;
+    if helper.parent() != Some(staging_dir.as_path())
+        || staged.parent() != Some(staging_dir.as_path())
+    {
+        return Err("the update startup files are outside the staging directory".to_string());
+    }
+    validate_sha256(&plan.expected_old_sha256)?;
+    validate_sha256(&plan.expected_new_sha256)?;
+    if sha256_file(&helper)? != plan.expected_old_sha256
+        || sha256_file(&staged)? != plan.expected_new_sha256
+    {
+        return Err("the update startup files do not match the plan".to_string());
+    }
+    let expected_sha256 = match status {
+        UpdateStartupStatus::Updated => &plan.expected_new_sha256,
+        UpdateStartupStatus::RolledBack => &plan.expected_old_sha256,
+    };
+    if sha256_file(&running)? != expected_sha256.as_str() {
+        return Err("the restarted executable does not match the expected update".to_string());
+    }
+    Ok(StartupUpdateContext {
+        status,
+        ack_path: staging_dir.join(STARTUP_ACK_NAME),
+        ack_payload: startup_ack_payload(status, expected_sha256),
+        staging_dir,
+    })
+}
+
+fn startup_ack_payload(status: UpdateStartupStatus, expected_sha256: &str) -> String {
+    let status = match status {
+        UpdateStartupStatus::Updated => "updated",
+        UpdateStartupStatus::RolledBack => "rolledBack",
+    };
+    format!("codex-switch-update-ack-v1\n{status}\n{expected_sha256}\n")
+}
+
+fn write_startup_ack(context: &StartupUpdateContext) -> Result<(), String> {
+    let staging_dir = canonical_staging_dir(&context.staging_dir)?;
+    if !paths_equal(&context.ack_path, &staging_dir.join(STARTUP_ACK_NAME)) {
+        return Err("the update startup acknowledgement path is unsafe".to_string());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&context.ack_path)
+        .map_err(|_| "failed to create the update startup acknowledgement".to_string())?;
+    file.write_all(context.ack_payload.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "failed to persist the update startup acknowledgement".to_string())
 }
 
 #[cfg(windows)]
@@ -412,7 +530,7 @@ fn apply_update_plan_with<W, L>(
 ) -> Result<(), String>
 where
     W: FnOnce() -> Result<(), String>,
-    L: FnMut(&Path, LaunchStatus, &Path) -> Result<(), String>,
+    L: FnMut(&Path, LaunchStatus, &Path, &str) -> Result<(), String>,
 {
     validate_update_plan(plan, running_helper)?;
     apply_validated_update_plan_with(plan, wait_for_parent, launch)
@@ -425,7 +543,7 @@ fn apply_validated_update_plan_with<W, L>(
 ) -> Result<(), String>
 where
     W: FnOnce() -> Result<(), String>,
-    L: FnMut(&Path, LaunchStatus, &Path) -> Result<(), String>,
+    L: FnMut(&Path, LaunchStatus, &Path, &str) -> Result<(), String>,
 {
     wait_for_parent()?;
     let target_parent = plan
@@ -457,12 +575,18 @@ where
             let _ = fs::rename(&backup, &plan.target_exe);
             return Err("failed to activate the replacement executable".to_string());
         }
-        if let Err(error) = launch(&plan.target_exe, LaunchStatus::Updated, &plan.staging_dir) {
+        if let Err(error) = launch(
+            &plan.target_exe,
+            LaunchStatus::Updated,
+            &plan.staging_dir,
+            &plan.expected_new_sha256,
+        ) {
             rollback_executable(&plan.target_exe, &backup)?;
             launch(
                 &plan.target_exe,
                 LaunchStatus::RolledBack,
                 &plan.staging_dir,
+                &plan.expected_old_sha256,
             )
             .map_err(|_| "update failed and the restored version could not restart".to_string())?;
             fallback_launched = true;
@@ -483,6 +607,7 @@ where
                 &plan.target_exe,
                 LaunchStatus::RolledBack,
                 &plan.staging_dir,
+                &plan.expected_old_sha256,
             );
         }
     }
@@ -534,22 +659,81 @@ fn launch_and_confirm(
     target: &Path,
     status: LaunchStatus,
     staging_dir: &Path,
+    expected_sha256: &str,
 ) -> Result<(), String> {
     let notice_arg = match status {
         LaunchStatus::Updated => UPDATE_COMPLETE_ARG,
         LaunchStatus::RolledBack => UPDATE_ROLLED_BACK_ARG,
     };
+    let ack_path = staging_dir.join(STARTUP_ACK_NAME);
+    match fs::remove_file(&ack_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("failed to reset the update startup acknowledgement".to_string()),
+    }
     let mut child = Command::new(target)
         .arg(notice_arg)
         .arg(staging_dir)
         .spawn()
         .map_err(|_| "failed to restart the application after update".to_string())?;
-    thread::sleep(Duration::from_millis(1500));
-    match child.try_wait() {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err("the application exited immediately after update".to_string()),
-        Err(_) => Err("failed to verify the restarted application".to_string()),
+    let payload = startup_ack_payload(status.startup_status(), expected_sha256);
+    wait_for_startup_ack(&mut child, &ack_path, &payload)
+}
+
+#[cfg(windows)]
+trait StartupChild {
+    fn has_exited(&mut self) -> Result<bool, String>;
+    fn abort(&mut self);
+}
+
+#[cfg(windows)]
+impl StartupChild for std::process::Child {
+    fn has_exited(&mut self) -> Result<bool, String> {
+        self.try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| "failed to monitor the restarted application".to_string())
     }
+
+    fn abort(&mut self) {
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_startup_ack(
+    child: &mut impl StartupChild,
+    ack_path: &Path,
+    expected_payload: &str,
+) -> Result<(), String> {
+    wait_for_startup_ack_with(
+        child,
+        ack_path,
+        expected_payload,
+        STARTUP_ACK_ATTEMPTS,
+        STARTUP_ACK_INTERVAL,
+    )
+}
+
+#[cfg(windows)]
+fn wait_for_startup_ack_with(
+    child: &mut impl StartupChild,
+    ack_path: &Path,
+    expected_payload: &str,
+    attempts: usize,
+    interval: Duration,
+) -> Result<(), String> {
+    for _ in 0..attempts {
+        if fs::read(ack_path).is_ok_and(|payload| payload == expected_payload.as_bytes()) {
+            return Ok(());
+        }
+        if child.has_exited()? {
+            return Err("the application exited before completing startup".to_string());
+        }
+        thread::sleep(interval);
+    }
+    child.abort();
+    Err("timed out waiting for the application startup acknowledgement".to_string())
 }
 
 #[cfg(windows)]
@@ -782,6 +966,32 @@ mod tests {
         (temp, plan, helper)
     }
 
+    fn persist_plan(plan: &UpdatePlan) {
+        fs::write(
+            plan.staging_dir.join("update-plan.json"),
+            serde_json::to_vec(plan).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[derive(Default)]
+    struct FakeStartupChild {
+        exited: bool,
+        aborted: bool,
+    }
+
+    #[cfg(windows)]
+    impl StartupChild for FakeStartupChild {
+        fn has_exited(&mut self) -> Result<bool, String> {
+            Ok(self.exited)
+        }
+
+        fn abort(&mut self) {
+            self.aborted = true;
+        }
+    }
+
     #[test]
     fn accepts_only_the_fixed_single_asset_with_github_digest() {
         let digest = "a".repeat(64);
@@ -847,9 +1057,20 @@ mod tests {
             &plan,
             &helper,
             || Ok(()),
-            |target, status, _| {
+            |target, status, _, expected_sha256| {
                 launches.push(status);
                 assert_eq!(fs::read(target).unwrap(), b"new executable");
+                assert_eq!(sha256_file(target).unwrap(), expected_sha256);
+                assert!(target
+                    .parent()
+                    .unwrap()
+                    .read_dir()
+                    .unwrap()
+                    .any(|entry| entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("update-backup")));
                 Ok(())
             },
         )
@@ -870,6 +1091,95 @@ mod tests {
     }
 
     #[test]
+    fn startup_ack_requires_the_controlled_plan_target_status_and_hash() {
+        let (_temp, plan, _helper) = staged_plan();
+        persist_plan(&plan);
+        let args = vec![
+            std::ffi::OsString::from("codex-switch.exe"),
+            std::ffi::OsString::from(UPDATE_COMPLETE_ARG),
+            plan.staging_dir.as_os_str().to_owned(),
+        ];
+
+        assert!(startup_context_from_args(&args, &plan.target_exe).is_none());
+        fs::write(&plan.target_exe, b"new executable").unwrap();
+        let context = startup_context_from_args(&args, &plan.target_exe).unwrap();
+        write_startup_ack(&context).unwrap();
+        assert_eq!(
+            fs::read(&context.ack_path).unwrap(),
+            context.ack_payload.as_bytes()
+        );
+
+        let unrelated_target = tempfile::NamedTempFile::new().unwrap();
+        assert!(startup_context_from_args(&args, unrelated_target.path()).is_none());
+    }
+
+    #[test]
+    fn startup_ack_rejects_tampered_staging_files() {
+        let (_temp, plan, _helper) = staged_plan();
+        persist_plan(&plan);
+        fs::write(&plan.target_exe, b"new executable").unwrap();
+        fs::write(&plan.staged_exe, b"tampered staged executable").unwrap();
+        let args = vec![
+            std::ffi::OsString::from("codex-switch.exe"),
+            std::ffi::OsString::from(UPDATE_COMPLETE_ARG),
+            plan.staging_dir.as_os_str().to_owned(),
+        ];
+
+        assert!(startup_context_from_args(&args, &plan.target_exe).is_none());
+        assert!(!plan.staging_dir.join(STARTUP_ACK_NAME).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_waits_for_exact_startup_ack_and_aborts_on_timeout() {
+        let temp = Builder::new()
+            .prefix(UPDATE_DIR_PREFIX)
+            .tempdir_in(env::temp_dir())
+            .unwrap();
+        let ack_path = temp.path().join(STARTUP_ACK_NAME);
+        let payload = startup_ack_payload(UpdateStartupStatus::Updated, &"a".repeat(64));
+        fs::write(&ack_path, &payload).unwrap();
+        let mut acknowledged = FakeStartupChild::default();
+        wait_for_startup_ack_with(&mut acknowledged, &ack_path, &payload, 1, Duration::ZERO)
+            .unwrap();
+        assert!(!acknowledged.aborted);
+
+        fs::remove_file(&ack_path).unwrap();
+        let mut timed_out = FakeStartupChild::default();
+        let error =
+            wait_for_startup_ack_with(&mut timed_out, &ack_path, &payload, 1, Duration::ZERO)
+                .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(timed_out.aborted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_rejects_an_early_exit_without_an_ack() {
+        let temp = Builder::new()
+            .prefix(UPDATE_DIR_PREFIX)
+            .tempdir_in(env::temp_dir())
+            .unwrap();
+        let mut child = FakeStartupChild {
+            exited: true,
+            aborted: false,
+        };
+        let error = wait_for_startup_ack_with(
+            &mut child,
+            &temp.path().join(STARTUP_ACK_NAME),
+            "expected",
+            1,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("exited before completing startup"),
+            "{error}"
+        );
+        assert!(!child.aborted);
+    }
+
+    #[test]
     fn helper_rolls_back_when_the_new_executable_cannot_start() {
         let (_temp, plan, helper) = staged_plan();
         let mut launches = Vec::new();
@@ -877,8 +1187,9 @@ mod tests {
             &plan,
             &helper,
             || Ok(()),
-            |target, status, _| {
+            |target, status, _, expected_sha256| {
                 launches.push(status);
+                assert_eq!(sha256_file(target).unwrap(), expected_sha256);
                 if status == LaunchStatus::Updated {
                     assert_eq!(fs::read(target).unwrap(), b"new executable");
                     Err("injected launch failure".to_string())
@@ -902,7 +1213,7 @@ mod tests {
         let (_temp, mut plan, helper) = staged_plan();
         plan.expected_new_sha256 = "0".repeat(64);
         let error =
-            apply_update_plan_with(&plan, &helper, || Ok(()), |_, _, _| Ok(())).unwrap_err();
+            apply_update_plan_with(&plan, &helper, || Ok(()), |_, _, _, _| Ok(())).unwrap_err();
         assert_eq!(error, "the staged update executable is invalid");
         assert_eq!(fs::read(&plan.target_exe).unwrap(), b"old executable");
     }
@@ -919,7 +1230,7 @@ mod tests {
                 fs::write(&target, b"externally changed").unwrap();
                 Ok(())
             },
-            |_, _, _| {
+            |_, _, _, _| {
                 launch_count += 1;
                 Ok(())
             },

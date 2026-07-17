@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -99,9 +100,8 @@ impl RuntimeStore {
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeMetadata>, String> {
         let mut runtimes = Vec::new();
         for id in [PLUS_RUNTIME_ID, RELAY_RUNTIME_ID] {
-            let meta_path = self.runtime_dir(id).join("runtime.json");
-            if meta_path.exists() {
-                runtimes.push(self.load_metadata(id)?);
+            if let Some(metadata) = self.load_existing_metadata(id)? {
+                runtimes.push(metadata);
             }
         }
         Ok(runtimes)
@@ -120,7 +120,7 @@ impl RuntimeStore {
         let config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read plus config.toml: {error}"))?;
         let config_overlay = account_config_overlay(&config)?;
-        let existing = self.load_metadata(PLUS_RUNTIME_ID).ok();
+        let existing = self.load_existing_metadata(PLUS_RUNTIME_ID)?;
         if existing.is_some() && !confirm_overwrite {
             return Err("账号槽位已存在，请确认覆盖后重试".to_string());
         }
@@ -158,7 +158,7 @@ impl RuntimeStore {
         let base_config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read live config.toml: {error}"))?;
         let config_toml = relay_config_template(&base_config, &normalized_base_url, model)?;
-        let existing = self.load_metadata(RELAY_RUNTIME_ID).ok();
+        let existing = self.load_existing_metadata(RELAY_RUNTIME_ID)?;
         let auth = if input.api_key.trim().is_empty() {
             self.load_runtime_files(RELAY_RUNTIME_ID)
                 .map_err(|_| "relay API key is required for the first save".to_string())?
@@ -180,9 +180,14 @@ impl RuntimeStore {
             base_url: Some(normalized_base_url),
             model: Some(model.to_string()),
             created_at_ms,
-            last_used_at_ms: existing.and_then(|metadata| metadata.last_used_at_ms),
+            last_used_at_ms: existing
+                .as_ref()
+                .and_then(|metadata| metadata.last_used_at_ms),
             last_verified_at_ms: None,
         };
+        if existing.is_some() {
+            self.archive_runtime(RELAY_RUNTIME_ID)?;
+        }
         self.write_runtime(&metadata, &auth, &config_toml)?;
         Ok(metadata)
     }
@@ -215,6 +220,13 @@ impl RuntimeStore {
             ));
         }
         Ok(metadata)
+    }
+
+    fn load_existing_metadata(&self, runtime_id: &str) -> Result<Option<RuntimeMetadata>, String> {
+        if !self.runtime_dir(runtime_id).exists() {
+            return Ok(None);
+        }
+        self.load_metadata(runtime_id).map(Some)
     }
 
     pub fn detect_active_runtime(&self, codex_home: &Path) -> Result<RuntimeStatus, String> {
@@ -302,15 +314,18 @@ impl RuntimeStore {
     }
 
     fn archive_runtime(&self, runtime_id: &str) -> Result<(), String> {
+        self.archive_runtime_at(runtime_id, timestamp_millis()?)
+    }
+
+    fn archive_runtime_at(&self, runtime_id: &str, timestamp_ms: u128) -> Result<(), String> {
         let runtime_dir = self.runtime_dir(runtime_id);
         if !runtime_dir.exists() {
             return Ok(());
         }
-        let history_dir = runtime_dir
-            .join("history")
-            .join(format!("{}", timestamp_millis()?));
-        fs::create_dir_all(&history_dir)
-            .map_err(|error| format!("failed to create runtime history: {error}"))?;
+        let history_root = runtime_dir.join("history");
+        fs::create_dir_all(&history_root)
+            .map_err(|error| format!("failed to create runtime history root: {error}"))?;
+        let history_dir = create_history_dir(&history_root, timestamp_ms)?;
         for name in ["auth.enc", "config.toml", "runtime.json"] {
             let source = runtime_dir.join(name);
             if source.is_file() {
@@ -326,13 +341,114 @@ impl RuntimeStore {
         auth_json: &[u8],
         config_toml: &str,
     ) -> Result<(), String> {
+        self.write_runtime_with(metadata, auth_json, config_toml, atomic_write)
+    }
+
+    fn write_runtime_with<F>(
+        &self,
+        metadata: &RuntimeMetadata,
+        auth_json: &[u8],
+        config_toml: &str,
+        mut write_file: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&Path, &[u8]) -> Result<(), String>,
+    {
         let dir = self.runtime_dir(&metadata.id);
+        let auth_path = dir.join("auth.enc");
+        let config_path = dir.join("config.toml");
+        let metadata_path = dir.join("runtime.json");
+        let encrypted_auth = protect(auth_json)?;
+        let metadata_json = serialize_metadata(metadata)?;
+        let snapshots = [
+            snapshot_runtime_file(&auth_path)?,
+            snapshot_runtime_file(&config_path)?,
+            snapshot_runtime_file(&metadata_path)?,
+        ];
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create runtime dir: {error}"))?;
-        atomic_write(&dir.join("auth.enc"), &protect(auth_json)?)?;
-        atomic_write(&dir.join("config.toml"), config_toml.as_bytes())?;
-        write_metadata(&dir.join("runtime.json"), metadata)
+        let result = (|| {
+            write_file(&auth_path, &encrypted_auth)?;
+            write_file(&config_path, config_toml.as_bytes())?;
+            write_file(&metadata_path, &metadata_json)
+        })();
+        if let Err(error) = result {
+            return match restore_runtime_files(&snapshots) {
+                Ok(()) => Err(format!("{error}; rolled back previous runtime files")),
+                Err(rollback_error) => Err(format!("{error}; rollback failed: {rollback_error}")),
+            };
+        }
+        Ok(())
     }
+}
+
+#[derive(Debug)]
+struct RuntimeFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+fn snapshot_runtime_file(path: &Path) -> Result<RuntimeFileSnapshot, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("failed to snapshot runtime file: {error}")),
+    };
+    Ok(RuntimeFileSnapshot {
+        path: path.to_path_buf(),
+        contents,
+    })
+}
+
+fn restore_runtime_files(snapshots: &[RuntimeFileSnapshot]) -> Result<(), String> {
+    for snapshot in snapshots {
+        let result = match &snapshot.contents {
+            Some(contents) => atomic_write(&snapshot.path, contents),
+            None => match fs::remove_file(&snapshot.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("failed to remove new runtime file: {error}")),
+            },
+        };
+        let _ = result;
+    }
+
+    let mut verification_error = None;
+    for snapshot in snapshots {
+        let result = match &snapshot.contents {
+            Some(expected) => match fs::read(&snapshot.path) {
+                Ok(actual) if actual.as_slice() == expected.as_slice() => Ok(()),
+                Ok(_) => Err("restored runtime file did not match its snapshot".to_string()),
+                Err(error) => Err(format!("failed to verify restored runtime file: {error}")),
+            },
+            None => match snapshot.path.try_exists() {
+                Ok(false) => Ok(()),
+                Ok(true) => Err("new runtime file remained after rollback".to_string()),
+                Err(error) => Err(format!("failed to verify removed runtime file: {error}")),
+            },
+        };
+        if verification_error.is_none() {
+            verification_error = result.err();
+        }
+    }
+    verification_error.map_or(Ok(()), Err)
+}
+
+fn create_history_dir(history_root: &Path, timestamp_ms: u128) -> Result<PathBuf, String> {
+    for sequence in 0_u64.. {
+        let name = if sequence == 0 {
+            timestamp_ms.to_string()
+        } else {
+            format!("{timestamp_ms}-{sequence}")
+        };
+        let path = history_root.join(name);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to create runtime history: {error}")),
+        }
+    }
+    unreachable!("u64 history sequence cannot be exhausted")
 }
 
 fn validate_runtime_id(runtime_id: &str) -> Result<(), String> {
@@ -375,6 +491,9 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
         || parsed.fragment().is_some()
     {
         return Err("relay base URL must not contain credentials, query, or fragment".to_string());
+    }
+    if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
+        return Err("non-loopback relay URLs must use HTTPS".to_string());
     }
     let path = parsed.path().trim_end_matches('/');
     let normalized_path = if path.ends_with("/v1") {
@@ -468,9 +587,12 @@ fn read_model_from_config(config: &str) -> Option<String> {
 }
 
 fn write_metadata(path: &Path, metadata: &RuntimeMetadata) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(metadata)
-        .map_err(|error| format!("failed to serialize runtime metadata: {error}"))?;
-    atomic_write(path, json.as_bytes())
+    atomic_write(path, &serialize_metadata(metadata)?)
+}
+
+fn serialize_metadata(metadata: &RuntimeMetadata) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(metadata)
+        .map_err(|error| format!("failed to serialize runtime metadata: {error}"))
 }
 
 fn read_metadata(path: &Path) -> Result<RuntimeMetadata, String> {
@@ -484,6 +606,19 @@ fn timestamp_millis() -> Result<u128, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .map_err(|error| format!("system clock before unix epoch: {error}"))
+}
+
+pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
+    host.is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 fn auth_mode_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
@@ -663,6 +798,93 @@ mod tests {
     }
 
     #[test]
+    fn relay_update_archives_the_previous_runtime_before_overwrite() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://old.example.com/v1".to_string(),
+                    api_key: "sk-old-relay".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+        let old_auth = fs::read(runtime_dir.join("auth.enc")).unwrap();
+        let old_config = fs::read(runtime_dir.join("config.toml")).unwrap();
+        let old_metadata = fs::read(runtime_dir.join("runtime.json")).unwrap();
+
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://new.example.com/v1".to_string(),
+                    api_key: "sk-new-relay".to_string(),
+                    model: "new".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        let history = runtime_dir
+            .join("history")
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 1);
+        assert_eq!(fs::read(history[0].join("auth.enc")).unwrap(), old_auth);
+        assert_eq!(
+            fs::read(history[0].join("config.toml")).unwrap(),
+            old_config
+        );
+        assert_eq!(
+            fs::read(history[0].join("runtime.json")).unwrap(),
+            old_metadata
+        );
+        assert_ne!(fs::read(runtime_dir.join("auth.enc")).unwrap(), old_auth);
+        assert!(fs::read_to_string(runtime_dir.join("config.toml"))
+            .unwrap()
+            .contains("new.example.com"));
+    }
+
+    #[test]
+    fn same_millisecond_archives_use_distinct_history_directories() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-relay".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+        let first_config = fs::read(runtime_dir.join("config.toml")).unwrap();
+
+        store.archive_runtime_at(RELAY_RUNTIME_ID, 123).unwrap();
+        fs::write(runtime_dir.join("config.toml"), "model = \"second\"\n").unwrap();
+        store.archive_runtime_at(RELAY_RUNTIME_ID, 123).unwrap();
+
+        assert_eq!(
+            fs::read(runtime_dir.join("history/123/config.toml")).unwrap(),
+            first_config
+        );
+        assert_eq!(
+            fs::read_to_string(runtime_dir.join("history/123-1/config.toml")).unwrap(),
+            "model = \"second\"\n"
+        );
+    }
+
+    #[test]
     fn runtime_overlays_do_not_persist_unrelated_live_global_sections() {
         let home = tempdir().unwrap();
         fs::write(
@@ -704,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_url_rejects_credentials_query_and_non_http_schemes() {
+    fn relay_url_rejects_credentials_query_non_http_and_insecure_remote_schemes() {
         let home = tempdir().unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
         let root = tempdir().unwrap();
@@ -713,6 +935,8 @@ mod tests {
             "https://user:password@relay.example.com/v1",
             "https://relay.example.com/v1?api_key=secret",
             "file:///tmp/relay",
+            "http://relay.example.com/v1",
+            "http://192.168.1.20:8787/v1",
         ] {
             let error = store
                 .upsert_relay(
@@ -724,9 +948,28 @@ mod tests {
                     home.path(),
                 )
                 .unwrap_err();
-            assert!(error.contains("relay base URL") || error.contains("invalid"));
+            assert!(
+                error.contains("relay base URL")
+                    || error.contains("invalid")
+                    || error.contains("HTTPS"),
+                "{error}"
+            );
             assert!(!error.contains("password"));
             assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn relay_url_allows_http_only_for_loopback_hosts() {
+        for url in [
+            "http://localhost:8787",
+            "http://127.0.0.1:8787/v1",
+            "http://127.20.30.40:8787",
+            "http://[::1]:8787/v1",
+        ] {
+            let normalized = super::normalize_base_url(url).unwrap();
+            assert!(normalized.starts_with("http://"), "{normalized}");
+            assert!(normalized.ends_with("/v1"), "{normalized}");
         }
     }
 
@@ -838,5 +1081,200 @@ mod tests {
         let error = store.load_metadata(PLUS_RUNTIME_ID).unwrap_err();
 
         assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn invalid_fixed_slot_metadata_blocks_relay_listing_and_overwrite() {
+        for condition in ["missing", "corrupt", "mismatched"] {
+            let home = tempdir().unwrap();
+            fs::write(home.path().join("config.toml"), "model = \"live\"\n").unwrap();
+            let root = tempdir().unwrap();
+            let store = RuntimeStore::new(root.path().join("runtimes"));
+            store
+                .upsert_relay(
+                    super::RelayRuntimeInput {
+                        base_url: "https://old.example.com/v1".to_string(),
+                        api_key: "sk-old-secret".to_string(),
+                        model: "old".to_string(),
+                    },
+                    home.path(),
+                )
+                .unwrap();
+            let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+            let metadata_path = runtime_dir.join("runtime.json");
+            match condition {
+                "missing" => fs::remove_file(&metadata_path).unwrap(),
+                "corrupt" => fs::write(&metadata_path, b"not-json").unwrap(),
+                "mismatched" => {
+                    let mut metadata: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+                    metadata["id"] = serde_json::Value::String(PLUS_RUNTIME_ID.to_string());
+                    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = [
+                fs::read(runtime_dir.join("auth.enc")).ok(),
+                fs::read(runtime_dir.join("config.toml")).ok(),
+                fs::read(&metadata_path).ok(),
+            ];
+
+            assert!(store.list_runtimes().is_err(), "{condition}");
+            let error = store
+                .upsert_relay(
+                    super::RelayRuntimeInput {
+                        base_url: "https://new.example.com/v1".to_string(),
+                        api_key: "sk-new-secret".to_string(),
+                        model: "new".to_string(),
+                    },
+                    home.path(),
+                )
+                .unwrap_err();
+
+            assert!(!error.contains("sk-new-secret"), "{error}");
+            assert_eq!(
+                [
+                    fs::read(runtime_dir.join("auth.enc")).ok(),
+                    fs::read(runtime_dir.join("config.toml")).ok(),
+                    fs::read(&metadata_path).ok(),
+                ],
+                before,
+                "{condition}"
+            );
+            assert!(!runtime_dir.join("history").exists(), "{condition}");
+        }
+    }
+
+    #[test]
+    fn corrupt_plus_metadata_blocks_confirmed_overwrite() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first"}}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+        let runtime_dir = store.runtime_dir(PLUS_RUNTIME_ID);
+        let metadata_path = runtime_dir.join("runtime.json");
+        fs::write(&metadata_path, b"not-json").unwrap();
+        let before = [
+            fs::read(runtime_dir.join("auth.enc")).unwrap(),
+            fs::read(runtime_dir.join("config.toml")).unwrap(),
+            fs::read(&metadata_path).unwrap(),
+        ];
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"second"}}"#,
+        )
+        .unwrap();
+
+        let error = store.import_plus_from_home(home.path(), true).unwrap_err();
+
+        assert!(error.contains("runtime metadata"), "{error}");
+        assert_eq!(fs::read(runtime_dir.join("auth.enc")).unwrap(), before[0]);
+        assert_eq!(
+            fs::read(runtime_dir.join("config.toml")).unwrap(),
+            before[1]
+        );
+        assert_eq!(fs::read(&metadata_path).unwrap(), before[2]);
+        assert!(!runtime_dir.join("history").exists());
+    }
+
+    #[test]
+    fn runtime_write_failure_restores_all_previous_files() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://old.example.com/v1".to_string(),
+                    api_key: "sk-old-secret".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+        let before = [
+            fs::read(runtime_dir.join("auth.enc")).unwrap(),
+            fs::read(runtime_dir.join("config.toml")).unwrap(),
+            fs::read(runtime_dir.join("runtime.json")).unwrap(),
+        ];
+        let mut metadata = store.load_metadata(RELAY_RUNTIME_ID).unwrap();
+        metadata.base_url = Some("https://new.example.com/v1".to_string());
+        metadata.model = Some("new".to_string());
+        let mut writes = 0;
+
+        let error = store
+            .write_runtime_with(
+                &metadata,
+                br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-new-secret"}"#,
+                "model = \"new\"\n",
+                |path, bytes| {
+                    writes += 1;
+                    if writes == 2 {
+                        Err("injected config write failure".to_string())
+                    } else {
+                        crate::file_ops::atomic_write(path, bytes)
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!error.contains("sk-new-secret"), "{error}");
+        assert_eq!(fs::read(runtime_dir.join("auth.enc")).unwrap(), before[0]);
+        assert_eq!(
+            fs::read(runtime_dir.join("config.toml")).unwrap(),
+            before[1]
+        );
+        assert_eq!(
+            fs::read(runtime_dir.join("runtime.json")).unwrap(),
+            before[2]
+        );
+    }
+
+    #[test]
+    fn failed_first_runtime_write_removes_every_new_file() {
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        let metadata = super::RuntimeMetadata {
+            id: RELAY_RUNTIME_ID.to_string(),
+            name: "API 中转站".to_string(),
+            kind: RuntimeKind::Relay,
+            base_url: Some("https://relay.example.com/v1".to_string()),
+            model: Some("new".to_string()),
+            created_at_ms: 1,
+            last_used_at_ms: None,
+            last_verified_at_ms: None,
+        };
+        let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+        let mut writes = 0;
+
+        let error = store
+            .write_runtime_with(
+                &metadata,
+                br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-new-secret"}"#,
+                "model = \"new\"\n",
+                |path, bytes| {
+                    writes += 1;
+                    if writes == 2 {
+                        Err("injected config write failure".to_string())
+                    } else {
+                        crate::file_ops::atomic_write(path, bytes)
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.contains("rolled back"), "{error}");
+        for name in ["auth.enc", "config.toml", "runtime.json"] {
+            assert!(!runtime_dir.join(name).exists(), "{name}");
+        }
     }
 }

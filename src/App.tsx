@@ -100,6 +100,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   const canSync = data.sessions.status === 'ready' && data.managedSessions.status === 'ready';
   const canMutateSessions = data.managedSessions.status === 'ready';
   const canRestoreBackup = data.backups.status === 'ready';
+  const exclusiveBusy = busy !== null || updateInstalling;
   const threadCount = sessions ? numberFormat.format(sessions.threadCount) : statusLabel(data.sessions);
   const jsonlCount = sessions ? numberFormat.format(sessions.sessionJsonlCount) : statusLabel(data.sessions);
 
@@ -135,7 +136,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   }
 
   async function handleInstallUpdate() {
-    if (updateInstalling) return;
+    if (updateInstalling || busy !== null) return;
     setUpdateInstalling(true);
     setUpdateError(null);
     setUpdateNotice(null);
@@ -154,6 +155,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
     view: (result: T) => OperationView,
     onFailure?: (message: string) => void,
   ) {
+    if (busy !== null || updateInstalling) return null;
     setBusy(label);
     setError(null);
     setReceipt(null);
@@ -228,7 +230,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
   }
 
   async function handleSyncSessions() {
-    if (!canSync) return;
+    if (!canSync || busy !== null || updateInstalling) return;
     setBusy('会话同步预检');
     setError(null);
     setReceipt(null);
@@ -305,13 +307,13 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
         </nav>
         <div className="topbar-actions">
           <span className="topbar-version" aria-live="polite">{versionStatus}</span>
-          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking || updateInstalling}>
+          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking || exclusiveBusy}>
             {updateChecking ? '检查中...' : updateInstalling ? '更新中...' : '检查更新'}
           </button>
           {activePage !== 'skills' ? <button className="ghost-button" onClick={() => {
             setError(null);
             refreshInBackground((reason) => setError(errorMessage(reason)));
-          }} disabled={busy !== null}>刷新</button> : null}
+          }} disabled={exclusiveBusy}>刷新</button> : null}
         </div>
       </header>
 
@@ -323,7 +325,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
             {updateResult.releaseNotes ? <p className="update-notes">{updateResult.releaseNotes}</p> : null}
           </div>
           <div className="update-actions">
-            <button className="warm-button" onClick={() => void handleInstallUpdate()} disabled={updateInstalling}>
+            <button className="warm-button" onClick={() => void handleInstallUpdate()} disabled={exclusiveBusy}>
               {updateInstalling ? '正在下载并安装…' : '立即更新'}
             </button>
             <button
@@ -369,8 +371,8 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
               onPrimary={() => void handleImportPlus()} primaryAction="保存当前账号态"
               onSwitch={() => void handleSwitch('plus', '切换 Codex 账号')}
               switchAction={isExactRuntime(runtimeStatus, 'plus') ? '当前为 Codex 账号' : runtimeStatus?.activeRuntimeId === 'plus' ? '重新应用 Codex 账号' : '切换到 Codex 账号'}
-              primaryDisabled={busy !== null || !canImportAccount}
-              switchDisabled={busy !== null || !canSwitchRuntime || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
+              primaryDisabled={exclusiveBusy || !canImportAccount}
+              switchDisabled={exclusiveBusy || !canSwitchRuntime || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
             />
             <RuntimeCard
               title="API 中转站态" kind="relay" description="URL、模型和加密保存的 API Key。"
@@ -380,26 +382,26 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
               onSwitch={() => void handleSwitch('relay', '切换中转站')}
               switchAction={isExactRuntime(runtimeStatus, 'relay') ? '当前为中转站' : runtimeStatus?.activeRuntimeId === 'relay' ? '重新应用中转站' : '切换到中转站'}
               onVerify={() => void handleVerifyRelay()}
-              primaryDisabled={busy !== null || !canConfigureRelay}
-              verifyDisabled={busy !== null || !canVerifyRelay}
-              switchDisabled={busy !== null || !canSwitchRuntime || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
+              primaryDisabled={exclusiveBusy || !canConfigureRelay}
+              verifyDisabled={exclusiveBusy || !canVerifyRelay}
+              switchDisabled={exclusiveBusy || !canSwitchRuntime || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
             />
 
             <aside className="detail-panel session-panel" aria-label="会话同步">
               <div className="card-title-row"><span className="card-icon">🔄</span><div><p className="eyebrow">先预检再写入</p><h2>会话热同步</h2></div></div>
               <p className="hint no-indent">执行前展示双向 dry-run 统计；完成后展示真实新增、复制、跳过和备份回执。</p>
               <div className="sync-stats"><strong>{threadCount}<span>threads</span></strong><strong>{jsonlCount}<span>JSONL</span></strong></div>
-              <button className="primary-button full" onClick={() => void handleSyncSessions()} disabled={busy !== null || !canSync}>立即同步</button>
+              <button className="primary-button full" onClick={() => void handleSyncSessions()} disabled={exclusiveBusy || !canSync}>立即同步</button>
             </aside>
 
             <SafetyPanel data={data} />
-            <BackupRecoveryPanel state={data.backups} disabled={busy !== null || !canRestoreBackup} onRestore={handleRestoreBackup} />
+            <BackupRecoveryPanel state={data.backups} disabled={exclusiveBusy || !canRestoreBackup} onRestore={handleRestoreBackup} />
             <OperationHistoryPanel state={data.operations} />
           </section>
         </>
       ) : activePage === 'sessions' && managedSessions ? (
         <SessionManagementPage
-          inventory={managedSessions} busy={busy !== null}
+          inventory={managedSessions} busy={exclusiveBusy}
           syncDisabled={!canSync} mutationDisabled={!canMutateSessions}
           onSync={() => void handleSyncSessions()} onDelete={handleDeleteSessions}
           onRestoreVisible={handleRestoreSessionsVisible}
@@ -408,14 +410,14 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
 
       <SkillsManagementPage
         active={activePage === 'skills'}
-        busy={busy !== null}
+        busy={exclusiveBusy}
         onBusyChange={setBusy}
         ensureCodexClosed={ensureCodexClosed}
       />
 
       {relayDialogOpen ? (
         <RelayRuntimeDialog
-          runtime={relayRuntime} fallbackModel={plusRuntime?.model ?? ''} busy={busy !== null}
+          runtime={relayRuntime} fallbackModel={plusRuntime?.model ?? ''} busy={exclusiveBusy}
           submitError={relaySubmitError}
           onCancel={() => { setRelaySubmitError(null); setRelayDialogOpen(false); }} onSave={handleSaveRelay}
         />

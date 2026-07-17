@@ -202,6 +202,57 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect((screen.getByRole('button', { name: '立即更新' }) as HTMLButtonElement).disabled).toBe(false));
   });
 
+  it('disables local mutations while update installation is pending', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<{
+      fromVersion: string; toVersion: string; downloadedBytes: number; sha256: string; restarting: boolean;
+    }>();
+    apiMocks.installUpdate.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '立即更新' }));
+    await waitFor(() => expect(apiMocks.installUpdate).toHaveBeenCalledTimes(1));
+    const saveAccount = screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement;
+    const sync = screen.getByRole('button', { name: '立即同步' }) as HTMLButtonElement;
+    expect(saveAccount.disabled).toBe(true);
+    expect(sync.disabled).toBe(true);
+    fireEvent.click(saveAccount);
+    expect(apiMocks.importPlusRuntime).not.toHaveBeenCalled();
+
+    pending.reject(new Error('injected update failure'));
+    expect(await screen.findByText('injected update failure')).toBeTruthy();
+  });
+
+  it('disables update installation while a local mutation is pending', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<{
+      id: string; name: string; kind: 'plus'; baseUrl: null; model: string;
+      createdAtMs: number; lastUsedAtMs: null; lastVerifiedAtMs: null;
+    }>();
+    apiMocks.importPlusRuntime.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const install = await screen.findByRole('button', { name: '立即更新' }) as HTMLButtonElement;
+    fireEvent.click(screen.getByRole('button', { name: '保存当前账号态' }));
+    await waitFor(() => expect(apiMocks.importPlusRuntime).toHaveBeenCalledTimes(1));
+    expect(install.disabled).toBe(true);
+    fireEvent.click(install);
+    expect(apiMocks.installUpdate).not.toHaveBeenCalled();
+
+    pending.resolve({
+      id: 'plus', name: 'Codex 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+      createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
+    });
+    await waitFor(() => expect(install.disabled).toBe(false));
+  });
+
   it('shows completion and rollback notices from the restarted process', async () => {
     apiMocks.getUpdateStartupNotice.mockResolvedValue({ status: 'updated' });
     const { unmount } = render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);

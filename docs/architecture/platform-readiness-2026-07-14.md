@@ -28,7 +28,7 @@
 | mutation 跨进程锁 | Windows `OpenOptionsExt::share_mode(0)` | Unix advisory lock 或平台锁抽象，并验证崩溃释放 | 记录为迁移阻塞项 |
 | 内置 Skill | PowerShell helper + DPAPI 配置 | 按 OS 提供 runtime/helper、密钥读取和包 manifest | 明确保留 Windows-only |
 | UI 文案 | 多处明确写 Windows DPAPI | 由后端 capability 返回平台密钥库名称和可用性 | 记录为迁移项 |
-| CI/发布 | `windows-latest`，单个 x64 EXE | macOS/Linux check/test/build matrix、图标/签名/包格式 | 本轮不扩展 |
+| CI/发布 | `windows-latest` 构建并验证/留存单个 x64 EXE | macOS/Linux check/test/build matrix、图标/签名/包格式 | Windows 真实产物门禁已补齐，不扩展目标 |
 
 ## 证据位置
 
@@ -37,7 +37,7 @@
 - `src-tauri/src/crypto.rs`：Windows DPAPI 与非 Windows unsupported 边界。
 - `src-tauri/src/process_control.rs`：Windows 进程控制边界。
 - `src-tauri/src/file_ops.rs`：Windows write-through replace 与非 Windows rename。
-- `src-tauri/src/commands.rs`、`profile_store.rs`、`runtime_store.rs`：当前 `APPDATA` 依赖。
+- `src-tauri/src/commands.rs`、`runtime_store.rs`：当前 `APPDATA` 依赖。
 - `src-tauri/src/skill_manager.rs`、`src-tauri/resources/skills/`：Windows/PowerShell Skill runtime。
 - `.github/workflows/ci.yml`：当前仅 Windows 质量门禁。
 

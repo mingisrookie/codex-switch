@@ -132,6 +132,7 @@ preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
 - 热同步允许 Codex 运行，是上述规则的显式例外：失败时恢复工具内部 shared 根，但不得用操作前快照覆盖可能已产生并发变化的 live current Home；必须保留并回报 current 安全备份供人工恢复。
 - 文件写入、复制和 JSONL 重写统一走 `file_ops` 原子操作；不得直接 `fs::write` 覆盖 live 文件。
 - 所有会修改运行态、凭据、current/shared 或备份目标的 command 必须共用 mutation guard：进程内 try-lock + Windows 独占 `mutation.lock` 文件句柄；新增入口不得绕过同进程/跨进程串行化。
+- 一键更新安装也必须取得同一 mutation guard；helper readiness 成功后父进程进入 shutdown-pending，退出前不得释放跨进程锁或接受新 mutation。前端禁用只能改善体验，不能替代后端互斥。
 - 当前没有备份 retention/prune；任何清理策略必须先定义保留周期、容量上限、在用/安全快照保护与用户确认，不能在列表扫描或其他无关流程中静默删除。
 - SQLite 备份必须使用 SQLite Online Backup API；不得把直接复制 WAL/SHM 当成一致性快照。
 - 工具自有备份 payload 必须全部 DPAPI 加密，并记录大小和 SHA-256；恢复前必须校验 manifest 和 payload，恢复后执行必要的解析/`quick_check`。
@@ -153,7 +154,7 @@ preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
 
 本项目当前运行态是固定的 `plus`（Codex 账号内部兼容 ID）和 `relay` 两槽位。扩展为任意账号池属于产品范围变化，必须先更新 PRD，不能仅通过循环 UI 或复用 legacy profile command 偷渡。
 
-Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTP(S) Base URL。API Key 只能通过 password 表单进入，首次必填、后续空值表示保留，不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key。
+Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填、后续空值表示保留，不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key，成功响应也必须设置严格字节上限。
 
 内置 Skill 接入必须使用编译期固定 ID、固定文件 allowlist、来源/版本/hash manifest 和后端推导目标；不得让前端传任意下载 URL、源路径、目标路径或文件名。Skill 状态必须区分 missing/current/update available/local drift/unmanaged/invalid，未知目录和本地修改不得静默覆盖。安装/更新属于关闭态 mutation，必须共用 mutation guard、同卷 stage、完整旧目录备份、原子激活、后置 hash 验证、崩溃 journal 恢复和 typed receipt。
 
@@ -174,7 +175,7 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - 固定仓库更新检查属于外部只读集成：后端固定 endpoint，设置超时/响应上限、禁止元数据重定向、验证稳定 SemVer，错误不得回显响应正文；前端不得传任意仓库或下载 URL。
 - 启动更新检查必须与 Dashboard 七域解耦并保持非阻塞；应用不是常驻工具，不新增后台服务或运行中轮询。
 - Windows 单文件自更新必须只接受唯一固定名称的 Release EXE，要求 GitHub SHA-256 digest，按元数据大小和全量流式 hash 双重验证；下载 URL 从固定仓库和已验证 tag 推导，只允许 HTTPS GitHub Release 资产重定向。当前 EXE 复制为同版本 helper，父进程只能在 helper 完成计划/路径/hash/进程句柄预检并写入 readiness 后退出。
-- EXE 替换必须在目标目录同卷完成：先写 replacement 并复核 hash，再备份旧 EXE、激活 replacement、启动确认；启动失败恢复旧 EXE并重新启动。staging 只能是系统临时目录下固定前缀的直接子目录，清理入口不得接受任意路径。debug 和非 Windows 构建必须明确拒绝真实安装。
+- EXE 替换必须在目标目录同卷完成：先写 replacement 并复核 hash，再备份旧 EXE、激活 replacement。新进程必须在 Tauri `RunEvent::Ready` 后写入绑定受控 plan、状态与目标 hash 的 ACK；helper 在 ACK 前保留 backup，早退/超时必须终止新进程并恢复旧 EXE。staging 只能是系统临时目录下固定前缀的直接子目录，清理前必须重新验证 plan 和受控文件。debug 和非 Windows 构建必须明确拒绝真实安装。
 
 ## 3. 测试规范
 
@@ -200,12 +201,13 @@ npm test -- --run
 npm run typecheck
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build
+npm run check:release
 ```
 
-- `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建和 Rust fmt/clippy/test；CI 文件存在不等于本轮已通过。
+- `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建、Rust fmt/clippy/test、完整 Tauri release 编译、版本/PE/路径/敏感 marker 合同及 verified artifact 留存；CI 文件存在不等于本轮已通过。
 - 备份、切换、双根同步/删除/恢复等高风险变化必须有临时目录或临时 `CODEX_HOME` 测试，至少覆盖幂等、故障注入和回滚终态。
 - Skill 安装测试必须使用临时 `CODEX_HOME` / `APPDATA`，覆盖 clean install、幂等 current、未知目录/漂移确认、旧目录备份、URL 拒绝、Key 密文与空 Key 保留；vendored PowerShell/Python 至少做语法解析，并验证 Rust DPAPI 密文可被 Windows PowerShell 读取。
 - 发布回执必须区分已运行、未运行和被环境阻断的检查；不得把局部测试写成“全量通过”。

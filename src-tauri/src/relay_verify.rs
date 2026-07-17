@@ -1,9 +1,12 @@
 use reqwest::{blocking::Client, redirect::Policy, Url};
 use serde::Serialize;
 use serde_json::Value;
-use std::time::Duration;
+use std::{io::Read, time::Duration};
+
+use crate::runtime_store::is_loopback_host;
 
 const RELAY_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RELAY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -48,8 +51,21 @@ fn verify_relay_with_timeout(
             status.as_u16()
         ));
     }
-    let body: Value = response
-        .json()
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELAY_RESPONSE_BYTES as u64)
+    {
+        return Err("relay /models response exceeded the size limit".to_string());
+    }
+    let mut payload = Vec::new();
+    response
+        .take((MAX_RELAY_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
+        .map_err(|_| "failed to read relay /models response".to_string())?;
+    if payload.len() > MAX_RELAY_RESPONSE_BYTES {
+        return Err("relay /models response exceeded the size limit".to_string());
+    }
+    let body: Value = serde_json::from_slice(&payload)
         .map_err(|_| "relay /models response was not valid JSON".to_string())?;
     let models = body
         .get("data")
@@ -70,11 +86,12 @@ fn models_url(base_url: &str) -> Result<Url, String> {
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.scheme() == "http" && !is_loopback_host(url.host_str()))
     {
         return Err("invalid relay base URL".to_string());
     }
-    url.set_query(None);
-    url.set_fragment(None);
     let path = url.path().trim_end_matches('/');
     url.set_path(&format!("{path}/models"));
     Ok(url)
@@ -90,12 +107,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{verify_relay, verify_relay_with_timeout};
+    use super::{verify_relay, verify_relay_with_timeout, MAX_RELAY_RESPONSE_BYTES};
 
-    fn spawn_server(response: &'static [u8], delay: Duration) -> (String, Receiver<String>) {
+    fn spawn_server(response: &[u8], delay: Duration) -> (String, Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
+        let response = response.to_vec();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -117,7 +135,7 @@ mod tests {
             }
             let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
             thread::sleep(delay);
-            let _ = stream.write_all(response);
+            let _ = stream.write_all(&response);
         });
         (format!("http://{address}/v1"), receiver)
     }
@@ -166,6 +184,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_loopback_http_without_echoing_input_or_key() {
+        let api_key = "sk-test-relay-secret";
+        let base_url = "http://relay.example.com/v1";
+
+        let error = verify_relay(base_url, api_key).unwrap_err();
+
+        assert!(error.contains("invalid relay base URL"), "{error}");
+        assert!(!error.contains(base_url));
+        assert!(!error.contains(api_key));
+    }
+
+    #[test]
     fn reports_timeout_without_exposing_key() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}";
         let (base_url, _) = spawn_server(response, Duration::from_millis(250));
@@ -178,5 +208,41 @@ mod tests {
         assert!(error.contains("timed out"), "{error}");
         assert!(!error.contains(api_key));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rejects_oversized_declared_response_without_exposing_body_or_key() {
+        let api_key = "sk-test-relay-secret";
+        let marker = "oversized-body-marker";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"data\":[],\"error\":\"{marker} {api_key}\"}}",
+            MAX_RELAY_RESPONSE_BYTES + 1
+        );
+        let (base_url, _) = spawn_server(response.as_bytes(), Duration::ZERO);
+
+        let error = verify_relay(&base_url, api_key).unwrap_err();
+
+        assert!(error.contains("size limit"), "{error}");
+        assert!(!error.contains(api_key));
+        assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn rejects_oversized_streamed_response_without_exposing_body_or_key() {
+        let api_key = "sk-test-relay-secret";
+        let marker = "streamed-body-marker";
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        response.extend_from_slice(b"{\"data\":[],\"padding\":\"");
+        response.resize(response.len() + MAX_RELAY_RESPONSE_BYTES + 1, b'x');
+        response.extend_from_slice(format!("{marker} {api_key}\"}}").as_bytes());
+        let (base_url, _) = spawn_server(&response, Duration::ZERO);
+
+        let error = verify_relay(&base_url, api_key).unwrap_err();
+
+        assert!(error.contains("size limit"), "{error}");
+        assert!(!error.contains(api_key));
+        assert!(!error.contains(marker));
     }
 }

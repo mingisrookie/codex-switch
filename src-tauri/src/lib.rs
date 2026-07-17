@@ -7,8 +7,6 @@ pub mod crypto;
 pub mod file_ops;
 pub mod operation_log;
 pub mod process_control;
-pub mod profile_store;
-pub mod redaction;
 pub mod relay_verify;
 pub mod runtime_store;
 pub mod runtime_switcher;
@@ -16,12 +14,11 @@ pub mod session_manager;
 pub mod session_scan;
 pub mod session_sync;
 pub mod skill_manager;
-pub mod switcher;
 pub mod update_check;
 pub mod update_install;
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
             commands::check_for_updates,
@@ -49,6 +46,13 @@ pub fn run() {
             commands::install_skill,
             commands::save_skill_config
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Codex Switch");
+        .build(tauri::generate_context!())
+        .expect("failed to build Codex Switch");
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Ready)
+            && update_install::acknowledge_update_startup().is_err()
+        {
+            app_handle.exit(1);
+        }
+    });
 }

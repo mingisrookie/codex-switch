@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.8 - 2026-07-18
+
+### 可靠性与安全加固
+
+- 自更新与运行态/会话/Skill mutation 共用后端互斥；进入退出阶段后继续持有跨进程锁，前端也双向禁用重叠操作。
+- 新 EXE 不再以“存活固定时间”判定成功：只有进入 Tauri `RunEvent::Ready` 并写入绑定受控 plan、状态和 SHA-256 的 ACK 后，helper 才删除旧 EXE；早退或 15 秒超时会恢复旧版本。
+- 固定运行态槽位的 metadata 缺失、损坏或 ID 不匹配改为 fail-closed；`auth.enc`、`config.toml`、`runtime.json` 任一步写失败会恢复并验证全部旧文件。
+- Relay 覆盖前归档完整旧槽位；同毫秒历史目录避免碰撞。远程 Relay 强制 HTTPS，HTTP 只允许 loopback；`/models` 成功响应限制为 4 MiB。
+- Skill 崩溃 journal 增加阶段状态，修复备份尚未创建时恢复流程误删用户原 Skill 的窗口。
+- `taskkill` 后重新枚举 Codex 进程，只有确认全部退出才报告成功；关闭态 mutation 在备份后、写入前再次检查进程状态。
+
+### 架构与发布工程
+
+- 删除当前产品链路没有调用的 legacy `profile_store`、`switcher`、`redaction` 模块，减少 556 行旧攻击面和维护分支。
+- Windows CI 固定 Actions 与 Rust toolchain，使用 lockfile 执行 Rust 门禁，并真实构建 Tauri release EXE。
+- 新增 release contract：校验五处版本、tag、PE 格式/大小、ProductVersion、构建机路径和常见 GitHub token marker；CI 留存对应 commit 的 verified artifact。
+- README、跨平台审计、DXM 长期文档和 Trellis 可执行规范与真实实现同步；当前仍只发布 Windows x64 单文件 EXE。
+
+### 兼容性与已知边界
+
+- `v0.1.7` 用户可直接通过应用内“一键更新”升级到本版本；受管运行态、备份和 Skill 配置路径保持兼容。
+- 原先配置为非 loopback 明文 HTTP 的 Relay 将被拒绝，必须改用 HTTPS；这是防止 Bearer Key 明文传输的有意收紧。
+- GitHub Release digest 仍不是独立签名信任根；EXE 替换尚未实现断电级 durable journal，热同步也尚非跨 SQLite/JSONL/index 的单一事务。发布说明不把这些残余描述为已解决。
+
+### 验证
+
+- `npm test -- --run`（53 项）、`npm run typecheck`、`npm run build`。
+- `cargo fmt -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`（107 项单元测试 + 7 项 Skill 合同测试；2 项 live GitHub 测试默认 ignored）。
+- updater replacement 成功、启动失败回滚、ACK 篡改、早退、超时和 mutation 双向互斥对抗测试通过。
+- 完整 Tauri release build、版本/PE/路径/敏感 marker 合同和临时 `CODEX_HOME` / `APPDATA` 真实 EXE 启动冒烟通过。
+
 ## v0.1.7 - 2026-07-14
 
 ### 新增

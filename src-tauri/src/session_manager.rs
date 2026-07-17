@@ -253,6 +253,8 @@ fn delete_managed_sessions_inner(
         .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
     let shared_paths = local_codex_paths(shared_home);
     let backups = result.backups.clone();
+    ensure_codex_still_closed("delete")
+        .map_err(|message| SessionMutationFailure::new(message, backups.clone()))?;
     let mutation = (|| {
         apply_delete_to_root(&current_paths, &selected_set, &mut result)?;
         if fail_after_current {
@@ -317,9 +319,22 @@ pub fn restore_sessions_visible_detailed(
     );
     let paths = resolve_user_codex_paths(codex_home)
         .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
+    ensure_codex_still_closed("visibility restore")
+        .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
     result.restored_threads = restore_visible_in_db(&paths.state_db, &selected_set)
         .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
     Ok(result)
+}
+
+fn ensure_codex_still_closed(operation: &str) -> Result<(), String> {
+    #[cfg(not(test))]
+    if !crate::process_control::list_codex_processes()?.is_empty() {
+        return Err(format!(
+            "Codex started during {operation} preflight; close it and retry before files are changed"
+        ));
+    }
+    let _ = operation;
+    Ok(())
 }
 
 fn scan_source(paths: &CodexPaths) -> Result<HashMap<String, SessionSourceRecord>, String> {
