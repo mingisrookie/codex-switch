@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Windows 原子替换在深层加密备份目录中兼容超过传统 `MAX_PATH` 的临时文件；调用 `MoveFileExW` 前规范化已存在的父目录，同时保留目录联接迁移后的路径兼容性。
+- 新增长路径备份形态的回归测试，覆盖临时文件超过 260 字符时的原子写入。
+- 会话同步在同一会话 ID 存在多份 JSONL 时优先采用 SQLite 当前 `rollout_path`，只允许严格追加版本推进活动文件；较短或内容分叉的来源不再把目标数据库改指向不完整副本。
+- 会话文件比较忽略 `session_meta.payload.model_provider` 的运行态差异，避免单纯切换 provider 生成伪冲突副本，并阻止 `-imported-*` 后缀反复嵌套。
+
 ## v0.1.8 - 2026-07-18
 
 ### 可靠性与安全加固
