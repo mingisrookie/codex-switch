@@ -114,12 +114,36 @@ fn unique_temp_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
+fn windows_api_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "atomic replace path must have a parent directory".to_string())?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "atomic replace path must have a file name".to_string())?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("failed to resolve atomic replace parent directory: {error}"))?;
+    Ok(canonical_parent.join(file_name))
+}
+
+#[cfg(windows)]
 fn replace_path(source: &Path, target: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    // Rust's file APIs accept long Windows paths, but MoveFileExW receives the
+    // raw path passed here. Canonicalizing the existing parent produces an
+    // absolute verbatim path and also resolves directory junctions before the
+    // atomic replacement.
+    let source = windows_api_path(source)?;
+    let target = windows_api_path(target)?;
     let source_wide = source
         .as_os_str()
         .encode_wide()
@@ -156,7 +180,7 @@ fn replace_path(source: &Path, target: &Path) -> Result<(), String> {
 mod tests {
     use tempfile::tempdir;
 
-    use super::walk_jsonl_files;
+    use super::{atomic_write, walk_jsonl_files};
 
     #[test]
     fn jsonl_walk_propagates_directory_errors() {
@@ -165,5 +189,32 @@ mod tests {
         let error = walk_jsonl_files(&temp.path().join("missing")).unwrap_err();
 
         assert!(error.contains("failed to walk JSONL directory"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_supports_backup_paths_over_legacy_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let temp = tempdir().unwrap();
+        let parent = temp
+            .path()
+            .join("backups")
+            .join("1784447000000-99999-0-switch-runtime-current")
+            .join("payload")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("19");
+        let target = parent.join(format!("rollout-{}.jsonl.enc", "x".repeat(115)));
+        let generated_temp = super::unique_temp_path(&target).unwrap();
+
+        assert!(
+            generated_temp.as_os_str().encode_wide().count() > 260,
+            "the regression fixture must cross the legacy MAX_PATH boundary"
+        );
+
+        atomic_write(&target, b"long-path-backup").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"long-path-backup");
     }
 }
