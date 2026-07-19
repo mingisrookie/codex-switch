@@ -114,21 +114,38 @@ fn unique_temp_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-fn windows_api_path(path: &Path) -> Result<PathBuf, String> {
-    let parent = path
+fn windows_api_paths(source: &Path, target: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let source_parent = source
         .parent()
         .ok_or_else(|| "atomic replace path must have a parent directory".to_string())?;
-    let parent = if parent.as_os_str().is_empty() {
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| "atomic replace path must have a parent directory".to_string())?;
+    let source_parent = if source_parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
-        parent
+        source_parent
     };
-    let file_name = path
+    let target_parent = if target_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        target_parent
+    };
+    if source_parent != target_parent {
+        return Err("atomic replace paths must share a parent directory".to_string());
+    }
+    let source_name = source
         .file_name()
         .ok_or_else(|| "atomic replace path must have a file name".to_string())?;
-    let canonical_parent = fs::canonicalize(parent)
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| "atomic replace path must have a file name".to_string())?;
+    let canonical_parent = fs::canonicalize(source_parent)
         .map_err(|error| format!("failed to resolve atomic replace parent directory: {error}"))?;
-    Ok(canonical_parent.join(file_name))
+    Ok((
+        canonical_parent.join(source_name),
+        canonical_parent.join(target_name),
+    ))
 }
 
 #[cfg(windows)]
@@ -142,8 +159,7 @@ fn replace_path(source: &Path, target: &Path) -> Result<(), String> {
     // raw path passed here. Canonicalizing the existing parent produces an
     // absolute verbatim path and also resolves directory junctions before the
     // atomic replacement.
-    let source = windows_api_path(source)?;
-    let target = windows_api_path(target)?;
+    let (source, target) = windows_api_paths(source, target)?;
     let source_wide = source
         .as_os_str()
         .encode_wide()

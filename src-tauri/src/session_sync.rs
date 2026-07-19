@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -241,7 +241,8 @@ fn sync_sessions_in_transaction(
             count_db_rows_without_session_file(source_conn.as_ref(), &candidate_ids)?;
 
         for thread in source_threads {
-            let existing_rollout = existing_thread_rollout_path(target_conn, &thread.id)?;
+            let existing_rollout =
+                existing_thread_rollout_path(target_conn, target_root, &thread.id)?;
             let copied_rollout =
                 copy_rollout_file(target_root, &thread, allow_existing_replacement)?;
             let selected_rollout = select_target_rollout_path(
@@ -249,13 +250,26 @@ fn sync_sessions_in_transaction(
                 copied_rollout.path.as_str(),
             )?;
             if let Some(provider_id) = provider_id {
-                if rewrite_existing_provider || copied_rollout.copied {
+                if rewrite_existing_provider {
                     rewrite_session_metadata_provider(Path::new(&selected_rollout), provider_id)?;
+                    if copied_rollout.copied && copied_rollout.path != selected_rollout {
+                        rewrite_session_metadata_provider(
+                            Path::new(&copied_rollout.path),
+                            provider_id,
+                        )?;
+                    }
+                } else if copied_rollout.copied {
+                    rewrite_session_metadata_provider(
+                        Path::new(&copied_rollout.path),
+                        provider_id,
+                    )?;
                 }
             }
             if thread_exists(target_conn, &thread.id)? {
                 duplicate_threads += 1;
-                let provider_for_thread = if rewrite_existing_provider || copied_rollout.copied {
+                let provider_for_thread = if rewrite_existing_provider
+                    || (copied_rollout.copied && copied_rollout.path == selected_rollout)
+                {
                     provider_id
                 } else {
                     None
@@ -430,19 +444,19 @@ fn read_session_files(
 
     let mut output = Vec::new();
     for (id, mut candidates) in grouped {
-        let preferred_name = source_rows
+        let preferred_relative = source_rows
             .get(&id)
             .and_then(|row| row.values_by_column.get("rollout_path"))
             .and_then(|value| match value {
-                Value::Text(path) => Path::new(path).file_name().map(|name| name.to_os_string()),
+                Value::Text(path) => relative_from_sessions(Path::new(path)),
                 _ => None,
             });
-        let mut selected = preferred_name
+        let mut selected = preferred_relative
             .as_ref()
             .and_then(|preferred| {
                 candidates
                     .iter()
-                    .position(|(path, _)| path.file_name() == Some(preferred.as_os_str()))
+                    .position(|(path, _)| relative_from_sessions(path).as_ref() == Some(preferred))
             })
             .unwrap_or_else(|| {
                 candidates
@@ -462,20 +476,33 @@ fn read_session_files(
                     .unwrap_or(0)
             });
         loop {
-            let mut extension = None;
+            let mut extensions = Vec::new();
             for (index, (path, _)) in candidates.iter().enumerate() {
                 if index != selected
                     && session_file_relation(path, &candidates[selected].0)?
                         == SessionFileRelation::LeftExtendsRight
                 {
-                    extension = Some(index);
-                    break;
+                    extensions.push(index);
                 }
             }
-            let Some(index) = extension else {
+            let Some(mut next) = extensions.first().copied() else {
                 break;
             };
-            selected = index;
+            let mut ambiguous = false;
+            for index in extensions.into_iter().skip(1) {
+                match session_file_relation(&candidates[index].0, &candidates[next].0)? {
+                    SessionFileRelation::LeftExtendsRight => next = index,
+                    SessionFileRelation::RightExtendsLeft | SessionFileRelation::Equal => {}
+                    SessionFileRelation::Divergent => {
+                        ambiguous = true;
+                        break;
+                    }
+                }
+            }
+            if ambiguous {
+                break;
+            }
+            selected = next;
         }
         output.push(candidates.swap_remove(selected));
     }
@@ -628,7 +655,11 @@ fn thread_exists(conn: &Connection, id: &str) -> Result<bool, String> {
     Ok(count > 0)
 }
 
-fn existing_thread_rollout_path(conn: &Connection, id: &str) -> Result<Option<String>, String> {
+fn existing_thread_rollout_path(
+    conn: &Connection,
+    target_root: &SyncRoot,
+    id: &str,
+) -> Result<Option<String>, String> {
     if !thread_exists(conn, id)? {
         return Ok(None);
     }
@@ -636,12 +667,45 @@ fn existing_thread_rollout_path(conn: &Connection, id: &str) -> Result<Option<St
     if !columns.iter().any(|column| column == "rollout_path") {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT rollout_path FROM threads WHERE id = ?1",
-        [id],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .map_err(|error| format!("failed to read target thread rollout path: {error}"))
+    let stored = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(|error| format!("failed to read target thread rollout path: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let stored_path = PathBuf::from(&stored);
+    let candidate = if stored_path.is_absolute() {
+        stored_path
+    } else {
+        target_root.root.join(stored_path)
+    };
+    let Ok(relative) = candidate.strip_prefix(&target_root.sessions_dir) else {
+        return Ok(None);
+    };
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Ok(None);
+    }
+    if !target_root.sessions_dir.is_dir() || !candidate.is_file() {
+        return Ok(None);
+    }
+    let canonical_candidate = fs::canonicalize(&candidate)
+        .map_err(|error| format!("failed to resolve target thread rollout path: {error}"))?;
+    let canonical_sessions = fs::canonicalize(&target_root.sessions_dir)
+        .map_err(|error| format!("failed to resolve target sessions directory: {error}"))?;
+    if !canonical_candidate.starts_with(&canonical_sessions) {
+        return Ok(None);
+    }
+    if session_file_meta(&canonical_candidate)?.is_none_or(|meta| meta.id != id) {
+        return Ok(None);
+    }
+    Ok(Some(candidate.to_string_lossy().to_string()))
 }
 
 fn select_target_rollout_path(
@@ -1977,6 +2041,196 @@ mod tests {
             name.starts_with("rollout-thread-chain-imported-")
                 && !name.contains("aaaaaaaaaaaa-imported")
         }));
+    }
+
+    #[test]
+    fn hot_sync_preserves_active_rollout_when_shorter_candidate_has_a_different_name() {
+        let shared = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let shared_jsonl = shared
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-hot-short-imported-aaaaaaaaaaaa.jsonl");
+        let home_jsonl = home
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-hot-short.jsonl");
+        fs::create_dir_all(shared_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(home_jsonl.parent().unwrap()).unwrap();
+        fs::write(
+            &shared_jsonl,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread-hot-short","model_provider":"openai_custom"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let live_bytes = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-hot-short","model_provider":"live-provider"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"text":"live tail"}}"#,
+            "\n",
+        );
+        fs::write(&home_jsonl, live_bytes).unwrap();
+        create_db(
+            &shared.path().join("state_5.sqlite"),
+            &[("thread-hot-short", shared_jsonl.to_str().unwrap())],
+        );
+        create_db(
+            &home.path().join("state_5.sqlite"),
+            &[("thread-hot-short", home_jsonl.to_str().unwrap())],
+        );
+        set_provider(home.path(), "live-provider");
+
+        sync_shared_to_user_home_hot(shared.path(), home.path(), "openai").unwrap();
+
+        assert_eq!(fs::read(&home_jsonl).unwrap(), live_bytes.as_bytes());
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let provider: String = conn
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'thread-hot-short'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "live-provider");
+    }
+
+    #[test]
+    fn duplicate_thread_repairs_an_existing_rollout_outside_the_target_home() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let source_jsonl = source
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-outside.jsonl");
+        let external_jsonl = external.path().join("rollout-thread-outside.jsonl");
+        fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
+        let source_bytes = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-outside","model_provider":"openai_custom"}}"#,
+            "\n",
+        );
+        let external_bytes = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-outside","model_provider":"external-provider"}}"#,
+            "\n",
+        );
+        fs::write(&source_jsonl, source_bytes).unwrap();
+        fs::write(&external_jsonl, external_bytes).unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[("thread-outside", source_jsonl.to_str().unwrap())],
+        );
+        create_db(
+            &target.path().join("state_5.sqlite"),
+            &[("thread-outside", external_jsonl.to_str().unwrap())],
+        );
+
+        sync_sessions_for_provider(&[source.path().to_path_buf()], target.path(), "openai")
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&external_jsonl).unwrap(),
+            external_bytes.as_bytes()
+        );
+        let conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let rollout_path: String = conn
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = 'thread-outside'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(std::path::Path::new(&rollout_path).starts_with(target.path()));
+    }
+
+    #[test]
+    fn source_database_rollout_matches_the_full_sessions_relative_path() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let stale = source
+            .path()
+            .join("sessions/2026/07/18/rollout-thread-same-name.jsonl");
+        let active = source
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-same-name.jsonl");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::create_dir_all(active.parent().unwrap()).unwrap();
+        fs::write(
+            &stale,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread-same-name"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"text":"stale branch"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &active,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread-same-name"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"text":"active branch"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[("thread-same-name", active.to_str().unwrap())],
+        );
+        create_db(&target.path().join("state_5.sqlite"), &[]);
+
+        sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        let copied = target
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-same-name.jsonl");
+        assert!(fs::read_to_string(copied)
+            .unwrap()
+            .contains("active branch"));
+    }
+
+    #[test]
+    fn ambiguous_strict_extensions_do_not_replace_the_database_rollout() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let dir = source.path().join("sessions/2026/07/19");
+        fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("rollout-thread-ambiguous.jsonl");
+        let branch_a = dir.join("rollout-thread-ambiguous-imported-aaaaaaaaaaaa.jsonl");
+        let branch_b = dir.join("rollout-thread-ambiguous-imported-bbbbbbbbbbbb.jsonl");
+        let prefix = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-ambiguous"}}"#,
+            "\n",
+        );
+        fs::write(&active, prefix).unwrap();
+        fs::write(
+            &branch_a,
+            format!(
+                "{prefix}{}\n",
+                r#"{"type":"response_item","payload":{"text":"branch a"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &branch_b,
+            format!(
+                "{prefix}{}\n",
+                r#"{"type":"response_item","payload":{"text":"branch b"}}"#
+            ),
+        )
+        .unwrap();
+        create_db(
+            &source.path().join("state_5.sqlite"),
+            &[("thread-ambiguous", active.to_str().unwrap())],
+        );
+        create_db(&target.path().join("state_5.sqlite"), &[]);
+
+        sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        let copied = target
+            .path()
+            .join("sessions/2026/07/19/rollout-thread-ambiguous.jsonl");
+        assert_eq!(fs::read_to_string(copied).unwrap(), prefix);
     }
 
     fn set_provider(home: &std::path::Path, provider: &str) {
