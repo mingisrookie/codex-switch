@@ -8,7 +8,7 @@
 
 [快速使用](#快速使用) · [下载 Release](https://github.com/mingisrookie/codex-switch/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](#安全说明) · [开发](#开发)
 
-![release](https://img.shields.io/badge/release-v0.1.8-f97316)
+![release](https://img.shields.io/badge/release-v0.1.9-f97316)
 ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![platform](https://img.shields.io/badge/platform-Windows-2563eb)
 ![stack](https://img.shields.io/badge/Tauri-2.x-24c8db)

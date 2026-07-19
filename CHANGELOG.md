@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.9 - 2026-07-19
 
 ### Fixed
 
@@ -8,6 +8,9 @@
 - 新增长路径备份形态的回归测试，覆盖临时文件超过 260 字符时的原子写入。
 - 会话同步在同一会话 ID 存在多份 JSONL 时优先采用 SQLite 当前 `rollout_path`，只允许严格追加版本推进活动文件；较短或内容分叉的来源不再把目标数据库改指向不完整副本。
 - 会话文件比较忽略 `session_meta.payload.model_provider` 的运行态差异，避免单纯切换 provider 生成伪冲突副本，并阻止 `-imported-*` 后缀反复嵌套。
+- 热同步只改写本轮新复制且实际选中的文件；未选中的候选不再改写 live JSONL 或活动 thread provider。
+- 目标 SQLite 中的既有 `rollout_path` 必须通过受管 `sessions` 根、路径穿越、canonical containment 和 session ID 校验；越界、失配或陈旧路径按缺失路径修复。
+- SQLite 当前候选按完整 `sessions/...` 相对路径匹配；多个互相分叉的追加候选保持原活动文件，不再按文件名顺序静默提升分支。
 
 ## v0.1.8 - 2026-07-18
 
