@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.2.0 - 2026-07-26
+
+### 体验与品牌
+
+- 公开 UI 与窗口标题统一为 **ChatGPT Switch**；仓库名、`.codex`、`CODEX_HOME`、`plus` 槽位和既有 wire contract 继续保留兼容命名。Release 资产仍唯一命名 `codex-switch.exe`，兼容 v0.1.9 updater 的固定资产校验。
+- 前端重构为更清晰的运行态工作台，生产 UI 统一使用 Lucide 图标，不使用 emoji、`window.confirm`、`window.prompt` 或原生 `<dialog>`；配置、覆盖、同步和删除确认都在页面内完成。
+- 窄屏主导航改为顶部两行 sticky header，不再用固定底栏遮挡会话表和运行态内容；会话表在窄容器内保持可横向访问，不产生页面级横向溢出。
+- 点击切换后立即显示页面内任务执行器，通过 Tauri `Channel` 展示 relay 验证、ChatGPT 检测/关闭、两根备份、双向同步、运行态应用、校验和回滚等真实后端阶段，不显示伪造百分比。
+- 切换失败明确区分“写入前失败”“已自动回滚”和“回滚失败”；切换成功后提示会话域将在进入会话页时刷新。
+
+### 性能与可靠性
+
+- 首屏只加载运行态、已保存槽位和操作记录；会话扫描在进入会话页时按需执行，备份哈希校验在用户主动加载时执行。切换后只刷新运行态域，并把会话/备份域标记为 stale，避免切换完成后再次同步阻塞 UI。
+- `switch_runtime` 的 relay 网络验证、scoped 备份、SQLite/JSONL 同步和后置校验整体进入 Tauri blocking worker，避免大型会话池占用异步事件线程。
+- Windows 进程控制改用 ToolHelp 快照建立 PID/PPID 进程树，只管理已识别的 `ChatGPT.exe` / `OpenAI.Codex.exe` 根及其后代，不误杀独立 `codex.exe` CLI；先温和关闭并等待，约 8 秒后才对仍可证明身份的进程使用强制兜底。
+- 切换在关闭 ChatGPT 前完成 current/shared/backup/外置 SQLite roots 冲突检查和磁盘容量预检；估算按本次 scope 的实际写集覆盖 payload、SQLite workspace、加密/manifest 开销，以及至少 2 GiB 或 15% 的安全余量。
+- 会话同步不再只为 provider 变化重写内容等价的既有 JSONL；未变化文件保持原 bytes 和 mtime，provider 可只更新到 SQLite。仅新建、复制或增长替换的 JSONL 才归一运行态元数据。
+
+### 安全与数据完整性
+
+- 备份 manifest 升级为 v3，并显式记录 `scope` / `trackedDatabases`。runtime / sessions / state-only 快照只覆盖实际写集；hard delete、手工 full backup 和 restore safety 才通过 SQLite Online Backup API 覆盖四个受管数据库。局部快照不进入 UI 可恢复列表，既有 v2 快照继续可恢复。
+- Relay 只有在 URL origin 不变时才允许留空 API Key 并保留旧密文；改变 scheme、host 或 port 必须输入对应来源的新 Key。
+- updater staging 名改用 Windows CSPRNG；目录按当前 token 是否 elevated 设置受限 DACL，并在准备与 helper 执行期间持有目录句柄。
+- EXE replacement 新增持久化阶段 journal、旧/新文件 hash 复核和中断恢复；Tauri Ready ACK 前的早退、超时或不一致状态会走受控回滚。
+- 构建链将 `postcss` 升级到 `8.5.23`、`nanoid` 升级到 `3.3.16`，消除旧版 source map 自动加载的路径遍历公告；生产和完整依赖审计均为零漏洞。
+
+### 兼容性与已知边界
+
+- 当前仍只发布 Windows x64 `codex-switch.exe`，技术数据路径仍使用 Codex Home 命名；品牌更名不迁移或重命名用户现有目录，也不能把 Release 资产改名为 `chatgpt-switch.exe`。
+- 当前没有自动 backup retention/prune；历史加密备份仍会累积。容量预检只阻止新的不安全切换，不会静默删除旧备份。
+- GitHub Release digest 与元数据仍来自同一控制面，当前 EXE 也没有 Authenticode 独立信任根；发布说明不得把这两项描述为已解决。
+- 热同步仍不是横跨 SQLite、JSONL 与 `session_index.jsonl` 的单一 durable transaction；失败时继续只补偿 shared-sessions，不用旧快照覆盖可能正在变化的 live current Home。
+
+### 发布验证
+
+- 发布 commit 必须执行 `npm test -- --run`、`npm run typecheck`、`npm run build`、`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`、`cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` 和 `cargo test --locked --manifest-path src-tauri/Cargo.toml`。
+- 完整 release 还必须执行 `npm run tauri -- build` 与 `npm run check:release`，并留存版本/PE/hash、临时 `CODEX_HOME`、updater 成功/回滚、乱码和敏感形态检查证据；最终测试计数以发布 commit 的实际输出为准。
+
 ## v0.1.9 - 2026-07-19
 
 ### Fixed
@@ -34,7 +72,7 @@
 
 - `v0.1.7` 用户可直接通过应用内“一键更新”升级到本版本；受管运行态、备份和 Skill 配置路径保持兼容。
 - 原先配置为非 loopback 明文 HTTP 的 Relay 将被拒绝，必须改用 HTTPS；这是防止 Bearer Key 明文传输的有意收紧。
-- GitHub Release digest 仍不是独立签名信任根；EXE 替换尚未实现断电级 durable journal，热同步也尚非跨 SQLite/JSONL/index 的单一事务。发布说明不把这些残余描述为已解决。
+- GitHub Release digest 仍不是独立签名信任根；热同步也尚非跨 SQLite/JSONL/index 的单一事务。发布说明不把这些残余描述为已解决。
 
 ### 验证
 
