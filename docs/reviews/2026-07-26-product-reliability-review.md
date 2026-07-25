@@ -139,16 +139,16 @@
 
 | Gate | 必须提供的证明 | 当前判定 |
 | --- | --- | --- |
-| G1 前端行为 | 更新旧测试后，Channel 成功/失败/回滚、一次点击切换、跨 tab 任务轨道、lazy sessions/backups、无 native dialog 全覆盖；`npm test -- --run` 通过 | 通过：5 个文件、73/73 |
+| G1 前端行为 | 更新旧测试后，Channel 成功/失败/回滚、一次点击切换、跨 tab 任务轨道、lazy sessions/backups、无 native dialog 全覆盖；`npm test -- --run` 通过 | 通过：5 个文件、76/76 |
 | G2 类型与构建 | `npm run typecheck`、`npm run build` 通过 | 通过：0 diagnostics，1789 modules |
-| G3 Rust 质量 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked` 通过 | 通过：201 passed / 0 failed / 2 live tests ignored |
+| G3 Rust 质量 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked` 通过 | 通过：202 passed / 0 failed / 2 live tests ignored |
 | G4 临时 Home E2E | 只用隔离的临时 `CODEX_HOME` 验证 relay/account 成功、幂等、写入前失败、写入后回滚；不得关闭承载当前任务的真实 ChatGPT | 通过：临时目录集成测试覆盖成功、no-op、失败和双根回滚；未触碰真实 Home |
 | G5 性能回归 | 证明等价 JSONL 内容与 mtime 不变；切换后 invoke 列表不包含 session/backup 全量扫描；任务期间 UI event loop 持续响应 | 通过：bytes/mtime、runtime-only scan、lazy stale 和 blocking worker 均有回归 |
 | G6 视觉与交互 | 1200x820、900x640、390x844 截图；无重叠、溢出、不可操作控件；Playwright `dialog` 事件计数为 0；reduced motion 截图通过 | 通过：三视口页面级横向溢出为 0；移动导航遮挡已修复；dialog=0；reduced-motion 动画/transition=0 |
-| G7 安装更新权限边界 | 验证 elevated token 检测、CSPRNG staging 名、受限 DACL、canonical path、持有目录句柄和任一步失败即中止；若无法证明则 elevated self-update 必须 fail closed | 通过：实际父/子 DACL、CSPRNG、lease、journal、WRITE_THROUGH、离线恢复和 Ready ACK 回归通过 |
+| G7 安装更新权限边界 | 验证 elevated token 检测、CSPRNG staging 名、受限 DACL、canonical path、持有目录句柄和任一步失败即中止；若无法证明则 elevated self-update 必须 fail closed | 通过：实际父/子 DACL、CSPRNG、lease、journal、WRITE_THROUGH、离线恢复和 Ready ACK 回归通过；elevated 无参数恢复发现 fail closed |
 | G8 依赖与敏感信息 | 修复或解释依赖漏洞；secret、URL credential、明文 Key 扫描通过 | 通过：PostCSS 8.5.23 / NanoID 3.3.16；生产与完整 `npm audit` 均为 0；敏感形态扫描无真实凭据 |
 | G9 品牌、版本与文档 | `package.json`、Cargo、Tauri config、README、CHANGELOG 和 release contract 全部为 `0.2.0`；用户文案为 ChatGPT，兼容标识保留 | 通过：五处版本为 0.2.0，内嵌 Skill 与 PE 品牌同步为 ChatGPT Switch |
-| G10 Windows 产物 | Tauri release build 成功；PE `ProductVersion/FileVersion`、资产名、SHA-256、体积和 `npm run check:release` 一致 | 通过：15,129,600 bytes；双版本 0.2.0；本地 SHA-256 `be1e603ee8e682a62313268babd1b8263f252f99977aac52a860cad9d5c89fb2` |
+| G10 Windows 产物 | Tauri release build 成功；PE `ProductVersion/FileVersion`、资产名、SHA-256、体积和 `npm run check:release` 一致 | 通过：15,129,600 bytes；双版本 0.2.0；本地 SHA-256 `d9e7b8ce1a576635ddd3c46060b4020c5c28fdc90414c4314b3ba473b3c5fa94`；Authenticode `NotSigned` |
 | G11 交付闭环 | PR CI 绿并合并；tag `v0.2.0`；Release 资产重下载校验；两个 live GitHub 合同测试；真实 v0.1.9 一键更新；PR #2 留说明并关闭 | 待远端执行，仍是发布阻断 |
 | G12 文本卫生 | 生产源码无 emoji、native dialog、手写 SVG、乱码和异常替换字符；`git diff --check` 通过 | 通过 |
 
@@ -156,7 +156,7 @@
 
 updater 会把 helper、更新资产和 plan 放在系统临时目录，再由 helper 替换安装位置。高完整性进程若使用普通低权限可写 staging，会形成不应接受的权限边界。
 
-当前源码已经增加 `process_is_elevated`、系统 CSPRNG 随机目录名、创建时受限 DACL 和 `StagingGuard`。elevated staging 的 ACL 只允许 `SYSTEM` / `Administrators`，普通 staging 只允许 `SYSTEM` / owner；安全描述符、目录创建、canonical 校验或句柄获取任一步失败都会中止。
+当前源码已经增加 `process_is_elevated`、系统 CSPRNG 随机目录名、创建时受限 DACL 和 `StagingGuard`。elevated staging 的 ACL 只允许 `SYSTEM` / `Administrators`，普通 staging 只允许 `SYSTEM` / owner；安全描述符、目录创建、canonical 校验或句柄获取任一步失败都会中止。正常 helper 仍以显式参数闭合完成或回滚；elevated 无参数启动不会扫描普通 `%TEMP%` 自动发现并执行恢复计划，token elevation 查询失败同样 fail closed。
 
 Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DACL 受保护并具有预期 `OICI`，子文件只保留受限主体，当前进程仍可正常读写；target lease 也通过跨进程排他测试。该证明覆盖本次实现边界，但不替代 Authenticode 或离线签名信任根。
 

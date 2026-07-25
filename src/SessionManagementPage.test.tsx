@@ -109,7 +109,7 @@ describe('SessionManagementPage', () => {
     await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
   });
 
-  it('uses an inline confirmation for every hard delete and supports cancel', () => {
+  it('focuses inline delete confirmation and restores the trigger on cancel', async () => {
     const onDelete = vi.fn();
     renderPage([
       session(1, {
@@ -121,14 +121,17 @@ describe('SessionManagementPage', () => {
     ], onDelete);
 
     fireEvent.click(screen.getByLabelText(/^选择 thread-01/));
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+    const trigger = screen.getByRole('button', { name: '删除所选' });
+    fireEvent.click(trigger);
 
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.getByRole('heading', { name: '确认硬删除 1 个会话' })).toBeTruthy();
+    const heading = screen.getByRole('heading', { name: '确认硬删除 1 个会话' });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
     expect(onDelete).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
 
     expect(screen.queryByRole('heading', { name: '确认硬删除 1 个会话' })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
     expect(screen.getByText('已选：1')).toBeTruthy();
     expect(onDelete).not.toHaveBeenCalled();
 
@@ -142,11 +145,15 @@ describe('SessionManagementPage', () => {
     renderPage([session(1)], onDelete);
 
     fireEvent.click(screen.getByLabelText(/^选择 thread-01/));
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+    const trigger = screen.getByRole('button', { name: '删除所选' });
+    fireEvent.click(trigger);
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
 
     await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
     expect(screen.queryByRole('heading', { name: '确认硬删除 1 个会话' })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(trigger.getAttribute('aria-disabled')).toBe('true');
+    expect((trigger as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('keeps the inline delete state and selection when deletion fails', async () => {
@@ -165,12 +172,14 @@ describe('SessionManagementPage', () => {
     await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
   });
 
-  it('requires typed confirmation when deleting more than 10 sessions', () => {
+  it('focuses the heading before typed confirmation when deleting more than 10 sessions', async () => {
     const onDelete = vi.fn();
     renderPage(Array.from({ length: 11 }, (_, index) => session(index + 1)), onDelete);
 
     fireEvent.click(screen.getByLabelText('全选本页'));
     fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+    const heading = screen.getByRole('heading', { name: '确认硬删除 11 个会话' });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
     const confirmButton = screen.getByRole('button', { name: '确认删除' }) as HTMLButtonElement;
     expect(confirmButton.disabled).toBe(true);
     expect(screen.queryByRole('dialog')).toBeNull();

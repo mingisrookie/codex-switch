@@ -24,6 +24,7 @@
 - Relay 只有在 URL origin 不变时才允许留空 API Key 并保留旧密文；改变 scheme、host 或 port 必须输入对应来源的新 Key。
 - updater staging 名改用 Windows CSPRNG；目录按当前 token 是否 elevated 设置受限 DACL，并在准备与 helper 执行期间持有目录句柄。
 - EXE replacement 新增持久化阶段 journal、旧/新文件 hash 复核和中断恢复；Tauri Ready ACK 前的早退、超时或不一致状态会走受控回滚。
+- elevated 无参数启动不再扫描 `%TEMP%` 自动续跑中断更新；正常 helper 的显式完成/回滚路径保持不变。
 - 构建链将 `postcss` 升级到 `8.5.23`、`nanoid` 升级到 `3.3.16`，消除旧版 source map 自动加载的路径遍历公告；生产和完整依赖审计均为零漏洞。
 
 ### 兼容性与已知边界

@@ -16,13 +16,14 @@ export function RelayRuntimeDialog({ runtime, fallbackModel, busy, submitError, 
   const [model, setModel] = useState(runtime?.model ?? fallbackModel);
   const [apiKey, setApiKey] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const firstFieldRef = useRef<HTMLInputElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    firstFieldRef.current?.focus();
+    headingRef.current?.scrollIntoView?.({ block: 'nearest' });
+    headingRef.current?.focus();
     return () => {
-      previousFocus?.focus();
+      window.requestAnimationFrame(() => previousFocus?.focus());
     };
   }, []);
 
@@ -91,13 +92,15 @@ export function RelayRuntimeDialog({ runtime, fallbackModel, busy, submitError, 
       >
         <div className="card-title-row">
           <span className="section-icon"><KeyRound aria-hidden="true" /></span>
-          <div><p className="eyebrow">凭据受控输入</p><h2 id="relay-config-title">配置 API 中转站</h2></div>
+          <div>
+            <p className="eyebrow">凭据受控输入</p>
+            <h2 ref={headingRef} tabIndex={-1} id="relay-config-title">配置 API 中转站</h2>
+          </div>
         </div>
         <form onSubmit={submit}>
           <label className="form-field">
             <span>Base URL</span>
             <input
-              ref={firstFieldRef}
               aria-label="Base URL"
               type="text"
               inputMode="url"

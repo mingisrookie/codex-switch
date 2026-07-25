@@ -54,6 +54,9 @@ export function SkillsManagementPage({
   const requestId = useRef(0);
   const installConfirmationRef = useRef<HTMLHeadingElement>(null);
   const installTriggerRef = useRef<HTMLElement | null>(null);
+  const configTriggerRef = useRef<HTMLElement | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   useEffect(() => {
     if (!active || loaded.current) return;
@@ -66,6 +69,7 @@ export function SkillsManagementPage({
     setPendingInstall(null);
     setConfiguring(null);
     setConfigError(null);
+    setError(null);
   }, [active]);
 
   useEffect(() => {
@@ -74,9 +78,9 @@ export function SkillsManagementPage({
     installConfirmationRef.current?.focus();
   }, [pendingInstall]);
 
-  async function refreshSkills() {
+  async function refreshSkills(showLoading = true) {
     const current = ++requestId.current;
-    setState({ status: 'loading' });
+    if (showLoading) setState({ status: 'loading' });
     try {
       const skills = await listSkills();
       if (current === requestId.current) setState({ status: 'ready', data: skills });
@@ -88,17 +92,22 @@ export function SkillsManagementPage({
   }
 
   function refreshInBackground(successMessage: string) {
-    void refreshSkills().then((ok) => {
+    void refreshSkills(false).then((ok) => {
       if (!ok) setError(`${successMessage}，但状态刷新失败`);
     });
   }
 
-  function requestInstall(skill: SkillStatus) {
+  function restorePageFocus(target: HTMLElement | null) {
+    if (!activeRef.current) return;
+    window.requestAnimationFrame(() => {
+      if (activeRef.current && target?.isConnected) target.focus();
+    });
+  }
+
+  function requestInstall(skill: SkillStatus, trigger: HTMLElement) {
     const replacing = ['drifted', 'unmanaged', 'invalid'].includes(skill.state);
     if (replacing) {
-      installTriggerRef.current = document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
+      installTriggerRef.current = trigger;
       setPendingInstall(skill.id);
       return;
     }
@@ -114,22 +123,25 @@ export function SkillsManagementPage({
       await ensureCodexClosed('技能安装');
       const result = await installSkill(skill.id, replacing);
       setReceipt(receiptView(result));
-      setPendingInstall(null);
+      if (replacing) closePendingInstall();
       refreshInBackground('技能安装已成功');
     } catch (reason) {
       setError(errorMessage(reason));
-      void refreshSkills().catch(() => undefined);
+      void refreshSkills(false).catch(() => undefined);
     } finally {
       onBusyChange(null);
-      if (replacing) {
-        window.requestAnimationFrame(() => installTriggerRef.current?.focus());
-      }
     }
   }
 
-  function cancelPendingInstall() {
+  function closePendingInstall() {
     setPendingInstall(null);
-    window.requestAnimationFrame(() => installTriggerRef.current?.focus());
+    restorePageFocus(installTriggerRef.current);
+  }
+
+  function closeConfigPanel() {
+    setConfigError(null);
+    setConfiguring(null);
+    restorePageFocus(configTriggerRef.current);
   }
 
   async function handleSaveConfig(input: SkillConfigInput) {
@@ -141,7 +153,7 @@ export function SkillsManagementPage({
       await ensureCodexClosed('技能配置');
       const result = await saveSkillConfig(input);
       setReceipt(receiptView(result));
-      setConfiguring(null);
+      closeConfigPanel();
       refreshInBackground('技能配置已保存');
       return true;
     } catch (reason) {
@@ -206,13 +218,14 @@ export function SkillsManagementPage({
               <p className="safe-note">{skill.message}</p>
               <div className="skill-actions">
                 {skill.canInstall || skill.canUpdate ? (
-                  <button className="primary-button" disabled={busy || pendingInstall !== null || configuring !== null} onClick={() => requestInstall(skill)}>
+                  <button className="primary-button" disabled={busy || pendingInstall !== null || configuring !== null} onClick={(event) => requestInstall(skill, event.currentTarget)}>
                     <Download className="button-icon" aria-hidden="true" />
                     {skillActionLabel(skill)} {skill.displayName}
                   </button>
                 ) : null}
                 {canConfigure(skill.state) ? (
-                  <button className="ghost-button inline" disabled={busy || pendingInstall !== null || configuring !== null} onClick={() => {
+                  <button className="ghost-button inline" disabled={busy || pendingInstall !== null || configuring !== null} onClick={(event) => {
+                    configTriggerRef.current = event.currentTarget;
                     setConfigError(null);
                     setConfiguring(skill);
                   }}>
@@ -221,7 +234,7 @@ export function SkillsManagementPage({
                   </button>
                 ) : null}
               </div>
-              {pendingInstall === skill.id ? (
+              {active && pendingInstall === skill.id ? (
                 <section className="inline-confirmation warning-confirmation" aria-labelledby={`install-confirmation-${skill.id}`}>
                   <ShieldAlert aria-hidden="true" />
                   <div>
@@ -230,7 +243,7 @@ export function SkillsManagementPage({
                     <p>现有目录会先完整备份，再替换为受管版本。</p>
                   </div>
                   <div className="form-actions">
-                    <button type="button" className="ghost-button inline" disabled={busy} onClick={cancelPendingInstall}>
+                    <button type="button" className="ghost-button inline" disabled={busy} onClick={closePendingInstall}>
                       <X className="button-icon" aria-hidden="true" />
                       取消
                     </button>
@@ -241,12 +254,12 @@ export function SkillsManagementPage({
                   </div>
                 </section>
               ) : null}
-              {configuring?.id === skill.id ? (
+              {active && configuring?.id === skill.id ? (
                 <SkillConfigPanel
                   skill={configuring}
                   busy={busy}
                   submitError={configError}
-                  onCancel={() => { setConfigError(null); setConfiguring(null); }}
+                  onCancel={closeConfigPanel}
                   onSave={handleSaveConfig}
                 />
               ) : null}
@@ -274,14 +287,11 @@ function SkillConfigPanel({
   const [baseUrl, setBaseUrl] = useState(skill.baseUrl);
   const [apiKey, setApiKey] = useState('');
   const [localError, setLocalError] = useState<string | null>(null);
-  const firstFieldRef = useRef<HTMLInputElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    firstFieldRef.current?.focus();
-    return () => {
-      previousFocus?.focus();
-    };
+    headingRef.current?.scrollIntoView?.({ block: 'nearest' });
+    headingRef.current?.focus();
   }, []);
 
   function cancel() {
@@ -323,12 +333,15 @@ function SkillConfigPanel({
     >
       <div className="card-title-row">
         <span className="section-icon"><KeyRound aria-hidden="true" /></span>
-        <div><p className="eyebrow">Windows DPAPI</p><h2 id="skill-config-title">配置 {skill.displayName}</h2></div>
+        <div>
+          <p className="eyebrow">Windows DPAPI</p>
+          <h2 ref={headingRef} tabIndex={-1} id="skill-config-title">配置 {skill.displayName}</h2>
+        </div>
       </div>
       <form onSubmit={(event) => void submit(event)}>
         <label className="form-field">
           <span>服务 URL</span>
-          <input ref={firstFieldRef} aria-label="服务 URL" inputMode="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
+          <input aria-label="服务 URL" inputMode="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
         </label>
         <label className="form-field">
           <span>API Key</span>

@@ -15,6 +15,36 @@ function event(
 }
 
 describe('RuntimeSwitchProgressPanel', () => {
+  it('keeps the elapsed clock outside the phase-only live status', () => {
+    const flow: RuntimeSwitchFlow = {
+      status: 'running',
+      target: 'relay',
+      startedAtMs: 100,
+      events: [event('verifyingRelay', 110)],
+    };
+    const view = render(<RuntimeSwitchProgressPanel flow={flow} now={1_100} />);
+    const panel = screen.getByLabelText('运行态切换进度');
+    const liveStatus = screen.getByRole('status');
+    const clock = panel.querySelector('.switch-progress-clock');
+
+    expect(panel.getAttribute('aria-live')).toBeNull();
+    expect(liveStatus.textContent).toBe('验证中转站');
+    expect(clock?.getAttribute('aria-hidden')).toBe('true');
+    expect(clock?.textContent).toContain('1.0s');
+
+    view.rerender(<RuntimeSwitchProgressPanel flow={flow} now={2_100} />);
+    expect(screen.getByRole('status')).toBe(liveStatus);
+    expect(liveStatus.textContent).toBe('验证中转站');
+    expect(clock?.textContent).toContain('2.0s');
+
+    const nextFlow = {
+      ...flow,
+      events: [...flow.events, event('detectingApp', 2_000)],
+    };
+    view.rerender(<RuntimeSwitchProgressPanel flow={nextFlow} now={2_100} />);
+    expect(liveStatus.textContent).toBe('检测 ChatGPT');
+  });
+
   it('shows rollback as running only while the task is still running', () => {
     const flow: RuntimeSwitchFlow = {
       status: 'running',

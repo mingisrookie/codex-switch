@@ -401,9 +401,14 @@ describe('App release-hardening UI', () => {
   it('uses a controlled password form instead of prompt for relay credentials', async () => {
     const prompt = vi.spyOn(window, 'prompt');
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
-    fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
+    const trigger = await screen.findByRole('button', { name: '配置中转站' });
+    trigger.focus();
+    fireEvent.click(trigger);
 
     const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    await waitFor(() => expect(document.activeElement).toBe(
+      within(panel).getByRole('heading', { name: '配置 API 中转站' }),
+    ));
     const key = within(panel).getByLabelText('API Key') as HTMLInputElement;
     expect(key.type).toBe('password');
     fireEvent.change(within(panel).getByLabelText('Base URL'), { target: { value: 'https://new.example.com/v1' } });
@@ -416,6 +421,22 @@ describe('App release-hardening UI', () => {
     }));
     expect(prompt).not.toHaveBeenCalled();
     expect(screen.queryByText('sk-secret')).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('restores relay configuration focus after inline cancellation', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    const trigger = await screen.findByRole('button', { name: '配置中转站' });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    const heading = within(panel).getByRole('heading', { name: '配置 API 中转站' });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    fireEvent.click(within(panel).getByRole('button', { name: '取消' }));
+
+    await waitFor(() => expect(screen.queryByRole('region', { name: '配置 API 中转站' })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 
   it('submits an empty key explicitly to preserve the existing encrypted relay key', async () => {

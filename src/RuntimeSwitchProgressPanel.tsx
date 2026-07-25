@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import {
   Check,
   CircleAlert,
@@ -79,7 +80,7 @@ export function RuntimeSwitchProgressPanel({
       aria-label="运行态切换进度"
       aria-busy={flow.status === 'running'}
     >
-      <span className="sr-only" role="status" aria-atomic="true">{liveStatus}</span>
+      <SwitchLiveStatus message={liveStatus} />
       <header className="switch-progress-header">
         <div>
           <p className="eyebrow">任务执行器</p>
@@ -139,6 +140,10 @@ export function RuntimeSwitchProgressPanel({
     </section>
   );
 }
+
+const SwitchLiveStatus = memo(function SwitchLiveStatus({ message }: { message: string }) {
+  return <span className="sr-only" role="status" aria-atomic="true">{message}</span>;
+});
 
 function stepState(
   flow: RuntimeSwitchFlow,

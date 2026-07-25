@@ -92,7 +92,7 @@ export function SessionManagementPage({
   }, [allVisibleSelected, someVisibleSelected]);
 
   useEffect(() => {
-    if (!deleteRequest || deleteRequest.ids.length > 10) return;
+    if (!deleteRequest) return;
     deleteHeadingRef.current?.scrollIntoView?.({ block: 'nearest' });
     deleteHeadingRef.current?.focus();
   }, [deleteRequest]);
@@ -325,7 +325,13 @@ export function SessionManagementPage({
               <ArchiveRestore className="button-icon" aria-hidden="true" />
               恢复可见
             </button>
-            <button ref={deleteTriggerRef} className="danger" onClick={requestDeleteSelected} disabled={busy || mutationDisabled || Boolean(deleteRequest) || selectedIds.size === 0}>
+            <button
+              ref={deleteTriggerRef}
+              className="danger"
+              onClick={requestDeleteSelected}
+              disabled={busy || mutationDisabled || Boolean(deleteRequest)}
+              aria-disabled={selectedIds.size === 0}
+            >
               <Trash2 className="button-icon" aria-hidden="true" />
               删除所选
             </button>
@@ -359,7 +365,6 @@ export function SessionManagementPage({
                     value={deletePhrase}
                     onChange={(event) => setDeletePhrase(event.target.value)}
                     autoComplete="off"
-                    autoFocus
                   />
                 </label>
               ) : null}

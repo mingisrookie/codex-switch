@@ -196,12 +196,12 @@ pub fn process_startup_update_args() -> Option<i32> {
     if context.is_none() && args.len() == 1 {
         match discover_interrupted_update(&current_exe) {
             Some(StartupRecoveryAction::Resume(recovered)) => context = Some(recovered),
-            Some(StartupRecoveryAction::RestartHelper(plan)) => {
-                if restart_interrupted_update(&plan).is_ok() {
-                    return Some(0);
-                }
+            Some(StartupRecoveryAction::RestartHelper(plan))
+                if restart_interrupted_update(&plan).is_ok() =>
+            {
+                return Some(0);
             }
-            None => {}
+            Some(StartupRecoveryAction::RestartHelper(_)) | None => {}
         }
     }
     let notice = context.as_ref().map(|context| UpdateStartupNotice {
@@ -311,6 +311,9 @@ fn validate_startup_context(
 
 #[cfg(windows)]
 fn discover_interrupted_update(current_exe: &Path) -> Option<StartupRecoveryAction> {
+    if !automatic_recovery_allowed(process_is_elevated()) {
+        return None;
+    }
     let temp = fs::canonicalize(env::temp_dir()).ok()?;
     let mut discovered = None;
     for entry in fs::read_dir(&temp).ok()? {
@@ -336,6 +339,10 @@ fn discover_interrupted_update(current_exe: &Path) -> Option<StartupRecoveryActi
         discovered = Some(action);
     }
     discovered
+}
+
+fn automatic_recovery_allowed(elevation: Result<bool, String>) -> bool {
+    matches!(elevation, Ok(false))
 }
 
 #[cfg(not(windows))]
@@ -2731,6 +2738,15 @@ mod tests {
             let action = recovery_action_from_staging(&plan.staging_dir, &plan.target_exe).unwrap();
             assert!(matches!(action, StartupRecoveryAction::RestartHelper(_)));
         }
+    }
+
+    #[test]
+    fn automatic_recovery_requires_a_confirmed_non_elevated_process() {
+        assert!(automatic_recovery_allowed(Ok(false)));
+        assert!(!automatic_recovery_allowed(Ok(true)));
+        assert!(!automatic_recovery_allowed(Err(
+            "security context unavailable".to_string()
+        )));
     }
 
     #[test]

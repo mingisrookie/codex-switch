@@ -66,7 +66,7 @@ ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 
 
 ### 自动更新
 
-ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装后台服务、不设置自启动项，也不会在运行期间周期轮询。检查源固定为本仓库最新正式 GitHub Release，draft 和 prerelease 不参与比较；网络失败不会阻塞其他功能。发现新版后点击“立即更新”，应用会下载固定的 Windows x64 EXE、核对 GitHub 资产大小和 SHA-256，在受限 staging 中准备 helper、plan 和持久化 journal，退出当前进程后替换原 EXE，再自动启动新版本；启动失败或检测到未完成阶段时会验证并恢复旧版本。
+ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装后台服务、不设置自启动项，也不会在运行期间周期轮询。检查源固定为本仓库最新正式 GitHub Release，draft 和 prerelease 不参与比较；网络失败不会阻塞其他功能。发现新版后点击“立即更新”，应用会下载固定的 Windows x64 EXE、核对 GitHub 资产大小和 SHA-256，在受限 staging 中准备 helper、plan 和持久化 journal，退出当前进程后替换原 EXE，再自动启动新版本；启动失败或检测到未完成阶段时会验证并恢复旧版本。正常 helper 的显式完成/回滚启动仍会闭合恢复；管理员权限进程若在 helper 之外无参数重启，不会扫描 `%TEMP%` 自动续跑，避免接受低完整性进程预造的恢复计划。
 
 > v0.1.6 本身尚未包含 updater，因此从 v0.1.6 升级到 v0.1.7 需要最后一次手动替换；从 v0.1.7 开始，后续版本可在应用内一键更新。
 
@@ -291,7 +291,7 @@ Codex 会话存储说明：
 - 后端用进程内 try-lock + Windows 独占 `%APPDATA%\codex-switch\mutation.lock` 文件句柄串行化保存、验证、切换、同步、删除、恢复和一键更新安装；同一进程或第二个 ChatGPT Switch 进程已有写操作时，新操作会立即拒绝。更新进入退出阶段后锁保持到父进程终止，前端同时双向禁用其他 mutation。
 - 操作记录只保存 action、阶段、终态、操作 ID、备份目录和计数，不保存凭据、请求正文或自由文本错误。
 - 会话管理里的删除是硬删除；工具会先备份并支持失败补偿，同时清理四个受管 SQLite 中可识别的 thread 关联。操作前仍需在页面内确认选择范围。
-- 自更新 staging 名来自 Windows CSPRNG；目录创建时按当前 token 是否 elevated 应用受限 DACL，并持有目录句柄。helper 以持久化阶段 journal、目标/备份 hash 和 Tauri Ready ACK 决定继续、完成或回滚。
+- 自更新 staging 名来自 Windows CSPRNG；目录创建时按当前 token 是否 elevated 应用受限 DACL，并持有目录句柄。helper 以持久化阶段 journal、目标/备份 hash 和 Tauri Ready ACK 决定继续、完成或回滚；elevated 无参数启动不会从 `%TEMP%` 自动发现并执行恢复计划。
 - 生产 UI 不使用 emoji、`window.alert`、`window.confirm`、`window.prompt` 或原生 `<dialog>`；配置、确认、进度和失败都在页面内呈现，图标统一使用 Lucide。
 
 ## 开发
