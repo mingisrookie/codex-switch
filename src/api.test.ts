@@ -1,8 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const invoke = vi.hoisted(() => vi.fn());
+const { invoke, Channel } = vi.hoisted(() => {
+  class MockChannel<T> {
+    onmessage: (message: T) => void;
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+    constructor(onmessage: (message: T) => void) {
+      this.onmessage = onmessage;
+    }
+  }
+
+  return { invoke: vi.fn(), Channel: MockChannel };
+});
+
+vi.mock('@tauri-apps/api/core', () => ({ Channel, invoke }));
 
 import {
   checkForUpdates,
@@ -12,9 +22,13 @@ import {
   importPlusRuntime,
   installUpdate,
   installSkill,
+  loadBackupDashboard,
   listSkills,
   loadDashboard,
+  loadRuntimeDashboard,
+  loadSessionDashboard,
   saveSkillConfig,
+  switchRuntime,
 } from './api';
 
 describe('dashboard API', () => {
@@ -56,6 +70,52 @@ describe('dashboard API', () => {
     expect(dashboard.operations).toMatchObject({ status: 'ready', data: [] });
     expect(invoke).toHaveBeenCalledTimes(7);
     expect(invoke).toHaveBeenCalledWith('list_operation_records', { limit: 20 });
+  });
+
+  it('refreshes runtime-facing domains without scanning sessions', async () => {
+    invoke.mockImplementation((command: string) => Promise.resolve({
+      list_runtimes: [],
+      scan_runtime_status: {
+        activeRuntimeId: 'relay',
+        confidence: 'exact',
+        authMode: 'apikey',
+        modelProvider: 'openai_custom',
+        detectedAtMs: 1,
+      },
+      list_operation_records: [],
+    }[command]));
+
+    const dashboard = await loadRuntimeDashboard();
+
+    expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
+    expect(invoke).toHaveBeenCalledTimes(4);
+    expect(invoke).not.toHaveBeenCalledWith('scan_sessions');
+    expect(invoke).not.toHaveBeenCalledWith('scan_managed_sessions');
+    expect(invoke).not.toHaveBeenCalledWith('list_backups');
+  });
+
+  it('loads session domains independently when the session page becomes visible', async () => {
+    invoke.mockImplementation((command: string) => Promise.resolve({
+      scan_sessions: { threadCount: 4, sessionJsonlCount: 3 },
+      scan_managed_sessions: { totalCount: 4, archivedCount: 0, sessions: [] },
+    }[command]));
+
+    const dashboard = await loadSessionDashboard();
+
+    expect(dashboard.sessions).toMatchObject({ status: 'ready' });
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).not.toHaveBeenCalledWith('list_backups');
+    expect(invoke).not.toHaveBeenCalledWith('list_runtimes');
+  });
+
+  it('loads expensive backup verification only through its explicit loader', async () => {
+    invoke.mockResolvedValue([]);
+
+    const dashboard = await loadBackupDashboard();
+
+    expect(dashboard.backups).toMatchObject({ status: 'ready', data: [] });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('list_backups');
   });
 
   it('passes overwrite confirmation explicitly when importing the account runtime', async () => {
@@ -114,5 +174,23 @@ describe('dashboard API', () => {
         apiKey: 'sk-fake',
       },
     });
+  });
+
+  it('passes a per-switch channel and forwards backend progress events', async () => {
+    invoke.mockResolvedValue({ changed: true });
+    const events: string[] = [];
+
+    await switchRuntime('relay', (event) => events.push(event.phase));
+
+    const payload = invoke.mock.calls[0][1] as {
+      runtimeId: string;
+      onProgress: { onmessage: (event: { phase: string }) => void };
+    };
+    expect(invoke).toHaveBeenCalledWith('switch_runtime', {
+      runtimeId: 'relay',
+      onProgress: expect.any(Channel),
+    });
+    payload.onProgress.onmessage({ phase: 'detectingApp' });
+    expect(events).toEqual(['detectingApp']);
   });
 });

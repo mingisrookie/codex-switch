@@ -11,18 +11,22 @@ export type OperationView = {
 export function OperationResultPanel({ result }: { result: OperationView }) {
   return (
     <section className={`operation-result ${result.rolledBack ? 'rolled-back' : ''}`} aria-live="polite">
-      <div>
+      <div className="operation-result-heading">
+        {result.rolledBack ? <RotateCcw className="section-icon" aria-hidden="true" /> : <CheckCircle2 className="section-icon" aria-hidden="true" />}
+        <div>
         <p className="eyebrow">最近操作回执</p>
         <h2>{result.label}</h2>
+        </div>
       </div>
       <div className="receipt-items">
         {result.operationId ? <span>操作 ID：{result.operationId}</span> : null}
         {result.metrics.map((metric) => <span key={metric}>{metric}</span>)}
         {result.backupCount !== undefined ? <span>备份：{result.backupCount}</span> : null}
         {result.backupPaths?.map((path) => <span className="receipt-path" title={path} key={path}>备份路径：{path}</span>)}
-        {result.warnings?.map((warning) => <span className="receipt-warning" key={warning}>警告：{warning}</span>)}
+        {result.warnings?.map((warning) => <span className="receipt-warning" key={warning}><TriangleAlert aria-hidden="true" />警告：{warning}</span>)}
         {result.rolledBack ? <span>结果：已回滚</span> : <span>结果：成功</span>}
       </div>
     </section>
   );
 }
+import { CheckCircle2, RotateCcw, TriangleAlert } from 'lucide-react';

@@ -44,6 +44,24 @@ fn installs_both_fixed_packages_and_detects_managed_state() {
         fs::read_to_string(codex_home.path().join("skills/grok-search/SKILL.md")).unwrap();
     assert!(!grok_skill.contains("C:\\Users\\admin"));
     assert!(!grok_skill.contains("x666.me"));
+    for relative_path in [
+        "skills/newapi-image2-client/SOURCE.json",
+        "skills/newapi-image2-client/SKILL.md",
+        "skills/newapi-image2-client/scripts/image2.ps1",
+        "skills/grok-search/SOURCE.json",
+        "skills/grok-search/SKILL.md",
+        "skills/grok-search/scripts/grok-search.ps1",
+    ] {
+        let contents = fs::read_to_string(codex_home.path().join(relative_path)).unwrap();
+        assert!(
+            contents.contains("ChatGPT Switch"),
+            "{relative_path} must use the current product name"
+        );
+        assert!(
+            !contents.contains("Codex Switch"),
+            "{relative_path} must not expose the retired product name"
+        );
+    }
 
     let statuses = list_skills_at(codex_home.path(), appdata.path()).unwrap();
     assert_eq!(statuses.len(), 2);

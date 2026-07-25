@@ -5,9 +5,9 @@ description: Use when an agent needs to generate or edit images through a user-p
 
 # New API Image2 Client
 
-## Codex Switch installation
+## ChatGPT Switch installation
 
-When this skill is installed by Codex Switch, use the bundled PowerShell helper first. It reads the configured URL and the current user's DPAPI-protected Key without printing either credential:
+When this skill is installed by ChatGPT Switch, use the bundled PowerShell helper first. It reads the configured URL and the current user's DPAPI-protected Key without printing either credential:
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
@@ -15,7 +15,7 @@ $image2 = Join-Path $codexHome 'skills\newapi-image2-client\scripts\image2.ps1'
 & $image2 -Action generate -Prompt "<prompt>" -OutputPath "<absolute-output.png>"
 ```
 
-For edits, add `-Action edit -ImagePath "<input.png>"` and optionally `-MaskPath "<mask.png>"`. Never open, copy, print, or request the DPAPI credential file. If the helper reports that configuration is missing, ask the user to configure Image2 in Codex Switch.
+For edits, add `-Action edit -ImagePath "<input.png>"` and optionally `-MaskPath "<mask.png>"`. Never open, copy, print, or request the DPAPI credential file. If the helper reports that configuration is missing, ask the user to configure Image2 in ChatGPT Switch.
 
 ## Purpose
 
@@ -59,8 +59,8 @@ Recovery: retry the same prompt through `/images/generations` with `response_for
 
 Ask the user for these if missing:
 
-1. The user's New API key, configured through Codex Switch or `NEWAPI_API_KEY` outside a Codex Switch installation.
-2. The base URL, configured through Codex Switch or `NEWAPI_BASE_URL`, defaulting to `https://api.lcming951.com/v1` when absent.
+1. The user's New API key, configured through ChatGPT Switch or `NEWAPI_API_KEY` outside a ChatGPT Switch installation.
+2. The base URL, configured through ChatGPT Switch or `NEWAPI_BASE_URL`, defaulting to `https://api.lcming951.com/v1` when absent.
 3. Prompt and desired output path.
 
 Never ask for or expose the server's internal proxyd key, account cookies, refresh tokens, or admin credentials.

@@ -1,7 +1,7 @@
 {
   "name": "codex-switch",
-  "version": "0.1.9",
-  "description": "Windows desktop tool for switching Codex account/API runtime states and syncing local sessions.",
+  "version": "0.2.0",
+  "description": "Windows desktop tool for switching ChatGPT account/API runtime states and syncing local sessions.",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
+    "lucide-react": "1.26.0",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },

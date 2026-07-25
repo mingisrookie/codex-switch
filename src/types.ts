@@ -19,7 +19,6 @@ export type CodexHomeStatus = {
   logsDb: FileStatus;
   codexDevDb: FileStatus;
   sessionsDir: FileStatus;
-  sessionJsonlCount: number;
   authSummary: AuthSummary | null;
 };
 
@@ -63,6 +62,18 @@ export type DashboardData = {
   backups: DomainState<BackupSummary[]>;
   operations: DomainState<OperationRecord[]>;
 };
+
+export type RuntimeDashboardData = Pick<
+  DashboardData,
+  'codexHome' | 'runtimes' | 'runtimeStatus' | 'operations'
+>;
+
+export type SessionDashboardData = Pick<
+  DashboardData,
+  'sessions' | 'managedSessions'
+>;
+
+export type BackupDashboardData = Pick<DashboardData, 'backups'>;
 
 export type AppStatus = {
   appName: string;
@@ -163,6 +174,7 @@ export type RuntimeStatus = {
 export type CodexProcess = {
   imageName: string;
   pid: number;
+  parentPid: number;
 };
 
 export type RelayRuntimeInput = {
@@ -216,10 +228,14 @@ export type SkillMutationReceipt = {
   warnings: string[];
 };
 
+export type BackupScope = 'full' | 'runtime' | 'sessions' | 'stateOnly';
+
 export type BackupManifest = {
   backupDir: string;
   reason: string;
   createdAtMs: number;
+  scope: BackupScope;
+  trackedDatabases: string[];
   completeSessions: boolean;
 };
 
@@ -292,6 +308,27 @@ export type RuntimeSwitchResult = {
   toShared: SessionSyncResult;
   fromShared: SessionSyncResult;
   rolledBack: boolean;
+};
+
+export type RuntimeSwitchPhase =
+  | 'detectingApp'
+  | 'closingApp'
+  | 'verifyingRelay'
+  | 'backingUpCurrent'
+  | 'backingUpShared'
+  | 'syncingToShared'
+  | 'applyingRuntime'
+  | 'syncingToCurrent'
+  | 'verifying'
+  | 'rollingBack'
+  | 'complete'
+  | 'failed';
+
+export type RuntimeSwitchProgress = {
+  phase: RuntimeSwitchPhase;
+  timestampMs: number;
+  message?: string | null;
+  outcome?: 'failedBeforeWrite' | 'rolledBack' | 'rollbackFailed' | null;
 };
 
 export type SyncDryRun = {

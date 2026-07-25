@@ -47,12 +47,24 @@ pub fn run() {
             commands::save_skill_config
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build Codex Switch");
+        .expect("failed to build ChatGPT Switch");
     app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::Ready)
+        if matches!(&event, tauri::RunEvent::Ready)
             && update_install::acknowledge_update_startup().is_err()
         {
             app_handle.exit(1);
+        }
+        match event {
+            tauri::RunEvent::ExitRequested { api, .. } if commands::mutation_blocks_shutdown() => {
+                api.prevent_exit();
+            }
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } if commands::mutation_blocks_shutdown() => {
+                api.prevent_close();
+            }
+            _ => {}
         }
     });
 }

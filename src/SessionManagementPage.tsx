@@ -1,4 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ArchiveRestore,
+  ChevronLeft,
+  ChevronRight,
+  FolderArchive,
+  RefreshCw,
+  Repeat2,
+  Trash2,
+  X,
+} from 'lucide-react';
 import type { ManagedSessionInventory, ManagedSessionRecord } from './types';
 
 type SessionFilter = 'all' | 'visible' | 'archived' | 'current' | 'shared';
@@ -17,6 +27,12 @@ type SessionManagementPageProps = {
 const numberFormat = new Intl.NumberFormat('zh-CN');
 const pageSize = 50;
 
+type DeleteRequest = {
+  ids: string[];
+  selectedOnPage: number;
+  selectedOnOtherPages: number;
+};
+
 export function SessionManagementPage({
   inventory,
   busy,
@@ -31,7 +47,11 @@ export function SessionManagementPage({
   const [sort, setSort] = useState<SessionSort>('updated-desc');
   const [page, setPage] = useState(1);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
+  const [deletePhrase, setDeletePhrase] = useState('');
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement>(null);
+  const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     const availableIds = new Set(inventory.sessions.map((session) => session.id));
@@ -39,6 +59,8 @@ export function SessionManagementPage({
       const next = new Set(Array.from(current).filter((id) => availableIds.has(id)));
       return next.size === current.size ? current : next;
     });
+    setDeleteRequest(null);
+    setDeletePhrase('');
   }, [inventory.sessions]);
 
   useEffect(() => setPage(1), [filter, query, sort, inventory.sessions]);
@@ -68,6 +90,12 @@ export function SessionManagementPage({
       selectAllRef.current.indeterminate = someVisibleSelected && !allVisibleSelected;
     }
   }, [allVisibleSelected, someVisibleSelected]);
+
+  useEffect(() => {
+    if (!deleteRequest) return;
+    deleteHeadingRef.current?.scrollIntoView?.({ block: 'nearest' });
+    deleteHeadingRef.current?.focus();
+  }, [deleteRequest]);
 
   function toggleSession(id: string) {
     setSelectedIds((current) => {
@@ -112,26 +140,36 @@ export function SessionManagementPage({
     if (action === 'clear') clearSelected();
   }
 
-  async function deleteSelected() {
+  function requestDeleteSelected() {
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return;
     const selectedOnPage = visibleIds.filter((id) => selectedIds.has(id)).length;
     const selectedOnOtherPages = ids.length - selectedOnPage;
-    const ok = window.confirm(
-      `将硬删除 ${ids.length} 个会话（本页 ${selectedOnPage} 个，其他页 ${selectedOnOtherPages} 个）在当前 Codex Home 和 shared-sessions 中的副本。后端会先创建完整备份，确认继续？`,
-    );
-    if (!ok) return;
-    if (ids.length > 10) {
-      const confirmation = window.prompt(`批量硬删除风险较高，请输入“删除 ${ids.length}”继续。`, '');
-      if (confirmation !== `删除 ${ids.length}`) return;
-    }
-    const succeeded = await onDelete(ids, true);
-    if (succeeded === true) {
-      setSelectedIds((current) => {
-        const next = new Set(current);
-        ids.forEach((id) => next.delete(id));
-        return next;
-      });
+    setDeletePhrase('');
+    setDeleteRequest({ ids, selectedOnPage, selectedOnOtherPages });
+  }
+
+  function cancelDelete() {
+    setDeleteRequest(null);
+    setDeletePhrase('');
+    window.requestAnimationFrame(() => deleteTriggerRef.current?.focus());
+  }
+
+  async function confirmDelete() {
+    if (!deleteRequest) return;
+    if (deleteRequest.ids.length > 10 && deletePhrase !== `删除 ${deleteRequest.ids.length}`) return;
+    try {
+      const succeeded = await onDelete(deleteRequest.ids, true);
+      if (succeeded === true) {
+        setSelectedIds((current) => {
+          const next = new Set(current);
+          deleteRequest.ids.forEach((id) => next.delete(id));
+          return next;
+        });
+        cancelDelete();
+      }
+    } catch {
+      // The parent action surface owns the error message; keep this confirmation open for retry.
     }
   }
 
@@ -151,12 +189,9 @@ export function SessionManagementPage({
     <section className="session-management-page" aria-label="会话管理">
       <section className="hero-card session-hero">
         <div>
-          <p className="eyebrow">当前 Codex Home + shared-sessions</p>
+          <p className="eyebrow">ChatGPT 数据目录 + shared-sessions</p>
           <h1>会话管理</h1>
-          <p className="lede">
-            合并展示本机与共享池会话；归档会话默认只跳过同步，不自动清理。所有硬删除都需确认，
-            超过 10 个会话还需输入确认文字。
-          </p>
+          <p className="lede">本机与共享池的统一会话视图。</p>
           <div className="hero-meta" aria-label="会话管理摘要">
             <span>合计：{numberFormat.format(inventory.totalCount)}</span>
             <span>已归档：{numberFormat.format(inventory.archivedCount)}</span>
@@ -165,7 +200,10 @@ export function SessionManagementPage({
           </div>
         </div>
         <div className="hero-actions">
-          <button className="primary-button" onClick={onSync} disabled={busy || syncDisabled}>立即同步</button>
+          <button className="primary-button" onClick={onSync} disabled={busy || syncDisabled}>
+            <RefreshCw className="button-icon" aria-hidden="true" />
+            立即同步
+          </button>
         </div>
       </section>
 
@@ -197,7 +235,7 @@ export function SessionManagementPage({
             <FilterButton label="本机" active={filter === 'current'} onClick={() => setFilter('current')} />
             <FilterButton label="共享池" active={filter === 'shared'} onClick={() => setFilter('shared')} />
           </div>
-          <p className="safe-note">搜索作用于当前筛选；批量全选/反选只作用于本页，已选会话会跨页保留。每页最多显示 50 个会话。</p>
+          <p className="safe-note">每页 50 个会话，选择状态跨页保留。</p>
         </aside>
 
         <section className="session-table-card">
@@ -209,12 +247,15 @@ export function SessionManagementPage({
                   type="checkbox"
                   checked={allVisibleSelected}
                   onChange={toggleVisibleSelection}
-                  disabled={busy || sessions.length === 0}
+                  disabled={busy || Boolean(deleteRequest) || sessions.length === 0}
                   aria-label="全选本页"
                 />
                 <span>全选本页</span>
               </label>
-              <button onClick={invertVisibleSelection} disabled={busy || sessions.length === 0}>反选本页</button>
+              <button onClick={invertVisibleSelection} disabled={busy || Boolean(deleteRequest) || sessions.length === 0}>
+                <Repeat2 className="button-icon" aria-hidden="true" />
+                反选本页
+              </button>
             </div>
             <label className="bulk-select-field">
               <span>选择操作</span>
@@ -225,7 +266,7 @@ export function SessionManagementPage({
                   handleBulkAction(event.target.value);
                   event.target.value = '';
                 }}
-                disabled={busy || sessions.length === 0}
+                disabled={busy || Boolean(deleteRequest) || sessions.length === 0}
                 aria-label="选择操作"
               >
                 <option value="" disabled>批量选择</option>
@@ -251,21 +292,27 @@ export function SessionManagementPage({
                 key={session.id}
                 session={session}
                 selected={selectedIds.has(session.id)}
-                disabled={busy}
+                disabled={busy || Boolean(deleteRequest)}
                 onToggle={() => toggleSession(session.id)}
               />
             ))}
           </div>
           <div className="session-pagination" aria-label="会话分页">
-            <button onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={busy || currentPage === 1}>上一页</button>
+            <button onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={busy || currentPage === 1}>
+              <ChevronLeft className="button-icon" aria-hidden="true" />
+              上一页
+            </button>
             <span>第 {currentPage} / {pageCount} 页</span>
-            <button onClick={() => setPage((value) => Math.min(pageCount, value + 1))} disabled={busy || currentPage === pageCount}>下一页</button>
+            <button onClick={() => setPage((value) => Math.min(pageCount, value + 1))} disabled={busy || currentPage === pageCount}>
+              下一页
+              <ChevronRight className="button-icon" aria-hidden="true" />
+            </button>
           </div>
         </section>
 
         <aside className="detail-panel selected-session-panel">
           <div className="card-title-row">
-            <span className="card-icon">🗂️</span>
+            <span className="section-icon"><FolderArchive aria-hidden="true" /></span>
             <div><p className="eyebrow">所选会话</p><h2>{numberFormat.format(selectedIds.size)} 个</h2></div>
           </div>
           <dl className="compact-meta">
@@ -274,11 +321,70 @@ export function SessionManagementPage({
             <div><dt>可恢复</dt><dd>{numberFormat.format(restoreIds.length)}</dd></div>
           </dl>
           <div className="detail-actions">
-            <button onClick={() => void restoreSelected()} disabled={busy || mutationDisabled || restoreIds.length === 0}>恢复可见</button>
-            <button className="danger" onClick={() => void deleteSelected()} disabled={busy || mutationDisabled || selectedIds.size === 0}>删除所选</button>
-            <button onClick={clearSelected} disabled={busy || selectedIds.size === 0}>清空选择</button>
+            <button onClick={() => void restoreSelected()} disabled={busy || mutationDisabled || Boolean(deleteRequest) || restoreIds.length === 0}>
+              <ArchiveRestore className="button-icon" aria-hidden="true" />
+              恢复可见
+            </button>
+            <button
+              ref={deleteTriggerRef}
+              className="danger"
+              onClick={requestDeleteSelected}
+              disabled={busy || mutationDisabled || Boolean(deleteRequest)}
+              aria-disabled={selectedIds.size === 0}
+            >
+              <Trash2 className="button-icon" aria-hidden="true" />
+              删除所选
+            </button>
+            <button onClick={clearSelected} disabled={busy || Boolean(deleteRequest) || selectedIds.size === 0}>
+              <X className="button-icon" aria-hidden="true" />
+              清空选择
+            </button>
           </div>
-          <p className="safe-note">恢复只处理当前 Home 中已归档的会话；共享池独有或未归档会话不会误写。</p>
+          {deleteRequest ? (
+            <form
+              className="inline-confirmation danger-confirmation"
+              aria-labelledby="delete-confirmation-title"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void confirmDelete();
+              }}
+            >
+              <div>
+                <p className="eyebrow">不可撤销操作</p>
+                <h3 ref={deleteHeadingRef} tabIndex={-1} id="delete-confirmation-title">确认硬删除 {deleteRequest.ids.length} 个会话</h3>
+                <p>
+                  本页 {deleteRequest.selectedOnPage} 个，其他页 {deleteRequest.selectedOnOtherPages} 个。
+                  执行前会创建完整备份。
+                </p>
+              </div>
+              {deleteRequest.ids.length > 10 ? (
+                <label className="form-field">
+                  <span>输入“删除 {deleteRequest.ids.length}”继续</span>
+                  <input
+                    aria-label="批量删除确认"
+                    value={deletePhrase}
+                    onChange={(event) => setDeletePhrase(event.target.value)}
+                    autoComplete="off"
+                  />
+                </label>
+              ) : null}
+              <div className="form-actions">
+                <button type="button" className="ghost-button inline" onClick={cancelDelete} disabled={busy}>
+                  <X className="button-icon" aria-hidden="true" />
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  className="danger"
+                  disabled={busy || (deleteRequest.ids.length > 10 && deletePhrase !== `删除 ${deleteRequest.ids.length}`)}
+                >
+                  <Trash2 className="button-icon" aria-hidden="true" />
+                  确认删除
+                </button>
+              </div>
+            </form>
+          ) : null}
+          <p className="safe-note">恢复范围：当前 Home 中已归档的会话。</p>
         </aside>
       </section>
     </section>

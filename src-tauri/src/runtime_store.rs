@@ -115,7 +115,7 @@ impl RuntimeStore {
         let auth = fs::read(codex_home.join("auth.json"))
             .map_err(|error| format!("failed to read plus auth.json: {error}"))?;
         if auth_mode_from_bytes(&auth)?.as_deref() != Some("chatgpt") {
-            return Err("当前 auth.json 不是 Codex 账号登录态，不能保存到账号槽位".to_string());
+            return Err("当前 auth.json 不是 ChatGPT 账号登录态，不能保存到账号槽位".to_string());
         }
         let config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read plus config.toml: {error}"))?;
@@ -133,7 +133,7 @@ impl RuntimeStore {
             .unwrap_or(timestamp_millis()?);
         let metadata = RuntimeMetadata {
             id: PLUS_RUNTIME_ID.to_string(),
-            name: "Codex 账号".to_string(),
+            name: "ChatGPT 账号".to_string(),
             kind: RuntimeKind::Plus,
             base_url: None,
             model: read_model_from_config(&config),
@@ -155,18 +155,31 @@ impl RuntimeStore {
         if model.is_empty() {
             return Err("relay model is required".to_string());
         }
+        let existing = self.load_existing_metadata(RELAY_RUNTIME_ID)?;
+        if input.api_key.trim().is_empty() {
+            let existing_base_url = existing
+                .as_ref()
+                .and_then(|metadata| metadata.base_url.as_deref())
+                .ok_or_else(|| "relay API key is required for the first save".to_string())?;
+            if normalized_url_origin(existing_base_url)?
+                != normalized_url_origin(&normalized_base_url)?
+            {
+                return Err("relay API key is required when changing the relay origin".to_string());
+            }
+        }
         let base_config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read live config.toml: {error}"))?;
         let config_toml = relay_config_template(&base_config, &normalized_base_url, model)?;
-        let existing = self.load_existing_metadata(RELAY_RUNTIME_ID)?;
         let auth = if input.api_key.trim().is_empty() {
             self.load_runtime_files(RELAY_RUNTIME_ID)
-                .map_err(|_| "relay API key is required for the first save".to_string())?
+                .map_err(|_| {
+                    "stored relay credentials are invalid; enter a new API key".to_string()
+                })?
                 .auth_json
         } else {
             relay_auth_json(&input.api_key)?
         };
-        if auth_mode_from_bytes(&auth)?.as_deref() != Some("apikey") {
+        if !valid_relay_auth(&auth) {
             return Err("stored relay credentials are invalid".to_string());
         }
         let created_at_ms = existing
@@ -507,6 +520,29 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedUrlOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn normalized_url_origin(value: &str) -> Result<NormalizedUrlOrigin, String> {
+    let parsed =
+        reqwest::Url::parse(value).map_err(|_| "stored relay base URL is invalid".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "stored relay base URL is invalid".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "stored relay base URL is invalid".to_string())?;
+    Ok(NormalizedUrlOrigin {
+        scheme: parsed.scheme().to_ascii_lowercase(),
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
 fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
     let key = api_key.trim();
     if key.is_empty() {
@@ -517,6 +553,18 @@ fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
         "OPENAI_API_KEY": key
     }))
     .map_err(|error| format!("failed to serialize relay auth: {error}"))
+}
+
+fn valid_relay_auth(auth: &[u8]) -> bool {
+    serde_json::from_slice::<JsonValue>(auth)
+        .ok()
+        .is_some_and(|value| {
+            value.get("auth_mode").and_then(JsonValue::as_str) == Some("apikey")
+                && value
+                    .get("OPENAI_API_KEY")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|key| !key.trim().is_empty())
+        })
 }
 
 fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Result<String, String> {
@@ -758,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_update_with_blank_key_preserves_the_encrypted_credential() {
+    fn relay_update_with_blank_key_preserves_credential_for_same_origin_path_change() {
         let home = tempdir().unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
         let root = tempdir().unwrap();
@@ -766,7 +814,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
-                    base_url: "https://relay.example.com/v1".to_string(),
+                    base_url: "https://relay.example.com/gateway".to_string(),
                     api_key: "sk-preserved".to_string(),
                     model: "old".to_string(),
                 },
@@ -777,7 +825,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
-                    base_url: "https://relay.example.com/v1".to_string(),
+                    base_url: "https://relay.example.com/edge".to_string(),
                     api_key: String::new(),
                     model: "new".to_string(),
                 },
@@ -787,6 +835,7 @@ mod tests {
 
         let connection = store.load_relay_connection().unwrap();
         assert_eq!(connection.api_key, "sk-preserved");
+        assert_eq!(connection.base_url, "https://relay.example.com/edge/v1");
         assert_eq!(
             store
                 .load_metadata(RELAY_RUNTIME_ID)
@@ -795,6 +844,66 @@ mod tests {
                 .as_deref(),
             Some("new")
         );
+    }
+
+    #[test]
+    fn relay_update_with_blank_key_rejects_origin_changes_before_writing() {
+        for (old_url, new_url) in [
+            (
+                "https://relay.example.com/v1",
+                "https://other.example.com/v1",
+            ),
+            (
+                "https://relay.example.com/v1",
+                "https://relay.example.com:8443/v1",
+            ),
+            ("https://localhost/v1", "http://localhost/v1"),
+        ] {
+            let home = tempdir().unwrap();
+            fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+            let root = tempdir().unwrap();
+            let store = RuntimeStore::new(root.path().join("runtimes"));
+            store
+                .upsert_relay(
+                    super::RelayRuntimeInput {
+                        base_url: old_url.to_string(),
+                        api_key: "sk-preserved".to_string(),
+                        model: "old".to_string(),
+                    },
+                    home.path(),
+                )
+                .unwrap();
+            let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
+            let before = [
+                fs::read(runtime_dir.join("auth.enc")).unwrap(),
+                fs::read(runtime_dir.join("config.toml")).unwrap(),
+                fs::read(runtime_dir.join("runtime.json")).unwrap(),
+            ];
+
+            let error = store
+                .upsert_relay(
+                    super::RelayRuntimeInput {
+                        base_url: new_url.to_string(),
+                        api_key: String::new(),
+                        model: "new".to_string(),
+                    },
+                    home.path(),
+                )
+                .unwrap_err();
+
+            assert!(error.contains("API key is required"), "{error}");
+            assert!(!error.contains(old_url), "{error}");
+            assert!(!error.contains(new_url), "{error}");
+            assert_eq!(
+                [
+                    fs::read(runtime_dir.join("auth.enc")).unwrap(),
+                    fs::read(runtime_dir.join("config.toml")).unwrap(),
+                    fs::read(runtime_dir.join("runtime.json")).unwrap(),
+                ],
+                before
+            );
+            assert!(!runtime_dir.join("history").exists());
+        }
     }
 
     #[test]
@@ -849,6 +958,9 @@ mod tests {
         assert!(fs::read_to_string(runtime_dir.join("config.toml"))
             .unwrap()
             .contains("new.example.com"));
+        let connection = store.load_relay_connection().unwrap();
+        assert_eq!(connection.base_url, "https://new.example.com/v1");
+        assert_eq!(connection.api_key, "sk-new-relay");
     }
 
     #[test]

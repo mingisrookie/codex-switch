@@ -169,12 +169,17 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
    Test-Path src-tauri\target\release\codex-switch.exe
    ```
 
+   公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；v0.1.9 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
+
 6. 创建或更新 GitHub Release 后必须验证：
 
    ```bash
-   gh release view <tag> --json tagName,name,isLatest,url,assets
+   gh release view <tag> --json tagName,name,url,assets
+   gh api repos/mingisrookie/codex-switch/releases/latest --jq .tag_name
    git ls-remote --tags origin <tag>
    ```
+
+   `gh release view --json` 不支持 `isLatest` 字段；必须把 `gh api .../releases/latest` 返回的 tag 与目标 `<tag>` 对比，不能仅凭 release 列表顺序推断 latest。
 
 Release 文案必须说明用户可见变化、风险/兼容性和本次验证命令，不得用空泛“更新 release”替代。
 
