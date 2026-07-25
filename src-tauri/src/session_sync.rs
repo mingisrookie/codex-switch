@@ -154,6 +154,21 @@ pub fn sync_shared_to_user_home_hot(
     )
 }
 
+pub(crate) fn preflight_session_database(path: &Path, label: &str) -> Result<(), String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| format!("failed to open {label} state_5.sqlite"))?;
+    conn.busy_timeout(Duration::from_secs(2))
+        .map_err(|_| format!("failed to inspect {label} state_5.sqlite"))?;
+    let quick_check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| format!("failed to inspect {label} state_5.sqlite"))?;
+    if quick_check != "ok" {
+        return Err(format!("{label} state_5.sqlite failed quick_check"));
+    }
+    validate_target_threads_schema(&conn)
+        .map_err(|error| format!("{label} state_5.sqlite is incompatible: {error}"))
+}
+
 fn root_from_paths(paths: CodexPaths) -> SyncRoot {
     SyncRoot {
         root: paths.codex_home,
@@ -168,7 +183,7 @@ fn sync_session_roots(
     target_root: SyncRoot,
     provider_id: Option<&str>,
     allow_existing_replacement: bool,
-    rewrite_existing_provider: bool,
+    update_existing_provider: bool,
 ) -> Result<SessionSyncResult, String> {
     let target_conn = Connection::open(&target_root.state_db)
         .map_err(|error| format!("failed to open target state_5.sqlite: {error}"))?;
@@ -185,7 +200,7 @@ fn sync_session_roots(
         &target_conn,
         provider_id,
         allow_existing_replacement,
-        rewrite_existing_provider,
+        update_existing_provider,
     );
     match result {
         Ok(mut result) => {
@@ -220,7 +235,7 @@ fn sync_sessions_in_transaction(
     target_conn: &Connection,
     provider_id: Option<&str>,
     allow_existing_replacement: bool,
-    rewrite_existing_provider: bool,
+    update_existing_provider: bool,
 ) -> Result<SessionSyncResult, String> {
     let mut inserted_threads = 0;
     let mut copied_session_files = 0;
@@ -250,15 +265,7 @@ fn sync_sessions_in_transaction(
                 copied_rollout.path.as_str(),
             )?;
             if let Some(provider_id) = provider_id {
-                if rewrite_existing_provider {
-                    rewrite_session_metadata_provider(Path::new(&selected_rollout), provider_id)?;
-                    if copied_rollout.copied && copied_rollout.path != selected_rollout {
-                        rewrite_session_metadata_provider(
-                            Path::new(&copied_rollout.path),
-                            provider_id,
-                        )?;
-                    }
-                } else if copied_rollout.copied {
+                if copied_rollout.copied {
                     rewrite_session_metadata_provider(
                         Path::new(&copied_rollout.path),
                         provider_id,
@@ -267,7 +274,7 @@ fn sync_sessions_in_transaction(
             }
             if thread_exists(target_conn, &thread.id)? {
                 duplicate_threads += 1;
-                let provider_for_thread = if rewrite_existing_provider
+                let provider_for_thread = if update_existing_provider
                     || (copied_rollout.copied && copied_rollout.path == selected_rollout)
                 {
                     provider_id
@@ -644,6 +651,63 @@ fn thread_value_for_target_column(
         }
     };
     Ok(value)
+}
+
+fn validate_target_threads_schema(conn: &Connection) -> Result<(), String> {
+    if !table_exists(conn, "threads")? {
+        return Err("threads table is missing".to_string());
+    }
+    let schema = table_schema(conn, "threads")?;
+    for required in ["id", "rollout_path"] {
+        if !schema.iter().any(|column| column.name == required) {
+            return Err(format!("threads.{required} is missing"));
+        }
+    }
+    for column in schema {
+        if column.not_null && column.default_value.is_none() && !known_target_column(&column.name) {
+            return Err(format!(
+                "unsupported threads schema: required column {} has no known value or default",
+                column.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn known_target_column(name: &str) -> bool {
+    matches!(
+        name,
+        "id" | "rollout_path"
+            | "model_provider"
+            | "created_at"
+            | "updated_at"
+            | "recency_at"
+            | "created_at_ms"
+            | "updated_at_ms"
+            | "recency_at_ms"
+            | "source"
+            | "cwd"
+            | "cli_version"
+            | "title"
+            | "preview"
+            | "first_user_message"
+            | "sandbox_policy"
+            | "approval_mode"
+            | "tokens_used"
+            | "has_user_event"
+            | "archived"
+            | "memory_mode"
+            | "thread_source"
+            | "agent_nickname"
+            | "agent_role"
+            | "agent_path"
+            | "model"
+            | "reasoning_effort"
+            | "archived_at"
+            | "git_sha"
+            | "git_branch"
+            | "git_origin_url"
+    )
 }
 
 fn thread_exists(conn: &Connection, id: &str) -> Result<bool, String> {
@@ -1736,6 +1800,52 @@ mod tests {
         sync_shared_to_user_home_hot(shared.path(), home.path(), "openai").unwrap();
 
         assert_eq!(fs::read(&home_jsonl).unwrap(), live_bytes);
+    }
+
+    #[test]
+    fn provider_switch_updates_sqlite_without_rewriting_unchanged_existing_jsonl() {
+        let shared = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let relative = "sessions/2026/07/25/rollout-thread-existing.jsonl";
+        let shared_jsonl = shared.path().join(relative);
+        let home_jsonl = home.path().join(relative);
+        fs::create_dir_all(shared_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(home_jsonl.parent().unwrap()).unwrap();
+        let existing_bytes = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-existing","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"text":"unchanged history"}}"#,
+            "\n",
+        );
+        fs::write(&shared_jsonl, existing_bytes).unwrap();
+        fs::write(&home_jsonl, existing_bytes).unwrap();
+        create_official_like_db(
+            &shared.path().join("state_5.sqlite"),
+            &[("thread-existing", shared_jsonl.to_str().unwrap())],
+        );
+        create_official_like_db(
+            &home.path().join("state_5.sqlite"),
+            &[("thread-existing", home_jsonl.to_str().unwrap())],
+        );
+        let modified_before = fs::metadata(&home_jsonl).unwrap().modified().unwrap();
+
+        let result = sync_shared_to_user_home(shared.path(), home.path(), "openai_custom").unwrap();
+
+        assert_eq!(result.copied_session_files, 0);
+        assert_eq!(fs::read(&home_jsonl).unwrap(), existing_bytes.as_bytes());
+        assert_eq!(
+            fs::metadata(&home_jsonl).unwrap().modified().unwrap(),
+            modified_before
+        );
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let provider: String = conn
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'thread-existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai_custom");
     }
 
     #[test]

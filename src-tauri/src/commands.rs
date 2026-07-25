@@ -11,18 +11,21 @@ use std::{
     thread,
     time::Duration,
 };
+use tauri::ipc::Channel;
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::{
     backup::{
-        create_backup as create_backup_snapshot, create_local_backup,
-        list_recent_backups as list_backup_snapshots, migrate_legacy_plaintext_auth,
+        create_backup as create_backup_snapshot, create_local_backup, create_local_session_backup,
+        create_session_backup, list_recent_backups as list_backup_snapshots,
+        migrate_legacy_plaintext_auth, preflight_runtime_backup_capacity,
         restore_backup as restore_backup_snapshot, verify_backup, BackupManifest, BackupSummary,
         RestoreResult,
     },
     codex_home::{scan_codex_home as scan_home, CodexHomeStatus},
+    codex_paths::validate_absolute_root,
     operation_log::{
         operation_id, timestamp_millis, OperationAction, OperationLog, OperationPhase,
         OperationRecord, OperationStatus,
@@ -34,7 +37,11 @@ use crate::{
     runtime_store::{
         RelayRuntimeInput, RuntimeMetadata, RuntimeStatus, RuntimeStore, RELAY_RUNTIME_ID,
     },
-    runtime_switcher::{switch_runtime_files_detailed, sync_home_with_shared, RuntimeSwitchResult},
+    runtime_switcher::{
+        preflight_runtime_session_sync, preflight_runtime_switch,
+        switch_runtime_files_preflighted_with_progress, sync_home_with_shared,
+        RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
+    },
     session_manager::{
         delete_managed_sessions_detailed as delete_sessions,
         restore_sessions_visible_detailed as restore_visible,
@@ -93,6 +100,13 @@ impl MutationCoordinator {
             lock_file: Some(lock_file),
         })
     }
+
+    fn blocks_shutdown(&self) -> bool {
+        if self.shutdown_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        matches!(self.process_lock.try_lock(), Err(TryLockError::WouldBlock))
+    }
 }
 
 #[derive(Debug)]
@@ -121,7 +135,11 @@ impl MutationGuard<'_> {
 }
 
 fn mutation_busy_error() -> String {
-    "another Codex Switch mutation is already in progress".to_string()
+    "another ChatGPT Switch mutation is already in progress".to_string()
+}
+
+pub(crate) fn mutation_blocks_shutdown() -> bool {
+    MUTATION_COORDINATOR.blocks_shutdown()
 }
 
 #[derive(Debug, Serialize)]
@@ -172,6 +190,17 @@ pub struct RestoreBackupReceipt {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSwitchProgress {
+    pub phase: RuntimeSwitchPhase,
+    pub timestamp_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RuntimeSwitchOutcome>,
+}
+
 #[derive(Debug, Clone)]
 struct HotSyncCompensation {
     shared_rolled_back: bool,
@@ -181,7 +210,7 @@ struct HotSyncCompensation {
 #[tauri::command]
 pub fn get_app_status() -> AppStatus {
     AppStatus {
-        app_name: "Codex Switch",
+        app_name: "ChatGPT Switch",
         version: env!("CARGO_PKG_VERSION"),
         phase: "hardened-mvp",
         codex_home: default_codex_home(),
@@ -221,23 +250,23 @@ pub fn get_update_startup_notice() -> Option<UpdateStartupNotice> {
 
 #[tauri::command]
 pub fn scan_codex_home() -> Result<CodexHomeStatus, String> {
-    scan_home(&default_codex_home())
+    scan_home(&managed_codex_home()?)
 }
 
 #[tauri::command]
 pub fn scan_sessions() -> Result<SessionInventory, String> {
-    scan_session_inventory(&default_codex_home())
+    scan_session_inventory(&managed_codex_home()?)
 }
 
 #[tauri::command]
 pub fn scan_managed_sessions() -> Result<ManagedSessionInventory, String> {
     let shared_home = default_shared_sessions_root()?;
-    scan_managed_session_inventory(&default_codex_home(), &shared_home)
+    scan_managed_session_inventory(&managed_codex_home()?, &shared_home)
 }
 
 #[tauri::command]
 pub fn dry_run_all_sessions() -> Result<AllSessionsDryRun, String> {
-    let current = scan_session_inventory(&default_codex_home())?;
+    let current = scan_session_inventory(&managed_codex_home()?)?;
     let shared = scan_local_session_inventory(&default_shared_sessions_root()?)?;
     Ok(AllSessionsDryRun {
         to_shared: build_sync_dry_run(std::slice::from_ref(&current), &shared),
@@ -252,7 +281,7 @@ pub fn list_runtimes() -> Result<Vec<RuntimeMetadata>, String> {
 
 #[tauri::command]
 pub fn scan_runtime_status() -> Result<RuntimeStatus, String> {
-    RuntimeStore::from_default_root()?.detect_active_runtime(&default_codex_home())
+    RuntimeStore::from_default_root()?.detect_active_runtime(&managed_codex_home()?)
 }
 
 #[tauri::command]
@@ -262,7 +291,7 @@ pub fn import_plus_runtime(confirm_overwrite: bool) -> Result<RuntimeMetadata, S
     let id = operation_id("import-account")?;
     let result = (|| {
         RuntimeStore::from_default_root()?
-            .import_plus_from_home(&default_codex_home(), confirm_overwrite)
+            .import_plus_from_home(&managed_codex_home()?, confirm_overwrite)
     })();
     record_result(
         &id,
@@ -281,7 +310,7 @@ pub fn upsert_relay_runtime(input: RelayRuntimeInput) -> Result<RuntimeMetadata,
     let started = timestamp_millis()?;
     let id = operation_id("save-relay")?;
     let result =
-        (|| RuntimeStore::from_default_root()?.upsert_relay(input, &default_codex_home()))();
+        (|| RuntimeStore::from_default_root()?.upsert_relay(input, &managed_codex_home()?))();
     record_result(
         &id,
         OperationAction::SaveRelay,
@@ -321,37 +350,113 @@ pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
 }
 
 #[tauri::command]
-pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    close_codex()
+pub async fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    tauri::async_runtime::spawn_blocking(close_codex)
+        .await
+        .map_err(|_| "ChatGPT process close worker failed".to_string())?
 }
 
 #[tauri::command]
-pub fn switch_runtime(runtime_id: String) -> Result<RuntimeSwitchResult, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let attempt_id = operation_id("switch-runtime-attempt")?;
+pub async fn switch_runtime(
+    runtime_id: String,
+    on_progress: Channel<RuntimeSwitchProgress>,
+) -> Result<RuntimeSwitchResult, String> {
+    let worker_progress = on_progress.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        switch_runtime_blocking(runtime_id, worker_progress)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = "runtime switch worker failed".to_string();
+            emit_runtime_switch_failure(
+                &on_progress,
+                &error,
+                RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn switch_runtime_blocking(
+    runtime_id: String,
+    on_progress: Channel<RuntimeSwitchProgress>,
+) -> Result<RuntimeSwitchResult, String> {
+    let _mutation_guard = match acquire_mutation_lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            emit_runtime_switch_failure(
+                &on_progress,
+                &error,
+                RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            return Err(error);
+        }
+    };
+    let started = match timestamp_millis() {
+        Ok(started) => started,
+        Err(error) => {
+            emit_runtime_switch_failure(
+                &on_progress,
+                &error,
+                RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            return Err(error);
+        }
+    };
+    let attempt_id = match operation_id("switch-runtime-attempt") {
+        Ok(attempt_id) => attempt_id,
+        Err(error) => {
+            emit_runtime_switch_failure(
+                &on_progress,
+                &error,
+                RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            return Err(error);
+        }
+    };
     let mut failure_backups = Vec::new();
+    let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
     let result = (|| {
-        ensure_codex_closed("switching runtimes")?;
+        let store = RuntimeStore::from_default_root()?;
+        let current_home = managed_codex_home()?;
         let backup_root = default_backup_root()?;
         let shared_home = default_shared_sessions_root()?;
-        let store = RuntimeStore::from_default_root()?;
-        if runtime_id == RELAY_RUNTIME_ID {
-            let connection = store.load_relay_connection()?;
-            verify_relay(&connection.base_url, &connection.api_key)?;
-            store.mark_verified(RELAY_RUNTIME_ID)?;
-        }
-        ensure_codex_closed("switching runtimes")?;
-        match switch_runtime_files_detailed(
+        let plan = prepare_runtime_switch_before_close(
+            runtime_id == RELAY_RUNTIME_ID,
+            || {
+                let plan = preflight_runtime_switch(&store, &runtime_id, &current_home)?;
+                let requires_change = plan.requires_change();
+                Ok((plan, requires_change))
+            },
+            || {
+                preflight_runtime_backup_capacity(&backup_root, &current_home, &shared_home)?;
+                preflight_runtime_session_sync(&current_home, &shared_home)
+            },
+            || {
+                let connection = store.load_relay_connection()?;
+                verify_relay(&connection.base_url, &connection.api_key)?;
+                store.mark_verified(RELAY_RUNTIME_ID)?;
+                Ok(())
+            },
+            list_processes,
+            || close_codex().map(|_| ()),
+            |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
+        )?;
+        match switch_runtime_files_preflighted_with_progress(
             &store,
-            &runtime_id,
-            &default_codex_home(),
+            &current_home,
             &backup_root,
             &shared_home,
+            plan,
+            &mut |phase| emit_runtime_switch_progress(&on_progress, phase, None),
         ) {
             Ok(receipt) => Ok(receipt),
             Err(failure) => {
                 failure_backups = failure.backups;
+                failure_outcome = failure.outcome;
                 Err(failure.message)
             }
         }
@@ -382,7 +487,125 @@ pub fn switch_runtime(runtime_id: String) -> Result<RuntimeSwitchResult, String>
         backups,
         counts,
     );
+    emit_runtime_switch_terminal(&on_progress, &result, failure_outcome);
     result
+}
+
+fn prepare_runtime_switch_before_close<Plan, Prepare, Capacity, Verify, List, Close, Progress>(
+    verify_relay_first: bool,
+    mut prepare_switch: Prepare,
+    mut verify_backup_capacity: Capacity,
+    mut verify_relay_connection: Verify,
+    list_managed_processes: List,
+    close_managed_processes: Close,
+    mut progress: Progress,
+) -> Result<Plan, String>
+where
+    Prepare: FnMut() -> Result<(Plan, bool), String>,
+    Capacity: FnMut() -> Result<(), String>,
+    Verify: FnMut() -> Result<(), String>,
+    List: FnMut() -> Result<Vec<CodexProcess>, String>,
+    Close: FnMut() -> Result<(), String>,
+    Progress: FnMut(RuntimeSwitchPhase, Option<String>),
+{
+    let (plan, requires_change) = prepare_switch()?;
+    if requires_change {
+        verify_backup_capacity()?;
+        run_runtime_switch_preflight(
+            verify_relay_first,
+            verify_relay_connection,
+            list_managed_processes,
+            close_managed_processes,
+            progress,
+        )?;
+    } else if verify_relay_first {
+        progress(RuntimeSwitchPhase::VerifyingRelay, None);
+        verify_relay_connection()?;
+    }
+    Ok(plan)
+}
+
+fn run_runtime_switch_preflight<Verify, List, Close, Progress>(
+    verify_relay_first: bool,
+    mut verify_relay_connection: Verify,
+    mut list_managed_processes: List,
+    mut close_managed_processes: Close,
+    mut progress: Progress,
+) -> Result<(), String>
+where
+    Verify: FnMut() -> Result<(), String>,
+    List: FnMut() -> Result<Vec<CodexProcess>, String>,
+    Close: FnMut() -> Result<(), String>,
+    Progress: FnMut(RuntimeSwitchPhase, Option<String>),
+{
+    if verify_relay_first {
+        progress(RuntimeSwitchPhase::VerifyingRelay, None);
+        verify_relay_connection()?;
+    }
+    progress(RuntimeSwitchPhase::DetectingApp, None);
+    let processes = list_managed_processes()?;
+    if !processes.is_empty() {
+        progress(
+            RuntimeSwitchPhase::ClosingApp,
+            Some(format!("Closing {} ChatGPT process(es)", processes.len())),
+        );
+        close_managed_processes()?;
+    }
+    if list_managed_processes()?.is_empty() {
+        Ok(())
+    } else {
+        Err("ChatGPT is still running; close it before switching runtimes".to_string())
+    }
+}
+
+fn emit_runtime_switch_progress(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    phase: RuntimeSwitchPhase,
+    message: Option<String>,
+) {
+    emit_runtime_switch_progress_event(on_progress, phase, message, None);
+}
+
+fn emit_runtime_switch_progress_event(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    phase: RuntimeSwitchPhase,
+    message: Option<String>,
+    outcome: Option<RuntimeSwitchOutcome>,
+) {
+    let _ = on_progress.send(RuntimeSwitchProgress {
+        phase,
+        timestamp_ms: timestamp_millis().unwrap_or_default(),
+        message,
+        outcome,
+    });
+}
+
+fn emit_runtime_switch_failure(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    error: &str,
+    outcome: RuntimeSwitchOutcome,
+) {
+    emit_runtime_switch_progress_event(
+        on_progress,
+        RuntimeSwitchPhase::Failed,
+        Some(error.to_string()),
+        Some(outcome),
+    );
+}
+
+fn emit_runtime_switch_terminal<T>(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    result: &Result<T, String>,
+    failure_outcome: RuntimeSwitchOutcome,
+) {
+    match result {
+        Ok(_) => {
+            emit_runtime_switch_progress(on_progress, RuntimeSwitchPhase::Complete, None);
+        }
+        Err(error) => {
+            emit_runtime_switch_failure(on_progress, error, failure_outcome);
+        }
+    }
 }
 
 #[tauri::command]
@@ -395,10 +618,10 @@ pub fn sync_all_sessions() -> Result<SessionSyncReceipt, String> {
     let mut result = (|| {
         let backup_root = default_backup_root()?;
         let shared_home = default_shared_sessions_root()?;
-        let current_home = default_codex_home();
-        let current_backup = create_backup_snapshot(&current_home, &backup_root, "sync-current")?;
+        let current_home = managed_codex_home()?;
+        let current_backup = create_session_backup(&current_home, &backup_root, "sync-current")?;
         backups.push(current_backup.clone());
-        let shared_backup = create_local_backup(&shared_home, &backup_root, "sync-shared")?;
+        let shared_backup = create_local_session_backup(&shared_home, &backup_root, "sync-shared")?;
         backups.push(shared_backup.clone());
         match sync_home_with_shared(&current_home, &shared_home) {
             Ok(sync_result) => Ok(SessionSyncReceipt {
@@ -470,7 +693,7 @@ pub fn delete_managed_sessions(
         let backup_root = default_backup_root()?;
         let shared_home = default_shared_sessions_root()?;
         match delete_sessions(
-            &default_codex_home(),
+            &managed_codex_home()?,
             &shared_home,
             &backup_root,
             &ids,
@@ -501,7 +724,7 @@ pub fn restore_sessions_visible(ids: Vec<String>) -> Result<SessionMutationRecei
     let result = (|| {
         ensure_codex_closed("restoring session visibility")?;
         let backup_root = default_backup_root()?;
-        match restore_visible(&default_codex_home(), &backup_root, &ids) {
+        match restore_visible(&managed_codex_home()?, &backup_root, &ids) {
             Ok(result) => Ok(result),
             Err(failure) => {
                 failure_backups = failure.backups;
@@ -541,7 +764,7 @@ pub fn restore_backup(backup_dir: String) -> Result<RestoreBackupReceipt, String
         let selected = validate_backup_selection(&backup_root, Path::new(&backup_dir))?;
         let manifest = verify_backup(&selected)?;
         backups.push(manifest.clone());
-        let current_home = default_codex_home();
+        let current_home = managed_codex_home()?;
         let shared_home = default_shared_sessions_root()?;
         let target_is_local = manifest.state_db_is_local;
         let target = if manifest.source_root == current_home {
@@ -673,12 +896,11 @@ fn default_codex_home() -> PathBuf {
 }
 
 fn skill_codex_home() -> Result<PathBuf, String> {
-    let home = default_codex_home();
-    if home.is_absolute() {
-        Ok(home)
-    } else {
-        Err("CODEX_HOME must resolve to an absolute path for skill operations".to_string())
-    }
+    managed_codex_home()
+}
+
+fn managed_codex_home() -> Result<PathBuf, String> {
+    validate_absolute_root(&default_codex_home(), "CODEX_HOME")
 }
 
 fn default_codex_home_from_env(
@@ -703,9 +925,10 @@ fn non_empty_os(value: Option<OsString>) -> Option<OsString> {
 }
 
 fn appdata_root() -> Result<PathBuf, String> {
-    std::env::var_os("APPDATA")
+    let root = std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA is not set".to_string())
+        .ok_or_else(|| "APPDATA is not set".to_string())?;
+    validate_absolute_root(&root, "APPDATA")
 }
 
 fn default_backup_root() -> Result<PathBuf, String> {
@@ -743,9 +966,9 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
 
     options.open(lock_path).map_err(|error| {
         if matches!(error.raw_os_error(), Some(32 | 33)) {
-            "another Codex Switch mutation is already in progress".to_string()
+            "another ChatGPT Switch mutation is already in progress".to_string()
         } else {
-            format!("failed to acquire the Codex Switch mutation lock: {error}")
+            format!("failed to acquire the ChatGPT Switch mutation lock: {error}")
         }
     })
 }
@@ -754,7 +977,9 @@ fn ensure_codex_closed(action: &str) -> Result<(), String> {
     if list_processes()?.is_empty() {
         Ok(())
     } else {
-        Err(format!("Codex is still running; close it before {action}"))
+        Err(format!(
+            "ChatGPT is still running; close it before {action}"
+        ))
     }
 }
 
@@ -1024,18 +1249,29 @@ fn finish_skill_operation(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        fs,
+        future::Future,
+        sync::{Arc, Mutex},
+    };
 
+    use tauri::ipc::{Channel, InvokeResponseBody};
     use tempfile::tempdir;
 
     use crate::{
-        backup::{create_backup, create_local_backup},
+        backup::{create_backup, create_local_session_backup, create_session_backup, BackupScope},
         operation_log::{OperationAction, OperationLog, OperationStatus},
+        process_control::CodexProcess,
     };
 
     use super::{
-        acquire_mutation_lock_at, compensate_failed_hot_sync, default_codex_home_from_env,
-        get_app_status, record_result_to_log, validate_backup_selection, MutationCoordinator,
+        acquire_mutation_lock_at, close_codex_processes, compensate_failed_hot_sync,
+        default_codex_home_from_env, emit_runtime_switch_terminal, get_app_status,
+        prepare_runtime_switch_before_close, record_result_to_log, run_runtime_switch_preflight,
+        switch_runtime, validate_backup_selection, MutationCoordinator, RuntimeSwitchOutcome,
+        RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
     };
 
     #[cfg(windows)]
@@ -1043,8 +1279,261 @@ mod tests {
 
     #[test]
     fn app_status_does_not_report_the_retired_scaffold_phase() {
+        assert_eq!(get_app_status().app_name, "ChatGPT Switch");
         assert_eq!(get_app_status().phase, "hardened-mvp");
         assert_eq!(get_app_status().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn runtime_switch_command_remains_async() {
+        fn assert_future<F>(future: F)
+        where
+            F: Future<Output = Result<RuntimeSwitchResult, String>> + Send,
+        {
+            drop(future);
+        }
+
+        let on_progress = Channel::<RuntimeSwitchProgress>::new(|_| Ok(()));
+        assert_future(switch_runtime("relay".to_string(), on_progress));
+    }
+
+    #[test]
+    fn process_close_command_remains_async() {
+        fn assert_future<F>(future: F)
+        where
+            F: Future<Output = Result<Vec<CodexProcess>, String>> + Send,
+        {
+            drop(future);
+        }
+
+        assert_future(close_codex_processes());
+    }
+
+    #[test]
+    fn runtime_switch_terminal_progress_is_typed_for_success_and_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let on_progress = Channel::<RuntimeSwitchProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("runtime switch progress must be JSON");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+        let success: Result<(), String> = Ok(());
+        emit_runtime_switch_terminal(
+            &on_progress,
+            &success,
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+        );
+        let failure: Result<(), String> = Err("switch failed safely".to_string());
+        emit_runtime_switch_terminal(
+            &on_progress,
+            &failure,
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+        );
+        let rolled_back: Result<(), String> = Err("opaque switch failure".to_string());
+        emit_runtime_switch_terminal(&on_progress, &rolled_back, RuntimeSwitchOutcome::RolledBack);
+        let rollback_failed: Result<(), String> = Err("another opaque switch failure".to_string());
+        emit_runtime_switch_terminal(
+            &on_progress,
+            &rollback_failed,
+            RuntimeSwitchOutcome::RollbackFailed,
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["phase"], "complete");
+        assert!(events[0]["timestampMs"].as_u64().unwrap() > 0);
+        assert!(events[0].get("message").is_none());
+        assert!(events[0].get("outcome").is_none());
+        assert_eq!(events[1]["phase"], "failed");
+        assert_eq!(events[1]["message"], "switch failed safely");
+        assert_eq!(events[1]["outcome"], "failedBeforeWrite");
+        assert!(events[1]["timestampMs"].as_u64().unwrap() > 0);
+        assert_eq!(events[2]["outcome"], "rolledBack");
+        assert_eq!(events[3]["outcome"], "rollbackFailed");
+    }
+
+    #[test]
+    fn relay_preflight_verifies_before_process_detection_and_never_closes_on_failure() {
+        let list_calls = Cell::new(0);
+        let close_calls = Cell::new(0);
+        let mut phases = Vec::new();
+
+        let error = run_runtime_switch_preflight(
+            true,
+            || Err("relay verification failed".to_string()),
+            || {
+                list_calls.set(list_calls.get() + 1);
+                Ok(Vec::new())
+            },
+            || {
+                close_calls.set(close_calls.get() + 1);
+                Ok(())
+            },
+            |phase, _| phases.push(phase),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "relay verification failed");
+        assert_eq!(phases, vec![RuntimeSwitchPhase::VerifyingRelay]);
+        assert_eq!(list_calls.get(), 0);
+        assert_eq!(close_calls.get(), 0);
+    }
+
+    #[test]
+    fn relay_and_account_preflight_emit_real_process_phases_in_order() {
+        let root = CodexProcess {
+            image_name: "ChatGPT.exe".to_string(),
+            pid: 1234,
+            parent_pid: 42,
+            creation_time_100ns: Some(1),
+        };
+        let mut relay_listings = VecDeque::from([Ok(vec![root]), Ok(Vec::new())]);
+        let relay_closed = Cell::new(false);
+        let mut relay_phases = Vec::new();
+        run_runtime_switch_preflight(
+            true,
+            || Ok(()),
+            || relay_listings.pop_front().expect("unexpected listing"),
+            || {
+                relay_closed.set(true);
+                Ok(())
+            },
+            |phase, _| relay_phases.push(phase),
+        )
+        .unwrap();
+        assert!(relay_closed.get());
+        assert_eq!(
+            relay_phases,
+            vec![
+                RuntimeSwitchPhase::VerifyingRelay,
+                RuntimeSwitchPhase::DetectingApp,
+                RuntimeSwitchPhase::ClosingApp,
+            ]
+        );
+
+        let mut account_phases = Vec::new();
+        run_runtime_switch_preflight(
+            false,
+            || panic!("account mode must not verify relay"),
+            || Ok(Vec::new()),
+            || panic!("there is no managed process to close"),
+            |phase, _| account_phases.push(phase),
+        )
+        .unwrap();
+        assert_eq!(account_phases, vec![RuntimeSwitchPhase::DetectingApp]);
+    }
+
+    #[test]
+    fn runtime_plan_capacity_and_relay_checks_all_finish_before_chatgpt_closes() {
+        let calls = RefCell::new(Vec::new());
+        let root = CodexProcess {
+            image_name: "ChatGPT.exe".to_string(),
+            pid: 1234,
+            parent_pid: 42,
+            creation_time_100ns: Some(1),
+        };
+        let listings = RefCell::new(VecDeque::from([Ok(vec![root]), Ok(Vec::new())]));
+
+        let plan = prepare_runtime_switch_before_close(
+            true,
+            || {
+                calls.borrow_mut().push("config");
+                Ok((true, true))
+            },
+            || {
+                calls.borrow_mut().push("capacity");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("relay");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("list");
+                listings
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected listing")
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Ok(())
+            },
+            |phase, _| match phase {
+                RuntimeSwitchPhase::VerifyingRelay => {
+                    calls.borrow_mut().push("phase:verifyingRelay")
+                }
+                RuntimeSwitchPhase::DetectingApp => calls.borrow_mut().push("phase:detectingApp"),
+                RuntimeSwitchPhase::ClosingApp => calls.borrow_mut().push("phase:closingApp"),
+                _ => panic!("unexpected pre-close phase"),
+            },
+        )
+        .unwrap();
+
+        assert!(plan);
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "config",
+                "capacity",
+                "phase:verifyingRelay",
+                "relay",
+                "phase:detectingApp",
+                "list",
+                "phase:closingApp",
+                "close",
+                "list",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_config_or_capacity_preflight_never_touches_chatgpt() {
+        let config_error = prepare_runtime_switch_before_close(
+            true,
+            || Err::<(bool, bool), _>("config preflight failed".to_string()),
+            || panic!("capacity must not run after config failure"),
+            || panic!("relay must not run after config failure"),
+            || panic!("processes must not be listed after config failure"),
+            || panic!("ChatGPT must not close after config failure"),
+            |_, _| panic!("progress must not advance after config failure"),
+        )
+        .unwrap_err();
+        assert_eq!(config_error, "config preflight failed");
+
+        let capacity_error = prepare_runtime_switch_before_close(
+            true,
+            || Ok((true, true)),
+            || Err("capacity preflight failed".to_string()),
+            || panic!("relay must not run after capacity failure"),
+            || panic!("processes must not be listed after capacity failure"),
+            || panic!("ChatGPT must not close after capacity failure"),
+            |_, _| panic!("process progress must not start after capacity failure"),
+        )
+        .unwrap_err();
+        assert_eq!(capacity_error, "capacity preflight failed");
+    }
+
+    #[test]
+    fn exact_account_no_op_skips_capacity_detection_and_close() {
+        let plan = prepare_runtime_switch_before_close(
+            false,
+            || Ok((false, false)),
+            || panic!("exact no-op must not scan backup capacity"),
+            || panic!("account mode must not verify relay"),
+            || panic!("exact no-op must not enumerate ChatGPT"),
+            || panic!("exact no-op must not close ChatGPT"),
+            |_, _| panic!("exact no-op has no pre-close process phase"),
+        )
+        .unwrap();
+
+        assert!(!plan);
     }
 
     #[test]
@@ -1066,12 +1555,16 @@ mod tests {
         let lock_path = root.path().join("mutation.lock");
         let coordinator = MutationCoordinator::new();
 
-        let failed_attempt = coordinator.acquire(&lock_path).unwrap();
-        drop(failed_attempt);
+        let regular_mutation = coordinator.acquire(&lock_path).unwrap();
+        assert!(coordinator.blocks_shutdown());
+        drop(regular_mutation);
+        assert!(!coordinator.blocks_shutdown());
         assert!(coordinator.acquire(&lock_path).is_ok());
 
         let successful_attempt = coordinator.acquire(&lock_path).unwrap();
+        assert!(coordinator.blocks_shutdown());
         successful_attempt.hold_until_process_exit();
+        assert!(!coordinator.blocks_shutdown());
         let error = coordinator.acquire(&lock_path).unwrap_err();
         assert!(error.contains("already in progress"), "{error}");
 
@@ -1171,9 +1664,12 @@ mod tests {
         fs::write(&current_session, "current-before\n").unwrap();
         fs::write(&shared_session, "shared-before\n").unwrap();
         let current_backup =
-            create_backup(current.path(), backups.path(), "current-before-sync").unwrap();
+            create_session_backup(current.path(), backups.path(), "current-before-sync").unwrap();
         let shared_backup =
-            create_local_backup(shared.path(), backups.path(), "shared-before-sync").unwrap();
+            create_local_session_backup(shared.path(), backups.path(), "shared-before-sync")
+                .unwrap();
+        assert_eq!(current_backup.scope, BackupScope::Sessions);
+        assert_eq!(shared_backup.scope, BackupScope::Sessions);
 
         let concurrent_session = current.path().join("sessions/2026/07/13/concurrent.jsonl");
         fs::write(&concurrent_session, "created-while-sync-was-running\n").unwrap();

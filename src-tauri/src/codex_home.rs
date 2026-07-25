@@ -6,7 +6,7 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{codex_paths::resolve_user_codex_paths, file_ops::walk_jsonl_files};
+use crate::codex_paths::resolve_user_codex_paths;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -35,7 +35,6 @@ pub struct CodexHomeStatus {
     pub logs_db: FileStatus,
     pub codex_dev_db: FileStatus,
     pub sessions_dir: FileStatus,
-    pub session_jsonl_count: usize,
     pub auth_summary: Option<AuthSummary>,
 }
 
@@ -60,7 +59,6 @@ pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
         logs_db: file_status(&paths.logs_db),
         codex_dev_db: file_status(&home.join("sqlite").join("codex-dev.db")),
         sessions_dir: file_status(sessions_path),
-        session_jsonl_count: count_session_jsonl(sessions_path)?,
         auth_summary,
     })
 }
@@ -97,13 +95,6 @@ fn file_status(path: &Path) -> FileStatus {
     }
 }
 
-fn count_session_jsonl(sessions_path: &Path) -> Result<usize, String> {
-    if !sessions_path.exists() {
-        return Ok(0);
-    }
-    Ok(walk_jsonl_files(sessions_path)?.len())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -138,7 +129,6 @@ model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
         assert!(status.config_toml.exists);
         assert!(status.state_db.exists);
         assert_eq!(status.sqlite_home, home);
-        assert_eq!(status.session_jsonl_count, 1);
         assert_eq!(
             status.auth_summary.unwrap().auth_mode.as_deref(),
             Some("chatgpt")

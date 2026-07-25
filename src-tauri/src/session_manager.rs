@@ -13,8 +13,13 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    backup::{create_backup, create_local_backup, restore_backup, BackupManifest},
-    codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
+    backup::{
+        create_backup_with_paths, create_state_backup_with_paths, ensure_roots_disjoint,
+        restore_backup, BackupManifest,
+    },
+    codex_paths::{
+        local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
+    },
     file_ops::{atomic_write, walk_jsonl_files},
 };
 
@@ -243,15 +248,25 @@ fn delete_managed_sessions_inner(
 
     let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
     let mut result = empty_result(selected.len());
-    let current_backup = create_backup(codex_home, backup_root, "delete-sessions-current")
-        .map_err(SessionMutationFailure::before_backup)?;
-    let shared_backup = create_local_backup(shared_home, backup_root, "delete-sessions-shared")
-        .map_err(|message| SessionMutationFailure::new(message, vec![current_backup.clone()]))?;
+    let (current_paths, shared_paths) =
+        resolve_mutation_paths(codex_home, shared_home, backup_root)
+            .map_err(SessionMutationFailure::before_backup)?;
+    let current_backup = create_backup_with_paths(
+        codex_home,
+        backup_root,
+        "delete-sessions-current",
+        current_paths.clone(),
+    )
+    .map_err(SessionMutationFailure::before_backup)?;
+    let shared_backup = create_backup_with_paths(
+        shared_home,
+        backup_root,
+        "delete-sessions-shared",
+        shared_paths.clone(),
+    )
+    .map_err(|message| SessionMutationFailure::new(message, vec![current_backup.clone()]))?;
     result.backups = vec![current_backup.clone(), shared_backup.clone()];
 
-    let current_paths = resolve_user_codex_paths(codex_home)
-        .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
-    let shared_paths = local_codex_paths(shared_home);
     let backups = result.backups.clone();
     ensure_codex_still_closed("delete")
         .map_err(|message| SessionMutationFailure::new(message, backups.clone()))?;
@@ -313,12 +328,17 @@ pub fn restore_sessions_visible_detailed(
     }
     let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
     let mut result = empty_result(selected.len());
+    let paths =
+        resolve_user_codex_paths(codex_home).map_err(SessionMutationFailure::before_backup)?;
     result.backups.push(
-        create_backup(codex_home, backup_root, "restore-sessions-visible")
-            .map_err(SessionMutationFailure::before_backup)?,
+        create_state_backup_with_paths(
+            codex_home,
+            backup_root,
+            "restore-sessions-visible",
+            paths.clone(),
+        )
+        .map_err(SessionMutationFailure::before_backup)?,
     );
-    let paths = resolve_user_codex_paths(codex_home)
-        .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
     ensure_codex_still_closed("visibility restore")
         .map_err(|message| SessionMutationFailure::new(message, result.backups.clone()))?;
     result.restored_threads = restore_visible_in_db(&paths.state_db, &selected_set)
@@ -326,11 +346,48 @@ pub fn restore_sessions_visible_detailed(
     Ok(result)
 }
 
+fn resolve_mutation_paths(
+    codex_home: &Path,
+    shared_home: &Path,
+    backup_root: &Path,
+) -> Result<(CodexPaths, CodexPaths), String> {
+    validate_absolute_root(codex_home, "CODEX_HOME")?;
+    validate_absolute_root(shared_home, "shared session root")?;
+    validate_absolute_root(backup_root, "backup root")?;
+    let current_paths = resolve_user_codex_paths(codex_home)?;
+    let shared_paths = local_codex_paths(shared_home);
+    for (left, left_label, right, right_label) in [
+        (codex_home, "CODEX_HOME", shared_home, "shared session root"),
+        (codex_home, "CODEX_HOME", backup_root, "backup root"),
+        (
+            shared_home,
+            "shared session root",
+            backup_root,
+            "backup root",
+        ),
+        (
+            current_paths.sqlite_home.as_path(),
+            "SQLite root",
+            shared_home,
+            "shared session root",
+        ),
+        (
+            current_paths.sqlite_home.as_path(),
+            "SQLite root",
+            backup_root,
+            "backup root",
+        ),
+    ] {
+        ensure_roots_disjoint(left, left_label, right, right_label)?;
+    }
+    Ok((current_paths, shared_paths))
+}
+
 fn ensure_codex_still_closed(operation: &str) -> Result<(), String> {
     #[cfg(not(test))]
     if !crate::process_control::list_codex_processes()?.is_empty() {
         return Err(format!(
-            "Codex started during {operation} preflight; close it and retry before files are changed"
+            "ChatGPT started during {operation} preflight; close it and retry before files are changed"
         ));
     }
     let _ = operation;
@@ -424,10 +481,67 @@ fn apply_delete_to_root(
     result: &mut SessionMutationResult,
 ) -> Result<(), String> {
     result.deleted_threads += delete_db_rows(&paths.state_db, ids)?;
+    delete_auxiliary_db_rows(paths, ids)?;
     result.deleted_session_files += delete_session_files(paths, ids)?;
     result.removed_session_index_entries +=
         remove_session_index_entries(&paths.session_index, ids)?;
     Ok(())
+}
+
+fn delete_auxiliary_db_rows(paths: &CodexPaths, ids: &HashSet<String>) -> Result<(), String> {
+    delete_rows_in_database(
+        &paths.goals_db,
+        "goals_1.sqlite",
+        &[
+            ("thread_goal_continuation_deferrals", "thread_id"),
+            ("thread_goals", "thread_id"),
+        ],
+        ids,
+    )?;
+    delete_rows_in_database(
+        &paths.memories_db,
+        "memories_1.sqlite",
+        &[("stage1_outputs", "thread_id")],
+        ids,
+    )?;
+    delete_rows_in_database(
+        &paths.logs_db,
+        "logs_2.sqlite",
+        &[("logs", "thread_id")],
+        ids,
+    )
+}
+
+fn delete_rows_in_database(
+    path: &Path,
+    database_name: &str,
+    tables: &[(&str, &str)],
+    ids: &HashSet<String>,
+) -> Result<(), String> {
+    if !path.exists() || ids.is_empty() {
+        return Ok(());
+    }
+    let mut conn = Connection::open(path)
+        .map_err(|error| format!("failed to open {database_name}: {error}"))?;
+    conn.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("failed to configure {database_name} busy timeout: {error}"))?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin {database_name} delete transaction: {error}"))?;
+    let mut deleted = 0;
+    for (table, column) in tables {
+        delete_matching_rows(&transaction, table, &[(column, ids)], &mut deleted)?;
+    }
+    for (table, column) in tables {
+        if matching_row_count(&transaction, table, column, ids)? != 0 {
+            return Err(format!(
+                "failed to verify deleted session rows in {database_name}.{table}"
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit {database_name} delete transaction: {error}"))
 }
 
 fn delete_db_rows(path: &Path, ids: &HashSet<String>) -> Result<usize, String> {
@@ -467,6 +581,32 @@ fn delete_db_rows(path: &Path, ids: &HashSet<String>) -> Result<usize, String> {
         .commit()
         .map_err(|error| format!("failed to commit state_5.sqlite delete transaction: {error}"))?;
     Ok(deleted_threads)
+}
+
+fn matching_row_count(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ids: &HashSet<String>,
+) -> Result<usize, String> {
+    if !table_exists(conn, table)?
+        || !table_columns(conn, table)?
+            .iter()
+            .any(|existing| existing == column)
+        || ids.is_empty()
+    {
+        return Ok(0);
+    }
+    let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} IN ({placeholders})");
+    let count: i64 = conn
+        .query_row(
+            &sql,
+            params_from_iter(ids.iter().cloned().map(SqlValue::Text)),
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to verify {table} rows: {error}"))?;
+    usize::try_from(count).map_err(|_| format!("invalid row count returned by {table}"))
 }
 
 fn delete_matching_rows(
@@ -764,6 +904,8 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
+    use crate::backup::BackupScope;
+
     use super::{
         delete_db_rows, delete_managed_sessions, delete_managed_sessions_with_failure_detailed,
         restore_sessions_visible, restore_sessions_visible_detailed, scan_managed_sessions,
@@ -806,6 +948,51 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    fn create_auxiliary_dbs(home: &std::path::Path) {
+        let goals = Connection::open(home.join("goals_1.sqlite")).unwrap();
+        goals
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE thread_goals (
+                    thread_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL
+                 );
+                 CREATE TABLE thread_goal_continuation_deferrals (
+                    thread_id TEXT PRIMARY KEY REFERENCES thread_goals(thread_id) ON DELETE CASCADE
+                 );
+                 INSERT INTO thread_goals VALUES ('thread-a', 'goal-a');
+                 INSERT INTO thread_goals VALUES ('thread-b', 'goal-b');
+                 INSERT INTO thread_goal_continuation_deferrals VALUES ('thread-a');",
+            )
+            .unwrap();
+        let memories = Connection::open(home.join("memories_1.sqlite")).unwrap();
+        memories
+            .execute_batch(
+                "CREATE TABLE stage1_outputs (thread_id TEXT PRIMARY KEY, raw_memory TEXT);
+                 INSERT INTO stage1_outputs VALUES ('thread-a', 'a');
+                 INSERT INTO stage1_outputs VALUES ('thread-b', 'b');",
+            )
+            .unwrap();
+        let logs = Connection::open(home.join("logs_2.sqlite")).unwrap();
+        logs.execute_batch(
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT);
+             INSERT INTO logs VALUES (1, 'thread-a');
+             INSERT INTO logs VALUES (2, 'thread-b');",
+        )
+        .unwrap();
+    }
+
+    fn count_rows(path: &std::path::Path, table: &str, thread_id: &str) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
+                [thread_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -869,6 +1056,8 @@ mod tests {
             "{\"id\":\"thread-a\"}\n",
         )
         .unwrap();
+        create_auxiliary_dbs(current.path());
+        create_auxiliary_dbs(shared.path());
 
         let rejected = delete_managed_sessions(
             current.path(),
@@ -890,11 +1079,125 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.backups.len(), 2);
+        assert!(result
+            .backups
+            .iter()
+            .all(|backup| backup.scope == BackupScope::Full));
         assert_eq!(result.deleted_threads, 2);
         assert_eq!(result.deleted_session_files, 2);
         assert_eq!(result.removed_session_index_entries, 1);
         assert!(!current_jsonl.exists());
         assert!(!shared_jsonl.exists());
+        for home in [current.path(), shared.path()] {
+            for (database, table) in [
+                ("goals_1.sqlite", "thread_goals"),
+                ("memories_1.sqlite", "stage1_outputs"),
+                ("logs_2.sqlite", "logs"),
+            ] {
+                assert_eq!(count_rows(&home.join(database), table, "thread-a"), 0);
+                assert_eq!(count_rows(&home.join(database), table, "thread-b"), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn hard_delete_routes_all_sqlite_mutations_to_external_sqlite_home() {
+        let current = tempdir().unwrap();
+        let sqlite_home = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        fs::write(
+            current.path().join("config.toml"),
+            format!("sqlite_home = \"{}\"\n", sqlite_home.path().display()).replace('\\', "\\\\"),
+        )
+        .unwrap();
+        let current_jsonl = write_jsonl(current.path(), "thread-a");
+        create_db(
+            &sqlite_home.path().join("state_5.sqlite"),
+            &[("thread-a", current_jsonl.to_str().unwrap(), 1000, 0, "A")],
+        );
+        create_auxiliary_dbs(sqlite_home.path());
+
+        let result = delete_managed_sessions(
+            current.path(),
+            shared.path(),
+            backup.path(),
+            &["thread-a".to_string()],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.deleted_threads, 1);
+        assert!(!current_jsonl.exists());
+        for (database, table) in [
+            ("goals_1.sqlite", "thread_goals"),
+            ("memories_1.sqlite", "stage1_outputs"),
+            ("logs_2.sqlite", "logs"),
+        ] {
+            assert_eq!(
+                count_rows(&sqlite_home.path().join(database), table, "thread-a"),
+                0
+            );
+            assert_eq!(
+                count_rows(&sqlite_home.path().join(database), table, "thread-b"),
+                1
+            );
+            assert!(!current.path().join(database).exists());
+        }
+    }
+
+    #[test]
+    fn hard_delete_rejects_overlapping_external_sqlite_and_shared_roots() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        fs::write(
+            current.path().join("config.toml"),
+            format!("sqlite_home = \"{}\"\n", shared.path().display()).replace('\\', "\\\\"),
+        )
+        .unwrap();
+
+        let error = delete_managed_sessions(
+            current.path(),
+            shared.path(),
+            backup.path(),
+            &["thread-a".to_string()],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("must not overlap"));
+        assert_eq!(fs::read_dir(backup.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn hard_delete_tolerates_missing_auxiliary_tables() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        let current_jsonl = write_jsonl(current.path(), "thread-a");
+        create_db(
+            &current.path().join("state_5.sqlite"),
+            &[("thread-a", current_jsonl.to_str().unwrap(), 1000, 0, "A")],
+        );
+        for database in ["goals_1.sqlite", "memories_1.sqlite", "logs_2.sqlite"] {
+            Connection::open(current.path().join(database))
+                .unwrap()
+                .execute("CREATE TABLE unrelated (value TEXT)", [])
+                .unwrap();
+        }
+
+        let result = delete_managed_sessions(
+            current.path(),
+            shared.path(),
+            backup.path(),
+            &["thread-a".to_string()],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.deleted_threads, 1);
+        assert!(!current_jsonl.exists());
     }
 
     #[test]
@@ -912,6 +1215,12 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.backups.len(), 1);
+        assert_eq!(result.backups[0].scope, BackupScope::StateOnly);
+        assert_eq!(result.backups[0].tracked_databases, vec!["state_5.sqlite"]);
+        assert!(result.backups[0]
+            .files
+            .iter()
+            .all(|file| { file.relative_path == std::path::Path::new("state_5.sqlite") }));
         assert_eq!(result.restored_threads, 1);
         let conn = Connection::open(current.path().join("state_5.sqlite")).unwrap();
         let archived: i64 = conn
@@ -995,6 +1304,7 @@ mod tests {
             &shared.path().join("state_5.sqlite"),
             &[("thread-a", shared_jsonl.to_str().unwrap(), 1000, 0, "A")],
         );
+        create_auxiliary_dbs(current.path());
 
         let error = delete_managed_sessions_with_failure_detailed(
             current.path(),
@@ -1015,6 +1325,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        assert_eq!(
+            count_rows(
+                &current.path().join("memories_1.sqlite"),
+                "stage1_outputs",
+                "thread-a",
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn auxiliary_database_failure_restores_state_auxiliary_files_and_index() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        let current_jsonl = write_jsonl(current.path(), "thread-a");
+        let shared_jsonl = write_jsonl(shared.path(), "thread-a");
+        create_db(
+            &current.path().join("state_5.sqlite"),
+            &[("thread-a", current_jsonl.to_str().unwrap(), 1000, 0, "A")],
+        );
+        create_db(
+            &shared.path().join("state_5.sqlite"),
+            &[("thread-a", shared_jsonl.to_str().unwrap(), 1000, 0, "A")],
+        );
+        create_auxiliary_dbs(current.path());
+        create_auxiliary_dbs(shared.path());
+        fs::write(
+            current.path().join("session_index.jsonl"),
+            "{\"id\":\"thread-a\"}\n",
+        )
+        .unwrap();
+        Connection::open(current.path().join("memories_1.sqlite"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_memory_delete
+                 BEFORE DELETE ON stage1_outputs
+                 WHEN OLD.thread_id = 'thread-a'
+                 BEGIN SELECT RAISE(ABORT, 'stop'); END;",
+            )
+            .unwrap();
+
+        let error = delete_managed_sessions(
+            current.path(),
+            shared.path(),
+            backup.path(),
+            &["thread-a".to_string()],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rolled back both roots"));
+        assert!(current_jsonl.exists());
+        assert!(shared_jsonl.exists());
+        assert!(
+            fs::read_to_string(current.path().join("session_index.jsonl"))
+                .unwrap()
+                .contains("thread-a")
+        );
+        for home in [current.path(), shared.path()] {
+            let threads: i64 = Connection::open(home.join("state_5.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM threads WHERE id = 'thread-a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(threads, 1);
+            for (database, table) in [
+                ("goals_1.sqlite", "thread_goals"),
+                ("memories_1.sqlite", "stage1_outputs"),
+                ("logs_2.sqlite", "logs"),
+            ] {
+                assert_eq!(count_rows(&home.join(database), table, "thread-a"), 1);
+            }
+        }
     }
 
     #[test]

@@ -10,7 +10,11 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use walkdir::WalkDir;
 
-use crate::{crypto::protect, file_ops::atomic_write, operation_log::operation_id};
+use crate::{
+    crypto::{protect, unprotect},
+    file_ops::atomic_write,
+    operation_log::operation_id,
+};
 
 const PACKAGE_MANIFEST: &str = ".codex-switch-package.json";
 const PACKAGE_VERSION: &str = "2026.07.14";
@@ -93,6 +97,24 @@ struct StoredSkillConfig {
     base_url: String,
     model: String,
     credential_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct SkillConfigFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct SkillConfigPairSnapshot {
+    config: SkillConfigFileSnapshot,
+    credential: SkillConfigFileSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillConfigWritePhase {
+    Apply,
+    Rollback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +400,20 @@ pub fn save_skill_config_at(
     appdata: &Path,
     input: SkillConfigInput,
 ) -> Result<SkillMutationReceipt, String> {
+    save_skill_config_at_with(codex_home, appdata, input, |_, path, bytes| {
+        atomic_write(path, bytes)
+    })
+}
+
+fn save_skill_config_at_with<F>(
+    codex_home: &Path,
+    appdata: &Path,
+    input: SkillConfigInput,
+    mut write_file: F,
+) -> Result<SkillMutationReceipt, String>
+where
+    F: FnMut(SkillConfigWritePhase, &Path, &[u8]) -> Result<(), String>,
+{
     require_absolute_root(codex_home, "CODEX_HOME")?;
     require_absolute_root(appdata, "APPDATA")?;
     let package = package(input.skill_id);
@@ -392,15 +428,39 @@ pub fn save_skill_config_at(
 
     let base_url = normalize_provider_url(input.skill_id, &input.base_url)?;
     let config_root = config_root(appdata, package);
-    fs::create_dir_all(&config_root)
-        .map_err(|error| format!("failed to create the skill configuration directory: {error}"))?;
-    reject_reparse_tree(&config_root)?;
     let credential_path = config_root.join("credential.enc");
     let config_path = config_root.join("config.json");
+    let previous = snapshot_skill_config_pair(&config_path, &credential_path)?;
     let key = input.api_key.trim();
-    if key.is_empty() && !credential_path.is_file() {
-        return Err("API key is required for the first skill configuration".to_string());
-    }
+    let encoded_credential = if key.is_empty() {
+        let previous_config =
+            previous.config.contents.as_deref().ok_or_else(|| {
+                "API key is required for the first skill configuration".to_string()
+            })?;
+        let stored_previous: StoredSkillConfig =
+            serde_json::from_slice(previous_config).map_err(|_| {
+                "stored skill configuration is invalid; enter a new API key".to_string()
+            })?;
+        if stored_previous.credential_path != credential_path {
+            return Err("stored skill configuration is invalid; enter a new API key".to_string());
+        }
+        let previous_base_url = normalize_provider_url(input.skill_id, &stored_previous.base_url)
+            .map_err(|_| {
+            "stored skill configuration is invalid; enter a new API key".to_string()
+        })?;
+        if normalized_provider_origin(&previous_base_url)? != normalized_provider_origin(&base_url)?
+        {
+            return Err("API key is required when changing the service origin".to_string());
+        }
+        let previous_credential =
+            previous.credential.contents.as_ref().ok_or_else(|| {
+                "stored skill credential is invalid; enter a new API key".to_string()
+            })?;
+        validate_stored_skill_credential(previous_credential)?;
+        None
+    } else {
+        Some(BASE64.encode(protect(key.as_bytes())?).into_bytes())
+    };
 
     let stored = StoredSkillConfig {
         base_url,
@@ -410,23 +470,25 @@ pub fn save_skill_config_at(
     let mut config_bytes = serde_json::to_vec_pretty(&stored)
         .map_err(|error| format!("failed to serialize the skill configuration: {error}"))?;
     config_bytes.push(b'\n');
-    let encoded_credential = if key.is_empty() {
-        None
-    } else {
-        Some(BASE64.encode(protect(key.as_bytes())?))
-    };
-    let previous_config = fs::read(&config_path).ok();
-    atomic_write(&config_path, &config_bytes)?;
+    let expected_credential = encoded_credential
+        .as_deref()
+        .or(previous.credential.contents.as_deref())
+        .ok_or_else(|| "API key is required for the first skill configuration".to_string())?;
+    let operation_id = operation_id("configure-skill")?;
 
-    if let Some(encoded) = encoded_credential {
-        if let Err(error) = atomic_write(&credential_path, encoded.as_bytes()) {
-            restore_optional_file(&config_path, previous_config.as_deref());
-            return Err(error);
-        }
-    }
+    fs::create_dir_all(&config_root)
+        .map_err(|error| format!("failed to create the skill configuration directory: {error}"))?;
+    reject_reparse_tree(&config_root)?;
+    write_skill_config_pair_with(
+        &previous,
+        &config_bytes,
+        encoded_credential.as_deref(),
+        expected_credential,
+        &mut write_file,
+    )?;
 
     Ok(SkillMutationReceipt {
-        operation_id: operation_id("configure-skill")?,
+        operation_id,
         skill_id: input.skill_id,
         action: SkillMutationAction::Configure,
         installed_version: manifest.version,
@@ -435,6 +497,138 @@ pub fn save_skill_config_at(
         restart_required: true,
         warnings: Vec::new(),
     })
+}
+
+fn snapshot_skill_config_pair(
+    config_path: &Path,
+    credential_path: &Path,
+) -> Result<SkillConfigPairSnapshot, String> {
+    Ok(SkillConfigPairSnapshot {
+        config: snapshot_skill_config_file(config_path)?,
+        credential: snapshot_skill_config_file(credential_path)?,
+    })
+}
+
+fn snapshot_skill_config_file(path: &Path) -> Result<SkillConfigFileSnapshot, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("failed to snapshot skill configuration: {error}")),
+    };
+    Ok(SkillConfigFileSnapshot {
+        path: path.to_path_buf(),
+        contents,
+    })
+}
+
+fn write_skill_config_pair_with<F>(
+    previous: &SkillConfigPairSnapshot,
+    config_bytes: &[u8],
+    credential_update: Option<&[u8]>,
+    expected_credential: &[u8],
+    write_file: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(SkillConfigWritePhase, &Path, &[u8]) -> Result<(), String>,
+{
+    let result = (|| {
+        write_file(
+            SkillConfigWritePhase::Apply,
+            &previous.config.path,
+            config_bytes,
+        )?;
+        if let Some(credential) = credential_update {
+            write_file(
+                SkillConfigWritePhase::Apply,
+                &previous.credential.path,
+                credential,
+            )?;
+        }
+        verify_skill_config_file(&previous.config.path, config_bytes)?;
+        verify_skill_config_file(&previous.credential.path, expected_credential)
+    })();
+
+    if let Err(error) = result {
+        return match restore_skill_config_pair_with(previous, write_file) {
+            Ok(()) => Err(format!("{error}; rolled back previous skill configuration")),
+            Err(rollback_error) => Err(format!("{error}; rollback failed: {rollback_error}")),
+        };
+    }
+    Ok(())
+}
+
+fn restore_skill_config_pair_with<F>(
+    previous: &SkillConfigPairSnapshot,
+    write_file: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(SkillConfigWritePhase, &Path, &[u8]) -> Result<(), String>,
+{
+    let mut first_error = None;
+    for snapshot in [&previous.config, &previous.credential] {
+        let result = match snapshot.contents.as_deref() {
+            Some(contents) => write_file(SkillConfigWritePhase::Rollback, &snapshot.path, contents),
+            None => match fs::remove_file(&snapshot.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!(
+                    "failed to remove a new skill configuration file: {error}"
+                )),
+            },
+        };
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    for snapshot in [&previous.config, &previous.credential] {
+        if let Err(error) = verify_skill_config_snapshot(snapshot) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn verify_skill_config_snapshot(snapshot: &SkillConfigFileSnapshot) -> Result<(), String> {
+    match snapshot.contents.as_deref() {
+        Some(expected) => verify_skill_config_file(&snapshot.path, expected),
+        None => match snapshot.path.try_exists() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("new skill configuration file remained after rollback".to_string()),
+            Err(error) => Err(format!(
+                "failed to verify removed skill configuration file: {error}"
+            )),
+        },
+    }
+}
+
+fn verify_skill_config_file(path: &Path, expected: &[u8]) -> Result<(), String> {
+    match fs::read(path) {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err("skill configuration pair verification failed".to_string()),
+        Err(error) => Err(format!(
+            "failed to verify skill configuration pair: {error}"
+        )),
+    }
+}
+
+fn validate_stored_skill_credential(encoded: &[u8]) -> Result<(), String> {
+    let encoded = std::str::from_utf8(encoded)
+        .map(str::trim)
+        .map_err(|_| "stored skill credential is invalid; enter a new API key".to_string())?;
+    let protected = BASE64
+        .decode(encoded)
+        .map_err(|_| "stored skill credential is invalid; enter a new API key".to_string())?;
+    let plaintext = unprotect(&protected)
+        .map_err(|_| "stored skill credential is invalid; enter a new API key".to_string())?;
+    if std::str::from_utf8(&plaintext)
+        .ok()
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return Err("stored skill credential is invalid; enter a new API key".to_string());
+    }
+    Ok(())
 }
 
 fn scan_skill(
@@ -641,6 +835,29 @@ fn normalize_provider_url(skill_id: SkillId, value: &str) -> Result<String, Stri
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedProviderOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn normalized_provider_origin(value: &str) -> Result<NormalizedProviderOrigin, String> {
+    let url = Url::parse(value)
+        .map_err(|_| "stored skill configuration is invalid; enter a new API key".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "stored skill configuration is invalid; enter a new API key".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "stored skill configuration is invalid; enter a new API key".to_string())?;
+    Ok(NormalizedProviderOrigin {
+        scheme: url.scheme().to_ascii_lowercase(),
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
 fn is_loopback_host(host: Option<Host<&str>>) -> bool {
     match host {
         Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
@@ -664,7 +881,7 @@ fn package(id: SkillId) -> &'static SkillPackage {
     static GROK: SkillPackage = SkillPackage {
         id: SkillId::GrokSearch,
         display_name: "Grok 搜索",
-        description: "为 Codex 提供 Grok Web 与 X 实时搜索能力",
+        description: "为 ChatGPT 提供 Grok Web 与 X 实时搜索能力",
         folder_name: "grok-search",
         config_folder_name: "grok-search",
         default_base_url: "",
@@ -810,17 +1027,6 @@ fn remove_directory_if_present(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn restore_optional_file(path: &Path, previous: Option<&[u8]>) {
-    match previous {
-        Some(bytes) => {
-            let _ = atomic_write(path, bytes);
-        }
-        None => {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 fn reject_reparse_tree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -845,4 +1051,262 @@ fn has_reparse_attribute(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn has_reparse_attribute(_metadata: &fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use tempfile::tempdir;
+
+    use super::{
+        install_skill_at, package, save_skill_config_at, save_skill_config_at_with,
+        SkillConfigInput, SkillConfigWritePhase, SkillId, StoredSkillConfig,
+    };
+
+    #[test]
+    fn user_visible_skill_metadata_uses_chatgpt_brand() {
+        for skill_id in [SkillId::Image2, SkillId::GrokSearch] {
+            let skill = package(skill_id);
+            assert!(!skill.description.contains("Codex"));
+        }
+        assert_eq!(
+            package(SkillId::GrokSearch).description,
+            "为 ChatGPT 提供 Grok Web 与 X 实时搜索能力"
+        );
+    }
+
+    #[test]
+    fn blank_key_preserves_skill_credential_for_same_origin_path_change() {
+        let codex_home = tempdir().unwrap();
+        let appdata = tempdir().unwrap();
+        install_skill_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillId::GrokSearch,
+            false,
+        )
+        .unwrap();
+        save_skill_config_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://research.example.com/api".to_string(),
+                api_key: "sk-preserved".to_string(),
+            },
+        )
+        .unwrap();
+        let config_root = appdata.path().join("codex-switch/skills/grok-search");
+        let credential_path = config_root.join("credential.enc");
+        let before_credential = fs::read(&credential_path).unwrap();
+
+        save_skill_config_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://research.example.com/search".to_string(),
+                api_key: String::new(),
+            },
+        )
+        .unwrap();
+
+        let stored: StoredSkillConfig =
+            serde_json::from_slice(&fs::read(config_root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(stored.base_url, "https://research.example.com/search");
+        assert_eq!(fs::read(credential_path).unwrap(), before_credential);
+    }
+
+    #[test]
+    fn blank_key_rejects_skill_origin_changes_without_file_changes() {
+        for (old_url, new_url) in [
+            (
+                "https://research.example.com/api",
+                "https://other.example.com/api",
+            ),
+            (
+                "https://research.example.com/api",
+                "https://research.example.com:8443/api",
+            ),
+            ("https://localhost/api", "http://localhost/api"),
+        ] {
+            let codex_home = tempdir().unwrap();
+            let appdata = tempdir().unwrap();
+            install_skill_at(
+                codex_home.path(),
+                appdata.path(),
+                SkillId::GrokSearch,
+                false,
+            )
+            .unwrap();
+            save_skill_config_at(
+                codex_home.path(),
+                appdata.path(),
+                SkillConfigInput {
+                    skill_id: SkillId::GrokSearch,
+                    base_url: old_url.to_string(),
+                    api_key: "sk-preserved".to_string(),
+                },
+            )
+            .unwrap();
+            let config_root = appdata.path().join("codex-switch/skills/grok-search");
+            let config_path = config_root.join("config.json");
+            let credential_path = config_root.join("credential.enc");
+            let before_config = fs::read(&config_path).unwrap();
+            let before_credential = fs::read(&credential_path).unwrap();
+
+            let error = save_skill_config_at(
+                codex_home.path(),
+                appdata.path(),
+                SkillConfigInput {
+                    skill_id: SkillId::GrokSearch,
+                    base_url: new_url.to_string(),
+                    api_key: String::new(),
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.contains("API key is required"), "{error}");
+            assert!(!error.contains(old_url), "{error}");
+            assert!(!error.contains(new_url), "{error}");
+            assert_eq!(fs::read(config_path).unwrap(), before_config);
+            assert_eq!(fs::read(credential_path).unwrap(), before_credential);
+        }
+    }
+
+    #[test]
+    fn new_key_allows_skill_origin_change() {
+        let codex_home = tempdir().unwrap();
+        let appdata = tempdir().unwrap();
+        install_skill_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillId::GrokSearch,
+            false,
+        )
+        .unwrap();
+        save_skill_config_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://old.example.com/api".to_string(),
+                api_key: "sk-old".to_string(),
+            },
+        )
+        .unwrap();
+
+        save_skill_config_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://new.example.com/search".to_string(),
+                api_key: "sk-new".to_string(),
+            },
+        )
+        .unwrap();
+
+        let config_root = appdata.path().join("codex-switch/skills/grok-search");
+        let stored: StoredSkillConfig =
+            serde_json::from_slice(&fs::read(config_root.join("config.json")).unwrap()).unwrap();
+        let protected = BASE64
+            .decode(
+                fs::read_to_string(config_root.join("credential.enc"))
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap();
+        assert_eq!(stored.base_url, "https://new.example.com/search");
+        assert_eq!(crate::crypto::unprotect(&protected).unwrap(), b"sk-new");
+    }
+
+    #[test]
+    fn skill_config_write_failure_restores_pair_and_reports_rollback_failure() {
+        let codex_home = tempdir().unwrap();
+        let appdata = tempdir().unwrap();
+        install_skill_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillId::GrokSearch,
+            false,
+        )
+        .unwrap();
+        save_skill_config_at(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://old.example.com/api".to_string(),
+                api_key: "sk-old".to_string(),
+            },
+        )
+        .unwrap();
+        let config_root = appdata.path().join("codex-switch/skills/grok-search");
+        let config_path = config_root.join("config.json");
+        let credential_path = config_root.join("credential.enc");
+        let before_config = fs::read(&config_path).unwrap();
+        let before_credential = fs::read(&credential_path).unwrap();
+        let mut apply_failed = false;
+
+        let error = save_skill_config_at_with(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://new.example.com/search".to_string(),
+                api_key: "sk-new-secret-marker".to_string(),
+            },
+            |phase, path, bytes| {
+                if phase == SkillConfigWritePhase::Apply
+                    && path == credential_path.as_path()
+                    && !apply_failed
+                {
+                    apply_failed = true;
+                    Err("injected credential write failure".to_string())
+                } else {
+                    crate::file_ops::atomic_write(path, bytes)
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rolled back previous"), "{error}");
+        assert!(!error.contains("sk-new-secret-marker"), "{error}");
+        assert_eq!(fs::read(&config_path).unwrap(), before_config);
+        assert_eq!(fs::read(&credential_path).unwrap(), before_credential);
+
+        let mut apply_failed = false;
+        let error = save_skill_config_at_with(
+            codex_home.path(),
+            appdata.path(),
+            SkillConfigInput {
+                skill_id: SkillId::GrokSearch,
+                base_url: "https://new.example.com/search".to_string(),
+                api_key: "sk-new-secret-marker".to_string(),
+            },
+            |phase, path, bytes| {
+                if phase == SkillConfigWritePhase::Apply
+                    && path == credential_path.as_path()
+                    && !apply_failed
+                {
+                    apply_failed = true;
+                    Err("injected credential write failure".to_string())
+                } else if phase == SkillConfigWritePhase::Rollback && path == config_path.as_path()
+                {
+                    Err("injected config rollback failure".to_string())
+                } else {
+                    crate::file_ops::atomic_write(path, bytes)
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rollback failed"), "{error}");
+        assert!(!error.contains("sk-new-secret-marker"), "{error}");
+        assert_ne!(fs::read(&config_path).unwrap(), before_config);
+        assert_eq!(fs::read(&credential_path).unwrap(), before_credential);
+    }
 }

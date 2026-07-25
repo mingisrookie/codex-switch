@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     str::FromStr,
 };
 
@@ -15,19 +15,19 @@ pub struct CodexPaths {
     pub state_db: PathBuf,
     pub logs_db: PathBuf,
     pub goals_db: PathBuf,
+    pub memories_db: PathBuf,
     pub sessions_dir: PathBuf,
     pub session_index: PathBuf,
 }
 
 pub fn resolve_user_codex_paths(codex_home: &Path) -> Result<CodexPaths, String> {
-    let cwd = env::current_dir().unwrap_or_else(|_| codex_home.to_path_buf());
+    let codex_home = validate_absolute_root(codex_home, "CODEX_HOME")?;
     let sqlite_home = resolve_sqlite_home(
-        codex_home,
-        read_config_sqlite_home(codex_home)?,
+        &codex_home,
+        read_config_sqlite_home(&codex_home)?,
         env::var_os("CODEX_SQLITE_HOME"),
-        &cwd,
-    );
-    Ok(build_paths(codex_home, &sqlite_home))
+    )?;
+    Ok(build_paths(&codex_home, &sqlite_home))
 }
 
 pub fn local_codex_paths(codex_home: &Path) -> CodexPaths {
@@ -41,6 +41,7 @@ fn build_paths(codex_home: &Path, sqlite_home: &Path) -> CodexPaths {
         state_db: sqlite_home.join("state_5.sqlite"),
         logs_db: sqlite_home.join("logs_2.sqlite"),
         goals_db: sqlite_home.join("goals_1.sqlite"),
+        memories_db: sqlite_home.join("memories_1.sqlite"),
         sessions_dir: codex_home.join("sessions"),
         session_index: codex_home.join("session_index.jsonl"),
     }
@@ -72,36 +73,46 @@ fn resolve_sqlite_home(
     codex_home: &Path,
     configured: Option<PathBuf>,
     env_value: Option<OsString>,
-    cwd: &Path,
-) -> PathBuf {
+) -> Result<PathBuf, String> {
     if let Some(path) = configured {
-        return absolutize(path, cwd);
+        return validate_absolute_root(&path, "config.toml sqlite_home");
     }
     if let Some(raw) = env_value {
         let text = raw.to_string_lossy();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            return absolutize(PathBuf::from(trimmed), cwd);
+            return validate_absolute_root(&PathBuf::from(trimmed), "CODEX_SQLITE_HOME");
         }
     }
-    codex_home.to_path_buf()
+    Ok(codex_home.to_path_buf())
 }
 
-fn absolutize(path: PathBuf, cwd: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
+pub fn validate_absolute_root(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} must be an absolute path"));
     }
+    if path.file_name().is_none() {
+        return Err(format!("{label} must not be a filesystem root"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!("{label} must not contain relative path components"));
+    }
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
+    use std::path::Path;
     use tempfile::tempdir;
 
-    use super::{local_codex_paths, resolve_sqlite_home, resolve_user_codex_paths};
+    use super::{
+        local_codex_paths, resolve_sqlite_home, resolve_user_codex_paths, validate_absolute_root,
+    };
 
     #[test]
     fn config_sqlite_home_overrides_codex_home() {
@@ -120,18 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn env_sqlite_home_relative_path_resolves_from_cwd() {
+    fn env_sqlite_home_relative_path_is_rejected() {
         let home = tempdir().unwrap();
-        let cwd = tempdir().unwrap();
 
-        let resolved = resolve_sqlite_home(
-            home.path(),
-            None,
-            Some(OsString::from("sqlite-state")),
-            cwd.path(),
-        );
+        let error = resolve_sqlite_home(home.path(), None, Some(OsString::from("sqlite-state")))
+            .unwrap_err();
 
-        assert_eq!(resolved, cwd.path().join("sqlite-state"));
+        assert!(error.contains("absolute"));
     }
 
     #[test]
@@ -142,6 +148,7 @@ mod tests {
 
         assert_eq!(paths.sqlite_home, home.path());
         assert_eq!(paths.state_db, home.path().join("state_5.sqlite"));
+        assert_eq!(paths.memories_db, home.path().join("memories_1.sqlite"));
     }
 
     #[test]
@@ -152,5 +159,36 @@ mod tests {
         let error = resolve_user_codex_paths(home.path()).unwrap_err();
 
         assert!(error.contains("config.toml"));
+    }
+
+    #[test]
+    fn relative_codex_home_is_rejected() {
+        let error = resolve_user_codex_paths(Path::new(".codex")).unwrap_err();
+
+        assert!(error.contains("CODEX_HOME"));
+        assert!(error.contains("absolute"));
+    }
+
+    #[test]
+    fn parent_components_are_rejected() {
+        let error =
+            validate_absolute_root(Path::new(r"C:\Users\name\..\other"), "root").unwrap_err();
+
+        assert!(error.contains("relative path components"));
+    }
+
+    #[test]
+    fn filesystem_root_is_rejected() {
+        let root = tempdir()
+            .unwrap()
+            .path()
+            .ancestors()
+            .last()
+            .unwrap()
+            .to_path_buf();
+
+        let error = validate_absolute_root(&root, "root").unwrap_err();
+
+        assert!(error.contains("filesystem root"));
     }
 }

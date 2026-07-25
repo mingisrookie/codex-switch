@@ -15,7 +15,7 @@ use std::{
     process::Command,
     sync::{Mutex, OnceLock, TryLockError},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 const UPDATE_ASSET_NAME: &str = "codex-switch.exe";
@@ -25,11 +25,20 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATE_DIR_PREFIX: &str = "codex-switch-update-";
 const UPDATE_PLAN_SCHEMA: u32 = 1;
 const APPLY_UPDATE_ARG: &str = "--codex-switch-apply-update";
+const RECOVER_UPDATE_ARG: &str = "--codex-switch-recover-update";
 const UPDATE_COMPLETE_ARG: &str = "--codex-switch-update-complete";
 const UPDATE_ROLLED_BACK_ARG: &str = "--codex-switch-update-rolled-back";
 const STARTUP_ACK_NAME: &str = "startup-ack";
+const RECOVERY_READY_PREFIX: &str = "recovery-helper-ready-";
+const UPDATE_JOURNAL_NAME: &str = "update-journal.json";
+const UPDATE_JOURNAL_TEMP_NAME: &str = ".update-journal.tmp";
+const UPDATE_JOURNAL_SCHEMA: u32 = 1;
 const STARTUP_ACK_ATTEMPTS: usize = 150;
 const STARTUP_ACK_INTERVAL: Duration = Duration::from_millis(100);
+const HELPER_READY_ATTEMPTS: usize = 150;
+const LEGACY_HELPER_ACK_GRACE: Duration = Duration::from_secs(16);
+#[cfg(windows)]
+const CLEANUP_LEASE_TIMEOUT_MS: u32 = 30_000;
 
 static UPDATE_INSTALL_STARTED: Mutex<bool> = Mutex::new(false);
 static STARTUP_NOTICE: OnceLock<Option<UpdateStartupNotice>> = OnceLock::new();
@@ -82,14 +91,50 @@ struct ValidatedAsset {
 struct StartupUpdateContext {
     status: UpdateStartupStatus,
     staging_dir: PathBuf,
+    target_exe: PathBuf,
+    plan: UpdatePlan,
+    journal_present: bool,
     ack_path: PathBuf,
     ack_payload: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum UpdatePhase {
+    Prepared,
+    ParentStopped,
+    ReplacementReady,
+    BackupReady,
+    Activated,
+    Launching,
+    Acked,
+    RollingBack,
+    RolledBack,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct UpdateJournal {
+    schema_version: u32,
+    phase: UpdatePhase,
+    target_exe: PathBuf,
+    replacement_exe: PathBuf,
+    backup_exe: PathBuf,
+    expected_old_sha256: String,
+    expected_new_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchStatus {
     Updated,
     RolledBack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartupRecoveryAction {
+    Resume(StartupUpdateContext),
+    RestartHelper(UpdatePlan),
 }
 
 impl LaunchStatus {
@@ -128,14 +173,37 @@ pub fn process_startup_update_args() -> Option<i32> {
     let args = env::args_os().collect::<Vec<_>>();
     if args.len() == 3 && args[1] == APPLY_UPDATE_ARG {
         let manifest = PathBuf::from(&args[2]);
-        return Some(if run_update_helper(&manifest).is_ok() {
+        return Some(if run_update_helper(&manifest, None).is_ok() {
             0
         } else {
             1
         });
     }
+    if args.len() == 4 && args[1] == RECOVER_UPDATE_ARG {
+        let manifest = PathBuf::from(&args[2]);
+        let recovery_parent_pid = args[3].to_str()?.parse::<u32>().ok()?;
+        return Some(
+            if run_update_helper(&manifest, Some(recovery_parent_pid)).is_ok() {
+                0
+            } else {
+                1
+            },
+        );
+    }
 
-    let context = startup_context_from_args(&args, &env::current_exe().ok()?);
+    let current_exe = env::current_exe().ok()?;
+    let mut context = startup_context_from_args(&args, &current_exe);
+    if context.is_none() && args.len() == 1 {
+        match discover_interrupted_update(&current_exe) {
+            Some(StartupRecoveryAction::Resume(recovered)) => context = Some(recovered),
+            Some(StartupRecoveryAction::RestartHelper(plan)) => {
+                if restart_interrupted_update(&plan).is_ok() {
+                    return Some(0);
+                }
+            }
+            None => {}
+        }
+    }
     let notice = context.as_ref().map(|context| UpdateStartupNotice {
         status: context.status,
     });
@@ -149,7 +217,7 @@ pub fn acknowledge_update_startup() -> Result<(), String> {
         return Ok(());
     };
     write_startup_ack(&context)?;
-    schedule_staging_cleanup(context.staging_dir);
+    schedule_staging_cleanup(context);
     Ok(())
 }
 
@@ -218,12 +286,149 @@ fn validate_startup_context(
     if sha256_file(&running)? != expected_sha256.as_str() {
         return Err("the restarted executable does not match the expected update".to_string());
     }
+    let journal_path = staging_dir.join(UPDATE_JOURNAL_NAME);
+    let journal_present = journal_path.is_file();
+    if journal_present {
+        let journal: UpdateJournal = serde_json::from_slice(
+            &fs::read(&journal_path)
+                .map_err(|_| "failed to read the update startup journal".to_string())?,
+        )
+        .map_err(|_| "the update startup journal is invalid".to_string())?;
+        validate_journal(&plan, &journal)?;
+        validate_startup_journal_phase(status, journal.phase)?;
+    }
+    let ack_payload = startup_ack_payload(status, expected_sha256);
     Ok(StartupUpdateContext {
         status,
+        target_exe: target,
+        plan,
+        journal_present,
         ack_path: staging_dir.join(STARTUP_ACK_NAME),
-        ack_payload: startup_ack_payload(status, expected_sha256),
+        ack_payload,
         staging_dir,
     })
+}
+
+#[cfg(windows)]
+fn discover_interrupted_update(current_exe: &Path) -> Option<StartupRecoveryAction> {
+    let temp = fs::canonicalize(env::temp_dir()).ok()?;
+    let mut discovered = None;
+    for entry in fs::read_dir(&temp).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(UPDATE_DIR_PREFIX));
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !name_matches || !file_type.is_dir() {
+            continue;
+        }
+        let Ok(action) = recovery_action_from_staging(&entry.path(), current_exe) else {
+            continue;
+        };
+        if discovered.is_some() {
+            return None;
+        }
+        discovered = Some(action);
+    }
+    discovered
+}
+
+#[cfg(not(windows))]
+fn discover_interrupted_update(_current_exe: &Path) -> Option<StartupRecoveryAction> {
+    None
+}
+
+fn recovery_action_from_staging(
+    staging_dir: &Path,
+    current_exe: &Path,
+) -> Result<StartupRecoveryAction, String> {
+    let staging_dir = canonical_staging_dir(staging_dir)?;
+    let plan: UpdatePlan = serde_json::from_slice(
+        &fs::read(staging_dir.join("update-plan.json"))
+            .map_err(|_| "the interrupted update plan is missing".to_string())?,
+    )
+    .map_err(|_| "the interrupted update plan is invalid".to_string())?;
+    let planned_staging = canonical_staging_dir(&plan.staging_dir)?;
+    if !paths_equal(&planned_staging, &staging_dir) {
+        return Err("the interrupted update staging directory does not match the plan".to_string());
+    }
+    validate_update_plan(&plan, &plan.helper_exe)?;
+    let current = fs::canonicalize(current_exe)
+        .map_err(|_| "failed to resolve the interrupted update target".to_string())?;
+    let target = fs::canonicalize(&plan.target_exe)
+        .map_err(|_| "the interrupted update target is missing".to_string())?;
+    if !paths_equal(&current, &target) {
+        return Err("the interrupted update belongs to another executable".to_string());
+    }
+    let journal: UpdateJournal = serde_json::from_slice(
+        &fs::read(staging_dir.join(UPDATE_JOURNAL_NAME))
+            .map_err(|_| "the interrupted update journal is missing".to_string())?,
+    )
+    .map_err(|_| "the interrupted update journal is invalid".to_string())?;
+    validate_journal(&plan, &journal)?;
+
+    let target_hash = sha256_file(&target)?;
+    if target_hash == plan.expected_new_sha256 {
+        if matches!(
+            journal.phase,
+            UpdatePhase::BackupReady
+                | UpdatePhase::Activated
+                | UpdatePhase::Launching
+                | UpdatePhase::Acked
+                | UpdatePhase::Complete
+        ) {
+            return validate_startup_context(&staging_dir, UpdateStartupStatus::Updated, &current)
+                .map(StartupRecoveryAction::Resume);
+        }
+        if journal.phase == UpdatePhase::RollingBack {
+            return Ok(StartupRecoveryAction::RestartHelper(plan));
+        }
+        return Err("the interrupted update phase does not match the installed executable".into());
+    }
+    if target_hash == plan.expected_old_sha256 {
+        if journal.phase == UpdatePhase::RolledBack {
+            return validate_startup_context(
+                &staging_dir,
+                UpdateStartupStatus::RolledBack,
+                &current,
+            )
+            .map(StartupRecoveryAction::Resume);
+        }
+        if !matches!(journal.phase, UpdatePhase::Acked | UpdatePhase::Complete) {
+            return Ok(StartupRecoveryAction::RestartHelper(plan));
+        }
+        return Err("the interrupted update phase does not match the installed executable".into());
+    }
+    Err("the interrupted update target hash is invalid".to_string())
+}
+
+#[cfg(windows)]
+fn restart_interrupted_update(plan: &UpdatePlan) -> Result<(), String> {
+    let recovery_parent_pid = std::process::id();
+    let ready_path = helper_ready_path(&plan.staging_dir, Some(recovery_parent_pid));
+    match fs::remove_file(&ready_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("failed to reset the recovery helper readiness".to_string()),
+    }
+    let manifest_path = plan.staging_dir.join("update-plan.json");
+    let mut helper = Command::new(&plan.helper_exe)
+        .arg(RECOVER_UPDATE_ARG)
+        .arg(&manifest_path)
+        .arg(recovery_parent_pid.to_string())
+        .spawn()
+        .map_err(|_| "failed to restart the interrupted update helper".to_string())?;
+    wait_for_helper_ready(&mut helper, &ready_path)
+}
+
+#[cfg(not(windows))]
+fn restart_interrupted_update(_plan: &UpdatePlan) -> Result<(), String> {
+    Err("self-update is not available on this platform".to_string())
 }
 
 fn startup_ack_payload(status: UpdateStartupStatus, expected_sha256: &str) -> String {
@@ -234,10 +439,43 @@ fn startup_ack_payload(status: UpdateStartupStatus, expected_sha256: &str) -> St
     format!("codex-switch-update-ack-v1\n{status}\n{expected_sha256}\n")
 }
 
+fn validate_startup_journal_phase(
+    status: UpdateStartupStatus,
+    phase: UpdatePhase,
+) -> Result<(), String> {
+    let matches_status = match status {
+        UpdateStartupStatus::Updated => matches!(
+            phase,
+            UpdatePhase::BackupReady
+                | UpdatePhase::Activated
+                | UpdatePhase::Launching
+                | UpdatePhase::Acked
+                | UpdatePhase::Complete
+        ),
+        UpdateStartupStatus::RolledBack => {
+            matches!(phase, UpdatePhase::RollingBack | UpdatePhase::RolledBack)
+        }
+    };
+    if matches_status {
+        Ok(())
+    } else {
+        Err("the update startup journal phase does not match the status".to_string())
+    }
+}
+
 fn write_startup_ack(context: &StartupUpdateContext) -> Result<(), String> {
     let staging_dir = canonical_staging_dir(&context.staging_dir)?;
     if !paths_equal(&context.ack_path, &staging_dir.join(STARTUP_ACK_NAME)) {
         return Err("the update startup acknowledgement path is unsafe".to_string());
+    }
+    if context.ack_path.exists() {
+        return if fs::read(&context.ack_path)
+            .is_ok_and(|payload| payload == context.ack_payload.as_bytes())
+        {
+            Ok(())
+        } else {
+            Err("the update startup acknowledgement is invalid".to_string())
+        };
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -263,16 +501,19 @@ fn prepare_update() -> Result<UpdateInstallReceipt, String> {
         .map_err(|_| "failed to resolve the running executable".to_string())?;
     preflight_target(&target_exe)?;
     let old_sha256 = sha256_file(&target_exe)?;
-    let staging_dir = create_staging_dir()?;
+    let (staging_dir, staging_guard) = create_staging_dir()?;
     let staged_exe = staging_dir.join("downloaded.exe");
     let helper_exe = staging_dir.join("updater-helper.exe");
     let manifest_path = staging_dir.join("update-plan.json");
-    let ready_path = staging_dir.join("helper-ready");
+    let ready_path = helper_ready_path(&staging_dir, None);
 
     let result = (|| {
         download_asset(&asset, &staged_exe)?;
-        fs::copy(&target_exe, &helper_exe)
-            .map_err(|_| "failed to stage the update helper".to_string())?;
+        copy_file_synced(
+            &target_exe,
+            &helper_exe,
+            "failed to stage the update helper",
+        )?;
         if sha256_file(&helper_exe)? != old_sha256 {
             return Err("staged update helper verification failed".to_string());
         }
@@ -304,6 +545,7 @@ fn prepare_update() -> Result<UpdateInstallReceipt, String> {
         })
     })();
 
+    drop(staging_guard);
     if result.is_err() {
         let _ = remove_staging_dir(&staging_dir);
     }
@@ -366,7 +608,7 @@ fn preflight_target(target_exe: &Path) -> Result<(), String> {
     let probe = parent.join(format!(
         ".codex-switch-update-probe-{}-{}",
         std::process::id(),
-        timestamp_nanos()
+        secure_random_hex()?
     ));
     let file = OpenOptions::new()
         .write(true)
@@ -378,15 +620,252 @@ fn preflight_target(target_exe: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn create_staging_dir() -> Result<PathBuf, String> {
+fn create_staging_dir() -> Result<(PathBuf, StagingGuard), String> {
+    let elevated = process_is_elevated()?;
+    let random = secure_random_hex()?;
     let path = env::temp_dir().join(format!(
-        "{UPDATE_DIR_PREFIX}{}-{}",
-        std::process::id(),
-        timestamp_nanos()
+        "{UPDATE_DIR_PREFIX}{}-{random}",
+        std::process::id()
     ));
-    fs::create_dir(&path)
-        .map_err(|_| "failed to create the update staging directory".to_string())?;
-    canonical_staging_dir(&path)
+    create_staging_directory_with_restricted_dacl(&path, elevated)?;
+    let canonical = canonical_staging_dir(&path)?;
+    let guard = StagingGuard::open(&canonical)?;
+    Ok((canonical, guard))
+}
+
+#[cfg(windows)]
+fn process_is_elevated() -> Result<bool, String> {
+    use std::{ffi::c_void, mem::size_of, ptr};
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err("failed to inspect the update process security context".to_string());
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    if result == 0 || returned != size_of::<TOKEN_ELEVATION>() as u32 {
+        return Err("failed to inspect the update process elevation".to_string());
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+#[cfg(windows)]
+fn secure_random_hex() -> Result<String, String> {
+    use std::ptr;
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+
+    let mut bytes = [0u8; 16];
+    if unsafe {
+        BCryptGenRandom(
+            ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    } < 0
+    {
+        return Err("failed to create a secure update staging name".to_string());
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(windows)]
+fn staging_sddl(elevated: bool) -> &'static str {
+    if elevated {
+        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    } else {
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"
+    }
+}
+
+#[cfg(windows)]
+fn create_staging_directory_with_restricted_dacl(
+    path: &Path,
+    elevated: bool,
+) -> Result<(), String> {
+    use std::{ffi::c_void, mem::size_of, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree, Security::SECURITY_ATTRIBUTES, Storage::FileSystem::CreateDirectoryW,
+    };
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+    }
+
+    let sddl = staging_sddl(elevated)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err("failed to create the update staging security descriptor".to_string());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if created == 0 {
+        return Err("failed to create the protected update staging directory".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct StagingGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl StagingGuard {
+    fn open(path: &Path) -> Result<Self, String> {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            },
+        };
+
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err("failed to lock the update staging directory".to_string());
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct UpdateLease {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl UpdateLease {
+    fn acquire(target: &Path, timeout_ms: u32) -> Result<Self, String> {
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{CreateMutexW, WaitForSingleObject},
+        };
+
+        let name = lease_name_for_target(target)?
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err("failed to create the update target lease".to_string());
+        }
+        match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle }),
+            WAIT_TIMEOUT => {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                Err("another process is already updating this executable".to_string())
+            }
+            _ => {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                Err("failed to acquire the update target lease".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UpdateLease {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+        unsafe {
+            ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lease_name_for_target(target: &Path) -> Result<String, String> {
+    let canonical = fs::canonicalize(target)
+        .map_err(|_| "failed to resolve the update lease target".to_string())?;
+    let normalized = canonical
+        .as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    Ok(format!("Global\\CodexSwitchUpdate-{:x}", hasher.finalize()))
 }
 
 #[cfg(windows)]
@@ -499,10 +978,10 @@ fn write_update_plan(path: &Path, plan: &UpdatePlan) -> Result<(), String> {
         .map_err(|_| "failed to persist the update plan".to_string())
 }
 
-fn run_update_helper(manifest_path: &Path) -> Result<(), String> {
+fn run_update_helper(manifest_path: &Path, recovery_parent_pid: Option<u32>) -> Result<(), String> {
     #[cfg(not(windows))]
     {
-        let _ = manifest_path;
+        let _ = (manifest_path, recovery_parent_pid);
         Err("self-update is not available on this platform".to_string())
     }
     #[cfg(windows)]
@@ -515,10 +994,73 @@ fn run_update_helper(manifest_path: &Path) -> Result<(), String> {
             .and_then(fs::canonicalize)
             .map_err(|_| "failed to resolve the update helper".to_string())?;
         validate_update_plan(&plan, &helper_exe)?;
-        let waiter = ParentProcessWaiter::open(plan.parent_pid)?;
-        write_helper_ready(&plan.staging_dir.join("helper-ready"))?;
-        apply_validated_update_plan_with(&plan, || waiter.wait(), launch_and_confirm)
+        let _staging_guard = StagingGuard::open(&plan.staging_dir)?;
+        let _lease = UpdateLease::acquire(&plan.target_exe, 0)?;
+        let journal =
+            load_helper_journal_with(&plan, recovery_parent_pid.is_none(), fetch_latest_release)?;
+        let ready_path = helper_ready_path(&plan.staging_dir, recovery_parent_pid);
+
+        if let Some(recovery_parent_pid) = recovery_parent_pid {
+            let waiter = ParentProcessWaiter::open(recovery_parent_pid)?;
+            write_helper_ready(&ready_path)?;
+            waiter.wait()?;
+            return apply_validated_update_plan_with(&plan, || Ok(()), launch_and_confirm);
+        }
+
+        let waiter = if journal.phase == UpdatePhase::Prepared {
+            Some(ParentProcessWaiter::open(plan.parent_pid)?)
+        } else {
+            None
+        };
+        write_helper_ready(&ready_path)?;
+        apply_validated_update_plan_with(
+            &plan,
+            || match waiter {
+                Some(waiter) => waiter.wait(),
+                None => Ok(()),
+            },
+            launch_and_confirm,
+        )
     }
+}
+
+fn load_helper_journal_with<F>(
+    plan: &UpdatePlan,
+    create_if_missing: bool,
+    fetch_release: F,
+) -> Result<UpdateJournal, String>
+where
+    F: FnOnce() -> Result<ReleaseCandidate, String>,
+{
+    if plan.staging_dir.join(UPDATE_JOURNAL_NAME).exists() {
+        return load_or_create_journal(plan);
+    }
+    if !create_if_missing {
+        return Err("the interrupted update journal is missing".to_string());
+    }
+    validate_plan_release_binding(plan, &fetch_release()?)?;
+    load_or_create_journal(plan)
+}
+
+fn validate_plan_release_binding(
+    plan: &UpdatePlan,
+    release: &ReleaseCandidate,
+) -> Result<(), String> {
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| "current application version is invalid".to_string())?;
+    if release.version <= current {
+        return Err("the update plan is not bound to a newer GitHub release".to_string());
+    }
+    let asset = select_update_asset(release)?;
+    if asset.sha256 != plan.expected_new_sha256
+        || fs::metadata(&plan.staged_exe)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default()
+            != asset.size
+    {
+        return Err("the update plan does not match the current GitHub release".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -545,7 +1087,271 @@ where
     W: FnOnce() -> Result<(), String>,
     L: FnMut(&Path, LaunchStatus, &Path, &str) -> Result<(), String>,
 {
-    wait_for_parent()?;
+    let mut journal = load_or_create_journal(plan)?;
+    if journal.phase == UpdatePhase::Prepared {
+        wait_for_parent()?;
+        persist_phase(plan, &mut journal, UpdatePhase::ParentStopped)?;
+    }
+
+    let mut updated_launch_completed = false;
+    let mut old_launch_completed = false;
+    let result = (|| {
+        let target_hash = sha256_file(&plan.target_exe)?;
+        if target_hash != plan.expected_old_sha256 && target_hash != plan.expected_new_sha256 {
+            return Err("the installed executable changed before update".to_string());
+        }
+
+        match journal.phase {
+            UpdatePhase::Complete => {
+                if target_hash == plan.expected_new_sha256 {
+                    return Ok(());
+                }
+                return Err("the completed update target is invalid".to_string());
+            }
+            UpdatePhase::RolledBack => {
+                if target_hash == plan.expected_old_sha256 {
+                    return Err("the update was rolled back".to_string());
+                }
+                return Err("the rolled back update target is invalid".to_string());
+            }
+            UpdatePhase::RollingBack => {
+                finish_rollback(plan, &mut journal, &mut launch)?;
+                old_launch_completed = true;
+                return Err("the interrupted update was rolled back".to_string());
+            }
+            UpdatePhase::Launching => {
+                if target_hash == plan.expected_new_sha256
+                    && startup_ack_matches(
+                        plan,
+                        UpdateStartupStatus::Updated,
+                        &plan.expected_new_sha256,
+                    )
+                {
+                    updated_launch_completed = true;
+                    persist_phase(plan, &mut journal, UpdatePhase::Acked)?;
+                    finalize_success(plan, &mut journal)?;
+                    return Ok(());
+                }
+                finish_rollback(plan, &mut journal, &mut launch)?;
+                old_launch_completed = true;
+                return Err("the interrupted update was rolled back".to_string());
+            }
+            UpdatePhase::Acked => {
+                if target_hash != plan.expected_new_sha256 {
+                    return Err("the acknowledged update target is invalid".to_string());
+                }
+                updated_launch_completed = true;
+                finalize_success(plan, &mut journal)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if target_hash == plan.expected_old_sha256 {
+            prepare_replacement_and_backup(plan, &mut journal)?;
+            atomic_replace_file(
+                &journal.replacement_exe,
+                &plan.target_exe,
+                "failed to activate the replacement executable",
+            )?;
+            if sha256_file(&plan.target_exe)? != plan.expected_new_sha256 {
+                return Err("activated replacement executable verification failed".to_string());
+            }
+            persist_phase(plan, &mut journal, UpdatePhase::Activated)?;
+        } else if journal.phase != UpdatePhase::Activated {
+            persist_phase(plan, &mut journal, UpdatePhase::Activated)?;
+        }
+
+        persist_phase(plan, &mut journal, UpdatePhase::Launching)?;
+        match launch(
+            &plan.target_exe,
+            LaunchStatus::Updated,
+            &plan.staging_dir,
+            &plan.expected_new_sha256,
+        ) {
+            Ok(()) => {
+                updated_launch_completed = true;
+                persist_phase(plan, &mut journal, UpdatePhase::Acked)?;
+                finalize_success(plan, &mut journal)
+            }
+            Err(error) => {
+                finish_rollback(plan, &mut journal, &mut launch)?;
+                old_launch_completed = true;
+                Err(error)
+            }
+        }
+    })();
+
+    if result.is_err() && !updated_launch_completed && !old_launch_completed {
+        let _ = emergency_restore_and_launch(plan, &mut journal, &mut launch);
+    }
+    result
+}
+
+fn prepare_replacement_and_backup(
+    plan: &UpdatePlan,
+    journal: &mut UpdateJournal,
+) -> Result<(), String> {
+    ensure_synced_copy(
+        &plan.staged_exe,
+        &journal.replacement_exe,
+        &plan.expected_new_sha256,
+        "failed to create the replacement executable",
+    )?;
+    persist_phase(plan, journal, UpdatePhase::ReplacementReady)?;
+    ensure_synced_copy(
+        &plan.target_exe,
+        &journal.backup_exe,
+        &plan.expected_old_sha256,
+        "failed to persist the previous executable",
+    )?;
+    persist_phase(plan, journal, UpdatePhase::BackupReady)
+}
+
+fn finalize_success(plan: &UpdatePlan, journal: &mut UpdateJournal) -> Result<(), String> {
+    if sha256_file(&plan.target_exe)? != plan.expected_new_sha256 {
+        return Err("the updated executable changed before cleanup".to_string());
+    }
+    remove_verified_file(
+        &journal.backup_exe,
+        &plan.expected_old_sha256,
+        "the update backup is invalid",
+    )?;
+    remove_verified_file(
+        &journal.replacement_exe,
+        &plan.expected_new_sha256,
+        "the update replacement is invalid",
+    )?;
+    persist_phase(plan, journal, UpdatePhase::Complete)
+}
+
+fn finish_rollback<L>(
+    plan: &UpdatePlan,
+    journal: &mut UpdateJournal,
+    launch: &mut L,
+) -> Result<(), String>
+where
+    L: FnMut(&Path, LaunchStatus, &Path, &str) -> Result<(), String>,
+{
+    persist_phase(plan, journal, UpdatePhase::RollingBack)?;
+    let target_hash = sha256_file(&plan.target_exe)?;
+    if target_hash == plan.expected_new_sha256 {
+        if sha256_file(&journal.backup_exe)? != plan.expected_old_sha256 {
+            return Err("update failed and the previous executable backup is invalid".to_string());
+        }
+        atomic_replace_file(
+            &journal.backup_exe,
+            &plan.target_exe,
+            "update failed and the previous executable could not be restored",
+        )?;
+    } else if target_hash != plan.expected_old_sha256 {
+        return Err("update failed and the installed executable is invalid".to_string());
+    }
+    if sha256_file(&plan.target_exe)? != plan.expected_old_sha256 {
+        return Err("update failed and the restored executable is invalid".to_string());
+    }
+    if !startup_ack_matches(
+        plan,
+        UpdateStartupStatus::RolledBack,
+        &plan.expected_old_sha256,
+    ) {
+        launch(
+            &plan.target_exe,
+            LaunchStatus::RolledBack,
+            &plan.staging_dir,
+            &plan.expected_old_sha256,
+        )
+        .map_err(|_| "update failed and the restored version could not restart".to_string())?;
+    }
+    persist_phase(plan, journal, UpdatePhase::RolledBack)?;
+    remove_verified_file(
+        &journal.replacement_exe,
+        &plan.expected_new_sha256,
+        "the update replacement is invalid",
+    )
+}
+
+fn emergency_restore_and_launch<L>(
+    plan: &UpdatePlan,
+    journal: &mut UpdateJournal,
+    launch: &mut L,
+) -> Result<(), String>
+where
+    L: FnMut(&Path, LaunchStatus, &Path, &str) -> Result<(), String>,
+{
+    let target_hash = sha256_file(&plan.target_exe)?;
+    let _ = persist_phase(plan, journal, UpdatePhase::RollingBack);
+    if target_hash == plan.expected_new_sha256 {
+        if sha256_file(&journal.backup_exe)? != plan.expected_old_sha256 {
+            return Err("the emergency update backup is invalid".to_string());
+        }
+        atomic_replace_file(
+            &journal.backup_exe,
+            &plan.target_exe,
+            "failed to perform the emergency update rollback",
+        )?;
+    } else if target_hash != plan.expected_old_sha256 {
+        return Err("the emergency update target is invalid".to_string());
+    }
+    if sha256_file(&plan.target_exe)? != plan.expected_old_sha256 {
+        return Err("the emergency restored executable is invalid".to_string());
+    }
+    if !startup_ack_matches(
+        plan,
+        UpdateStartupStatus::RolledBack,
+        &plan.expected_old_sha256,
+    ) {
+        launch(
+            &plan.target_exe,
+            LaunchStatus::RolledBack,
+            &plan.staging_dir,
+            &plan.expected_old_sha256,
+        )?;
+    }
+    let _ = persist_phase(plan, journal, UpdatePhase::RolledBack);
+    Ok(())
+}
+
+fn load_or_create_journal(plan: &UpdatePlan) -> Result<UpdateJournal, String> {
+    let path = plan.staging_dir.join(UPDATE_JOURNAL_NAME);
+    if path.exists() {
+        let journal: UpdateJournal = serde_json::from_slice(
+            &fs::read(&path).map_err(|_| "failed to read the update journal".to_string())?,
+        )
+        .map_err(|_| "the update journal is invalid".to_string())?;
+        validate_journal(plan, &journal)?;
+        return Ok(journal);
+    }
+
+    let (replacement_exe, backup_exe) = update_artifact_paths(plan)?;
+    let journal = UpdateJournal {
+        schema_version: UPDATE_JOURNAL_SCHEMA,
+        phase: UpdatePhase::Prepared,
+        target_exe: plan.target_exe.clone(),
+        replacement_exe,
+        backup_exe,
+        expected_old_sha256: plan.expected_old_sha256.clone(),
+        expected_new_sha256: plan.expected_new_sha256.clone(),
+    };
+    write_update_journal(plan, &journal)?;
+    Ok(journal)
+}
+
+fn validate_journal(plan: &UpdatePlan, journal: &UpdateJournal) -> Result<(), String> {
+    let (replacement_exe, backup_exe) = update_artifact_paths(plan)?;
+    if journal.schema_version != UPDATE_JOURNAL_SCHEMA
+        || !paths_equal(&journal.target_exe, &plan.target_exe)
+        || !paths_equal(&journal.replacement_exe, &replacement_exe)
+        || !paths_equal(&journal.backup_exe, &backup_exe)
+        || journal.expected_old_sha256 != plan.expected_old_sha256
+        || journal.expected_new_sha256 != plan.expected_new_sha256
+    {
+        return Err("the update journal does not match the update plan".to_string());
+    }
+    Ok(())
+}
+
+fn update_artifact_paths(plan: &UpdatePlan) -> Result<(PathBuf, PathBuf), String> {
     let target_parent = plan
         .target_exe
         .parent()
@@ -555,63 +1361,136 @@ where
         .file_name()
         .ok_or_else(|| "the update target filename is invalid".to_string())?
         .to_string_lossy();
-    let suffix = format!("{}-{}", plan.parent_pid, timestamp_nanos());
-    let replacement = target_parent.join(format!(".{target_name}.update-new-{suffix}"));
-    let backup = target_parent.join(format!(".{target_name}.update-backup-{suffix}"));
+    let mut hasher = Sha256::new();
+    hasher.update(plan.staging_dir.as_os_str().to_string_lossy().as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    let suffix = &key[..16];
+    Ok((
+        target_parent.join(format!(".{target_name}.update-new-{suffix}")),
+        target_parent.join(format!(".{target_name}.update-backup-{suffix}")),
+    ))
+}
 
-    let mut fallback_launched = false;
-    let result = (|| {
-        if sha256_file(&plan.target_exe)? != plan.expected_old_sha256 {
-            return Err("the installed executable changed before update".to_string());
-        }
-        fs::copy(&plan.staged_exe, &replacement)
-            .map_err(|_| "failed to create the replacement executable".to_string())?;
-        if sha256_file(&replacement)? != plan.expected_new_sha256 {
-            return Err("replacement executable verification failed".to_string());
-        }
-        fs::rename(&plan.target_exe, &backup)
-            .map_err(|_| "failed to back up the installed executable".to_string())?;
-        if fs::rename(&replacement, &plan.target_exe).is_err() {
-            let _ = fs::rename(&backup, &plan.target_exe);
-            return Err("failed to activate the replacement executable".to_string());
-        }
-        if let Err(error) = launch(
-            &plan.target_exe,
-            LaunchStatus::Updated,
-            &plan.staging_dir,
-            &plan.expected_new_sha256,
-        ) {
-            rollback_executable(&plan.target_exe, &backup)?;
-            launch(
-                &plan.target_exe,
-                LaunchStatus::RolledBack,
-                &plan.staging_dir,
-                &plan.expected_old_sha256,
-            )
-            .map_err(|_| "update failed and the restored version could not restart".to_string())?;
-            fallback_launched = true;
-            return Err(error);
-        }
-        fs::remove_file(&backup).map_err(|_| {
-            "updated successfully but failed to remove the old executable".to_string()
-        })?;
-        Ok(())
-    })();
+fn persist_phase(
+    plan: &UpdatePlan,
+    journal: &mut UpdateJournal,
+    phase: UpdatePhase,
+) -> Result<(), String> {
+    journal.phase = phase;
+    write_update_journal(plan, journal)
+}
 
-    if result.is_err() {
-        let _ = fs::remove_file(&replacement);
-        let target_is_expected_old = plan.target_exe.exists()
-            && sha256_file(&plan.target_exe).is_ok_and(|hash| hash == plan.expected_old_sha256);
-        if !fallback_launched && target_is_expected_old && !backup.exists() {
-            let _ = launch(
-                &plan.target_exe,
-                LaunchStatus::RolledBack,
-                &plan.staging_dir,
-                &plan.expected_old_sha256,
-            );
-        }
+fn write_update_journal(plan: &UpdatePlan, journal: &UpdateJournal) -> Result<(), String> {
+    validate_journal(plan, journal)?;
+    let payload = serde_json::to_vec(journal)
+        .map_err(|_| "failed to encode the update journal".to_string())?;
+    let temporary = plan.staging_dir.join(UPDATE_JOURNAL_TEMP_NAME);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("failed to reset the update journal transaction".to_string()),
     }
-    result
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| "failed to create the update journal transaction".to_string())?;
+    file.write_all(&payload)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "failed to persist the update journal transaction".to_string())?;
+    drop(file);
+    atomic_replace_file(
+        &temporary,
+        &plan.staging_dir.join(UPDATE_JOURNAL_NAME),
+        "failed to commit the update journal",
+    )
+}
+
+fn ensure_synced_copy(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+    error: &str,
+) -> Result<(), String> {
+    if destination.exists() {
+        if sha256_file(destination)? == expected_sha256 {
+            return Ok(());
+        }
+        return Err(error.to_string());
+    }
+    copy_file_synced(source, destination, error)?;
+    if sha256_file(destination)? != expected_sha256 {
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn copy_file_synced(source: &Path, destination: &Path, error: &str) -> Result<(), String> {
+    let mut input = File::open(source).map_err(|_| error.to_string())?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| error.to_string())?;
+    std::io::copy(&mut input, &mut output).map_err(|_| error.to_string())?;
+    output.sync_all().map_err(|_| error.to_string())
+}
+
+fn remove_verified_file(path: &Path, expected_sha256: &str, error: &str) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if sha256_file(path)? != expected_sha256 {
+        return Err(error.to_string());
+    }
+    fs::remove_file(path).map_err(|_| error.to_string())
+}
+
+fn startup_ack_matches(
+    plan: &UpdatePlan,
+    status: UpdateStartupStatus,
+    expected_sha256: &str,
+) -> bool {
+    fs::read(plan.staging_dir.join(STARTUP_ACK_NAME))
+        .is_ok_and(|payload| payload == startup_ack_payload(status, expected_sha256).as_bytes())
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(source: &Path, destination: &Path, error: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &Path, destination: &Path, error: &str) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|_| error.to_string())?;
+    }
+    fs::rename(source, destination).map_err(|_| error.to_string())
 }
 
 fn validate_update_plan(plan: &UpdatePlan, running_helper: &Path) -> Result<(), String> {
@@ -645,13 +1524,6 @@ fn validate_update_plan(plan: &UpdatePlan, running_helper: &Path) -> Result<(), 
         return Err("the staged update executable is invalid".to_string());
     }
     Ok(())
-}
-
-fn rollback_executable(target: &Path, backup: &Path) -> Result<(), String> {
-    fs::remove_file(target)
-        .map_err(|_| "update failed and the replacement could not be removed".to_string())?;
-    fs::rename(backup, target)
-        .map_err(|_| "update failed and the previous executable could not be restored".to_string())
 }
 
 #[cfg(windows)]
@@ -791,7 +1663,7 @@ impl Drop for ParentProcessWaiter {
 
 #[cfg(windows)]
 fn wait_for_helper_ready(child: &mut std::process::Child, ready_path: &Path) -> Result<(), String> {
-    for _ in 0..50 {
+    for _ in 0..HELPER_READY_ATTEMPTS {
         if ready_path.is_file() {
             return Ok(());
         }
@@ -808,11 +1680,19 @@ fn wait_for_helper_ready(child: &mut std::process::Child, ready_path: &Path) -> 
     Err("timed out waiting for the update helper safety preflight".to_string())
 }
 
+fn helper_ready_path(staging_dir: &Path, recovery_parent_pid: Option<u32>) -> PathBuf {
+    match recovery_parent_pid {
+        Some(pid) => staging_dir.join(format!("{RECOVERY_READY_PREFIX}{pid}")),
+        None => staging_dir.join("helper-ready"),
+    }
+}
+
 #[cfg(windows)]
 fn write_helper_ready(path: &Path) -> Result<(), String> {
     let file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(path)
         .map_err(|_| "failed to signal update helper readiness".to_string())?;
     file.sync_all()
@@ -890,32 +1770,126 @@ fn reset_update_started() {
     }
 }
 
-fn schedule_staging_cleanup(path: PathBuf) {
-    let Ok(staging_dir) = canonical_staging_dir(&path) else {
+fn schedule_staging_cleanup(context: StartupUpdateContext) {
+    let Ok(staging_dir) = canonical_staging_dir(&context.staging_dir) else {
         return;
     };
+    let cleanup_delay = startup_cleanup_delay(&staging_dir);
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(3));
-        for _ in 0..10 {
-            if remove_staging_dir(&staging_dir).is_ok() || !staging_dir.exists() {
-                break;
+        thread::sleep(cleanup_delay);
+        #[cfg(windows)]
+        {
+            let Ok(staging_guard) = StagingGuard::open(&staging_dir) else {
+                return;
+            };
+            let Ok(_lease) = UpdateLease::acquire(&context.target_exe, CLEANUP_LEASE_TIMEOUT_MS)
+            else {
+                return;
+            };
+            if finalize_startup_cleanup(&context).is_err() {
+                return;
             }
-            thread::sleep(Duration::from_millis(500));
+            drop(staging_guard);
+            remove_staging_with_retries(&staging_dir);
+        }
+        #[cfg(not(windows))]
+        {
+            if finalize_startup_cleanup(&context).is_err() {
+                return;
+            }
+            remove_staging_with_retries(&staging_dir);
         }
     });
 }
 
-fn remove_staging_dir(path: &Path) -> Result<(), String> {
-    let safe = canonical_staging_dir(path)?;
-    fs::remove_dir_all(safe)
-        .map_err(|_| "failed to remove the update staging directory".to_string())
+fn startup_cleanup_delay(staging_dir: &Path) -> Duration {
+    if staging_dir.join(UPDATE_JOURNAL_NAME).is_file() {
+        Duration::ZERO
+    } else {
+        LEGACY_HELPER_ACK_GRACE
+    }
 }
 
-fn timestamp_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
+fn remove_staging_with_retries(staging_dir: &Path) {
+    for _ in 0..10 {
+        if remove_staging_dir(staging_dir).is_ok() || !staging_dir.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn finalize_startup_cleanup(context: &StartupUpdateContext) -> Result<(), String> {
+    let plan = &context.plan;
+    let planned_staging = canonical_staging_dir(&plan.staging_dir)?;
+    let planned_target = fs::canonicalize(&plan.target_exe)
+        .map_err(|_| "the update cleanup target is missing".to_string())?;
+    if !paths_equal(&planned_staging, &context.staging_dir)
+        || !paths_equal(&planned_target, &context.target_exe)
+    {
+        return Err("the update cleanup context is invalid".to_string());
+    }
+    let expected = match context.status {
+        UpdateStartupStatus::Updated => &plan.expected_new_sha256,
+        UpdateStartupStatus::RolledBack => &plan.expected_old_sha256,
+    };
+    if sha256_file(&context.target_exe)? != expected.as_str() {
+        return Err("the update cleanup target is invalid".to_string());
+    }
+
+    let journal_path = context.staging_dir.join(UPDATE_JOURNAL_NAME);
+    if context.journal_present {
+        let mut journal: UpdateJournal = serde_json::from_slice(
+            &fs::read(&journal_path)
+                .map_err(|_| "failed to read the update cleanup journal".to_string())?,
+        )
+        .map_err(|_| "the update cleanup journal is invalid".to_string())?;
+        validate_journal(plan, &journal)?;
+        remove_verified_file(
+            &journal.backup_exe,
+            &plan.expected_old_sha256,
+            "the update cleanup backup is invalid",
+        )?;
+        remove_verified_file(
+            &journal.replacement_exe,
+            &plan.expected_new_sha256,
+            "the update cleanup replacement is invalid",
+        )?;
+        let phase = match context.status {
+            UpdateStartupStatus::Updated => UpdatePhase::Complete,
+            UpdateStartupStatus::RolledBack => UpdatePhase::RolledBack,
+        };
+        persist_phase(plan, &mut journal, phase)?;
+    }
+    Ok(())
+}
+
+fn remove_staging_dir(path: &Path) -> Result<(), String> {
+    let safe = canonical_staging_dir(path)?;
+    let helper = safe.join("updater-helper.exe");
+    if helper.exists() {
+        fs::remove_file(&helper)
+            .map_err(|_| "the update helper is still using the staging directory".to_string())?;
+    }
+
+    let mut files = fs::read_dir(&safe)
+        .map_err(|_| "failed to inspect the update staging directory".to_string())?
+        .map(|entry| {
+            entry.map_err(|_| "failed to inspect the update staging directory".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    files.sort_by_key(|entry| entry.file_name() == STARTUP_ACK_NAME);
+    for entry in files {
+        let file_type = entry
+            .file_type()
+            .map_err(|_| "failed to inspect an update staging entry".to_string())?;
+        if !file_type.is_file() {
+            return Err("the update staging directory contains an unsafe entry".to_string());
+        }
+        fs::remove_file(entry.path())
+            .map_err(|_| "failed to remove an update staging file".to_string())?;
+    }
+    fs::remove_dir(safe).map_err(|_| "failed to remove the update staging directory".to_string())
 }
 
 #[cfg(test)]
@@ -990,6 +1964,130 @@ mod tests {
         fn abort(&mut self) {
             self.aborted = true;
         }
+    }
+
+    #[cfg(windows)]
+    fn file_dacl_evidence(path: &Path) -> Option<(bool, String, u32)> {
+        use std::{ffi::c_void, mem::size_of, os::windows::ffi::OsStrExt, ptr, slice};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAce, GetAclInformation, GetFileSecurityW,
+            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, ACE_HEADER, ACL,
+            ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERITED_ACE, SE_DACL_PROTECTED,
+        };
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                security_descriptor: *mut c_void,
+                requested_string_sd_revision: u32,
+                security_information: u32,
+                string_security_descriptor: *mut *mut u16,
+                string_security_descriptor_len: *mut u32,
+            ) -> i32;
+        }
+
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut needed = 0u32;
+        unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        if needed == 0 {
+            return None;
+        }
+        let mut descriptor = vec![0u8; needed as usize];
+        if unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                descriptor.as_mut_ptr().cast(),
+                descriptor.len() as u32,
+                &mut needed,
+            )
+        } == 0
+        {
+            return None;
+        }
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe {
+            GetSecurityDescriptorControl(
+                descriptor.as_mut_ptr().cast(),
+                &mut control,
+                &mut revision,
+            )
+        } == 0
+        {
+            return None;
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut::<ACL>();
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.as_mut_ptr().cast(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            )
+        } == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return None;
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return None;
+        }
+        let inherited_aces = (0..info.AceCount)
+            .filter(|index| {
+                let mut ace = ptr::null_mut::<c_void>();
+                (unsafe { GetAce(dacl, *index, &mut ace) }) != 0
+                    && !ace.is_null()
+                    && unsafe { (*(ace.cast::<ACE_HEADER>())).AceFlags as u32 & INHERITED_ACE != 0 }
+            })
+            .count() as u32;
+        let mut sddl = ptr::null_mut::<u16>();
+        let mut sddl_len = 0u32;
+        if unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.as_mut_ptr().cast(),
+                1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                &mut sddl_len,
+            )
+        } == 0
+            || sddl.is_null()
+        {
+            return None;
+        }
+        let sddl_text =
+            String::from_utf16_lossy(unsafe { slice::from_raw_parts(sddl, sddl_len as usize) });
+        unsafe {
+            LocalFree(sddl.cast());
+        }
+        Some((control & SE_DACL_PROTECTED != 0, sddl_text, inherited_aces))
     }
 
     #[test]
@@ -1129,6 +2227,129 @@ mod tests {
         assert!(!plan.staging_dir.join(STARTUP_ACK_NAME).exists());
     }
 
+    #[test]
+    fn startup_context_accepts_only_a_matching_current_journal() {
+        let (_temp, plan, _helper) = staged_plan();
+        persist_plan(&plan);
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::Launching).unwrap();
+        fs::write(&plan.target_exe, b"new executable").unwrap();
+        let args = vec![
+            std::ffi::OsString::from("codex-switch.exe"),
+            std::ffi::OsString::from(UPDATE_COMPLETE_ARG),
+            plan.staging_dir.as_os_str().to_owned(),
+        ];
+
+        let context = startup_context_from_args(&args, &plan.target_exe).unwrap();
+        assert!(context.journal_present);
+        journal.backup_exe = plan.target_exe.with_extension("outside-journal");
+        fs::write(
+            plan.staging_dir.join(UPDATE_JOURNAL_NAME),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        assert!(startup_context_from_args(&args, &plan.target_exe).is_none());
+    }
+
+    #[test]
+    fn legacy_startup_without_a_journal_keeps_the_ack_grace_period() {
+        let (_temp, plan, _helper) = staged_plan();
+        let old_helper_ack_window = STARTUP_ACK_INTERVAL * STARTUP_ACK_ATTEMPTS as u32;
+        assert!(
+            startup_cleanup_delay(&plan.staging_dir)
+                >= old_helper_ack_window + Duration::from_secs(1)
+        );
+        load_or_create_journal(&plan).unwrap();
+        assert_eq!(startup_cleanup_delay(&plan.staging_dir), Duration::ZERO);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_cleanup_preserves_ack_while_the_helper_is_locked() {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            },
+        };
+
+        let (_temp, plan, helper) = staged_plan();
+        persist_plan(&plan);
+        let ack = plan.staging_dir.join(STARTUP_ACK_NAME);
+        fs::write(&ack, b"legacy helper still needs this ack").unwrap();
+        let helper_wide = helper
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let helper_guard = unsafe {
+            CreateFileW(
+                helper_wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(helper_guard, INVALID_HANDLE_VALUE);
+
+        assert_eq!(
+            remove_staging_dir(&plan.staging_dir).unwrap_err(),
+            "the update helper is still using the staging directory"
+        );
+        assert!(ack.exists());
+        assert!(plan.staged_exe.exists());
+        assert!(plan.staging_dir.join("update-plan.json").exists());
+
+        unsafe {
+            CloseHandle(helper_guard);
+        }
+        remove_staging_dir(&plan.staging_dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cleanup_ignores_a_journal_injected_after_startup_validation() {
+        let (_temp, plan, _helper) = staged_plan();
+        persist_plan(&plan);
+        fs::write(&plan.target_exe, b"new executable").unwrap();
+        let args = vec![
+            std::ffi::OsString::from("codex-switch.exe"),
+            std::ffi::OsString::from(UPDATE_COMPLETE_ARG),
+            plan.staging_dir.as_os_str().to_owned(),
+        ];
+        let context = startup_context_from_args(&args, &plan.target_exe).unwrap();
+        assert!(!context.journal_present);
+
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        fs::write(victim.path(), b"old executable").unwrap();
+        let mut injected_plan = plan.clone();
+        injected_plan.target_exe = victim.path().to_path_buf();
+        injected_plan.expected_old_sha256 = sha256_file(victim.path()).unwrap();
+        let (replacement_exe, backup_exe) = update_artifact_paths(&injected_plan).unwrap();
+        let injected_journal = UpdateJournal {
+            schema_version: UPDATE_JOURNAL_SCHEMA,
+            phase: UpdatePhase::Acked,
+            target_exe: injected_plan.target_exe.clone(),
+            replacement_exe,
+            backup_exe,
+            expected_old_sha256: injected_plan.expected_old_sha256.clone(),
+            expected_new_sha256: injected_plan.expected_new_sha256.clone(),
+        };
+        fs::write(
+            plan.staging_dir.join(UPDATE_JOURNAL_NAME),
+            serde_json::to_vec(&injected_journal).unwrap(),
+        )
+        .unwrap();
+
+        finalize_startup_cleanup(&context).unwrap();
+        assert!(victim.path().exists());
+        assert_eq!(fs::read(victim.path()).unwrap(), b"old executable");
+    }
+
     #[cfg(windows)]
     #[test]
     fn helper_waits_for_exact_startup_ack_and_aborts_on_timeout() {
@@ -1239,6 +2460,478 @@ mod tests {
         assert_eq!(error, "the installed executable changed before update");
         assert_eq!(launch_count, 0);
         assert_eq!(fs::read(&plan.target_exe).unwrap(), b"externally changed");
+    }
+
+    #[test]
+    fn helper_recovers_an_activation_committed_before_the_journal_phase() {
+        let (_temp, plan, helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        atomic_replace_file(
+            &journal.replacement_exe,
+            &plan.target_exe,
+            "injected activation failure",
+        )
+        .unwrap();
+        assert_eq!(journal.phase, UpdatePhase::BackupReady);
+
+        let mut launches = Vec::new();
+        apply_update_plan_with(
+            &plan,
+            &helper,
+            || panic!("a recovered helper must not wait for the original parent"),
+            |target, status, _, expected_sha256| {
+                launches.push(status);
+                assert_eq!(sha256_file(target).unwrap(), expected_sha256);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(launches, vec![LaunchStatus::Updated]);
+        assert_eq!(fs::read(&plan.target_exe).unwrap(), b"new executable");
+        assert_eq!(
+            load_or_create_journal(&plan).unwrap().phase,
+            UpdatePhase::Complete
+        );
+        assert!(!journal.backup_exe.exists());
+    }
+
+    #[test]
+    fn helper_rolls_back_an_uncertain_launch_without_an_exact_ack() {
+        let (_temp, plan, helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        atomic_replace_file(
+            &journal.replacement_exe,
+            &plan.target_exe,
+            "injected activation failure",
+        )
+        .unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::Launching).unwrap();
+
+        let mut launches = Vec::new();
+        let error = apply_update_plan_with(
+            &plan,
+            &helper,
+            || panic!("a recovered helper must not wait for the original parent"),
+            |target, status, _, expected_sha256| {
+                launches.push(status);
+                assert_eq!(status, LaunchStatus::RolledBack);
+                assert_eq!(sha256_file(target).unwrap(), expected_sha256);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "the interrupted update was rolled back");
+        assert_eq!(launches, vec![LaunchStatus::RolledBack]);
+        assert_eq!(fs::read(&plan.target_exe).unwrap(), b"old executable");
+        assert_eq!(
+            load_or_create_journal(&plan).unwrap().phase,
+            UpdatePhase::RolledBack
+        );
+    }
+
+    #[test]
+    fn helper_accepts_a_durable_exact_ack_after_restart() {
+        let (_temp, plan, helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        atomic_replace_file(
+            &journal.replacement_exe,
+            &plan.target_exe,
+            "injected activation failure",
+        )
+        .unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::Launching).unwrap();
+        fs::write(
+            plan.staging_dir.join(STARTUP_ACK_NAME),
+            startup_ack_payload(UpdateStartupStatus::Updated, &plan.expected_new_sha256),
+        )
+        .unwrap();
+
+        apply_update_plan_with(
+            &plan,
+            &helper,
+            || panic!("a recovered helper must not wait for the original parent"),
+            |_, _, _, _| panic!("an acknowledged update must not launch a duplicate process"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&plan.target_exe).unwrap(), b"new executable");
+        assert_eq!(
+            load_or_create_journal(&plan).unwrap().phase,
+            UpdatePhase::Complete
+        );
+    }
+
+    #[test]
+    fn journal_failure_after_activation_emergency_restores_and_launches_old_version() {
+        let (_temp, plan, helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        atomic_replace_file(
+            &journal.replacement_exe,
+            &plan.target_exe,
+            "injected activation failure",
+        )
+        .unwrap();
+        fs::create_dir(plan.staging_dir.join(UPDATE_JOURNAL_TEMP_NAME)).unwrap();
+
+        let mut launches = Vec::new();
+        let error = apply_update_plan_with(
+            &plan,
+            &helper,
+            || panic!("a recovered helper must not wait for the original parent"),
+            |target, status, _, expected_sha256| {
+                launches.push(status);
+                assert_eq!(status, LaunchStatus::RolledBack);
+                assert_eq!(sha256_file(target).unwrap(), expected_sha256);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "failed to reset the update journal transaction");
+        assert_eq!(launches, vec![LaunchStatus::RolledBack]);
+        assert_eq!(fs::read(&plan.target_exe).unwrap(), b"old executable");
+    }
+
+    #[test]
+    fn tampered_journal_fails_closed_before_target_mutation() {
+        let (_temp, plan, helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        journal.backup_exe = plan.target_exe.with_extension("attacker-controlled");
+        fs::write(
+            plan.staging_dir.join(UPDATE_JOURNAL_NAME),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            apply_update_plan_with(&plan, &helper, || Ok(()), |_, _, _, _| Ok(())).unwrap_err();
+        assert_eq!(error, "the update journal does not match the update plan");
+        assert_eq!(fs::read(&plan.target_exe).unwrap(), b"old executable");
+    }
+
+    #[test]
+    fn helper_rebinds_the_plan_to_the_current_fixed_github_digest() {
+        let (_temp, plan, _helper) = staged_plan();
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let next = Version::new(current.major, current.minor, current.patch + 1);
+        let tag = format!("v{next}");
+        let release = ReleaseCandidate {
+            tag_name: tag.clone(),
+            version: next,
+            release_notes: None,
+            assets: vec![asset(
+                fs::metadata(&plan.staged_exe).unwrap().len(),
+                Some(format!("sha256:{}", plan.expected_new_sha256)),
+                &format!("{UPDATE_URL_PREFIX}{tag}/{UPDATE_ASSET_NAME}"),
+            )],
+        };
+
+        validate_plan_release_binding(&plan, &release).unwrap();
+        let mut tampered = plan.clone();
+        tampered.expected_new_sha256 = "0".repeat(64);
+        assert_eq!(
+            validate_plan_release_binding(&tampered, &release).unwrap_err(),
+            "the update plan does not match the current GitHub release"
+        );
+    }
+
+    #[test]
+    fn existing_journal_resumes_without_fetching_github() {
+        let (_temp, plan, _helper) = staged_plan();
+        let journal = load_or_create_journal(&plan).unwrap();
+        let mut fetched = false;
+
+        let loaded = load_helper_journal_with(&plan, true, || {
+            fetched = true;
+            Err("offline".to_string())
+        })
+        .unwrap();
+
+        assert!(!fetched);
+        assert_eq!(loaded, journal);
+    }
+
+    #[test]
+    fn recovery_helper_requires_an_existing_journal_without_fetching_github() {
+        let (_temp, plan, _helper) = staged_plan();
+        let mut fetched = false;
+
+        let error = load_helper_journal_with(&plan, false, || {
+            fetched = true;
+            Err("offline".to_string())
+        })
+        .unwrap_err();
+
+        assert!(!fetched);
+        assert_eq!(error, "the interrupted update journal is missing");
+    }
+
+    #[test]
+    fn startup_recovery_accepts_new_target_phases_and_old_rolled_back_target() {
+        for phase in [
+            UpdatePhase::BackupReady,
+            UpdatePhase::Activated,
+            UpdatePhase::Launching,
+            UpdatePhase::Acked,
+            UpdatePhase::Complete,
+        ] {
+            let (_temp, plan, _helper) = staged_plan();
+            persist_plan(&plan);
+            let mut journal = load_or_create_journal(&plan).unwrap();
+            persist_phase(&plan, &mut journal, phase).unwrap();
+            fs::write(&plan.target_exe, b"new executable").unwrap();
+
+            let action = recovery_action_from_staging(&plan.staging_dir, &plan.target_exe).unwrap();
+            assert!(matches!(
+                action,
+                StartupRecoveryAction::Resume(StartupUpdateContext {
+                    status: UpdateStartupStatus::Updated,
+                    ..
+                })
+            ));
+        }
+
+        let (_temp, plan, _helper) = staged_plan();
+        persist_plan(&plan);
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::RolledBack).unwrap();
+        let action = recovery_action_from_staging(&plan.staging_dir, &plan.target_exe).unwrap();
+        assert!(matches!(
+            action,
+            StartupRecoveryAction::Resume(StartupUpdateContext {
+                status: UpdateStartupStatus::RolledBack,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn startup_recovery_restarts_helper_for_old_nonterminal_target() {
+        for phase in [
+            UpdatePhase::Prepared,
+            UpdatePhase::ReplacementReady,
+            UpdatePhase::BackupReady,
+            UpdatePhase::RollingBack,
+        ] {
+            let (_temp, plan, _helper) = staged_plan();
+            persist_plan(&plan);
+            let mut journal = load_or_create_journal(&plan).unwrap();
+            persist_phase(&plan, &mut journal, phase).unwrap();
+
+            let action = recovery_action_from_staging(&plan.staging_dir, &plan.target_exe).unwrap();
+            assert!(matches!(action, StartupRecoveryAction::RestartHelper(_)));
+        }
+    }
+
+    #[test]
+    fn startup_recovery_ignores_legacy_tampered_and_unrelated_staging() {
+        let (_legacy_temp, legacy, _helper) = staged_plan();
+        persist_plan(&legacy);
+        assert!(recovery_action_from_staging(&legacy.staging_dir, &legacy.target_exe).is_err());
+
+        let (_tampered_temp, tampered, _helper) = staged_plan();
+        persist_plan(&tampered);
+        load_or_create_journal(&tampered).unwrap();
+        fs::write(tampered.staging_dir.join(UPDATE_JOURNAL_NAME), b"tampered").unwrap();
+        assert!(recovery_action_from_staging(&tampered.staging_dir, &tampered.target_exe).is_err());
+
+        let (_unrelated_temp, unrelated, _helper) = staged_plan();
+        persist_plan(&unrelated);
+        load_or_create_journal(&unrelated).unwrap();
+        let other_target = tempfile::NamedTempFile::new().unwrap();
+        assert!(recovery_action_from_staging(&unrelated.staging_dir, other_target.path()).is_err());
+    }
+
+    #[test]
+    fn rollback_stays_in_progress_until_old_startup_is_acknowledged() {
+        let (_temp, plan, _helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        atomic_replace_file(
+            &journal.replacement_exe,
+            &plan.target_exe,
+            "injected activation failure",
+        )
+        .unwrap();
+
+        finish_rollback(&plan, &mut journal, &mut |_, status, _, _| {
+            assert_eq!(status, LaunchStatus::RolledBack);
+            assert_eq!(
+                load_or_create_journal(&plan).unwrap().phase,
+                UpdatePhase::RollingBack
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            load_or_create_journal(&plan).unwrap().phase,
+            UpdatePhase::RolledBack
+        );
+    }
+
+    #[test]
+    fn exact_rollback_ack_avoids_a_duplicate_old_process_launch() {
+        let (_temp, plan, _helper) = staged_plan();
+        let mut journal = load_or_create_journal(&plan).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::ParentStopped).unwrap();
+        prepare_replacement_and_backup(&plan, &mut journal).unwrap();
+        persist_phase(&plan, &mut journal, UpdatePhase::RollingBack).unwrap();
+        fs::write(
+            plan.staging_dir.join(STARTUP_ACK_NAME),
+            startup_ack_payload(UpdateStartupStatus::RolledBack, &plan.expected_old_sha256),
+        )
+        .unwrap();
+        let mut launches = 0;
+
+        finish_rollback(&plan, &mut journal, &mut |_, _, _, _| {
+            launches += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(launches, 0);
+        assert_eq!(
+            load_or_create_journal(&plan).unwrap().phase,
+            UpdatePhase::RolledBack
+        );
+    }
+
+    #[test]
+    fn v0_1_9_plan_args_and_ack_contract_remain_compatible() {
+        let plan = UpdatePlan {
+            schema_version: 1,
+            parent_pid: 42,
+            staging_dir: PathBuf::from("staging"),
+            target_exe: PathBuf::from("target.exe"),
+            helper_exe: PathBuf::from("helper.exe"),
+            staged_exe: PathBuf::from("staged.exe"),
+            expected_old_sha256: "a".repeat(64),
+            expected_new_sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "parentPid": 42,
+                "stagingDir": "staging",
+                "targetExe": "target.exe",
+                "helperExe": "helper.exe",
+                "stagedExe": "staged.exe",
+                "expectedOldSha256": "a".repeat(64),
+                "expectedNewSha256": "b".repeat(64),
+            })
+        );
+        assert_eq!(APPLY_UPDATE_ARG, "--codex-switch-apply-update");
+        assert_eq!(UPDATE_COMPLETE_ARG, "--codex-switch-update-complete");
+        assert_eq!(UPDATE_ROLLED_BACK_ARG, "--codex-switch-update-rolled-back");
+        assert_eq!(
+            startup_ack_payload(UpdateStartupStatus::Updated, &"b".repeat(64)),
+            format!("codex-switch-update-ack-v1\nupdated\n{}\n", "b".repeat(64))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_staging_is_not_replaceable_while_guarded() {
+        let (staging_dir, guard) = create_staging_dir().unwrap();
+        let elevated = process_is_elevated().unwrap();
+        let child = staging_dir.join("child-file");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&child)
+            .unwrap();
+        file.write_all(b"protected").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(fs::read(&child).unwrap(), b"protected");
+        OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(b"-writable")
+            .unwrap();
+        let (parent_protected, parent_sddl, _) = file_dacl_evidence(&staging_dir).unwrap();
+        assert!(parent_protected);
+        assert!(parent_sddl.starts_with("D:P"), "{parent_sddl}");
+        let (_, child_sddl, _) = file_dacl_evidence(&child).unwrap();
+        assert_eq!(child_sddl.matches("(A;").count(), 2, "{child_sddl}");
+        assert!(child_sddl.contains("(A;;FA;;;SY)"), "{child_sddl}");
+        let expected_principal = if elevated { "BA" } else { "OW" };
+        assert!(
+            child_sddl.contains(&format!("(A;;FA;;;{expected_principal})")),
+            "{child_sddl}"
+        );
+        for forbidden_principal in ["WD", "BU", "AU", "AC"] {
+            assert!(
+                !child_sddl.contains(&format!(";;;{forbidden_principal})")),
+                "{child_sddl}"
+            );
+        }
+        assert!(fs::remove_dir(&staging_dir).is_err());
+        assert!(!staging_sddl(true).contains(";;;OW"));
+        assert!(staging_sddl(true).contains("(A;OICI;FA;;;SY)"));
+        assert!(staging_sddl(true).contains("(A;OICI;FA;;;BA)"));
+        assert!(staging_sddl(false).contains("(A;OICI;FA;;;OW)"));
+        drop(guard);
+        remove_staging_dir(&staging_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_lease_probe_child() {
+        let Some(target) = env::var_os("CODEX_SWITCH_UPDATE_LEASE_PROBE_TARGET") else {
+            return;
+        };
+        let mode = env::var("CODEX_SWITCH_UPDATE_LEASE_PROBE_MODE").unwrap();
+        let result = UpdateLease::acquire(Path::new(&target), 0);
+        if mode == "blocked" {
+            assert_eq!(
+                result.map(|_lease| ()).unwrap_err(),
+                "another process is already updating this executable"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_lease_rejects_a_second_process_owner() {
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let first = UpdateLease::acquire(target.path(), 0).unwrap();
+        let blocked = Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("update_install::tests::target_lease_probe_child")
+            .env("CODEX_SWITCH_UPDATE_LEASE_PROBE_TARGET", target.path())
+            .env("CODEX_SWITCH_UPDATE_LEASE_PROBE_MODE", "blocked")
+            .status()
+            .unwrap();
+        assert!(blocked.success());
+        drop(first);
+
+        let released = Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("update_install::tests::target_lease_probe_child")
+            .env("CODEX_SWITCH_UPDATE_LEASE_PROBE_TARGET", target.path())
+            .env("CODEX_SWITCH_UPDATE_LEASE_PROBE_MODE", "released")
+            .status()
+            .unwrap()
+            .success();
+        assert!(released);
     }
 
     #[test]
