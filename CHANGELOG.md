@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- 受管会话备份不再随每次切换、同步或会话 mutation 无上限累积：自动保留最新一次备份操作，以及最近一次成功的 current/shared 完整回滚组。
+- 自动清理只删除 manifest 与全部 DPAPI payload 大小/SHA-256 均通过校验的受管直接子目录；损坏、未完成、链接或无法验证的目录保持不动。
+- 创建快照前按 current/shared 实际 payload 估算空间，并额外保留 5% 加密开销、每文件 4 KiB 和 1 GiB 卷安全余量；空间不足时在写入第一份备份前停止。
+- 运行态切换回执增加旧备份清理警告，前端与其他 mutation 一致展示，不再静默吞掉保留策略失败。
+- Codex 进程扫描改用 Windows Tool Help 原生快照，不再启动外部 `tasklist.exe`，避免系统工具偶发 `0xc0000142` 弹框阻断切换；关闭命令使用绝对 System32 `taskkill.exe` 且不创建控制台窗口，随后仍重新枚举确认退出。
+
 ## v0.1.9 - 2026-07-19
 
 ### Fixed

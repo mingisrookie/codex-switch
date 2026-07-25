@@ -18,6 +18,9 @@ use crate::{
 };
 
 static BACKUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const BACKUP_SPACE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+const BACKUP_ESTIMATE_OVERHEAD_PERCENT: u64 = 5;
+const BACKUP_ESTIMATE_PER_FILE_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +70,125 @@ pub struct BackupSummary {
     pub complete_sessions: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupRetentionReport {
+    pub removed_directories: usize,
+    pub reclaimed_bytes: u64,
+    pub retained_directories: usize,
+    pub skipped_unmanaged_directories: usize,
+    pub skipped_unverified_directories: usize,
+}
+
+pub fn ensure_backup_capacity_for_roots(
+    destination_root: &Path,
+    roots: &[(&Path, bool)],
+) -> Result<u64, String> {
+    fs::create_dir_all(destination_root)
+        .map_err(|error| format!("failed to create backup storage: {error}"))?;
+    let mut payload_bytes = 0_u64;
+    let mut file_count = 0_u64;
+    for (home, state_db_is_local) in roots {
+        let paths = if *state_db_is_local {
+            local_codex_paths(home)
+        } else {
+            resolve_user_codex_paths(home)?
+        };
+        let (root_bytes, root_files) = estimate_backup_payload(home, &paths)?;
+        payload_bytes = payload_bytes.saturating_add(root_bytes);
+        file_count = file_count.saturating_add(root_files);
+    }
+    let estimated_bytes = payload_bytes
+        .saturating_add(payload_bytes.saturating_mul(BACKUP_ESTIMATE_OVERHEAD_PERCENT) / 100)
+        .saturating_add(file_count.saturating_mul(BACKUP_ESTIMATE_PER_FILE_BYTES));
+    let available_bytes = backup_volume_available_bytes(destination_root)?;
+    validate_backup_capacity(estimated_bytes, available_bytes, BACKUP_SPACE_RESERVE_BYTES)?;
+    Ok(estimated_bytes)
+}
+
+pub fn prune_managed_backups(
+    destination_root: &Path,
+    managed_dirs: &[PathBuf],
+    protected_dirs: &[PathBuf],
+) -> Result<BackupRetentionReport, String> {
+    if !destination_root.exists() {
+        return Ok(BackupRetentionReport {
+            removed_directories: 0,
+            reclaimed_bytes: 0,
+            retained_directories: 0,
+            skipped_unmanaged_directories: 0,
+            skipped_unverified_directories: 0,
+        });
+    }
+    let canonical_root = fs::canonicalize(destination_root)
+        .map_err(|error| format!("failed to resolve backup storage: {error}"))?;
+    let mut protected = HashSet::new();
+    let mut managed = HashSet::new();
+    for path in managed_dirs {
+        let Ok(canonical) = fs::canonicalize(path) else {
+            continue;
+        };
+        if canonical.parent() == Some(canonical_root.as_path()) {
+            managed.insert(canonical);
+        }
+    }
+    for path in protected_dirs {
+        let Ok(canonical) = fs::canonicalize(path) else {
+            continue;
+        };
+        if canonical.parent() == Some(canonical_root.as_path()) {
+            protected.insert(canonical);
+        }
+    }
+
+    let mut report = BackupRetentionReport {
+        removed_directories: 0,
+        reclaimed_bytes: 0,
+        retained_directories: 0,
+        skipped_unmanaged_directories: 0,
+        skipped_unverified_directories: 0,
+    };
+    for entry in fs::read_dir(&canonical_root)
+        .map_err(|error| format!("failed to list backup storage: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("failed to read backup entry: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("failed to inspect backup entry: {error}"))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || has_reparse_attribute(&metadata)
+        {
+            continue;
+        }
+        let candidate = fs::canonicalize(entry.path())
+            .map_err(|error| format!("failed to resolve backup entry: {error}"))?;
+        if candidate.parent() != Some(canonical_root.as_path()) {
+            return Err("backup retention candidate escaped the managed root".to_string());
+        }
+        if protected.contains(&candidate) {
+            report.retained_directories += 1;
+            continue;
+        }
+        if !managed.contains(&candidate) {
+            report.skipped_unmanaged_directories += 1;
+            continue;
+        }
+        let Ok(manifest) = verify_backup(&candidate) else {
+            report.skipped_unverified_directories += 1;
+            continue;
+        };
+        let reclaimed = manifest.files.iter().map(|file| file.bytes).sum::<u64>();
+        fs::remove_dir_all(&candidate).map_err(|error| {
+            format!(
+                "failed to remove superseded backup {}: {error}",
+                candidate.display()
+            )
+        })?;
+        report.removed_directories += 1;
+        report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed);
+    }
+    Ok(report)
+}
+
 pub fn create_backup(
     home: &Path,
     destination_root: &Path,
@@ -82,6 +204,93 @@ pub fn create_local_backup(
     reason: &str,
 ) -> Result<BackupManifest, String> {
     create_backup_with_paths(home, destination_root, reason, local_codex_paths(home))
+}
+
+fn estimate_backup_payload(home: &Path, paths: &CodexPaths) -> Result<(u64, u64), String> {
+    let mut bytes = 0_u64;
+    let mut files = 0_u64;
+    for source in [
+        home.join("auth.json"),
+        home.join("config.toml"),
+        paths.session_index.clone(),
+        paths.state_db.clone(),
+    ] {
+        if source.is_file() {
+            let metadata = fs::metadata(&source).map_err(|error| {
+                format!(
+                    "failed to inspect backup source {}: {error}",
+                    source.display()
+                )
+            })?;
+            bytes = bytes.saturating_add(metadata.len());
+            files += 1;
+        }
+    }
+    if paths.sessions_dir.is_dir() {
+        for path in walk_jsonl_files(&paths.sessions_dir)? {
+            let metadata = fs::metadata(&path).map_err(|error| {
+                format!(
+                    "failed to inspect backup session {}: {error}",
+                    path.display()
+                )
+            })?;
+            bytes = bytes.saturating_add(metadata.len());
+            files += 1;
+        }
+    }
+    Ok((bytes, files))
+}
+
+fn validate_backup_capacity(
+    estimated_bytes: u64,
+    available_bytes: u64,
+    reserve_bytes: u64,
+) -> Result<(), String> {
+    let required_bytes = estimated_bytes.saturating_add(reserve_bytes);
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "insufficient backup storage: need about {} bytes plus safety reserve, only {} bytes available",
+            estimated_bytes, available_bytes
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn backup_volume_available_bytes(path: &Path) -> Result<u64, String> {
+    use std::{os::windows::ffi::OsStrExt, ptr::null_mut};
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve backup storage for capacity check: {error}"))?;
+    let wide = canonical
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available = 0_u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, null_mut(), null_mut()) };
+    if ok == 0 {
+        return Err("failed to query backup storage capacity".to_string());
+    }
+    Ok(available)
+}
+
+#[cfg(not(windows))]
+fn backup_volume_available_bytes(_path: &Path) -> Result<u64, String> {
+    Ok(u64::MAX)
+}
+
+#[cfg(windows)]
+fn has_reparse_attribute(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn has_reparse_attribute(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn create_backup_with_paths(
@@ -605,8 +814,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        create_backup, create_local_backup, list_recent_backups, migrate_legacy_plaintext_auth,
-        restore_backup, verify_backup,
+        create_backup, create_local_backup, estimate_backup_payload, list_recent_backups,
+        migrate_legacy_plaintext_auth, prune_managed_backups, restore_backup,
+        validate_backup_capacity, verify_backup,
     };
 
     fn seed_home(home: &std::path::Path) -> std::path::PathBuf {
@@ -851,5 +1061,71 @@ mod tests {
             .find(|file| file.relative_path == std::path::Path::new("state_5.sqlite"))
             .unwrap();
         assert_eq!(state.source, shared.path().join("state_5.sqlite"));
+    }
+
+    #[test]
+    fn backup_estimate_includes_every_payload_that_will_be_snapshotted() {
+        let home = tempdir().unwrap();
+        let rollout = seed_home(home.path());
+        let paths = crate::codex_paths::resolve_user_codex_paths(home.path()).unwrap();
+
+        let (bytes, files) = estimate_backup_payload(home.path(), &paths).unwrap();
+        let expected = [
+            home.path().join("auth.json"),
+            home.path().join("config.toml"),
+            home.path().join("session_index.jsonl"),
+            home.path().join("state_5.sqlite"),
+            rollout,
+        ]
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum::<u64>();
+
+        assert_eq!(files, 5);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn backup_capacity_check_preserves_the_safety_reserve() {
+        assert!(validate_backup_capacity(100, 1_100, 1_000).is_ok());
+        assert!(validate_backup_capacity(101, 1_100, 1_000).is_err());
+    }
+
+    #[test]
+    fn retention_removes_only_verified_unprotected_backup_directories() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let protected = create_backup(home.path(), backup_root.path(), "protected").unwrap();
+        let superseded = create_backup(home.path(), backup_root.path(), "superseded").unwrap();
+        let unverified = backup_root.path().join("manual-or-incomplete");
+        fs::create_dir_all(&unverified).unwrap();
+        fs::write(unverified.join("note.txt"), "do not delete").unwrap();
+
+        let untracked = create_backup(home.path(), backup_root.path(), "untracked").unwrap();
+        let managed = vec![
+            protected.backup_dir.clone(),
+            superseded.backup_dir.clone(),
+            unverified.clone(),
+        ];
+        let report = prune_managed_backups(
+            backup_root.path(),
+            &managed,
+            std::slice::from_ref(&protected.backup_dir),
+        )
+        .unwrap();
+
+        assert!(protected.backup_dir.exists());
+        assert!(!superseded.backup_dir.exists());
+        assert!(untracked.backup_dir.exists());
+        assert!(unverified.exists());
+        assert_eq!(report.removed_directories, 1);
+        assert_eq!(report.retained_directories, 1);
+        assert_eq!(report.skipped_unmanaged_directories, 1);
+        assert_eq!(report.skipped_unverified_directories, 1);
+        assert_eq!(
+            report.reclaimed_bytes,
+            superseded.files.iter().map(|file| file.bytes).sum::<u64>()
+        );
     }
 }

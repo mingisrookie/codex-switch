@@ -1,6 +1,17 @@
 use serde::Serialize;
 #[cfg(windows)]
-use std::process::Command;
+use std::{mem::size_of, os::windows::process::CommandExt, path::PathBuf, process::Command};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        Threading::CREATE_NO_WINDOW,
+    },
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -11,15 +22,33 @@ pub struct CodexProcess {
 
 #[cfg(windows)]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    let output = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-        .map_err(|error| format!("failed to run tasklist: {error}"))?;
-    if !output.status.success() {
-        return Err("tasklist failed".to_string());
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err("failed to create a Windows process snapshot".to_string());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_tasklist_csv(&stdout))
+    let _snapshot = SnapshotHandle(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        return Err("failed to read the Windows process snapshot".to_string());
+    }
+
+    let mut processes = Vec::new();
+    loop {
+        let image_name = decode_process_name(&entry.szExeFile);
+        if is_codex_process(&image_name) {
+            processes.push(CodexProcess {
+                image_name,
+                pid: entry.th32ProcessID,
+            });
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+    Ok(processes)
 }
 
 #[cfg(not(windows))]
@@ -29,15 +58,42 @@ pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
 
 #[cfg(windows)]
 pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    close_codex_processes_with(list_codex_processes, |pid| {
-        match Command::new("taskkill")
+    let taskkill = system_tool_path("taskkill.exe")?;
+    close_codex_processes_with(list_codex_processes, move |pid| {
+        match Command::new(&taskkill)
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(output) if output.status.success() => TaskkillResult::Succeeded,
             Ok(_) | Err(_) => TaskkillResult::Failed,
         }
     })
+}
+
+#[cfg(windows)]
+struct SnapshotHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn system_tool_path(name: &str) -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "Windows system directory is unavailable".to_string())?;
+    let path = root.join("System32").join(name);
+    if !path.is_file() {
+        return Err("required Windows process-control tool is unavailable".to_string());
+    }
+    Ok(path)
 }
 
 #[cfg(not(windows))]
@@ -97,36 +153,13 @@ fn format_pids(pids: impl IntoIterator<Item = u32>) -> String {
         .join(", ")
 }
 
-pub fn parse_tasklist_csv(text: &str) -> Vec<CodexProcess> {
-    text.lines()
-        .filter_map(parse_tasklist_line)
-        .filter(|process| is_codex_process(&process.image_name))
-        .collect()
-}
-
-fn parse_tasklist_line(line: &str) -> Option<CodexProcess> {
-    let fields = parse_csv_line(line);
-    let image_name = fields.first()?.to_string();
-    let pid = fields.get(1)?.parse().ok()?;
-    Some(CodexProcess { image_name, pid })
-}
-
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for ch in line.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                fields.push(current.clone());
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    fields.push(current);
-    fields
+#[cfg(any(windows, test))]
+fn decode_process_name(buffer: &[u16]) -> String {
+    let end = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 fn is_codex_process(image_name: &str) -> bool {
@@ -136,7 +169,10 @@ fn is_codex_process(image_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{close_codex_processes_with, parse_tasklist_csv, CodexProcess, TaskkillResult};
+    use super::{
+        close_codex_processes_with, decode_process_name, is_codex_process, CodexProcess,
+        TaskkillResult,
+    };
     use std::{cell::RefCell, collections::VecDeque};
 
     fn process(image_name: &str, pid: u32) -> CodexProcess {
@@ -147,11 +183,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_processes_without_matching_codex_switch() {
-        let rows = "\"codex.exe\",\"1234\",\"Console\",\"1\",\"10,000 K\"\n\"codex-switch.exe\",\"5678\",\"Console\",\"1\",\"10,000 K\"\n";
-        let processes = parse_tasklist_csv(rows);
-        assert_eq!(processes.len(), 1);
-        assert_eq!(processes[0].pid, 1234);
+    fn recognizes_codex_process_names_without_matching_codex_switch() {
+        assert!(is_codex_process("codex.exe"));
+        assert!(is_codex_process("OpenAI.Codex.exe"));
+        assert!(!is_codex_process("codex-switch.exe"));
+    }
+
+    #[test]
+    fn decodes_null_terminated_windows_process_names() {
+        let mut buffer = [0_u16; 260];
+        let encoded = "codex.exe".encode_utf16().collect::<Vec<_>>();
+        buffer[..encoded.len()].copy_from_slice(&encoded);
+
+        assert_eq!(decode_process_name(&buffer), "codex.exe");
     }
 
     #[test]

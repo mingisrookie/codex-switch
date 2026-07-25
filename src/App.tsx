@@ -222,6 +222,7 @@ function App({ loadDashboard = defaultLoadDashboard }: AppProps) {
       backupCount: result.backups.length,
       backupPaths: result.backups.map((backup) => backup.backupDir),
       rolledBack: result.rolledBack,
+      warnings: result.warnings,
       metrics: [
         `写入共享池：${result.toShared.insertedThreads}`,
         `写回当前 Home：${result.fromShared.insertedThreads}`,
@@ -499,7 +500,7 @@ function BackupRecoveryPanel({ state, disabled, onRestore }: { state: DomainStat
   return (
     <aside className="detail-panel backup-panel" aria-label="备份恢复">
       <div className="card-title-row"><span className="card-icon">↩</span><div><p className="eyebrow">完整快照</p><h2>备份恢复</h2></div></div>
-      <p className="hint no-indent">仅校验并展示最近 5 份备份候选；旧备份不会自动清理。</p>
+      <p className="hint no-indent">仅校验并展示最近 5 份备份候选；成功操作后自动保留最新操作和最近完整成功回滚组。</p>
       {state.status === 'error' ? <p className="empty-state" role="alert">{state.error}</p>
         : state.status === 'loading' ? <p className="empty-state">备份列表扫描中...</p>
         : verifiedBackups.length > 0 ? <div className="backup-list">

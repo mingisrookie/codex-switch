@@ -18,7 +18,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::{
     backup::{
         create_backup as create_backup_snapshot, create_local_backup,
-        list_recent_backups as list_backup_snapshots, migrate_legacy_plaintext_auth,
+        ensure_backup_capacity_for_roots, list_recent_backups as list_backup_snapshots,
+        migrate_legacy_plaintext_auth, prune_managed_backups,
         restore_backup as restore_backup_snapshot, verify_backup, BackupManifest, BackupSummary,
         RestoreResult,
     },
@@ -331,7 +332,7 @@ pub fn switch_runtime(runtime_id: String) -> Result<RuntimeSwitchResult, String>
     let started = timestamp_millis()?;
     let attempt_id = operation_id("switch-runtime-attempt")?;
     let mut failure_backups = Vec::new();
-    let result = (|| {
+    let mut result = (|| {
         ensure_codex_closed("switching runtimes")?;
         let backup_root = default_backup_root()?;
         let shared_home = default_shared_sessions_root()?;
@@ -342,6 +343,7 @@ pub fn switch_runtime(runtime_id: String) -> Result<RuntimeSwitchResult, String>
             store.mark_verified(RELAY_RUNTIME_ID)?;
         }
         ensure_codex_closed("switching runtimes")?;
+        maintain_backup_retention(&[])?;
         match switch_runtime_files_detailed(
             &store,
             &runtime_id,
@@ -356,32 +358,35 @@ pub fn switch_runtime(runtime_id: String) -> Result<RuntimeSwitchResult, String>
             }
         }
     })();
-    let (id, backups, counts) = match &result {
-        Ok(receipt) => (
-            receipt.operation_id.as_str(),
-            receipt.backups.as_slice(),
-            BTreeMap::from([
-                ("toShared".to_string(), receipt.to_shared.inserted_threads),
-                (
-                    "fromShared".to_string(),
-                    receipt.from_shared.inserted_threads,
-                ),
-            ]),
-        ),
-        Err(_) => (
-            attempt_id.as_str(),
-            failure_backups.as_slice(),
-            BTreeMap::new(),
-        ),
-    };
-    record_result(
-        id,
-        OperationAction::SwitchRuntime,
-        started,
-        &result,
-        backups,
-        counts,
-    );
+    match &mut result {
+        Ok(receipt) => {
+            receipt.warnings = record_success(
+                &receipt.operation_id,
+                OperationAction::SwitchRuntime,
+                started,
+                &receipt.backups,
+                BTreeMap::from([
+                    ("toShared".to_string(), receipt.to_shared.inserted_threads),
+                    (
+                        "fromShared".to_string(),
+                        receipt.from_shared.inserted_threads,
+                    ),
+                ]),
+            )
+            .into_iter()
+            .collect();
+        }
+        Err(error) => {
+            let _ = append_operation_record(
+                &attempt_id,
+                OperationAction::SwitchRuntime,
+                terminal_status(error),
+                started,
+                &failure_backups,
+                BTreeMap::new(),
+            );
+        }
+    }
     result
 }
 
@@ -394,8 +399,13 @@ pub fn sync_all_sessions() -> Result<SessionSyncReceipt, String> {
     let mut failure_status = None;
     let mut result = (|| {
         let backup_root = default_backup_root()?;
+        maintain_backup_retention(&[])?;
         let shared_home = default_shared_sessions_root()?;
         let current_home = default_codex_home();
+        ensure_backup_capacity_for_roots(
+            &backup_root,
+            &[(&current_home, false), (&shared_home, true)],
+        )?;
         let current_backup = create_backup_snapshot(&current_home, &backup_root, "sync-current")?;
         backups.push(current_backup.clone());
         let shared_backup = create_local_backup(&shared_home, &backup_root, "sync-shared")?;
@@ -468,6 +478,9 @@ pub fn delete_managed_sessions(
     let result = (|| {
         ensure_codex_closed("deleting sessions")?;
         let backup_root = default_backup_root()?;
+        if confirmed && ids.iter().any(|id| !id.trim().is_empty()) {
+            maintain_backup_retention(&[])?;
+        }
         let shared_home = default_shared_sessions_root()?;
         match delete_sessions(
             &default_codex_home(),
@@ -501,6 +514,9 @@ pub fn restore_sessions_visible(ids: Vec<String>) -> Result<SessionMutationRecei
     let result = (|| {
         ensure_codex_closed("restoring session visibility")?;
         let backup_root = default_backup_root()?;
+        if ids.iter().any(|id| !id.trim().is_empty()) {
+            maintain_backup_retention(&[])?;
+        }
         match restore_visible(&default_codex_home(), &backup_root, &ids) {
             Ok(result) => Ok(result),
             Err(failure) => {
@@ -540,6 +556,7 @@ pub fn restore_backup(backup_dir: String) -> Result<RestoreBackupReceipt, String
         let backup_root = default_backup_root()?;
         let selected = validate_backup_selection(&backup_root, Path::new(&backup_dir))?;
         let manifest = verify_backup(&selected)?;
+        maintain_backup_retention(std::slice::from_ref(&selected))?;
         backups.push(manifest.clone());
         let current_home = default_codex_home();
         let shared_home = default_shared_sessions_root()?;
@@ -551,6 +568,7 @@ pub fn restore_backup(backup_dir: String) -> Result<RestoreBackupReceipt, String
         } else {
             return Err("backup source is not one of the managed roots".to_string());
         };
+        ensure_backup_capacity_for_roots(&backup_root, &[(&target, target_is_local)])?;
         let safety_backup = if target_is_local {
             create_local_backup(&target, &backup_root, "pre-restore-safety")?
         } else {
@@ -859,7 +877,7 @@ fn record_result<T>(
     let Ok(log) = operation_log() else {
         return;
     };
-    let _ = record_result_to_log(
+    if record_result_to_log(
         &log,
         operation_id,
         action,
@@ -867,7 +885,11 @@ fn record_result<T>(
         result,
         backups,
         counts,
-    );
+    )
+    .is_ok()
+    {
+        let _ = maintain_backup_retention(&[]);
+    }
 }
 
 fn record_result_to_log<T>(
@@ -910,7 +932,7 @@ fn record_success(
         counts,
     )
     .err()
-    .map(|_| "操作已成功，但本地操作记录写入失败".to_string())
+    .map(|_| "操作已成功，但本地操作记录或旧备份清理失败。".to_string())
 }
 
 fn terminal_status(error: &str) -> OperationStatus {
@@ -931,15 +953,53 @@ fn append_operation_record(
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
 ) -> Result<(), String> {
+    let log = operation_log()?;
     append_operation_record_to(
-        &operation_log()?,
+        &log,
         operation_id,
         action,
         status,
         started_at_ms,
         backups,
         counts,
-    )
+    )?;
+    maintain_backup_retention(&[])
+}
+
+fn protected_backup_dirs(records: &[OperationRecord]) -> Vec<PathBuf> {
+    let mut protected = Vec::new();
+    if let Some(latest) = records.iter().find(|record| !record.backup_dirs.is_empty()) {
+        protected.extend(latest.backup_dirs.iter().cloned());
+    }
+    if let Some(last_complete) = records
+        .iter()
+        .find(|record| record.status == OperationStatus::Succeeded && record.backup_dirs.len() >= 2)
+    {
+        for path in &last_complete.backup_dirs {
+            if !protected.contains(path) {
+                protected.push(path.clone());
+            }
+        }
+    }
+    protected
+}
+
+fn maintain_backup_retention(extra_protected: &[PathBuf]) -> Result<(), String> {
+    let records = operation_log()?.list(usize::MAX)?;
+    let managed = records
+        .iter()
+        .flat_map(|record| record.backup_dirs.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut protected = protected_backup_dirs(&records);
+    for path in extra_protected {
+        if !protected.contains(path) {
+            protected.push(path.clone());
+        }
+    }
+    if protected.is_empty() || managed.is_empty() {
+        return Ok(());
+    }
+    prune_managed_backups(&default_backup_root()?, &managed, &protected).map(|_| ())
 }
 
 fn append_operation_record_to(
@@ -1030,12 +1090,15 @@ mod tests {
 
     use crate::{
         backup::{create_backup, create_local_backup},
-        operation_log::{OperationAction, OperationLog, OperationStatus},
+        operation_log::{
+            OperationAction, OperationLog, OperationPhase, OperationRecord, OperationStatus,
+        },
     };
 
     use super::{
         acquire_mutation_lock_at, compensate_failed_hot_sync, default_codex_home_from_env,
-        get_app_status, record_result_to_log, validate_backup_selection, MutationCoordinator,
+        get_app_status, protected_backup_dirs, record_result_to_log, validate_backup_selection,
+        MutationCoordinator,
     };
 
     #[cfg(windows)]
@@ -1118,6 +1181,77 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, OperationStatus::Failed);
         assert_eq!(records[0].backup_dirs, vec![backup.backup_dir]);
+    }
+
+    #[test]
+    fn retention_keeps_only_the_latest_operation_when_it_is_a_complete_success() {
+        let records = vec![
+            operation_record(
+                "latest",
+                OperationStatus::Succeeded,
+                &["latest-current", "latest-shared"],
+            ),
+            operation_record(
+                "old",
+                OperationStatus::Succeeded,
+                &["old-current", "old-shared"],
+            ),
+        ];
+
+        assert_eq!(
+            protected_backup_dirs(&records),
+            vec![
+                std::path::PathBuf::from("latest-current"),
+                std::path::PathBuf::from("latest-shared")
+            ]
+        );
+    }
+
+    #[test]
+    fn retention_keeps_a_partial_latest_attempt_and_the_last_complete_success() {
+        let records = vec![
+            operation_record(
+                "partial-failure",
+                OperationStatus::Failed,
+                &["partial-current"],
+            ),
+            operation_record(
+                "last-complete",
+                OperationStatus::Succeeded,
+                &["complete-current", "complete-shared"],
+            ),
+            operation_record(
+                "older",
+                OperationStatus::Succeeded,
+                &["older-current", "older-shared"],
+            ),
+        ];
+
+        assert_eq!(
+            protected_backup_dirs(&records),
+            vec![
+                std::path::PathBuf::from("partial-current"),
+                std::path::PathBuf::from("complete-current"),
+                std::path::PathBuf::from("complete-shared")
+            ]
+        );
+    }
+
+    fn operation_record(
+        id: &str,
+        status: OperationStatus,
+        backup_dirs: &[&str],
+    ) -> OperationRecord {
+        OperationRecord {
+            operation_id: id.to_string(),
+            action: OperationAction::SwitchRuntime,
+            status,
+            phase: OperationPhase::Complete,
+            started_at_ms: 0,
+            completed_at_ms: 1,
+            backup_dirs: backup_dirs.iter().map(std::path::PathBuf::from).collect(),
+            counts: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]

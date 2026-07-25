@@ -5,7 +5,10 @@ use serde::Serialize;
 use toml_edit::DocumentMut;
 
 use crate::{
-    backup::{create_backup, create_local_backup, restore_backup, BackupManifest},
+    backup::{
+        create_backup, create_local_backup, ensure_backup_capacity_for_roots, restore_backup,
+        BackupManifest,
+    },
     codex_paths::resolve_user_codex_paths,
     config_patch::{plan_runtime_config_patch, RuntimeConfigKind},
     file_ops::atomic_write,
@@ -27,6 +30,7 @@ pub struct RuntimeSwitchResult {
     pub to_shared: SessionSyncResult,
     pub from_shared: SessionSyncResult,
     pub rolled_back: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,9 +148,12 @@ fn switch_runtime_files_internal(
             to_shared: empty_sync_result(),
             from_shared: empty_sync_result(),
             rolled_back: false,
+            warnings: Vec::new(),
         });
     }
 
+    ensure_backup_capacity_for_roots(backup_root, &[(codex_home, false), (shared_home, true)])
+        .map_err(RuntimeSwitchFailure::before_backup)?;
     let current_backup = create_backup(codex_home, backup_root, "switch-runtime-current")
         .map_err(RuntimeSwitchFailure::before_backup)?;
     let shared_backup = create_local_backup(shared_home, backup_root, "switch-runtime-shared")
@@ -195,6 +202,7 @@ fn switch_runtime_files_internal(
             to_shared,
             from_shared,
             rolled_back: false,
+            warnings: Vec::new(),
         }),
         Err(error) => {
             let current_restore = restore_backup(&current_backup.backup_dir, codex_home);

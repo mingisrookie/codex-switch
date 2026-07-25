@@ -133,7 +133,7 @@ preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
 - 文件写入、复制和 JSONL 重写统一走 `file_ops` 原子操作；不得直接 `fs::write` 覆盖 live 文件。
 - 所有会修改运行态、凭据、current/shared 或备份目标的 command 必须共用 mutation guard：进程内 try-lock + Windows 独占 `mutation.lock` 文件句柄；新增入口不得绕过同进程/跨进程串行化。
 - 一键更新安装也必须取得同一 mutation guard；helper readiness 成功后父进程进入 shutdown-pending，退出前不得释放跨进程锁或接受新 mutation。前端禁用只能改善体验，不能替代后端互斥。
-- 当前没有备份 retention/prune；任何清理策略必须先定义保留周期、容量上限、在用/安全快照保护与用户确认，不能在列表扫描或其他无关流程中静默删除。
+- 备份 retention 必须在 mutation guard 内运行，只能删除 manifest 与全部 payload 均通过大小/SHA-256 校验的受管直接子目录；必须保护最新一次产生备份的操作和最近一次成功的 current/shared 完整回滚组。未验证、未完成、链接或无法归属的目录不得自动删除。创建新快照前必须估算本轮 payload 和加密开销，并保留固定卷安全余量；空间不足必须在写入第一份备份前停止。
 - SQLite 备份必须使用 SQLite Online Backup API；不得把直接复制 WAL/SHM 当成一致性快照。
 - 工具自有备份 payload 必须全部 DPAPI 加密，并记录大小和 SHA-256；恢复前必须校验 manifest 和 payload，恢复后执行必要的解析/`quick_check`。
 - 成功回执必须包含可关联的 operation ID、备份引用、计数、回滚终态和警告。命令完成后必须释放 UI busy，Dashboard 刷新走后台 best-effort；操作成功后的刷新失败必须与 mutation 失败分开表达，操作失败后的刷新失败不得覆盖原错误。

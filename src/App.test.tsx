@@ -587,7 +587,7 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     expect(await screen.findByText('session-sync')).toBeTruthy();
-    expect(screen.getByText('仅校验并展示最近 5 份备份候选；旧备份不会自动清理。')).toBeTruthy();
+    expect(screen.getByText('仅校验并展示最近 5 份备份候选；成功操作后自动保留最新操作和最近完整成功回滚组。')).toBeTruthy();
     expect(screen.getByText('来源：C:\\shared-sessions')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: /^恢复此备份/ })).toHaveLength(2);
   });

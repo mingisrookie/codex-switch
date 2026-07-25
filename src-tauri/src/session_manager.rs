@@ -13,7 +13,10 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    backup::{create_backup, create_local_backup, restore_backup, BackupManifest},
+    backup::{
+        create_backup, create_local_backup, ensure_backup_capacity_for_roots, restore_backup,
+        BackupManifest,
+    },
     codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
     file_ops::{atomic_write, walk_jsonl_files},
 };
@@ -243,6 +246,8 @@ fn delete_managed_sessions_inner(
 
     let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
     let mut result = empty_result(selected.len());
+    ensure_backup_capacity_for_roots(backup_root, &[(codex_home, false), (shared_home, true)])
+        .map_err(SessionMutationFailure::before_backup)?;
     let current_backup = create_backup(codex_home, backup_root, "delete-sessions-current")
         .map_err(SessionMutationFailure::before_backup)?;
     let shared_backup = create_local_backup(shared_home, backup_root, "delete-sessions-shared")
@@ -313,6 +318,8 @@ pub fn restore_sessions_visible_detailed(
     }
     let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
     let mut result = empty_result(selected.len());
+    ensure_backup_capacity_for_roots(backup_root, &[(codex_home, false)])
+        .map_err(SessionMutationFailure::before_backup)?;
     result.backups.push(
         create_backup(codex_home, backup_root, "restore-sessions-visible")
             .map_err(SessionMutationFailure::before_backup)?,

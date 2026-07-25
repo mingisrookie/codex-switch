@@ -292,6 +292,7 @@ export type RuntimeSwitchResult = {
   toShared: SessionSyncResult;
   fromShared: SessionSyncResult;
   rolledBack: boolean;
+  warnings?: string[];
 };
 
 export type SyncDryRun = {
