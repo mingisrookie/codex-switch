@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $configPath = Join-Path $env:APPDATA 'codex-switch\skills\grok-search\config.json'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    throw 'Grok Search is not configured. Open Codex Switch and save the Grok Search configuration.'
+    throw 'Grok Search is not configured. Open ChatGPT Switch and save the Grok Search configuration.'
 }
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 Import-Module (Join-Path $PSScriptRoot 'GrokSearch.psm1') -Force

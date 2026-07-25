@@ -1,6 +1,7 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   AppStatus,
+  BackupDashboardData,
   CodexHomeStatus,
   CodexProcess,
   DashboardData,
@@ -16,10 +17,14 @@ import type {
   SessionSyncResult,
   AllSessionsDryRun,
   OperationRecord,
+  RuntimeDashboardData,
+  RuntimeKind,
+  RuntimeSwitchProgress,
   SkillConfigInput,
   SkillId,
   SkillMutationReceipt,
   SkillStatus,
+  SessionDashboardData,
   UpdateCheckResult,
   UpdateInstallReceipt,
   UpdateStartupNotice,
@@ -64,6 +69,41 @@ export async function loadDashboard(): Promise<DashboardData> {
   };
 }
 
+export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
+  const [codexHome, runtimes, runtimeStatus, operations] = await Promise.allSettled([
+    invoke<CodexHomeStatus>('scan_codex_home'),
+    invoke<RuntimeMetadata[]>('list_runtimes'),
+    invoke<RuntimeStatus>('scan_runtime_status'),
+    invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
+  ]);
+
+  return {
+    codexHome: settledDomain(codexHome),
+    runtimes: settledDomain(runtimes),
+    runtimeStatus: settledDomain(runtimeStatus),
+    operations: settledDomain(operations),
+  };
+}
+
+export async function loadSessionDashboard(): Promise<SessionDashboardData> {
+  const [sessions, managedSessions] = await Promise.allSettled([
+    invoke<SessionInventory>('scan_sessions'),
+    invoke<ManagedSessionInventory>('scan_managed_sessions'),
+  ]);
+
+  return {
+    sessions: settledDomain(sessions),
+    managedSessions: settledDomain(managedSessions),
+  };
+}
+
+export async function loadBackupDashboard(): Promise<BackupDashboardData> {
+  const [backups] = await Promise.allSettled([
+    invoke<BackupSummary[]>('list_backups'),
+  ]);
+  return { backups: settledDomain(backups) };
+}
+
 export function loadingDashboard(): DashboardData {
   return {
     codexHome: { status: 'loading' },
@@ -92,8 +132,12 @@ export function closeCodexProcesses() {
   return invoke<CodexProcess[]>('close_codex_processes');
 }
 
-export function switchRuntime(runtimeId: string) {
-  return invoke<RuntimeSwitchResult>('switch_runtime', { runtimeId });
+export function switchRuntime(
+  runtimeId: RuntimeKind,
+  onProgress: (event: RuntimeSwitchProgress) => void,
+) {
+  const onProgressChannel = new Channel<RuntimeSwitchProgress>(onProgress);
+  return invoke<RuntimeSwitchResult>('switch_runtime', { runtimeId, onProgress: onProgressChannel });
 }
 
 export function syncAllSessions() {

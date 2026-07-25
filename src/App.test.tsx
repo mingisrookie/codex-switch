@@ -1,7 +1,7 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DashboardData } from './types';
+import type { DashboardData, RuntimeSwitchProgress, RuntimeSwitchResult, UpdateInstallReceipt } from './types';
 
 const apiMocks = vi.hoisted(() => ({
   getAppStatus: vi.fn(),
@@ -14,6 +14,9 @@ const apiMocks = vi.hoisted(() => ({
   listCodexProcesses: vi.fn(),
   closeCodexProcesses: vi.fn(),
   switchRuntime: vi.fn(),
+  loadRuntimeDashboard: vi.fn(),
+  loadSessionDashboard: vi.fn(),
+  loadBackupDashboard: vi.fn(),
   dryRunAllSessions: vi.fn(),
   syncAllSessions: vi.fn(),
   deleteManagedSessions: vi.fn(),
@@ -44,7 +47,6 @@ function dashboardData(): DashboardData {
         logsDb: { path: 'logs_2.sqlite', exists: true, bytes: 681955328 },
         codexDevDb: { path: 'sqlite/codex-dev.db', exists: true, bytes: 98304 },
         sessionsDir: { path: 'sessions', exists: true, bytes: null },
-        sessionJsonlCount: 200,
         authSummary: { authMode: 'apikey', topLevelKeys: ['auth_mode'], hasTokensObject: false },
       },
     },
@@ -72,7 +74,7 @@ function dashboardData(): DashboardData {
       status: 'ready',
       data: [
         {
-          id: 'plus', name: 'Codex 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+          id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
           createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
         },
         {
@@ -124,9 +126,21 @@ describe('App release-hardening UI', () => {
     }
     apiMocks.listCodexProcesses.mockResolvedValue([]);
     apiMocks.listSkills.mockResolvedValue([]);
+    const initial = dashboardData();
+    apiMocks.loadRuntimeDashboard.mockResolvedValue({
+      codexHome: initial.codexHome,
+      runtimes: initial.runtimes,
+      runtimeStatus: initial.runtimeStatus,
+      operations: initial.operations,
+    });
+    apiMocks.loadSessionDashboard.mockResolvedValue({
+      sessions: initial.sessions,
+      managedSessions: initial.managedSessions,
+    });
+    apiMocks.loadBackupDashboard.mockResolvedValue({ backups: initial.backups });
     apiMocks.getUpdateStartupNotice.mockResolvedValue(null);
     apiMocks.getAppStatus.mockResolvedValue({
-      appName: 'Codex Switch', version: '0.1.5', phase: 'hardened-mvp',
+      appName: 'ChatGPT Switch', version: '0.1.5', phase: 'hardened-mvp',
       codexHome: 'C:\\Users\\alice\\.codex',
     });
     apiMocks.checkForUpdates.mockResolvedValue({
@@ -135,7 +149,7 @@ describe('App release-hardening UI', () => {
       checkedAtMs: 10,
     });
     apiMocks.importPlusRuntime.mockResolvedValue({
-      id: 'plus', name: 'Codex 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
       createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
     });
     apiMocks.upsertRelayRuntime.mockResolvedValue({
@@ -152,7 +166,7 @@ describe('App release-hardening UI', () => {
   it('checks once on startup without blocking the dashboard', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
-    expect(await screen.findByRole('article', { name: 'Codex 账号态' })).toBeTruthy();
+    expect(await screen.findByRole('article', { name: 'ChatGPT 账号态' })).toBeTruthy();
     await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
     expect(screen.getByText('v0.1.5 · 已是最新版')).toBeTruthy();
     expect(screen.queryByRole('region', { name: '发现新版本' })).toBeNull();
@@ -161,7 +175,7 @@ describe('App release-hardening UI', () => {
   it('does not duplicate the startup check during React StrictMode effect replay', async () => {
     render(<StrictMode><App loadDashboard={() => Promise.resolve(dashboardData())} /></StrictMode>);
 
-    await screen.findByRole('article', { name: 'Codex 账号态' });
+    await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
   });
 
@@ -226,8 +240,54 @@ describe('App release-hardening UI', () => {
     expect(await screen.findByText('injected update failure')).toBeTruthy();
   });
 
+  it('ignores a stale switch click while update installation is pending', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<{
+      fromVersion: string; toVersion: string; downloadedBytes: number; sha256: string; restarting: boolean;
+    }>();
+    apiMocks.installUpdate.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const switchButton = await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement;
+    fireEvent.click(await screen.findByRole('button', { name: '立即更新' }));
+    await waitFor(() => expect(switchButton.disabled).toBe(true));
+
+    switchButton.disabled = false;
+    fireEvent.click(switchButton);
+
+    expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
+    expect(screen.queryByRole('region', { name: '运行态切换进度' })).toBeNull();
+    pending.reject(new Error('injected update failure'));
+    await screen.findByText('injected update failure');
+  });
+
+  it('blocks backup retry while update installation is pending', async () => {
+    const data = dashboardData();
+    data.backups = { status: 'error', error: 'backup index unavailable' };
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<UpdateInstallReceipt>();
+    apiMocks.installUpdate.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const retry = await screen.findByRole('button', { name: '重试' }) as HTMLButtonElement;
+    fireEvent.click(await screen.findByRole('button', { name: '立即更新' }));
+    await waitFor(() => expect(retry.disabled).toBe(true));
+
+    retry.disabled = false;
+    fireEvent.click(retry);
+
+    expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
+    pending.reject(new Error('injected update failure'));
+    await screen.findByText('injected update failure');
+  });
+
   it('disables update installation while a local mutation is pending', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     apiMocks.checkForUpdates.mockResolvedValue({
       currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
       releaseNotes: null, checkedAtMs: 10,
@@ -241,13 +301,14 @@ describe('App release-hardening UI', () => {
 
     const install = await screen.findByRole('button', { name: '立即更新' }) as HTMLButtonElement;
     fireEvent.click(screen.getByRole('button', { name: '保存当前账号态' }));
+    fireEvent.click(await screen.findByRole('button', { name: '确认覆盖' }));
     await waitFor(() => expect(apiMocks.importPlusRuntime).toHaveBeenCalledTimes(1));
     expect(install.disabled).toBe(true);
     fireEvent.click(install);
     expect(apiMocks.installUpdate).not.toHaveBeenCalled();
 
     pending.resolve({
-      id: 'plus', name: 'Codex 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
       createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
     });
     await waitFor(() => expect(install.disabled).toBe(false));
@@ -288,7 +349,7 @@ describe('App release-hardening UI', () => {
     apiMocks.checkForUpdates.mockReturnValue(pending.promise);
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
-    const button = await screen.findByRole('button', { name: '检查中...' }) as HTMLButtonElement;
+    const button = await screen.findByRole('button', { name: '检查中' }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
     fireEvent.click(button);
     expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1);
@@ -304,7 +365,7 @@ describe('App release-hardening UI', () => {
   it('renders saved, current, and verified as separate runtime states', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
-    const account = await screen.findByRole('article', { name: 'Codex 账号态' });
+    const account = await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     const relay = screen.getByRole('article', { name: 'API 中转站态' });
     expect(within(account).getByText('已保存')).toBeTruthy();
     expect(within(account).getByText('非当前')).toBeTruthy();
@@ -316,7 +377,7 @@ describe('App release-hardening UI', () => {
 
   it('loads the independent skills page only after the user opens its tab', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
-    await screen.findByRole('article', { name: 'Codex 账号态' });
+    await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     expect(apiMocks.listSkills).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: '技能' }));
@@ -342,13 +403,13 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
 
-    const dialog = screen.getByRole('dialog', { name: '配置 API 中转站' });
-    const key = within(dialog).getByLabelText('API Key') as HTMLInputElement;
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    const key = within(panel).getByLabelText('API Key') as HTMLInputElement;
     expect(key.type).toBe('password');
-    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'https://new.example.com/v1' } });
-    fireEvent.change(within(dialog).getByLabelText('模型'), { target: { value: 'gpt-5.5-mini' } });
+    fireEvent.change(within(panel).getByLabelText('Base URL'), { target: { value: 'https://new.example.com/v1' } });
+    fireEvent.change(within(panel).getByLabelText('模型'), { target: { value: 'gpt-5.5-mini' } });
     fireEvent.change(key, { target: { value: 'sk-secret' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: '保存中转站' }));
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
     await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith({
       baseUrl: 'https://new.example.com/v1', model: 'gpt-5.5-mini', apiKey: 'sk-secret',
@@ -361,7 +422,7 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
 
-    fireEvent.click(within(screen.getByRole('dialog', { name: '配置 API 中转站' }))
+    fireEvent.click(within(screen.getByRole('region', { name: '配置 API 中转站' }))
       .getByRole('button', { name: '保存中转站' }));
 
     await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith({
@@ -372,79 +433,100 @@ describe('App release-hardening UI', () => {
   it('rejects relay URLs with embedded credentials before invoking the backend', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
-    const dialog = screen.getByRole('dialog', { name: '配置 API 中转站' });
-    fireEvent.change(within(dialog).getByLabelText('Base URL'), {
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    fireEvent.change(within(panel).getByLabelText('Base URL'), {
       target: { value: 'https://user:secret@relay.example.com/v1' },
     });
-    fireEvent.click(within(dialog).getByRole('button', { name: '保存中转站' }));
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
-    expect(await within(dialog).findByText('Base URL 不能包含用户名、密码、查询参数或片段')).toBeTruthy();
+    expect(await within(panel).findByText('Base URL 不能包含用户名、密码、查询参数或片段')).toBeTruthy();
     expect(apiMocks.upsertRelayRuntime).not.toHaveBeenCalled();
   });
 
   it('normalizes a relay host without a scheme to https before saving', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
-    const dialog = screen.getByRole('dialog', { name: '配置 API 中转站' });
-    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'relay.example.com/v1' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: '保存中转站' }));
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    fireEvent.change(within(panel).getByLabelText('Base URL'), { target: { value: 'relay.example.com/v1' } });
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
     await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith(expect.objectContaining({
       baseUrl: 'https://relay.example.com/v1',
     })));
   });
 
-  it('requires an explicit warning confirmation for non-local plain HTTP relays', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+  it('rejects non-local plain HTTP relays without opening a browser confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm');
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
-    const dialog = screen.getByRole('dialog', { name: '配置 API 中转站' });
-    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'http://relay.example.com/v1' } });
-    expect(within(dialog).getByRole('status').textContent).toContain('明文传输');
-    fireEvent.click(within(dialog).getByRole('button', { name: '保存中转站' }));
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    fireEvent.change(within(panel).getByLabelText('Base URL'), { target: { value: 'http://relay.example.com/v1' } });
+    expect(within(panel).getByRole('alert').textContent).toContain('远程中转站必须使用 HTTPS');
+    expect((within(panel).getByRole('button', { name: '保存中转站' }) as HTMLButtonElement).disabled).toBe(true);
 
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('明文 HTTP'));
+    expect(confirm).not.toHaveBeenCalled();
     expect(apiMocks.upsertRelayRuntime).not.toHaveBeenCalled();
   });
 
-  it('keeps the successful receipt and closes the dialog when only refresh fails', async () => {
-    const pendingRefresh = deferred<DashboardData>();
-    const load = vi.fn()
-      .mockResolvedValueOnce(dashboardData())
-      .mockReturnValueOnce(pendingRefresh.promise);
-    render(<App loadDashboard={load} />);
+  it('allows loopback HTTP relays without a browser confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm');
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
-    fireEvent.click(within(screen.getByRole('dialog', { name: '配置 API 中转站' }))
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    fireEvent.change(within(panel).getByLabelText('Base URL'), { target: { value: 'http://127.0.0.1:8787/v1' } });
+    fireEvent.change(within(panel).getByLabelText('API Key'), { target: { value: 'sk-loopback' } });
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
+
+    await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: 'http://127.0.0.1:8787/v1',
+    })));
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps the successful receipt and closes the dialog when only refresh fails', async () => {
+    const pendingRefresh = deferred<{
+      codexHome: DashboardData['codexHome'];
+      runtimes: DashboardData['runtimes'];
+      runtimeStatus: DashboardData['runtimeStatus'];
+      operations: DashboardData['operations'];
+    }>();
+    apiMocks.loadRuntimeDashboard.mockReturnValueOnce(pendingRefresh.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
+    fireEvent.click(within(screen.getByRole('region', { name: '配置 API 中转站' }))
       .getByRole('button', { name: '保存中转站' }));
 
     expect(await screen.findByText('API 中转站已保存')).toBeTruthy();
-    await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-    const dialogClosedBeforeRefresh = screen.queryByRole('dialog', { name: '配置 API 中转站' }) === null;
+    await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
+    const panelClosedBeforeRefresh = screen.queryByRole('region', { name: '配置 API 中转站' }) === null;
     const configureEnabledBeforeRefresh = !(screen.getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('refresh failed'));
     expect(await screen.findByText(/操作已成功，但状态刷新失败：refresh failed/)).toBeTruthy();
-    expect(dialogClosedBeforeRefresh).toBe(true);
+    expect(panelClosedBeforeRefresh).toBe(true);
     expect(configureEnabledBeforeRefresh).toBe(true);
   });
 
   it('keeps the relay key and shows backend save failures inside the dialog', async () => {
-    const pendingRefresh = deferred<DashboardData>();
+    const pendingRefresh = deferred<{
+      codexHome: DashboardData['codexHome'];
+      runtimes: DashboardData['runtimes'];
+      runtimeStatus: DashboardData['runtimeStatus'];
+      operations: DashboardData['operations'];
+    }>();
     apiMocks.upsertRelayRuntime.mockRejectedValue(new Error('relay store unavailable'));
-    const load = vi.fn()
-      .mockResolvedValueOnce(dashboardData())
-      .mockReturnValueOnce(pendingRefresh.promise);
-    render(<App loadDashboard={load} />);
+    apiMocks.loadRuntimeDashboard.mockReturnValueOnce(pendingRefresh.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
-    const dialog = screen.getByRole('dialog', { name: '配置 API 中转站' });
-    const key = within(dialog).getByLabelText('API Key') as HTMLInputElement;
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    const key = within(panel).getByLabelText('API Key') as HTMLInputElement;
     fireEvent.change(key, { target: { value: 'sk-retry-value' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: '保存中转站' }));
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
-    expect(await within(dialog).findByText('relay store unavailable')).toBeTruthy();
-    await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-    const saveEnabledBeforeRefresh = !(within(dialog).getByRole('button', { name: '保存中转站' }) as HTMLButtonElement).disabled;
+    expect(await within(panel).findByText('relay store unavailable')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
+    const saveEnabledBeforeRefresh = !(within(panel).getByRole('button', { name: '保存中转站' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('history refresh failed'));
-    await waitFor(() => expect(within(dialog).getByText('relay store unavailable')).toBeTruthy());
+    await waitFor(() => expect(within(panel).getByText('relay store unavailable')).toBeTruthy());
     expect(key.value).toBe('sk-retry-value');
     expect(saveEnabledBeforeRefresh).toBe(true);
     expect(screen.queryByText('history refresh failed')).toBeNull();
@@ -473,7 +555,7 @@ describe('App release-hardening UI', () => {
     data.managedSessions.data.totalCount = 1;
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+    fireEvent.click(await screen.findByRole('button', { name: '会话' }));
     fireEvent.click(screen.getByLabelText(/^选择 thread-a/));
     expect((screen.getByRole('button', { name: '立即同步' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: '删除所选' }) as HTMLButtonElement).disabled).toBe(false);
@@ -502,14 +584,18 @@ describe('App release-hardening UI', () => {
   });
 
   it('confirms overwrite when saving an existing account runtime', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.spyOn(window, 'confirm');
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '保存当前账号态' }));
+    const confirmation = await screen.findByRole('region', { name: '覆盖已保存的 ChatGPT 账号态' });
+    expect(within(confirmation).getByText('当前账号态会先归档，再写入新的加密快照。')).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '确认覆盖' }));
     await waitFor(() => expect(apiMocks.importPlusRuntime).toHaveBeenCalledWith(true));
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it('shows sync dry-run before execution and renders the backend receipt', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.spyOn(window, 'confirm');
     apiMocks.syncAllSessions.mockResolvedValue({
       operationId: 'sync-1', backups: [{ backupDir: 'C:\\backups\\sync-1' }],
       insertedThreads: 3, copiedSessionFiles: 2, duplicateThreads: 8,
@@ -520,17 +606,19 @@ describe('App release-hardening UI', () => {
     fireEvent.click(await screen.findByRole('button', { name: '立即同步' }));
 
     await waitFor(() => expect(apiMocks.dryRunAllSessions).toHaveBeenCalled());
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('预计新增 3 个线程'));
+    const confirmation = await screen.findByRole('region', { name: '会话同步预检已完成' });
+    expect(within(confirmation).getByText('新增 3 个线程')).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '开始同步' }));
     await waitFor(() => expect(apiMocks.syncAllSessions).toHaveBeenCalled());
     expect(await screen.findByText('操作 ID：sync-1')).toBeTruthy();
     expect(screen.getByText('新增线程：3')).toBeTruthy();
     expect(screen.getByText('备份：1')).toBeTruthy();
     expect(screen.getByText('警告：审计日志写入失败')).toBeTruthy();
     expect(apiMocks.listCodexProcesses).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it('keeps the successful sync receipt when only the dashboard refresh fails', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const pendingRefresh = deferred<DashboardData>();
     const load = vi.fn()
       .mockResolvedValueOnce(dashboardData())
@@ -542,6 +630,7 @@ describe('App release-hardening UI', () => {
     });
     render(<App loadDashboard={load} />);
     fireEvent.click(await screen.findByRole('button', { name: '立即同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始同步' }));
 
     expect(await screen.findByText('操作 ID：sync-refresh-failed')).toBeTruthy();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
@@ -552,7 +641,6 @@ describe('App release-hardening UI', () => {
   });
 
   it('refreshes durable history after a failed session sync', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const pendingRefresh = deferred<DashboardData>();
     const failed = dashboardData();
     if (failed.operations.status !== 'ready') throw new Error('fixture mismatch');
@@ -566,6 +654,7 @@ describe('App release-hardening UI', () => {
     apiMocks.syncAllSessions.mockRejectedValue(new Error('sync apply failed'));
     render(<App loadDashboard={load} />);
     fireEvent.click(await screen.findByRole('button', { name: '立即同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始同步' }));
 
     expect(await screen.findByText('sync apply failed')).toBeTruthy();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
@@ -587,7 +676,7 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     expect(await screen.findByText('session-sync')).toBeTruthy();
-    expect(screen.getByText('仅校验并展示最近 5 份备份候选；旧备份不会自动清理。')).toBeTruthy();
+    expect(screen.getByText('最近 5 份已验证快照')).toBeTruthy();
     expect(screen.getByText('来源：C:\\shared-sessions')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: /^恢复此备份/ })).toHaveLength(2);
   });
@@ -598,7 +687,7 @@ describe('App release-hardening UI', () => {
     data.backups = { status: 'error', error: 'backup index unavailable' };
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
-    const account = await screen.findByRole('article', { name: 'Codex 账号态' });
+    const account = await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     expect(within(account).getAllByText('不可用').length).toBeGreaterThan(0);
     const backupPanel = screen.getByRole('complementary', { name: '备份恢复' });
     expect(within(backupPanel).getByText('backup index unavailable')).toBeTruthy();
@@ -632,9 +721,14 @@ describe('App release-hardening UI', () => {
       operationId: 'verify-failed-1', action: 'verifyRelay', status: 'failed', phase: 'verify',
       startedAtMs: 11, completedAtMs: 12, backupDirs: [], counts: {},
     }];
-    const load = vi.fn().mockResolvedValueOnce(dashboardData()).mockResolvedValueOnce(failed);
+    apiMocks.loadRuntimeDashboard.mockResolvedValueOnce({
+      codexHome: failed.codexHome,
+      runtimes: failed.runtimes,
+      runtimeStatus: failed.runtimeStatus,
+      operations: failed.operations,
+    });
     apiMocks.verifyRelayRuntime.mockRejectedValue(new Error('relay unreachable'));
-    render(<App loadDashboard={load} />);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '验证连接' }));
     expect(await screen.findByText('relay unreachable')).toBeTruthy();
@@ -643,25 +737,205 @@ describe('App release-hardening UI', () => {
     expect(within(history).getByText('失败')).toBeTruthy();
   });
 
-  it('closes a running Codex only after confirmation before switching', async () => {
+  it('shows switch loading immediately, streams stages, and keeps the task across tabs', async () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
-    apiMocks.listCodexProcesses.mockResolvedValue([{ imageName: 'codex.exe', pid: 1234 }]);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    apiMocks.switchRuntime.mockResolvedValue({
+    const pendingSwitch = deferred<{
+      operationId: string;
+      changed: boolean;
+      runtime: (typeof dashboard.runtimes.data)[number];
+      backups: [];
+      rolledBack: boolean;
+      toShared: { insertedThreads: number };
+      fromShared: { insertedThreads: number };
+    }>();
+    let onProgress!: (event: {
+      phase: 'detectingApp' | 'closingApp' | 'backingUpCurrent' | 'complete';
+      timestampMs: number;
+    }) => void;
+    apiMocks.switchRuntime.mockImplementation((_runtimeId, callback) => {
+      onProgress = callback;
+      return pendingSwitch.promise;
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+
+    const progress = screen.getByRole('region', { name: '运行态切换进度' });
+    expect(within(progress).getByRole('heading', { name: '正在切换到ChatGPT 账号' })).toBeTruthy();
+    expect(screen.getByText('切换 ChatGPT 账号处理中')).toBeTruthy();
+    expect(apiMocks.switchRuntime).toHaveBeenCalledWith('plus', expect.any(Function));
+    expect(apiMocks.listCodexProcesses).not.toHaveBeenCalled();
+    expect(apiMocks.closeCodexProcesses).not.toHaveBeenCalled();
+
+    act(() => {
+      onProgress({ phase: 'detectingApp', timestampMs: 100 });
+      onProgress({ phase: 'closingApp', timestampMs: 110 });
+      onProgress({ phase: 'backingUpCurrent', timestampMs: 120 });
+    });
+    expect(within(progress).getByText('备份当前数据', { selector: 'strong' }).closest('li')?.className).toBe('active');
+    expect(within(progress).getByText('检测 ChatGPT', { selector: 'strong' }).closest('li')?.className).toBe('done');
+
+    fireEvent.click(screen.getByRole('button', { name: '技能' }));
+    expect(screen.getByRole('region', { name: '运行态切换进度' })).toBeTruthy();
+
+    act(() => onProgress({ phase: 'complete', timestampMs: 130 }));
+    pendingSwitch.resolve({
       operationId: 'switch-1', changed: true, runtime: dashboard.runtimes.data[0],
       backups: [], rolledBack: false,
       toShared: { insertedThreads: 0 }, fromShared: { insertedThreads: 0 },
     });
-    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
-
-    fireEvent.click(await screen.findByRole('button', { name: '切换到 Codex 账号' }));
-
-    await waitFor(() => expect(apiMocks.closeCodexProcesses).toHaveBeenCalled());
-    expect(apiMocks.switchRuntime).toHaveBeenCalledWith('plus');
+    expect(await screen.findByText('切换完成，可以重新打开 ChatGPT。会话索引将在打开会话页时刷新。')).toBeTruthy();
   });
 
-  it('closes a running Codex before a confirmed session mutation', async () => {
+  it('serializes same-tick switch clicks and waits for command completion before scanning stale sessions', async () => {
+    const dashboard = dashboardData();
+    dashboard.backups = { status: 'error', error: 'backup index unavailable' };
+    if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
+    const pendingSwitch = deferred<RuntimeSwitchResult>();
+    let onProgress!: (event: RuntimeSwitchProgress) => void;
+    apiMocks.switchRuntime.mockImplementation((_runtimeId, callback) => {
+      onProgress = callback;
+      return pendingSwitch.promise;
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    const switchButton = await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement;
+    act(() => {
+      switchButton.click();
+      switchButton.click();
+    });
+    expect(apiMocks.switchRuntime).toHaveBeenCalledTimes(1);
+
+    act(() => onProgress({ phase: 'applyingRuntime', timestampMs: 110 }));
+    fireEvent.click(screen.getByRole('button', { name: '会话' }));
+    expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
+
+    act(() => onProgress({ phase: 'complete', timestampMs: 120 }));
+    expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
+
+    pendingSwitch.resolve({
+      operationId: 'switch-serialized',
+      changed: true,
+      runtime: dashboard.runtimes.data[0],
+      backups: [],
+      rolledBack: false,
+      toShared: {
+        insertedThreads: 0,
+        copiedSessionFiles: 0,
+        duplicateThreads: 0,
+        skippedMissingSessionFiles: 0,
+        skippedArchivedThreads: 0,
+        mergedSessionIndexEntries: 0,
+      },
+      fromShared: {
+        insertedThreads: 0,
+        copiedSessionFiles: 0,
+        duplicateThreads: 0,
+        skippedMissingSessionFiles: 0,
+        skippedArchivedThreads: 0,
+        mergedSessionIndexEntries: 0,
+      },
+    });
+    await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
+  });
+
+  it('marks backups stale after the current snapshot even when switching fails before mutation', async () => {
+    const pendingSwitch = deferred<RuntimeSwitchResult>();
+    let onProgress!: (event: RuntimeSwitchProgress) => void;
+    apiMocks.switchRuntime.mockImplementation((_runtimeId, callback) => {
+      onProgress = callback;
+      return pendingSwitch.promise;
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+    act(() => onProgress({ phase: 'backingUpCurrent', timestampMs: 100 }));
+    expect(screen.queryByRole('button', { name: '加载备份' })).toBeNull();
+
+    act(() => onProgress({ phase: 'backingUpShared', timestampMs: 110 }));
+    const loadBackups = screen.getByRole('button', { name: '加载备份' }) as HTMLButtonElement;
+    expect(loadBackups.disabled).toBe(true);
+
+    act(() => {
+      onProgress({
+        phase: 'failed',
+        timestampMs: 120,
+        message: 'shared backup failed',
+        outcome: 'failedBeforeWrite',
+      });
+      pendingSwitch.reject(new Error('shared backup failed'));
+    });
+    await screen.findAllByText('shared backup failed');
+    await waitFor(() => expect(loadBackups.disabled).toBe(false));
+
+    fireEvent.click(loadBackups);
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+    expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
+  });
+
+  it('loads runtime state first, then sessions and backups only on demand', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
+    const plusRuntime = dashboard.runtimes.data[0];
+    apiMocks.switchRuntime.mockImplementation(async (_runtimeId, onProgress) => {
+      onProgress({ phase: 'detectingApp', timestampMs: 100 });
+      onProgress({ phase: 'applyingRuntime', timestampMs: 110 });
+      onProgress({ phase: 'complete', timestampMs: 120 });
+      return {
+        operationId: 'switch-lazy', changed: true, runtime: plusRuntime,
+        backups: [], rolledBack: false,
+        toShared: { insertedThreads: 0 }, fromShared: { insertedThreads: 0 },
+      };
+    });
+
+    render(<App />);
+
+    await screen.findByRole('article', { name: 'ChatGPT 账号态' });
+    expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1);
+    expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
+    expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '切换到 ChatGPT 账号' }));
+    await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(2));
+    expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
+    expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '会话' }));
+    await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
+    expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '运行态' }));
+    fireEvent.click(await screen.findByRole('button', { name: '加载备份' }));
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+  });
+
+  it('infers the interrupted step from the phase before rollback', async () => {
+    apiMocks.switchRuntime.mockImplementation(async (_runtimeId, onProgress) => {
+      onProgress({ phase: 'detectingApp', timestampMs: 100 });
+      onProgress({ phase: 'applyingRuntime', timestampMs: 110 });
+      onProgress({ phase: 'rollingBack', timestampMs: 120 });
+      onProgress({
+        phase: 'failed',
+        timestampMs: 130,
+        outcome: 'rolledBack',
+        message: 'runtime apply failed',
+      });
+      throw new Error('runtime apply failed');
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+
+    const progress = await screen.findByRole('region', { name: '运行态切换进度' });
+    await waitFor(() => expect(within(progress).getByText('已恢复切换前状态')).toBeTruthy());
+    const interrupted = within(progress).getByText('应用运行态', { selector: 'strong' }).closest('li');
+    expect(interrupted?.className).toBe('failed');
+    expect(within(interrupted as HTMLElement).getByText('中断')).toBeTruthy();
+    expect(within(progress).queryByText('正在恢复切换前状态')).toBeNull();
+  });
+
+  it('closes a running ChatGPT process only after inline session-delete confirmation', async () => {
     const dashboard = dashboardData();
     if (dashboard.managedSessions.status !== 'ready') throw new Error('test fixture must include sessions');
     dashboard.managedSessions.data.sessions = [{
@@ -676,24 +950,27 @@ describe('App release-hardening UI', () => {
     }];
     dashboard.managedSessions.data.totalCount = 1;
     dashboard.managedSessions.data.archivedCount = 1;
-    apiMocks.listCodexProcesses.mockResolvedValue([{ imageName: 'codex.exe', pid: 1234 }]);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    apiMocks.listCodexProcesses.mockResolvedValue([{ imageName: 'ChatGPT.exe', pid: 1234, parentPid: 10 }]);
+    const confirm = vi.spyOn(window, 'confirm');
     apiMocks.deleteManagedSessions.mockResolvedValue({
       operationId: 'delete-1', selectedCount: 1, backups: [], deletedThreads: 1,
       deletedSessionFiles: 1, removedSessionIndexEntries: 1, restoredThreads: 0,
     });
     render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: '会话管理' }));
+    fireEvent.click(await screen.findByRole('button', { name: '会话' }));
     fireEvent.click(screen.getByLabelText(/^选择 thread-a/));
     fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+    expect(apiMocks.deleteManagedSessions).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
 
     await waitFor(() => expect(apiMocks.closeCodexProcesses).toHaveBeenCalled());
     expect(apiMocks.deleteManagedSessions).toHaveBeenCalledWith(['thread-a'], true);
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it('restores only a verified backup after explicit confirmation', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.spyOn(window, 'confirm');
     apiMocks.restoreBackup.mockResolvedValue({
       operationId: 'restore-1', backupDir: 'C:\\backups\\safe-1', targetRoot: 'C:\\Users\\alice\\.codex',
       restoredFiles: 4, verified: true,
@@ -701,8 +978,29 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
     fireEvent.click(await screen.findByRole('button', { name: /^恢复此备份/ }));
+    expect(apiMocks.restoreBackup).not.toHaveBeenCalled();
+    const confirmation = screen.getByRole('region', { name: '恢复已验证备份' });
+    fireEvent.click(within(confirmation).getByRole('button', { name: '开始恢复' }));
     await waitFor(() => expect(apiMocks.restoreBackup).toHaveBeenCalledWith('C:\\backups\\safe-1'));
     expect(await screen.findByText('操作 ID：restore-1')).toBeTruthy();
     expect(screen.getByText('恢复文件：4')).toBeTruthy();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('uses only inline interaction surfaces and never invokes native dialogs', async () => {
+    const confirm = vi.spyOn(window, 'confirm');
+    const prompt = vi.spyOn(window, 'prompt');
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
+    expect(screen.getByRole('region', { name: '配置 API 中转站' })).toBeTruthy();
+    expect(document.querySelector('dialog')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存当前账号态' }));
+    expect(screen.getByRole('region', { name: '覆盖已保存的 ChatGPT 账号态' })).toBeTruthy();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
   });
 });

@@ -17,7 +17,7 @@ Add-Type -AssemblyName System.Net.Http
 function Get-ConfiguredCredential {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw 'Image2 credential is not configured. Open Codex Switch and save the Image2 configuration.'
+        throw 'Image2 credential is not configured. Open ChatGPT Switch and save the Image2 configuration.'
     }
     $protected = [Convert]::FromBase64String((Get-Content -LiteralPath $Path -Raw).Trim())
     $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
@@ -42,7 +42,7 @@ function Assert-ProviderUrl {
 
 $configPath = Join-Path $env:APPDATA 'codex-switch\skills\image2\config.json'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    throw 'Image2 is not configured. Open Codex Switch and save the Image2 configuration.'
+    throw 'Image2 is not configured. Open ChatGPT Switch and save the Image2 configuration.'
 }
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 $baseUrl = Assert-ProviderUrl ([string]$config.base_url)

@@ -17,7 +17,7 @@ $grokSearch = Join-Path $codexHome 'skills\grok-search\scripts\grok-search.ps1'
 & $grokSearch -Query "<research prompt>" -Mode <mode>
 ```
 
-The URL and current-user DPAPI-protected API Key are configured through Codex Switch. Never open, copy, print, or request the credential file. If the script reports missing configuration, ask the user to configure Grok Search in Codex Switch.
+The URL and current-user DPAPI-protected API Key are configured through ChatGPT Switch. Never open, copy, print, or request the credential file. If the script reports missing configuration, ask the user to configure Grok Search in ChatGPT Switch.
 
 Select the narrowest useful mode:
 
