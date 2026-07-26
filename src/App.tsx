@@ -36,6 +36,7 @@ import {
   getAppStatus as defaultGetAppStatus,
   getUpdateStartupNotice as defaultGetUpdateStartupNotice,
   installUpdate as defaultInstallUpdate,
+  launchChatgpt,
   listCodexProcesses,
   loadBackupDashboard as defaultLoadBackupDashboard,
   loadRuntimeDashboard as defaultLoadRuntimeDashboard,
@@ -132,7 +133,6 @@ function App({
   const [relaySubmitError, setRelaySubmitError] = useState<string | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [switchFlow, setSwitchFlow] = useState<RuntimeSwitchFlow | null>(null);
-  const [clockNow, setClockNow] = useState(Date.now);
   const [sessionsStale, setSessionsStale] = useState(() => loadDashboard === undefined);
   const [backupsStale, setBackupsStale] = useState(() => loadDashboard === undefined);
   const [backupLoading, setBackupLoading] = useState(false);
@@ -160,6 +160,9 @@ function App({
   const checkpointCleanupInFlight = useRef(false);
   const requestedSessionRevision = useRef(-1);
   const switchAttemptId = useRef(0);
+  const switchTrigger = useRef<HTMLElement | null>(null);
+  const switchFocusRestorePending = useRef(false);
+  const launchRetryInFlight = useRef(false);
   const confirmationTrigger = useRef<HTMLElement | null>(null);
   const startupCheckStarted = useRef(false);
   const updateCheckInFlight = useRef(false);
@@ -202,11 +205,21 @@ function App({
   }, []);
 
   useEffect(() => {
-    if (switchFlow?.status !== 'running') return undefined;
-    setClockNow(Date.now());
-    const timer = window.setInterval(() => setClockNow(Date.now()), 250);
-    return () => window.clearInterval(timer);
-  }, [switchFlow?.status]);
+    if (switchFlow || runtimeRefreshPending || !switchFocusRestorePending.current) return;
+    const trigger = switchTrigger.current;
+    if (!trigger?.isConnected) {
+      switchFocusRestorePending.current = false;
+      return;
+    }
+    trigger.focus({ preventScroll: true });
+    if (document.activeElement === trigger) {
+      switchFocusRestorePending.current = false;
+      return;
+    }
+    const runtimeCard = trigger.closest<HTMLElement>('.runtime-card');
+    runtimeCard?.focus({ preventScroll: true });
+    switchFocusRestorePending.current = false;
+  }, [runtimeRefreshPending, switchFlow]);
 
   useEffect(() => {
     let disposed = false;
@@ -513,15 +526,29 @@ function App({
     }), undefined, 'runtime');
   }
 
-  async function handleSwitch(runtimeId: RuntimeKind, label: string) {
+  async function handleSwitch(runtimeId: RuntimeKind, label: string, trigger?: HTMLElement) {
     if (!canSwitchRuntime || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
-    let attemptId: number | null = null;
+    switchTrigger.current = trigger ?? (
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    );
+    exclusiveActionInFlight.current = true;
+    switchCloseGuardActive.current = true;
+    const attemptId = ++switchAttemptId.current;
+    const startedAtMs = Date.now();
+    setBusy(label);
+    setError(null);
+    setReceipt(null);
+    setSwitchFlow({
+      status: 'running',
+      target: runtimeId,
+      events: [],
+      startedAtMs,
+    });
+
     let mutationObserved = false;
     let backupObserved = false;
-
-    let result: RuntimeSwitchResult | null = null;
     try {
-      result = await runAction(label, () => switchRuntime(runtimeId, (event) => {
+      const result: RuntimeSwitchResult = await switchRuntime(runtimeId, (event) => {
         if (attemptId !== switchAttemptId.current) return;
         if (!backupObserved && event.phase === 'backingUpShared') {
           backupObserved = true;
@@ -544,70 +571,102 @@ function App({
           ];
           return {
             ...current,
-            status: event.phase === 'failed' ? 'failed'
-              : event.phase === 'complete' ? 'succeeded'
-              : current.status,
             events,
             failedPhase,
-            completedAtMs: ['complete', 'failed'].includes(event.phase)
-              ? event.timestampMs
-              : current.completedAtMs,
           };
         });
-      }), (switchResult) => {
-        const cleanupComplete = switchResult.checkpointCleanup
-          && switchResult.checkpointCleanup.failedCount === 0
-          && switchResult.checkpointCleanup.reclaimedCount === switchResult.backups.length;
-        return {
-          label: switchResult.changed ? `${label}完成` : '运行态无需切换',
-          operationId: switchResult.operationId,
-          backupCount: cleanupComplete ? 0 : switchResult.backups.length,
-          backupPaths: cleanupComplete
-            ? []
-            : switchResult.backups.map((backup) => backup.backupDir),
-          rolledBack: switchResult.rolledBack,
-          warnings: switchResult.warnings,
-          metrics: [
-            `写入共享池：${switchResult.toShared.insertedThreads}`,
-            `写回本机：${switchResult.fromShared.insertedThreads}`,
-            ...(switchResult.checkpointCleanup
-              ? [`临时检查点已释放：${formatBytes(switchResult.checkpointCleanup.reclaimedBytes)}`]
-              : []),
-          ],
-        };
-      }, (message) => {
-        setSwitchFlow((current) => current ? {
-          ...current,
-          status: 'failed',
-          error: message,
-          failedPhase: current.failedPhase ?? lastRuntimeWorkPhase(current.events),
-          completedAtMs: Date.now(),
-        } : current);
-      }, 'runtime', () => {
-        switchCloseGuardActive.current = true;
-        attemptId = ++switchAttemptId.current;
-        setClockNow(Date.now());
-        setSwitchFlow({
-          status: 'running',
-          target: runtimeId,
-          events: [],
-          startedAtMs: Date.now(),
-        });
-      }, false);
-    } finally {
-      switchCloseGuardActive.current = false;
-    }
-
-    if (attemptId === null || attemptId !== switchAttemptId.current) return;
-    if (result) {
+      });
+      if (attemptId !== switchAttemptId.current) return;
       if (result.changed && !mutationObserved) markSessionsStale();
       if (result.changed && !backupObserved) markBackupsStale();
       setSwitchFlow((current) => current ? {
         ...current,
         status: 'succeeded',
-        completedAtMs: current.completedAtMs ?? Date.now(),
+        result,
+        completedAtMs: Date.now(),
       } : current);
+      refreshInBackground('runtime', (reason) => {
+        setSwitchFlow((current) => current ? {
+          ...current,
+          refreshError: errorMessage(reason),
+        } : current);
+      });
+    } catch (reason) {
+      if (attemptId !== switchAttemptId.current) return;
+      const message = errorMessage(reason);
+      setSwitchFlow((current) => current ? {
+        ...current,
+        status: 'failed',
+        error: message,
+        failedPhase: current.failedPhase ?? lastRuntimeWorkPhase(current.events),
+        completedAtMs: Date.now(),
+      } : current);
+      refreshInBackground('runtime', (refreshReason) => {
+        setSwitchFlow((current) => current ? {
+          ...current,
+          refreshError: errorMessage(refreshReason),
+        } : current);
+      });
+    } finally {
+      if (attemptId === switchAttemptId.current) {
+        switchCloseGuardActive.current = false;
+        exclusiveActionInFlight.current = false;
+        setBusy(null);
+      }
     }
+  }
+
+  async function handleRetryChatGptLaunch() {
+    if (
+      switchFlow?.status !== 'succeeded'
+      || !switchFlow.result
+      || switchFlow.result.chatgptLaunch.status !== 'failed'
+      || launchRetryInFlight.current
+      || exclusiveActionInFlight.current
+    ) return;
+    launchRetryInFlight.current = true;
+    exclusiveActionInFlight.current = true;
+    setBusy('打开 ChatGPT');
+    setSwitchFlow((current) => current ? { ...current, launchRetrying: true } : current);
+    try {
+      const launch = await launchChatgpt();
+      setSwitchFlow((current) => current?.result ? {
+        ...current,
+        launchRetrying: false,
+        result: { ...current.result, chatgptLaunch: launch },
+      } : current);
+    } catch (reason) {
+      setSwitchFlow((current) => current?.result ? {
+        ...current,
+        launchRetrying: false,
+        result: {
+          ...current.result,
+          chatgptLaunch: { status: 'failed', message: errorMessage(reason) },
+        },
+      } : current);
+    } finally {
+      launchRetryInFlight.current = false;
+      exclusiveActionInFlight.current = false;
+      setBusy(null);
+    }
+  }
+
+  function closeSwitchTask() {
+    if (
+      !switchFlow
+      || switchFlow.status === 'running'
+      || switchFlow.launchRetrying
+      || runtimeRefreshPending
+    ) return;
+    switchFocusRestorePending.current = true;
+    setSwitchFlow(null);
+    window.requestAnimationFrame(() => {
+      if (runtimeRefreshPending) return;
+      switchTrigger.current?.focus({ preventScroll: true });
+      if (document.activeElement === switchTrigger.current) {
+        switchFocusRestorePending.current = false;
+      }
+    });
   }
 
   async function handleSyncSessions() {
@@ -786,11 +845,16 @@ function App({
       : '版本读取中';
 
   return (
-    <main className="app-shell">
+    <>
+    <main
+      className="app-shell"
+      inert={switchFlow ? true : undefined}
+      aria-hidden={switchFlow ? true : undefined}
+    >
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark"><ArrowLeftRight aria-hidden="true" /></span>
-          <span><strong>CHATGPT SWITCH</strong><small>LOCAL RUNTIME CONTROL</small></span>
+          <span><strong>CHATGPT SWITCH</strong><small>LOCAL CONTROL SURFACE</small></span>
         </div>
         <nav className="topbar-tabs" aria-label="主导航">
           <button aria-current={activePage === 'runtime' ? 'page' : undefined} className={`topbar-tab ${activePage === 'runtime' ? 'active' : ''}`} onClick={() => setActivePage('runtime')}><Zap aria-hidden="true" />运行态</button>
@@ -845,8 +909,8 @@ function App({
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}
       {activePage !== 'skills' && error ? <p className="error-banner" role="alert">{error}</p> : null}
-      {busy ? <p className="busy-banner" role="status" aria-live="polite"><LoaderCircle className="spin" aria-hidden="true" />{busy}处理中</p> : null}
-      {!busy && runtimeRefreshPending ? (
+      {busy && !switchFlow ? <p className="busy-banner" role="status" aria-live="polite"><LoaderCircle className="spin" aria-hidden="true" />{busy}处理中</p> : null}
+      {!switchFlow && !busy && runtimeRefreshPending ? (
         <p className="busy-banner" role="status" aria-live="polite">
           <LoaderCircle className="spin" aria-hidden="true" />正在确认当前运行态
         </p>
@@ -863,14 +927,16 @@ function App({
           onConfirm={() => void confirmPendingAction()}
         />
       ) : null}
-      {switchFlow ? <RuntimeSwitchProgressPanel flow={switchFlow} now={clockNow} /> : null}
-
       {activePage === 'runtime' ? (
         <section className="runtime-page">
           <header className="runtime-intro">
             <div className="runtime-intro-copy">
-              <p className="eyebrow">本机运行态控制台</p>
+              <p className="eyebrow">LOCAL RUNTIME / CONTROL 01</p>
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
+              <p className="runtime-intro-lede">
+                在一个受保护的任务链中切换认证、模型与会话索引。每一步都有真实状态，
+                完成后自动回到 ChatGPT。
+              </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
               <div><dt>AUTH</dt><dd>{runtimeStatus?.authMode ?? authStatusLabel(data.codexHome)}</dd></div>
@@ -901,7 +967,7 @@ function App({
               runtime={plusRuntime} runtimeStatus={runtimeStatus} baseUrlFallback="本机 ChatGPT 登录态"
               runtimeDomainStatus={data.runtimes.status} runtimeStatusDomainStatus={data.runtimeStatus.status}
               onPrimary={() => void handleImportPlus()} primaryAction="保存当前账号态"
-              onSwitch={() => void handleSwitch('plus', '切换 ChatGPT 账号')}
+              onSwitch={(trigger) => void handleSwitch('plus', '切换 ChatGPT 账号', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'plus') ? '当前为 ChatGPT 账号' : runtimeStatus?.activeRuntimeId === 'plus' ? '重新应用 ChatGPT 账号' : '切换到 ChatGPT 账号'}
               primaryDisabled={exclusiveBusy || !canImportAccount}
               switchDisabled={exclusiveBusy || !canSwitchRuntime || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
@@ -911,7 +977,7 @@ function App({
               runtime={relayRuntime} runtimeStatus={runtimeStatus} baseUrlFallback="尚未配置"
               runtimeDomainStatus={data.runtimes.status} runtimeStatusDomainStatus={data.runtimeStatus.status}
               onPrimary={() => { setRelaySubmitError(null); setRelayEditorOpen(true); }} primaryAction="配置中转站"
-              onSwitch={() => void handleSwitch('relay', '切换中转站')}
+              onSwitch={(trigger) => void handleSwitch('relay', '切换中转站', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'relay') ? '当前为中转站' : runtimeStatus?.activeRuntimeId === 'relay' ? '重新应用中转站' : '切换到中转站'}
               onVerify={() => void handleVerifyRelay()}
               primaryDisabled={exclusiveBusy || !canConfigureRelay}
@@ -976,6 +1042,15 @@ function App({
         ensureCodexClosed={ensureChatGptClosed}
       />
     </main>
+    {switchFlow ? (
+      <RuntimeSwitchProgressPanel
+        flow={switchFlow}
+        closeDisabled={runtimeRefreshPending}
+        onClose={closeSwitchTask}
+        onRetryLaunch={() => void handleRetryChatGptLaunch()}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -1062,7 +1137,7 @@ function RuntimeCard({
   runtimeStatus: RuntimeStatus | null; baseUrlFallback: string; primaryAction: string; switchAction: string;
   runtimeDomainStatus: DomainState<RuntimeMetadata[]>['status'];
   runtimeStatusDomainStatus: DomainState<RuntimeStatus>['status'];
-  onPrimary: () => void; onSwitch: () => void; onVerify?: () => void;
+  onPrimary: () => void; onSwitch: (trigger?: HTMLElement) => void; onVerify?: () => void;
   primaryDisabled: boolean; verifyDisabled?: boolean; switchDisabled: boolean;
 }) {
   const savedState = runtimeDomainStatus === 'ready'
@@ -1079,8 +1154,11 @@ function RuntimeCard({
   const runtimeDetailUnavailable = runtimeDomainStatus !== 'ready';
   const RuntimeIcon = kind === 'plus' ? UserRound : KeyRound;
   return (
-    <article className={`runtime-card ${runtime?.kind ?? 'empty'}`} aria-label={title}>
-      <div className="card-title-row"><RuntimeIcon className="section-icon" aria-hidden="true" /><div><p className="eyebrow">{kind === 'plus' ? 'ACCOUNT' : 'RELAY'}</p><h2>{title}</h2></div></div>
+    <article className={`runtime-card ${runtime?.kind ?? 'empty'}`} aria-label={title} tabIndex={-1}>
+      <div className="runtime-card-head">
+        <div className="card-title-row"><RuntimeIcon className="section-icon" aria-hidden="true" /><div><p className="eyebrow">{kind === 'plus' ? 'ACCOUNT' : 'RELAY'}</p><h2>{title}</h2></div></div>
+        <span className="runtime-card-index" aria-hidden="true">{kind === 'plus' ? '01' : '02'}</span>
+      </div>
       <p className="runtime-description">{description}</p>
       <div className="runtime-state-grid">
         <span className={stateClass(savedState)}>{savedState}</span>
@@ -1095,9 +1173,9 @@ function RuntimeCard({
       <div className="runtime-actions">
         <button className="ghost-button inline" onClick={onPrimary} disabled={primaryDisabled}>{kind === 'plus' ? <Save className="button-icon" aria-hidden="true" /> : <Settings2 className="button-icon" aria-hidden="true" />}{primaryAction}</button>
         {onVerify ? <button className="ghost-button inline" onClick={onVerify} disabled={verifyDisabled || !runtime}><ShieldCheck className="button-icon" aria-hidden="true" />验证连接</button> : null}
-        <button className="switch-button" onClick={onSwitch} disabled={switchDisabled}><ArrowLeftRight className="button-icon" aria-hidden="true" />{switchAction}</button>
+        <button className="switch-button" onClick={(event) => onSwitch(event?.currentTarget)} disabled={switchDisabled}><ArrowLeftRight className="button-icon" aria-hidden="true" />{switchAction}</button>
       </div>
-      <p className="runtime-switch-note"><Power aria-hidden="true" />切换前会先关闭 ChatGPT</p>
+      <p className="runtime-switch-note"><Power aria-hidden="true" />任务执行器会安全关闭，并在成功后自动打开 ChatGPT</p>
     </article>
   );
 }
@@ -1460,7 +1538,9 @@ function syncReceipt(result: SessionSyncResult): OperationView {
   const backups = result.backups ?? [];
   const cleanupComplete = result.checkpointCleanup
     && result.checkpointCleanup.failedCount === 0
-    && result.checkpointCleanup.reclaimedCount === backups.length;
+    && result.checkpointCleanup.retainedCount === 0;
+  const sessionNetBytes = result.persistentSessionBytesAdded
+    - result.persistentSessionBytesReclaimed;
   return {
     label: '会话同步完成',
     operationId: result.operationId,
@@ -1472,6 +1552,11 @@ function syncReceipt(result: SessionSyncResult): OperationView {
       `新增线程：${result.insertedThreads}`,
       `复制 JSONL：${result.copiedSessionFiles}`,
       `跳过缺失正文：${result.skippedMissingSessionFiles}`,
+      `会话新增占用：${formatBytes(result.persistentSessionBytesAdded)}`,
+      `旧槽位回收：${formatBytes(result.persistentSessionBytesReclaimed)}`,
+      `会话净变化：${sessionNetBytes === 0
+        ? '0 B'
+        : `${sessionNetBytes > 0 ? '+' : '−'}${formatBytes(Math.abs(sessionNetBytes))}`}`,
       ...(result.checkpointCleanup
         ? [`临时检查点已释放：${formatBytes(result.checkpointCleanup.reclaimedBytes)}`]
         : []),

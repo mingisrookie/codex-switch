@@ -21,7 +21,35 @@ CC-Switch 值得借鉴的是迁移纪律，不是把它的 provider bucket 算�
 
 因此本项目的明确合同是：
 
-> 每次运行态切换不得仅因 provider 变化而重写未变化 JSONL。已有等价 JSONL 保持内容与 mtime；provider 路由更新落在 SQLite。只有新增、增长替换或实际复制的 JSONL 才允许必要写入。
+> 每次运行态切换不得覆盖任何既有 JSONL。热同步的 live existing thread 保持零文件 I/O；关闭态先按完整度选出活动历史，再在最多 32 个受管候选中复用完整 Remote provider 槽位，或发布带严格 provenance marker 的 immutable successor。SQLite 只在完整新槽位发布后改指它；旧工具槽位只有在 durable terminal、两库均无引用且 successor 完整包含 predecessor 时才可回收，证据不足就保留。
+
+## v0.2.2 candidate 补充：哪些借、哪些不移植
+
+当前 Remote provider 可见性修复继续借用 CC-Switch 的**选择性更新和可证明账本**理念，但没有移植它的单 Home 整文件 migration：
+
+| CC-Switch 原则 | 本项目当前落点 |
+| --- | --- |
+| 无匹配即无写 | hot shared→current existing thread 在任何 target candidate I/O 前跳过；closed provider 路径先在 32 个候选中复用完整槽位 |
+| 写前稳定性复检 | source 完整尾行/session ID/length/SHA-256 前后复检且仅有界重试；新 provider 槽位用 16 KiB 上限 marker 的 `createdBytes` 前缀 SHA-256 证明所有权 |
+| Online Backup + transaction | 窄 checkpoint 继续用 SQLite Online Backup；SQLite provider/path 在目标 transaction 中更新 |
+| 恢复依赖账本，不猜来源 | checkpoint cleanup 只接受与唯一 terminal record 全量匹配的 bound BackupManifest v4；未绑定 v2/v3 自动点保留。provider predecessor GC 只接受完整 successor 与两库无引用的实证 |
+| 大范围迁移显式 opt-in | 普通 runtime switch 不扫描/重写全部旧历史；未来统一旧历史仍需独立工具 |
+
+不直接移植：
+
+- 不移植每次运行态切换对匹配 JSONL 的整文件原地 rewrite；Remote provider 通过旁路 immutable successor 解决，任何既有 JSONL 都不覆盖。
+- 不移植单根 provider bucket 数据模型；本项目必须同时处理 current/shared、外置 `sqlite_home`、完整度/分叉、index 策略和双根补偿。
+- 不把一次性 migration marker 当持续同步游标；本项目自己的 provider marker 只证明固定 `createdBytes` 前缀、thread/provider/文件名与 origin，不授权覆盖或按年龄删除。
+- 不把 CC-Switch 的归档处理等同本项目普通同步：当前 provider 槽位只处理 active `sessions/`，`archived_sessions/` 仍只进入 Full/硬删除/管理边界。
+
+仍存在的真实风险：
+
+- source TOCTOU 只能通过执行期稳定性复检、no-clobber/原子发布和 fail closed 缩小，不能形成外部 ChatGPT 共同参与的单一事务。
+- SQLite、JSONL 与 `session_index.jsonl` 仍不是一个 durable transaction；失败时可能保留完整但未引用的工具文件，不能按 mtime/年龄反向猜测删除。
+- 首次为新 provider 生成槽位仍可能新增一份完整 JSONL 与 marker；当前先做 pre-close 保守容量初筛，关闭 ChatGPT 后以权威写集再次按卷校验。容量是保守上界，执行则在第一份 checkpoint 前和 live 写入前要求权威写集精确不变；晚期漂移至多留下 typed prewrite checkpoint，不产生 live mutation。合法增长不会覆盖旧槽位，而是只写最终 provider successor；真正 Divergent 为避免数据丢失可额外保留 raw 分支。旧 predecessor 只能在 durable terminal、两库无引用且 successor 完整包含它时回收。
+- `SessionSyncResult` 以实际 JSONL 与实际 marker 序列化长度统计持久会话 `added`，以证明式 GC 的 JSONL+marker 统计 `reclaimed`，前端派生 `net`；这些字段与 transient `checkpointCleanup.reclaimedBytes` 分开，不能把临时点释放计入会话净变化。
+- 普通 switch/sync 的窄 transient checkpoint 只在 durable terminal 落盘且证据重新通过后清理；manual Full、hard-delete Full 与 restore-safety 是持久恢复点，继续保留并由用户显式管理。
+- `archived_sessions/` 的 provider 可见性统一不在当前任务；把它加入普通切换前需要独立产品语义、容量和恢复合同。
 
 ## CC-Switch 实际做法
 
@@ -91,7 +119,7 @@ CC-Switch 的 rewrite 针对明确的存量迁移，完成后由 marker 阻止�
 
 CC-Switch 对实际匹配文件仍会整文件读入内存并整体原子写回。这在一次性迁移中可以接受，但不适合本项目已经出现接近 GiB 历史的高频切换。
 
-本项目中，ChatGPT 的可见 provider 路由可以通过 `state_5.sqlite.threads.model_provider` 更新；未变化的 JSONL 正文没有必要仅为了保持字段完全同值而改变 mtime。
+本项目中，热同步的既有 live thread 不应只为 provider 改写 JSONL；关闭态 Remote 过滤又要求 SQLite 与活动 JSONL provider 一致，因此采用受管旁路槽位，而不是修改原文件。这样既满足 Remote 文件名/provider 合同，也不改变原 JSONL 的 mtime。
 
 ### 3. 不复用 CC-Switch 的单根数据模型
 
@@ -119,27 +147,34 @@ marker 适合一次性 schema/data migration，不适合持续双向同步。持
 
 | source 与 target 关系 | 行为 | provider 处理 |
 | --- | --- | --- |
-| 内容相等 | 不复制，不重写 | 只更新 SQLite 行 |
-| target 严格扩展 source | 保留 target | 只更新 SQLite 行 |
-| source 严格扩展 target，且关闭态允许替换 | 原子复制增长版本 | 复制后按目标 runtime 归一新文件的 `session_meta` |
-| 内容分叉 | 保留当前活动 target；source 按内容哈希保存独立副本 | 只处理实际新建副本 |
-| target 不存在 | 原子复制 source | 复制后按目标 runtime 归一新文件 |
+| hot existing（任意关系） | `PreserveExisting` 在候选 I/O 前跳过 | SQLite/JSONL 均不改 |
+| closed 内容相等或 target 更长 | `SelectMostComplete` 保留完整活动文件 | provider 已匹配且 Remote 名合法则复用；否则在 32 个候选中先找完整 provider 槽位 |
+| closed source 严格扩展 target | 先选择更完整 source | 只发布最终 provider immutable successor + marker，不覆盖旧槽位、不额外写 raw/provider 双份 |
+| closed 内容真实 Divergent | 保留 current 活动分支；独立保存完整分叉 | 为避免数据丢失可单独保留 raw 分支，再按有界候选发布需要的 provider 槽位；不覆盖现有或未知槽位 |
+| target 不存在 | 目标 provider 已知时直接原子 no-clobber 发布最终 provider 文件 | 不先落 raw 副本再生成 provider 副本 |
 
-`sync_sessions_in_transaction` 只有在 `RolloutCopy.copied` 为真时调用 `rewrite_session_metadata_provider`。已有 thread 的 SQLite provider 由 `update_existing_thread` 更新，JSONL 不需要跟随每次 runtime 切换重写。
+`sync_sessions_in_transaction` 先执行完整度选择，再由 provider-aware 路径对最终来源规划槽位。槽位名符合 Remote 的 `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl`，由 thread/provider/sequence 稳定决定；严格 UUID 与 canonical containment 在任何 create 前验证。规划器最多检查 32 个候选：遇到 `Equal` 或完整覆盖来源的既有槽位就复用，扫描时只记首个空位，只有有界扫描结束仍无完整槽位时才使用该空位。每个新文件配套原子创建不超过 16 KiB 的 sidecar provenance marker，记录 `createdBytes` 与该前缀 SHA-256；创建后合法 append 不会使所有权失效，但前缀、marker、session ID、provider 或 containment 漂移都会 fail closed。
 
 ### 已有回归证明
 
 - `hot_sync_does_not_rewrite_an_existing_live_jsonl_for_provider_changes`
   - 热同步不为 provider 变化修改 live JSONL。
-- `provider_switch_updates_sqlite_without_rewriting_unchanged_existing_jsonl`
-  - 相等 JSONL 的 bytes 和 mtime 均保持不变；
-  - `copied_session_files == 0`；
-  - SQLite provider 更新为目标值。
-- `updates_a_stale_target_when_the_source_is_a_strictly_growing_jsonl`
-  - 只有严格增长时才替换旧版本。
-- `divergent_versions_use_content_hashes_instead_of_one_stale_imported_file`
-  - 内容分叉保留独立副本，不静默覆盖。
-- `runtime_switcher` 的切换测试同时断言旧 rollout bytes 与 mtime 不变。
+- `provider_switch_publishes_a_stable_remote_rollout_without_rewriting_original_history`
+  - 原 JSONL 的 bytes 和 mtime 保持不变；
+  - 重跑复用同一完整 provider 槽位；
+  - SQLite provider/path 与活动文件一致。
+- `owned_marker_accepts_append_but_rejects_a_changed_created_prefix`
+  - `createdBytes` 之后的合法 append 仍接受；
+  - 创建前缀变化时 marker 不再证明工具所有权。
+- `shared_long_current_short_plans_and_writes_only_the_final_provider_slot`
+  - 首次/增长只落最终 provider 文件，不形成 raw/provider 双份。
+- `owned_growth_uses_a_successor_and_gc_reclaims_only_an_unreferenced_stable_predecessor`
+  - 增长创建 immutable successor；
+  - durable terminal 后只有两库无引用且 successor 完整覆盖时才删除 predecessor。
+- `provider_gc_retains_a_predecessor_appended_after_candidate_creation`、`provider_gc_fails_closed_when_a_candidate_marker_is_malformed` 与 `provider_gc_retains_a_predecessor_when_any_managed_database_still_references_it`
+  - 清理计划后发生 append、marker 损坏或任一数据库仍引用时，旧槽位保留。
+- `provider_slots_stay_bounded_across_growth_and_repeated_round_trips`
+  - 连续 provider 往返的文件数在有界候选与证明式 GC 下保持有界。
 
 ## 为什么切换时不重写未变化 JSONL
 
@@ -157,7 +192,7 @@ marker 适合一次性 schema/data migration，不适合持续双向同步。持
 
 ### 语义
 
-会话正文是否完整与 runtime provider 是两个不同维度。SQLite 负责当前索引和 provider 可见性；JSONL provider 只在文件首次导入目标根时归一即可。比较历史完整性时应忽略 provider 字段，避免把相同正文误判为冲突。
+会话正文是否完整与 runtime provider 是两个不同维度。比较历史完整性时先忽略 provider 字段，避免把相同正文误判为冲突；活动历史确定后，Remote-visible 槽位再把 JSONL provider 与 SQLite provider/path 对齐。这样 provider 过滤不会倒逼原文件改写。
 
 ## 如果未来需要一次性历史归一
 
@@ -174,15 +209,19 @@ marker 适合一次性 schema/data migration，不适合持续双向同步。持
 9. 恢复严格依赖账本，不从混合后的 provider 猜来源。
 10. 该迁移完成后，普通 runtime switch 仍不得扫描和重写无变化历史。
 
-## 发布验收
+## v0.2.2 candidate 验收边界
 
-`v0.2.0` 至少应证明：
+当前开发分支进入 PR/发布门禁前至少应以真实测试证明；本节不填写尚未完成的
+PR、CI、tag、Release 或资产 hash：
 
 - 连续 account -> relay -> account 切换后，预存等价 JSONL bytes 与 mtime 不变；
-- SQLite `threads.model_provider` 与目标 runtime 匹配；
-- 新增或严格增长 JSONL 能正确复制；
-- 分叉 JSONL 不覆盖当前活动文件；
-- provider 字段差异不造成重复 `-imported-*` 嵌套；
+- SQLite `threads.model_provider`、`rollout_path` 与活动 JSONL provider 同时匹配；
+- 32 个候选中前空后完整时仍复用完整槽位；没有完整槽位时只使用扫描记录的首空位，全占时 fail closed；首次/严格增长只发布最终 provider successor + ≤16 KiB marker，不覆盖 predecessor、不形成 raw/provider 双份；
+- marker 的 `createdBytes` 前缀 SHA 接受创建后 append，拒绝创建前缀改变或截断；
+- 真正 Divergent 可保留独立 raw 分支，但不能覆盖或替换 current 活动历史；
+- durable terminal 后只有完整 successor 且 current/shared 两库均不引用时才 GC predecessor，任一证据漂移都保留；
+- pre-close 初始保守容量和 post-close 权威重算均覆盖 ordinary/provider rollout、marker、SQLite/index 与窄 checkpoint peak；晚期 plan 漂移不做 live mutation；
+- UI 分开显示持久会话 added/reclaimed/net 与 transient checkpoint reclaimed；
 - 切换后的前端刷新不调用会话和备份全量扫描；
 - 所有验证使用临时 Home，不操作承载当前任务的真实 ChatGPT Home。
 
@@ -190,4 +229,4 @@ marker 适合一次性 schema/data migration，不适合持续双向同步。持
 
 借鉴 CC-Switch 的选择性、账本、并发复检、Online Backup 和事务纪律；不照搬其一次性整文件 provider migration 到高频 runtime switch。
 
-本项目更合适的路径是：SQLite 更新 provider，JSONL 按内容关系增量合并，无变化文件零写入。这个策略既吸收了 CC-Switch 的安全原则，也直接解决了本项目已观测到的切后性能问题。
+本项目更合适的路径是：hot existing 零写；closed 先按内容关系和完整度选择活动历史，再复用完整 provider 槽位或发布 immutable successor，让 SQLite 与活动 JSONL provider 满足 Remote 过滤；任何既有 JSONL 都不覆盖。marker 只证明创建前缀，旧槽位清理由 durable terminal、双库无引用和 successor 完整覆盖共同授权。这个策略既吸收了 CC-Switch 的选择性、账本、并发复检、Online Backup 和事务纪律，也避免把一次性 migration 变成高频全量 rewrite。

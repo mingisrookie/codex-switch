@@ -4,11 +4,13 @@
 
 ## 结论
 
-当前分支已经把问题从“长时间无响应的黑盒切换”改造成“后台执行、页面内展示真实阶段、失败可归因”的任务流，并针对切换后的磁盘争用修复了三个主要放大器：无变化历史 JSONL 的批量重写、切换结束后的全量会话/备份扫描，以及已经终结的切换/同步检查点长期累积。
+当前开发分支继续把问题从“长时间无响应的黑盒切换”收敛为“单一应用内 task overlay、后台真实阶段、失败可归因、成功后受控重开 ChatGPT”的任务流，并针对 Remote 历史可见性、v0.2.0 按次吞掉 C 盘空间和 provider 副本写放大补齐 immutable successor、严格 provenance 与证明式回收合同。
 
 本审查在 PR 前的本地候选结论是 **GO for PR**。完整前端/Rust 门禁、隔离临时目录回归、三视口真实渲染、依赖与文本审计、elevated/non-elevated updater 安全测试以及 Windows release 产物合同均已通过。当时 `v0.2.0` 仍不能在远端交付闭环完成前发布：PR/CI、合并、tag CI、Release 重下载校验和真实 `v0.1.9 -> v0.2.0` 一键更新 smoke 是最后的阻断门禁。
 
 下文原始“已解决”表示当时工作树已有对应实现并通过本地门禁，不等同于已发布。`v0.2.0` 的实际远端闭环和随后发现的缺口见下一节。
+
+> 本文后半保留 v0.2.0/v0.2.1 当时结论作为审计历史；当前开发事实见“v0.2.2：v0.2.0 现场反馈与 PR #4 安全替代”。尚未出现的测试总数、PR/CI、tag 或 Release 资产不得从历史结论推断。
 
 ## 发布后闭环与二次审计
 
@@ -26,7 +28,7 @@
 
 `v0.2.1` 将 changed switch 固定为 current `RuntimeState` + shared `StateOnly`，普通同步固定为双 `StateOnly`，不再把 GiB 级 session payload 当临时检查点。会话 JSONL 生产路径现为零 in-place：Create 原子 no-clobber；允许替换时，严格扩展和 Divergent 都按稳定 source SHA-256 生成完整 imported JSONL，旧短文件 bytes/hash/mtime 不变。current→shared 与 ChatGPT 已关闭的双向切换使用 `SelectMostComplete`，完整文件发布后才可推进既有 SQLite `rollout_path`；只有 hot shared→current 使用 `PreserveExisting`，既有 current thread 在 `existing_thread_rollout_path` / `copy_rollout_file` 前直接 duplicate+continue，target candidate 不读取、不写入、不发布，`copied_session_files = 0`。原 rollout/provider/title 与旧 writer 可见性保留，不会创建 imported orphan；hot 新 thread 仍事务插入，复用 source row 可用字段并归一 current provider。live current `session_index.jsonl` 使用 `Skip`，工具独占的 shared index 以完整 merged bytes 同目录 `atomic_write`，`Deny` 零写，`Unchanged` 返回前复检。
 
-临时点在终态日志持久化后才释放：成功、切换完整回滚、typed `Failed + Backup` 写入前失败，以及恢复可见成功。显式 cleanup 支持严格 v3 prewrite 一根/两根和 restore-visible 单根，legacy v2 仅兼容旧成功/完整回滚双根；plan 与 execute 两阶段都重新强校验完整 payload SHA-256，计划后漂移 fail closed，不按年龄、数量、mtime 或容量猜测。cleanup Summary、Receipt 与新操作记录都包含 `attemptedCount` / `failedCount`；只有计划内目录在执行期 revalidate/remove 失败才是 partial/Failed，Full、孤儿、unclassified 等安全保留 warning 只作说明。持久 Full 列表只在用户请求时加载，最多返回 256 项；列表和删除共用 managed-full 强校验，extra file/hash drift 不显示为 verified 且保持不动。手工 Full、hard delete、restore safety 不自动删，但通过校验的 Full/legacy v2 可在页面内显式确认删除并写审计。Full/Sessions 与硬删除覆盖 `archived_sessions/`，runtime/state scope 不扩大。
+临时点在终态日志原子持久化后才释放：自动 checkpoint 必须是与唯一 terminal record 精确绑定的 v4；未绑定 v2/v3 自动点 fail closed 保留。plan 与 execute 两阶段都重新强校验完整 payload SHA-256，计划后漂移 fail closed，不按年龄、数量、mtime 或容量猜测。cleanup Summary、Receipt 与新操作记录都包含 `attemptedCount` / `failedCount`；只有计划内目录在执行期 revalidate/remove 失败才是 partial/Failed。持久 Full 列表只在用户请求时加载，最多返回 256 项；经 managed-full 强校验的 v2/v3/v4 Full 可显式管理且绝不自动删除。
 
 前端在挂载时预注册关闭门禁，未 ready 时切换 fail closed；切换后 runtime refresh pending 期间禁用两个切换入口。mutation 错误只出现一次，Relay 验证失败不再由局部与全局路径重复显示；unknown 终态保守提示先不要重新打开 ChatGPT。Full 删除、配置、确认与错误均留在页面内。v0.2.1 下载器采用 30 秒连接、10 分钟总超时，并补 helper kill + wait 与 cleanup retry；已发布 v0.2.0 的首跳虽然仍受 120 秒总超时约束，但真实 `v0.2.0 -> v0.2.1` smoke 已在该窗口内完成。
 
@@ -47,6 +49,60 @@
 **Hot-rollout P1 已关闭。** `SessionSyncPolicy.existing_rollout_path = ExistingRolloutPathPolicy::PreserveExisting` 现在只用于 hot shared→current；既有 live thread 在任何 target rollout 查询或候选复制前就直接跳过，而不是先发布一个不抢占活动路径的文件。`hot_sync_keeps_the_live_rollout_visible_when_a_longer_different_name_arrives` 同时持有旧 writer、执行同步、再写入并断言 `copied_session_files = 0`、异名 candidate 不存在、DB 的 rollout/provider/title 不变且新增尾部可见；`hot_sync_preserves_active_rollout_when_shorter_candidate_has_a_different_name` 同样断言零复制、candidate 不存在并保留既有 provider/path。`source_database_rollout_advances_to_a_strictly_more_complete_candidate` 则保留 `ExistingRolloutPathPolicy::SelectMostComplete` 在非 hot/关闭态推进更完整引用的能力。
 
 备份治理的对应回归包括：`recent_backup_listing_excludes_candidates_the_delete_contract_rejects` 证明列表与删除接受集合一致；`verified_full_backup_deletion_rejects_extra_files_and_payload_hash_drift` 锁定 extra/hash drift 的 fail-closed；`backup_list_exposes_recovery_points_beyond_the_previous_five_item_cap` 断言上限为 256 且第 6 项可见；`explicit_cleanup_keeps_informational_warnings_out_of_the_failure_count` 与 `checkpoint_cleanup_terminal_depends_on_real_failures_not_warnings` 锁定 warning 不等于失败，前端测试同时覆盖 retained warning 成功和真实删除失败 partial。它们不改变“Full 永不自动删除”的产品边界。
+
+### v0.2.2 candidate：v0.2.0 现场反馈与 PR #4 安全替代
+
+#### 用户现场与磁盘根因
+
+用户明确试用的是 `v0.2.0`。该版本每次 changed switch 都创建并永久保留：
+
+- current Home 的 `Runtime` checkpoint：包含 runtime 文件、`state_5.sqlite`、active session JSONL 和 index；
+- shared Home 的 `Sessions` checkpoint：包含 active session JSONL、index 和 `state_5.sqlite`。
+
+本机最新两份 current checkpoint 各约 `966 MB`，两份 shared checkpoint 约 `354 MB` 与 `190 MB`，四份合计约 `2.48 GiB`。这不是“执行文件”，而是 v0.2.0 每次复制整套会话正文留下的加密 checkpoint；成功切换也不删除，因此直接解释了 C 盘每切一次就减少。
+
+当前 candidate 已把 changed switch 改为 current `RuntimeState` + shared `StateOnly`，对应本机 payload 合计约 `25 MB`，不再复制全会话正文；普通同步使用双 `StateOnly`。current RuntimeState 还保存 `process_manager/chat_processes.json` 的 exact bytes。自动 cleanup 只接受携带非空 `operationId + role`、并与唯一 terminal record 全量匹配的 bound BackupManifest v4；未绑定 v2/v3 自动点以及 Apply/rollback/终态日志失败、Full、孤儿、hash drift、incomplete、unclassified 项继续保留。
+
+受控清理只证明 `21` 个目录、`6,327,089,609` bytes 降为 `17` 个目录、`2,693,977,957` bytes，回收 `3,633,111,652` bytes；不能表述成“旧备份已全部清空”。普通切换也不会创建 updater EXE；updater staging 只在用户主动更新时出现。当前普通切换的持久增长仅可能来自已纳入容量预检的 ordinary/new-session rollout、真正 Divergent 的 raw 分支、provider successor/marker 和窄 operation metadata/log。
+
+#### PR #4 决策
+
+审查时 GitHub 只有一个 open PR：[PR #4](https://github.com/mingisrookie/codex-switch/pull/4)。它识别出的核心问题可信：Remote 列表要求 SQLite `threads.model_provider` 与活动 JSONL 第一条 `session_meta.payload.model_provider` 一致，并要求官方 `rollout-<timestamp>-<thread-id>.jsonl` 文件名。
+
+**决定：PR #4 不直接合并，当前任务从 latest main 安全替代。**
+
+阻断项：
+
+1. legacy Remote 文件名在 fast-path 被误判为 unchanged 并冻结 `Deny`，执行期却必须 `Create` 规范文件，形成确定性死路。
+2. 在任何 checkpoint 之前修改 `process_manager/chat_processes.json`，且该副作用不在备份、rollback、receipt 或日志合同中。
+3. session id 未经严格文件名组件验证就拼入目标路径，存在路径穿越/越界发布风险。
+4. provider 副本输出未进入关闭前容量预检；按内容代际创建新副本会造成 O(n²) 全量累积。
+5. provider candidate 可能绕过 `SelectMostComplete`，让较短或 divergent shared 分支替换更完整 current 活动历史。
+
+安全替代保持以下顺序：
+
+1. 先用现有 completeness/divergence 规则选出活动历史；
+2. 再验证严格 UUID、选中来源与目标父目录的 canonical containment；
+3. 在最多 32 个 thread/provider 候选中遇到完整槽位就复用，扫描时只记首个空位；只有有界扫描结束仍无完整槽位时才在该空位发布 Remote-compatible immutable successor；
+4. 每个新槽位原子创建不超过 16 KiB 的 provenance marker，记录 `createdBytes` 与创建前缀 SHA-256。创建后的合法 append 可继续证明所有权，创建前缀或 marker 漂移则 fail closed；
+5. 任何既有 JSONL 都不覆盖。首次发布或合法增长只写最终 provider 文件与 marker，不先落 raw 再写 provider 双份；真正 Divergent 为避免数据丢失可单独保留 raw 分支并分配独立候选；
+6. SQLite provider/path 与活动 JSONL provider 一致提交；
+7. durable terminal 之后，只有 current/shared 两库都不再引用、successor 完整包含 predecessor 且两边 marker/source 均未漂移时才回收旧工具槽位；任何证据不足都保留；
+8. ChatGPT 仍运行时先用只读 plan 做 pre-close 保守容量初筛；关闭后重建 closed-session 权威写集并再次按实际卷与 checkpoint peak 聚合，每卷保留 `max(2 GiB, 15%)` 余量。容量是保守上界；执行在第一份 checkpoint 前和 checkpoint 后、live 写入前要求权威 plan 精确相等，晚期漂移至多留下 typed prewrite checkpoint，不做 live mutation。
+
+切换与同步回执/UI 分开显示持久会话 `added / reclaimed / net` 和 transient checkpoint reclaimed。前者解释 provider 文件与 marker 的长期净变化，后者只表示本轮窄临时点释放，二者不得合并为一个“已释放”数字。普通 switch/sync 中符合成功、完整回滚或 typed prewrite allow-list 的临时点只在 durable terminal 与强校验通过后清理；手工 Full、hard-delete Full 和 restore safety backup 继续保留。
+
+替代实现将 `process_manager/chat_processes.json` 纳入 current `RuntimeState`：双 checkpoint 和单次进程 inventory 门禁后进入真实 `repairingAppState` phase；任何合法 JSON 都 byte-exact 保留，仅明确空/全 NUL 损坏原子修复为 `[]`，缺失不创建，未知无效格式 fail closed。后续失败在再次进程门禁后恢复原字节，`chatProcessStateRepaired` 同步进入 receipt、操作计数和完成面。
+
+#### 单一 task overlay 与受控启动
+
+- 切换点击后只存在一个 modal/task overlay；它消费真实 `planningSessions` 至 `cleaningCheckpoints`/`LaunchingApp` phase，不显示伪造百分比，也不叠加 native dialog。
+- exact verify、durable terminal 和 checkpoint cleanup 完成后，后端才用关闭前从受管 ChatGPT 根捕获的唯一 AppUserModelID 调用 Windows `IApplicationActivationManager`。
+- 启动后必须出现同一 AUMID 的受管根才返回 `launched`；已经运行返回 `alreadyRunning`；缺失、冲突、激活失败或超时返回 typed `failed`。
+- launch failed 不回滚成功切换；同一完成态显示 warning 和“重新打开 ChatGPT”，重试 command 不接受路径/命令，也不查找 PATH 中同名 EXE。
+- UI 保持 Lucide-only、无 emoji，覆盖焦点捕获/恢复、screen reader 名称、reduced-motion 与 1200×820、900×640、390×844 三档无页面 overflow 合同。
+
+上述为 `v0.2.2 candidate` 实现/合同；测试总数、提交 hash、替代 PR、CI、tag 或 Release 资产只在真实完成并核验后记录，不预写尚未产生的证据。
 
 ### 本机检查点占用证据与保留决策
 
@@ -71,7 +127,7 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
 | --- | --- | --- | --- |
 | 点击切换后像卡死 | 修复前 Windows WER 有两次 `AppHangB1` | 同步 Tauri command 在 UI 敏感执行路径中做网络、DPAPI、SQLite 和大量文件 I/O | 切换在 blocking worker 中执行，窗口持续响应，开始后立即出现真实任务状态 |
 | 一次成功切换仍耗时 137.72 秒 | current 备份约 921.88 MiB / 57 秒，shared 备份约 480.86 MiB / 29.5 秒 | Runtime/Sessions scoped 快照复制大量会话 payload | changed switch 始终使用 `RuntimeState + StateOnly`，会话差异走零 in-place `Allow`，不再扩大检查点 |
-| 切换后 ChatGPT 明显变卡 | 532 个 JSONL、约 876.43 MiB 在切换尾段被重写；约 5.6 秒后启动 ChatGPT | 只为 provider 变化触碰全部历史文件，可能触发 ChatGPT 全量重索引 | 无变化 JSONL 的内容与 mtime 保持不变，只更新必要 SQLite 行和真正复制的文件 |
+| 切换后 ChatGPT 明显变卡 | 532 个 JSONL、约 876.43 MiB 在切换尾段被重写；约 5.6 秒后启动 ChatGPT | 只为 provider 变化触碰全部历史文件，可能触发 ChatGPT 全量重索引 | 原 JSONL 内容与 mtime 保持不变；Remote 只发布/复用活动历史对应的稳定 provider 槽位 |
 | 切换完成后仍有额外磁盘压力 | cleanup 前为 21 个目录/6,327,089,609 bytes；受控 UI 已删 4/4、回收 3,633,111,652 bytes，现为 17 个/2,693,977,957 bytes | 高流量临时点未终结，持久 Full 无管理入口，mutation 后重扫 | 高频操作只建窄状态点；严格终态自动/显式释放；已验证 Full 页面内删除；昂贵域按需刷新 |
 | 弹窗和控制台闪窗造成困惑 | 旧生产 UI 使用浏览器确认框、prompt、原生 dialog；Windows 子进程未隐藏窗口 | 操作授权与状态被拆散在系统级 UI 中 | 所有授权、配置、进度和错误都留在页面内，Windows helper 无可见控制台 |
 
@@ -117,10 +173,10 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
    - 先执行非强制 `/PID /T`，轮询最多约 8 秒；只对仍可用 PID、PPID、image 三元组证明身份的存活进程执行 `/F`。
    - `taskkill.exe` 从真实 Windows system directory 解析，拒绝 reparse path，并通过 `CREATE_NO_WINDOW` 隐藏控制台。
 
-3. **关闭 ChatGPT 前完成只读 fail-fast**
-   - `prepare_runtime_switch_before_close` 先解析完整 switch plan。
-   - 需要变化时先执行双根备份容量预检和根目录互斥检查，再验证 relay，之后才检测和关闭 ChatGPT。
-   - 空间不足、根目录重叠、runtime 文件无效或 relay 不可用时，不应先关闭用户正在使用的 ChatGPT。
+3. **pre-close 初筛与 post-close 权威重算形成双容量门禁**
+   - `prepare_runtime_switch_before_close` 先在 ChatGPT 仍运行时解析只读 switch plan，并以计划的普通/provider rollout、最多 16 KiB marker 预留、SQLite workspace、index 输出和窄 checkpoint peak 做第一轮按卷容量 fail-fast。
+   - 需要变化时完成 roots/容量/relay 初筛后才检测和关闭 ChatGPT；关闭完成后重新构建 closed-session 权威写集，并对同一保守容量模型再次校验。
+   - 只有 post-close plan 会进入执行；第一份 checkpoint 前和 checkpoint 后、live 写入前都必须重新证明它未漂移。初筛不足不会关闭 ChatGPT；post-close replan/capacity 失败或第一次 plan 复核失败不创建 checkpoint/output；checkpoint 后才出现的漂移不发布 live JSONL/runtime，已有 typed prewrite checkpoint 按终态证据清理。
 
 4. **备份与失败恢复保持强合同**
    - changed switch 固定使用 current `RuntimeState` + shared `StateOnly`，普通 sync 固定使用双 `StateOnly`，不复制 live 会话 payload。
@@ -130,12 +186,13 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
 
 5. **临时检查点有可证明的终点**
    - success、完整 rolledBack、typed `Failed + Backup` prewrite 和 restore-visible success 只在操作日志持久化后删除；Apply/rollback/log 失败或复核异常保持不动。
-   - 显式 cleanup 严格解析完整 `operations.jsonl`：v3 支持 prewrite 一根/两根、restore-visible 单根和成功/完整回滚双根；legacy v2 只兼容旧成功/完整回滚双根。operation ID、时间窗、reason、canonical root、scope 与引用必须精确。
+   - 显式 cleanup 严格解析完整 `operations.jsonl`：自动点只接受与唯一 terminal 在 operation ID、role、action/status/phase、时间窗、reason、canonical root、scope、引用和 payload hash 全部匹配的 bound v4；未绑定 v2/v3 自动点保留。
    - plan 与 execute 都重新比较 manifest、受管路径、精确文件集/大小和完整 payload SHA-256；计划后漂移、Full、孤儿、重复引用、日志/manifest/path/hash 损坏全部 fail closed。
    - UI 展示目录占用、可回收字节/数量、安全保留项、最近结果和警告，并用页面内单一诚实运行态与真实成功/失败终态执行，不弹系统窗口。Summary/Receipt/log 均记录 `attemptedCount` / `failedCount`；只有执行期 revalidate/remove 失败才显示 partial 并记录 Failed，安全保留 warning 只显示“完成（有保留说明）”。
+   - 普通 switch/sync 中符合成功、完整回滚或 typed prewrite allow-list 的窄临时点只在 durable terminal 与强校验通过后自动释放；Full、hard-delete Full 和 restore safety backup 是持久恢复点，不进入这条自动清理。
 
 6. **持久恢复点由用户管理**
-   - Full 与 legacy v2 只在用户请求时扫描，最多返回 256 个；前端展示后端返回的完整 verified 列表，不再裁成最近 5 个。
+   - v2 legacy Full、v3 Full 与 v4 Full 只在用户请求时扫描，最多返回 256 个；前端展示后端返回的完整 verified 列表，不再裁成最近 5 个。
    - 列表与删除共用 `verify_managed_full_backup`：受管直接子目录、Full scope、manifest、精确文件集合/大小和 payload SHA-256 任一不符都不会显示 verified。
    - 删除要求页面内显式确认并再次双重复检，回报 reclaimed bytes 并写 `deleteBackup` 审计；extra file/hash drift 候选保持在磁盘。
    - 手工 Full、hard delete 和 restore safety 不自动删；失败、孤儿与无证据目录也不会被 mtime/数量规则猜删。
@@ -153,7 +210,9 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
 
 9. **会话 JSONL/index 生产路径零 in-place**
    - source 在执行期校验完整尾行、session ID、长度和 SHA-256 前后稳定，只允许 bounded retry；`Unchanged` 返回前复检 source version 与 live relation。
-   - Create/Import 在同目录临时文件内完成 provider 元数据归一和同步，再通过 atomic hard-link no-clobber 发布；目标已存在时重新比较或 fail closed。允许替换时，严格扩展与 Divergent 都发布按稳定 source hash 命名的完整 imported JSONL，旧目标 bytes/hash/mtime 不变。
+   - Create/Import 在同目录临时文件内完成 provider 元数据归一和同步，再通过 atomic hard-link no-clobber 发布；目标已存在时重新比较或 fail closed。任何既有 JSONL 都不覆盖，包括工具拥有的 provider predecessor。
+   - provider-aware 路径最多检查 32 个候选，遇到完整 Remote 槽位就复用；扫描时只记首个空位，只有无完整槽位时才在该空位发布 immutable successor。sidecar marker 不超过 16 KiB，并以 `createdBytes` 前缀 SHA-256、thread/provider、文件名和 origin 证明工具所有权；创建后合法 append 可继续使用，创建前缀变化则拒绝所有权。
+   - 首次或合法增长只发布最终 provider JSONL 与 marker，不同时生成 raw/provider 两份；真正 Divergent 为避免数据丢失可额外保留 raw 分支。旧 provider predecessor 只有在 durable terminal、两库无引用且 successor 完整包含它时才回收；清理前任一复核失败都保留。
    - current→shared 与关闭态使用 `SelectMostComplete`，完整文件发布后才可推进既有 SQLite 引用；hot shared→current 使用 `PreserveExisting`，既有 thread 在 `existing_thread_rollout_path` / `copy_rollout_file` 前直接 duplicate+continue，不创建 candidate/orphan，保留 rollout/provider/title 和旧 writer 可见性；hot 新 thread 仍进入发布与事务插入。
    - hot current `session_index.jsonl` 使用 `Skip`；closed/app-owned shared index 生成完整 merged bytes 并同目录 `atomic_write`；`Deny` 只校验且零写入。
 
@@ -161,16 +220,17 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
 
 1. **切换不再批量触碰未变化历史**
    - `session_sync.rs::copy_rollout_file` 对相等文件不复制。
-   - 关闭态/provider switch 可以更新 SQLite `threads.model_provider`，不要求重写已经存在且正文相同的 JSONL；hot shared→current 的既有 row 则按 `PreserveExisting` 保留 provider/title。
-   - 只有真正复制、新建或发布完整 imported JSONL 时才做一次 `session_meta.payload.model_provider` 归一。
-   - `provider_switch_updates_sqlite_without_rewriting_unchanged_existing_jsonl` 明确断言内容和 mtime 不变。
+   - 关闭态/provider switch 先选择完整活动历史，再复用完整 Remote provider 槽位或发布 immutable successor，让 SQLite provider/path 与活动 JSONL provider 一致；原正文相同 JSONL 不重写。hot shared→current 的既有 row 则按 `PreserveExisting` 保留 provider/title。
+   - 只有真正复制或发布最终 provider successor 时才做一次 `session_meta.payload.model_provider` 归一；首次/增长路径不额外落 raw 副本。
+   - provider 回归锁定原 JSONL 内容/mtime 不变、16 KiB marker/创建前缀合同、32 个有界候选、前空后完整仍复用完整槽位、无完整槽位才使用首空位、合法 append、immutable growth、证明式 GC 和 SQLite/活动 JSONL provider 一致。
+   - typed result/UI 同时展示 `persistentSessionBytesAdded`、`persistentSessionBytesReclaimed` 及其净值；added 按实际 JSONL 与实际 marker 序列化长度计，reclaimed 按证明式 GC 的 JSONL+marker 计，`checkpointCleanup.reclaimedBytes` 单独展示，不能混算。
    - hot shared→current 的 existing branch 更早在 `copy_rollout_file` 前退出，既不读取/散列 target candidate，也不写入/发布文件；重复同步保持 `copied_session_files = 0`，避免异名 imported 文件累积、C 盘增长以及 ChatGPT 文件观察/索引压力。
 
 2. **所有高频切换/同步都使用窄状态检查点**
    - 切换在开始大会话规划前先通过 `Channel` 发送真实 `planningSessions`，避免首个可见阶段晚于昂贵扫描。
-   - 切换 plan 同时检查 current→shared 与 shared→current 是否需要 Create/Import JSONL，以及 index 应采用 `Skip`、完整原子合并或 `Deny`。
+   - 切换在关闭前先做只读 plan/capacity 初筛；关闭后再生成用于执行的权威 plan，并再次检查 current→shared 与 shared→current 的 immutable successor/普通 Create/Import、SQLite 和 index 输出。
    - changed switch 始终 current `RuntimeState` + shared `StateOnly`，普通 sync 始终双 `StateOnly`；不再复制 session payload。两边无需文件写入时冻结 `Deny`，需要合并时使用零 in-place `Allow`。
-   - `Deny` 后发生 JSONL/index 漂移会零写入并 fail closed；`Allow` 依赖 source 稳定快照、完整 JSONL 原子 no-clobber 发布、显式 rollout 选择策略和 index 策略，不扩大检查点范围。
+   - `Deny` 后发生 JSONL/index 漂移会零写入并 fail closed；`Allow` 依赖 source 稳定快照、完整 JSONL 原子 no-clobber 发布、显式 rollout 选择策略和 index 策略。post-close plan 在第一份 checkpoint 前和最后写前都复核，不扩大检查点范围。
    - 切换 `Channel` 在后置校验或已验证回滚之后发送真实 `cleaningCheckpoints` 阶段，最终 Complete/Failed 不会掩盖仍在执行的磁盘清理。
 
 3. **昂贵 Dashboard 域按需加载**
@@ -222,7 +282,7 @@ v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visi
 
 ## CC Switch 对照结论
 
-官方 CC Switch 当前会话迁移更接近单个 Home 的一次性 provider bucket/migration，不是本项目 current/shared 双根热同步，不能直接移植。可借鉴的是三点：迁移/写入前冻结 source 稳定性、把归档目录视作一等数据、把迁移来源与结果写入可审计记录。本项目据此补齐 source 尾行/session ID/len/hash 稳定校验和 `archived_sessions/` Full/硬删除范围，但保留更强的跨进程 mutation guard、DPAPI scoped checkpoint、完整 hash-named JSONL 的 no-clobber 发布、`PreserveExisting`/`SelectMostComplete` 活动引用策略和按运行态选择的 index 原子策略；不复制其单 Home 整文件 migration。
+官方 CC Switch 当前会话迁移更接近单个 Home 的一次性 provider bucket/migration，不是本项目 current/shared 双根热同步，不能直接移植。可借鉴的是三点：迁移/写入前冻结 source 稳定性、把归档目录视作一等数据、把迁移来源与结果写入可审计记录。本项目据此补齐 source 尾行/session ID/len/hash 稳定校验和 `archived_sessions/` Full/硬删除范围，但保留更强的跨进程 mutation guard、DPAPI scoped checkpoint、带严格 provenance 的 immutable successor、`PreserveExisting`/`SelectMostComplete` 活动引用策略和按运行态选择的 index 原子策略；不复制其单 Home 整文件 migration。
 
 ## v0.2.0 发布门禁
 
@@ -256,7 +316,7 @@ Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DA
 
 ### 核心产品承诺
 
-用户购买的不是“瞬时切换”，而是“我知道现在正在做什么，失败时不会覆盖已有会话”。高频 switch/sync 的安全边界不是复制全部 JSONL，而是窄 config/SQLite 检查点加零 in-place 的完整文件发布协议；真正会删除或覆盖完整数据的 hard delete、手工 Full 和 restore safety 仍必须覆盖四库与 active/archived 会话正文。正确优化顺序是：
+用户购买的不是“瞬时切换”，而是“我知道现在正在做什么，失败时不会覆盖已有会话”。高频 switch/sync 的安全边界不是复制全部 JSONL，而是窄 config/SQLite 检查点、pre-close 初筛 + post-close 权威写集的保守容量门禁，以及不覆盖既有文件的 immutable successor 协议；旧工具槽位也只能在 durable terminal、两库无引用和完整 successor 的共同证明下回收。真正会删除完整数据的 hard delete、手工 Full 和 restore safety 仍必须覆盖四库与 active/archived 会话正文。正确优化顺序是：
 
 1. 立即反馈并保持窗口响应。
 2. 不做与本次变更无关的 I/O。
@@ -277,6 +337,7 @@ Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DA
 - 切换期间禁止关闭窗口但没有取消。进入写入阶段后不应提供强制取消；未来只能在任何写入前提供安全取消。
 - 仓库和可执行资产仍使用 `codex-switch` 兼容名，而界面叫 ChatGPT Switch。短期保留可避免破坏 updater URL 和用户路径，但发布说明必须解释这是兼容命名。
 - 持久 Full 已可按需列出最多 256 个并逐个删除，但尚无 pin/按操作组的 retention；extra/hash drift、失败、孤儿与无证据目录不会伪装成 verified，也仍会长期占用磁盘。容量预检与“可证明回收”不等于所有历史目录可删。
+- provider predecessor GC 不属于 backup retention：它只能处理 provenance marker 明确归属、已被完整 successor 取代且 current/shared 两库都不再引用的旧会话槽位，不能授权按年龄、数量或剩余空间清理任意 JSONL、Full 或孤儿目录。
 
 ## 后续路线
 

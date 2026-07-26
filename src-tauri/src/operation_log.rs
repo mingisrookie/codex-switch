@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +10,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::file_ops::atomic_write;
 
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OPERATION_LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -88,26 +89,44 @@ impl OperationLog {
     where
         F: FnOnce(),
     {
+        self.append_with_lock_and_writer(record, on_locked, atomic_write)
+    }
+
+    fn append_with_lock_and_writer<F, WriteLog>(
+        &self,
+        record: &OperationRecord,
+        on_locked: F,
+        write_log: WriteLog,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(),
+        WriteLog: FnOnce(&Path, &[u8]) -> Result<(), String>,
+    {
         let _guard = OPERATION_LOG_LOCK
             .lock()
             .map_err(|_| "operation log lock is poisoned".to_string())?;
         on_locked();
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create operation log directory: {error}"))?;
+        let mut payload = if self.path.exists() {
+            fs::read(&self.path)
+                .map_err(|error| format!("failed to read operation log before append: {error}"))?
+        } else {
+            Vec::new()
+        };
+        let existing = parse_operation_records_strict(&payload)?;
+        if existing
+            .iter()
+            .any(|existing| existing.operation_id == record.operation_id)
+        {
+            return Err("operation log already contains this operation ID".to_string());
+        }
+        if !payload.is_empty() && !payload.ends_with(b"\n") {
+            payload.push(b'\n');
         }
         let mut encoded = serde_json::to_vec(record)
             .map_err(|error| format!("failed to serialize operation record: {error}"))?;
         encoded.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| format!("failed to open operation log: {error}"))?;
-        file.write_all(&encoded)
-            .map_err(|error| format!("failed to append operation log: {error}"))?;
-        file.sync_data()
-            .map_err(|error| format!("failed to sync operation log: {error}"))
+        payload.extend_from_slice(&encoded);
+        write_log(&self.path, &payload)
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<OperationRecord>, String> {
@@ -123,16 +142,7 @@ impl OperationLog {
         }
         let payload = fs::read(&self.path)
             .map_err(|error| format!("failed to read operation log: {error}"))?;
-        let mut records = Vec::new();
-        for line in payload
-            .split(|byte| *byte == b'\n')
-            .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
-        {
-            records.push(
-                serde_json::from_slice(line)
-                    .map_err(|error| format!("failed to parse operation record: {error}"))?,
-            );
-        }
+        let mut records = parse_operation_records_strict(&payload)?;
         records.reverse();
         Ok(records)
     }
@@ -171,6 +181,17 @@ impl OperationLog {
         records.truncate(limit);
         Ok(records)
     }
+}
+
+fn parse_operation_records_strict(payload: &[u8]) -> Result<Vec<OperationRecord>, String> {
+    payload
+        .split(|byte| *byte == b'\n')
+        .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+        .map(|line| {
+            serde_json::from_slice(line)
+                .map_err(|error| format!("failed to parse operation record: {error}"))
+        })
+        .collect()
 }
 
 pub fn operation_id(prefix: &str) -> Result<String, String> {
@@ -375,6 +396,53 @@ mod tests {
 
         assert!(log.list(10).is_ok());
         assert!(log.list_all_strict().is_err());
+    }
+
+    #[test]
+    fn failed_atomic_publish_keeps_the_previous_log_byte_exact() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("operations.jsonl");
+        let log = OperationLog::new(path.clone());
+        log.append(&record("complete", 1)).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = log
+            .append_with_lock_and_writer(
+                &record("must-not-appear", 2),
+                || {},
+                |_path, _payload| Err("injected pre-publish failure".to_string()),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, "injected pre-publish failure");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let records = log.list_all_strict().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation_id, "complete");
+    }
+
+    #[test]
+    fn append_rejects_a_damaged_existing_log_without_claiming_a_new_terminal() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("operations.jsonl");
+        let log = OperationLog::new(path.clone());
+        log.append(&record("complete", 1)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"operationId":"truncated""#)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = log.append(&record("must-not-appear", 2)).unwrap_err();
+
+        assert!(
+            error.contains("failed to parse operation record"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!String::from_utf8_lossy(&before).contains("must-not-appear"));
     }
 
     #[test]

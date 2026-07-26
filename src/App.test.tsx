@@ -26,6 +26,7 @@ const apiMocks = vi.hoisted(() => ({
   verifyRelayRuntime: vi.fn(),
   listCodexProcesses: vi.fn(),
   closeCodexProcesses: vi.fn(),
+  launchChatgpt: vi.fn(),
   switchRuntime: vi.fn(),
   loadRuntimeDashboard: vi.fn(),
   loadSessionDashboard: vi.fn(),
@@ -159,6 +160,7 @@ describe('App release-hardening UI', () => {
       mock.mockResolvedValue(undefined);
     }
     apiMocks.listCodexProcesses.mockResolvedValue([]);
+    apiMocks.launchChatgpt.mockResolvedValue({ status: 'alreadyRunning', message: null });
     apiMocks.listSkills.mockResolvedValue([]);
     const initial = dashboardData();
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
@@ -499,7 +501,7 @@ describe('App release-hardening UI', () => {
     expect(within(relay).getByText('当前运行')).toBeTruthy();
     expect(within(relay).getByText('已验证')).toBeTruthy();
     expect((within(relay).getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getAllByText('切换前会先关闭 ChatGPT')).toHaveLength(2);
+    expect(screen.getAllByText(/任务执行器会安全关闭，并在成功后自动打开 ChatGPT/)).toHaveLength(2);
   });
 
   it('loads the independent skills page only after the user opens its tab', async () => {
@@ -768,6 +770,7 @@ describe('App release-hardening UI', () => {
       operationId: 'sync-1', backups: [{ backupDir: 'C:\\backups\\sync-1' }],
       insertedThreads: 3, copiedSessionFiles: 2, duplicateThreads: 8,
       skippedMissingSessionFiles: 1, skippedArchivedThreads: 0, mergedSessionIndexEntries: 2,
+      persistentSessionBytesAdded: 2048, persistentSessionBytesReclaimed: 1024,
       warnings: ['审计日志写入失败'],
     });
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
@@ -795,12 +798,15 @@ describe('App release-hardening UI', () => {
       operationId: 'sync-refresh-failed', backups: [], insertedThreads: 1,
       copiedSessionFiles: 1, duplicateThreads: 0, skippedMissingSessionFiles: 0,
       skippedArchivedThreads: 0, mergedSessionIndexEntries: 1,
+      persistentSessionBytesAdded: 0, persistentSessionBytesReclaimed: 0,
     });
     render(<App loadDashboard={load} />);
     fireEvent.click(await screen.findByRole('button', { name: '立即同步' }));
     fireEvent.click(await screen.findByRole('button', { name: '开始同步' }));
 
     expect(await screen.findByText('操作 ID：sync-refresh-failed')).toBeTruthy();
+    expect(screen.getByText('会话净变化：0 B')).toBeTruthy();
+    expect(screen.queryByText('会话净变化：+0 B')).toBeNull();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
     const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '立即同步' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('refresh failed'));
@@ -1168,6 +1174,8 @@ describe('App release-hardening UI', () => {
       skippedMissingSessionFiles: 0,
       skippedArchivedThreads: 0,
       mergedSessionIndexEntries: 0,
+      persistentSessionBytesAdded: 0,
+      persistentSessionBytesReclaimed: 0,
       warnings: [],
     });
     render(<App />);
@@ -1372,7 +1380,7 @@ describe('App release-hardening UI', () => {
     expect(within(history).getByText('失败')).toBeTruthy();
   });
 
-  it('shows switch loading immediately, streams stages, and keeps the task across tabs', async () => {
+  it('shows one switch overlay immediately, streams stages, and makes the background inert', async () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
     const pendingSwitch = deferred<{
@@ -1383,6 +1391,8 @@ describe('App release-hardening UI', () => {
       rolledBack: boolean;
       toShared: { insertedThreads: number };
       fromShared: { insertedThreads: number };
+      chatProcessStateRepaired: boolean;
+      chatgptLaunch: { status: 'launched'; message: null };
     }>();
     let onProgress!: (event: {
       phase: 'detectingApp' | 'closingApp' | 'backingUpCurrent' | 'complete';
@@ -1396,9 +1406,10 @@ describe('App release-hardening UI', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
 
-    const progress = screen.getByRole('region', { name: '运行态切换进度' });
-    expect(within(progress).getByRole('heading', { name: '正在切换到ChatGPT 账号' })).toBeTruthy();
-    expect(screen.getByText('切换 ChatGPT 账号处理中')).toBeTruthy();
+    const progress = screen.getByRole('dialog', { name: '正在切换到 ChatGPT 账号态' });
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    expect(document.querySelector('main')?.hasAttribute('inert')).toBe(true);
+    expect(screen.queryByText('切换 ChatGPT 账号处理中')).toBeNull();
     expect(apiMocks.switchRuntime).toHaveBeenCalledWith('plus', expect.any(Function));
     expect(apiMocks.listCodexProcesses).not.toHaveBeenCalled();
     expect(apiMocks.closeCodexProcesses).not.toHaveBeenCalled();
@@ -1408,19 +1419,24 @@ describe('App release-hardening UI', () => {
       onProgress({ phase: 'closingApp', timestampMs: 110 });
       onProgress({ phase: 'backingUpCurrent', timestampMs: 120 });
     });
-    expect(within(progress).getByText('备份当前数据', { selector: 'strong' }).closest('li')?.className).toBe('active');
+    expect(progress.querySelector('.switch-timeline li.active')?.textContent).toContain('建立本机检查点');
     expect(within(progress).getByText('检测 ChatGPT', { selector: 'strong' }).closest('li')?.className).toBe('done');
 
-    fireEvent.click(screen.getByRole('button', { name: '技能' }));
-    expect(screen.getByRole('region', { name: '运行态切换进度' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '技能' })).toBeNull();
+    expect(screen.getByRole('dialog')).toBeTruthy();
 
     act(() => onProgress({ phase: 'complete', timestampMs: 130 }));
+    expect(progress.getAttribute('aria-busy')).toBe('true');
     pendingSwitch.resolve({
       operationId: 'switch-1', changed: true, runtime: dashboard.runtimes.data[0],
       backups: [], rolledBack: false,
       toShared: { insertedThreads: 0 }, fromShared: { insertedThreads: 0 },
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
     });
-    expect(await screen.findByText('切换完成，可以重新打开 ChatGPT。会话索引将在打开会话页时刷新。')).toBeTruthy();
+    expect((await screen.findAllByText('ChatGPT 已打开', { selector: 'strong' })).length)
+      .toBeGreaterThan(0);
+    expect(within(progress).getByText('switch-1')).toBeTruthy();
   });
 
   it('keeps both runtime switches disabled until the post-switch runtime scan finishes', async () => {
@@ -1440,6 +1456,8 @@ describe('App release-hardening UI', () => {
         rolledBack: false,
         toShared: emptySyncResult(),
         fromShared: emptySyncResult(),
+        chatProcessStateRepaired: false,
+        chatgptLaunch: { status: 'launched', message: null },
       };
     });
     render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
@@ -1447,11 +1465,10 @@ describe('App release-hardening UI', () => {
     fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
     await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
 
-    expect(screen.getByText('正在确认当前运行态')).toBeTruthy();
-    expect((screen.getByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement).disabled)
-      .toBe(true);
-    expect((screen.getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled)
-      .toBe(true);
+    const complete = await screen.findByRole('button', { name: '完成' });
+    expect((complete as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(complete);
+    expect(screen.getByRole('dialog')).toBeTruthy();
 
     const refreshed = dashboardData();
     if (refreshed.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
@@ -1469,11 +1486,51 @@ describe('App release-hardening UI', () => {
       operations: refreshed.operations,
     });
 
-    await waitFor(() => expect(screen.queryByText('正在确认当前运行态')).toBeNull());
+    await waitFor(() => expect((complete as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(complete);
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect((screen.getByRole('button', { name: '重新应用 ChatGPT 账号' }) as HTMLButtonElement).disabled)
       .toBe(false);
     expect((screen.getByRole('button', { name: '切换到中转站' }) as HTMLButtonElement).disabled)
       .toBe(false);
+  });
+
+  it('keeps a successful switch authoritative when ChatGPT launch fails and retries inline', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    const plusRuntime = dashboard.runtimes.data[0];
+    apiMocks.switchRuntime.mockImplementation(async (_runtimeId, onProgress) => {
+      onProgress({ phase: 'cleaningCheckpoints', timestampMs: 100 });
+      onProgress({ phase: 'launchingApp', timestampMs: 110 });
+      onProgress({ phase: 'complete', timestampMs: 120 });
+      return {
+        operationId: 'switch-launch-warning',
+        changed: true,
+        runtime: plusRuntime,
+        backups: [],
+        rolledBack: false,
+        toShared: emptySyncResult(),
+        fromShared: emptySyncResult(),
+        chatProcessStateRepaired: false,
+        chatgptLaunch: { status: 'failed' as const, message: 'activation unavailable' },
+      };
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    const switchButton = await screen.findByRole('button', { name: '切换到 ChatGPT 账号' });
+    fireEvent.click(switchButton);
+
+    expect(await screen.findByRole('button', { name: '重试打开 ChatGPT' })).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('activation unavailable');
+    expect(document.querySelector('.operation-result')).toBeNull();
+    expect(document.querySelector('.busy-banner')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试打开 ChatGPT' }));
+    await waitFor(() => expect(apiMocks.launchChatgpt).toHaveBeenCalledTimes(1));
+    expect((await screen.findAllByText('ChatGPT 已在运行')).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: '完成' }));
+    await waitFor(() => expect(document.activeElement).toBe(switchButton));
   });
 
   it('serializes same-tick switch clicks and waits for command completion before scanning stale sessions', async () => {
@@ -1496,7 +1553,8 @@ describe('App release-hardening UI', () => {
     expect(apiMocks.switchRuntime).toHaveBeenCalledTimes(1);
 
     act(() => onProgress({ phase: 'applyingRuntime', timestampMs: 110 }));
-    fireEvent.click(screen.getByRole('button', { name: '会话' }));
+    expect(document.querySelector('main')?.hasAttribute('inert')).toBe(true);
+    expect(screen.queryByRole('button', { name: '会话' })).toBeNull();
     expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
 
     act(() => onProgress({ phase: 'complete', timestampMs: 120 }));
@@ -1515,6 +1573,8 @@ describe('App release-hardening UI', () => {
         skippedMissingSessionFiles: 0,
         skippedArchivedThreads: 0,
         mergedSessionIndexEntries: 0,
+        persistentSessionBytesAdded: 0,
+        persistentSessionBytesReclaimed: 0,
       },
       fromShared: {
         insertedThreads: 0,
@@ -1523,8 +1583,14 @@ describe('App release-hardening UI', () => {
         skippedMissingSessionFiles: 0,
         skippedArchivedThreads: 0,
         mergedSessionIndexEntries: 0,
+        persistentSessionBytesAdded: 0,
+        persistentSessionBytesReclaimed: 0,
       },
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
     });
+    fireEvent.click(await screen.findByRole('button', { name: '完成' }));
+    fireEvent.click(screen.getByRole('button', { name: '会话' }));
     await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
   });
 
@@ -1569,10 +1635,13 @@ describe('App release-hardening UI', () => {
       rolledBack: false,
       toShared: emptySyncResult(),
       fromShared: emptySyncResult(),
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
     });
+    fireEvent.click(await screen.findByRole('button', { name: '完成' }));
     const relayButton = await screen.findByRole('button', { name: '切换到中转站' });
     fireEvent.click(relayButton);
-    expect(await screen.findByRole('heading', { name: '正在切换到API 中转站' })).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: '正在切换到 API 中转站态' })).toBeTruthy();
 
     act(() => progress[0]({
       phase: 'failed',
@@ -1582,7 +1651,7 @@ describe('App release-hardening UI', () => {
     }));
 
     expect(screen.queryByText('stale first switch event')).toBeNull();
-    expect(screen.getByRole('heading', { name: '正在切换到API 中转站' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '正在切换到 API 中转站态' })).toBeTruthy();
     second.resolve({
       operationId: 'switch-second',
       changed: true,
@@ -1591,8 +1660,10 @@ describe('App release-hardening UI', () => {
       rolledBack: false,
       toShared: emptySyncResult(),
       fromShared: emptySyncResult(),
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
     });
-    expect(await screen.findByText('操作 ID：switch-second')).toBeTruthy();
+    expect(await screen.findByText('switch-second')).toBeTruthy();
   });
 
   it('registers the close guard before enabling a switch and blocks close only while it runs', async () => {
@@ -1640,8 +1711,10 @@ describe('App release-hardening UI', () => {
       rolledBack: false,
       toShared: emptySyncResult(),
       fromShared: emptySyncResult(),
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
     });
-    expect(await screen.findByText('操作 ID：switch-close-guard')).toBeTruthy();
+    expect(await screen.findByText('switch-close-guard')).toBeTruthy();
 
     const after = { preventDefault: vi.fn() };
     act(() => closeHandler?.(after));
@@ -1685,8 +1758,7 @@ describe('App release-hardening UI', () => {
     expect(screen.queryByRole('button', { name: '加载备份' })).toBeNull();
 
     act(() => onProgress({ phase: 'backingUpShared', timestampMs: 110 }));
-    const loadBackups = screen.getByRole('button', { name: '加载备份' }) as HTMLButtonElement;
-    expect(loadBackups.disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: '加载备份' })).toBeNull();
 
     act(() => {
       onProgress({
@@ -1697,8 +1769,9 @@ describe('App release-hardening UI', () => {
       });
       pendingSwitch.reject(new Error('shared backup failed'));
     });
-    expect(await screen.findByText(/shared backup failed/)).toBeTruthy();
-    expect(screen.getAllByText(/shared backup failed/)).toHaveLength(1);
+    expect((await screen.findAllByText(/shared backup failed/)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('button', { name: '关闭任务' }));
+    const loadBackups = screen.getByRole('button', { name: '加载备份' }) as HTMLButtonElement;
     await waitFor(() => expect(loadBackups.disabled).toBe(false));
 
     fireEvent.click(loadBackups);
@@ -1714,6 +1787,8 @@ function emptySyncResult() {
     skippedMissingSessionFiles: 0,
     skippedArchivedThreads: 0,
     mergedSessionIndexEntries: 0,
+    persistentSessionBytesAdded: 0,
+    persistentSessionBytesReclaimed: 0,
   };
 }
 
@@ -1729,6 +1804,8 @@ function emptySyncResult() {
         operationId: 'switch-lazy', changed: true, runtime: plusRuntime,
         backups: [], rolledBack: false,
         toShared: { insertedThreads: 0 }, fromShared: { insertedThreads: 0 },
+        chatProcessStateRepaired: false,
+        chatgptLaunch: { status: 'launched', message: null },
       };
     });
 
@@ -1744,6 +1821,7 @@ function emptySyncResult() {
     expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
     expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
 
+    fireEvent.click(await screen.findByRole('button', { name: '完成' }));
     fireEvent.click(screen.getByRole('button', { name: '会话' }));
     await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
     expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
@@ -1770,7 +1848,7 @@ function emptySyncResult() {
 
     fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
 
-    const progress = await screen.findByRole('region', { name: '运行态切换进度' });
+    const progress = await screen.findByRole('dialog', { name: '切换到 ChatGPT 账号态' });
     await waitFor(() => expect(within(progress).getByText('已恢复切换前状态')).toBeTruthy());
     const interrupted = within(progress).getByText('应用运行态', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');

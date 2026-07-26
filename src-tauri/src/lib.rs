@@ -1,4 +1,5 @@
 pub mod backup;
+mod chat_process_state;
 pub mod codex_home;
 pub mod codex_paths;
 mod commands;
@@ -35,6 +36,7 @@ pub fn run() {
             commands::test_relay_connection,
             commands::list_codex_processes,
             commands::close_codex_processes,
+            commands::launch_chatgpt,
             commands::switch_runtime,
             commands::sync_all_sessions,
             commands::delete_managed_sessions,

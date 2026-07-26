@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.2 - 2026-07-26
+
+### 切换体验与 ChatGPT 启动
+
+- 运行态切换改为单一页面内 task overlay：切换开始后成为唯一任务焦点，持续展示真实后端 phase、当前说明、成功/写入前失败/已回滚/回滚失败终态和可执行操作；不使用 `alert`、`confirm`、`prompt`、原生 `<dialog>` 或额外系统确认框。
+- 每次成功切换（包括运行态已 exact 的 no-op）都会在持久终态之后受控打开 ChatGPT：changed switch 使用关闭前从受管进程捕获并验证的 Windows AppUserModelID，并严格排在临时点清理与 provider GC 尝试之后；no-op best-effort 捕获当前运行实例，已运行时返回 `alreadyRunning`。两者都不从 `PATH` 查找同名 EXE、不显示控制台窗口；启动失败只返回 typed warning，不回滚已经成功的运行态，并在同一完成态提供“重新打开 ChatGPT”。
+- 前端继续重构任务层级、运行态选择、状态说明和结果回执；图标统一使用 Lucide，不使用 emoji，并覆盖 reduced-motion、键盘焦点、screen-reader 名称及 1200×820、900×640、390×844 三档布局合同。
+
+### Remote 会话可见性与磁盘边界
+
+- Remote provider 归一现在严格发生在 `SelectMostComplete` 选出活动历史之后：较短 shared source 不会替换更完整 current，内容分叉也不会静默改指活动分支。SQLite `threads.model_provider` 与活动 JSONL 首条 `session_meta.payload.model_provider` 同步指向目标 provider。
+- provider 不匹配或活动文件仍是 legacy `-imported` 形态时，任何既有 JSONL 都不覆盖；在受管 `sessions` 根内最多检查 32 个稳定候选，遇到已经完整覆盖所选历史的 Remote-compatible 槽位就复用，同时只记住首个空位；只有有界扫描结束仍无完整槽位时才在该空位发布新的 immutable successor。每个新槽位原子创建不超过 16 KiB 的 provenance marker，以 `createdBytes` 和创建前缀 SHA-256 证明工具所有权；文件创建后的合法 append 可继续识别，创建前缀改变则 fail closed。首次发布或合法增长只写最终 provider 文件与 marker，不额外生成 raw/provider 双份；真正 Divergent 为避免数据丢失可单独保留 raw 分支。
+- session id 必须是严格 UUID 单文件名组件；选中来源和目标父目录都必须通过 canonical containment。路径分隔符、`..`、绝对/驱动器片段、越界目录或 ID 不匹配在发布前 fail closed。
+- 运行态 planning 先在 ChatGPT 仍运行时计算 provider rollout、普通 rollout、最多 16 KiB marker 预留、SQLite workspace/index 输出并做第一轮只读容量 fail-fast；关闭完成后重建 closed-session 权威写集并再次按真实卷聚合窄 checkpoint 峰值与 session 输出，每卷保留 `max(2 GiB, 15%)` 余量。容量是保守上界，精确相等约束作用于权威写集：post-close replan/capacity 失败或第一份 checkpoint 前发现 plan 漂移时不创建 checkpoint/output；checkpoint 后发现漂移时不做 live session/runtime 写入，已有 typed prewrite checkpoint 按终态证据清理。
+- hot shared→current 的 existing-thread `PreserveExisting` 快路径保持不变：在 target candidate 查询/复制前直接跳过，既有 SQLite provider/path/title 不变，`copied_session_files = 0`。
+- provider predecessor 只在 durable terminal 成功落盘、current/shared 两库均不再引用、successor 再次证明完整包含旧槽位且 provenance/source 未漂移时才回收；任何证据不足都保留旧槽位并给 warning。typed result/UI 分开披露持久会话 added、reclaimed、net 与 transient checkpoint reclaimed，避免把临时释放误报成会话净变化。
+- changed switch 在两根检查点和最后一次 ChatGPT 进程门禁之后校验固定的 `process_manager/chat_processes.json`。current `RuntimeState` 的 BackupManifest v4 会保存其 exact bytes；只有明确的空/全 NUL 损坏才原子修复为 `[]`，任何合法 JSON 都按原字节保留，缺失文件不创建；无效但非空/非全 NUL 的未知格式、超过 16 MiB、link/containment 或锁定异常均保留原文件并 fail closed。后续步骤失败会从检查点恢复原字节；真实 `repairingAppState` phase、`chatProcessStateRepaired` receipt、操作计数和完成面共同披露结果。
+
+### C 盘增长审计与 PR 决策
+
+- 已确认 v0.2.0 每次 changed switch 都永久创建 current `Runtime` 与 shared `Sessions` 两份全会话 checkpoint，是用户观察到 C 盘每切一次就减少的直接原因。本机最新四个 v0.2.0 switch 目录合计约 2.48 GiB；受控清理曾从 21 个目录、`6,327,089,609` bytes 降至 17 个目录、`2,693,977,957` bytes，但剩余项不是“已全部清空”。
+- 当前 writer 使用 BackupManifest v4；changed switch 的 current `RuntimeState` 额外声明 `trackedProcessState=true`，shared 仍为 `StateOnly`，普通同步仍为双 `StateOnly`。自动 checkpoint 必须携带非空 `operationId` 与精确 `role`，且只有 bound v4 与唯一 terminal record 的 ID/role/action/status/phase、reason/scope、路径、时间窗及完整 payload hash 全部匹配时才自动释放。未绑定 v2/v3 自动点一律 fail closed 保留；经 managed-full 强校验的 v2/v3/v4 Full 仍可显式列出、恢复和删除，但不参与自动 cleanup。
+- 普通切换不会创建 updater EXE；updater staging 只在用户主动执行更新时出现。正常切换的持久增长仅可能来自已通过容量预检的 ordinary/new-session rollout、真正 Divergent 的 raw 分支、Remote provider successor/marker 和窄 operation metadata/log。
+- PR #4 是审查时唯一 open PR；其 Remote/provider 与全 NUL process registry 诊断可取，但原实现会在 checkpoint 前破坏性修复，legacy Remote 文件名 fast-path 还会把后续必需的 Create 冻结为 `Deny`，并存在 session id 路径逃逸、provider 完整性绕过、输出容量遗漏、候选复用缺口和重复全量副本。本版本不直接合并该 PR，而是在 latest `main` 上用上述受检查点保护的链路完整替代。
+
+### 已知边界
+
+- 会话同步不是持久备份；手工 Full、硬删除前和恢复覆盖前的安全备份仍有独立用途，不参与自动清理。
+- provider rollout 首次生成仍可能增加一份完整 JSONL 和 provenance marker，但它有明确 Remote 可见性用途，并进入 pre-close 初筛与 post-close 权威重算的保守容量检查。活动/可复用槽位不会删除；只有工具可证明所有权、已有完整 successor 且两库均不再引用的 predecessor 才在 durable terminal 后回收，无法证明时继续占用磁盘。
+- `archived_sessions/` 不属于普通 active-session provider 归一范围；持续双向同步仍有 source TOCTOU 与跨 SQLite/JSONL/index 非单一 durable transaction 的残余风险，继续依赖稳定性复检、no-clobber 发布、SQLite transaction 和 typed failure 收敛。
+- exact no-op 不关闭 ChatGPT，也不检查或修复 process registry；`Full` 继续表示用户数据恢复点而不包含这个 transient registry。Windows 独占读取与同目录原子替换之间无法形成单一 OS 事务，因此修复前后都执行 exact revalidation，无法证明时终止并由现有补偿恢复。
+
 ## v0.2.1 - 2026-07-26
 
 ### 备份与数据安全

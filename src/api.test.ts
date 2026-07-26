@@ -25,6 +25,7 @@ import {
   importPlusRuntime,
   installUpdate,
   installSkill,
+  launchChatgpt,
   loadBackupDashboard,
   listSkills,
   loadDashboard,
@@ -332,5 +333,13 @@ describe('dashboard API', () => {
     });
     payload.onProgress.onmessage({ phase: 'detectingApp' });
     expect(events).toEqual(['detectingApp']);
+  });
+
+  it('retries ChatGPT launch through the fixed backend command without path arguments', async () => {
+    invoke.mockResolvedValue({ status: 'alreadyRunning', message: null });
+
+    await launchChatgpt();
+
+    expect(invoke).toHaveBeenCalledWith('launch_chatgpt');
   });
 });

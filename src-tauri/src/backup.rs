@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    chat_process_state::{
+        backup_source as chat_process_state_backup_source,
+        existing_restore_target as existing_chat_process_state_restore_target,
+        read_snapshot as read_chat_process_state_snapshot,
+        restore_target as chat_process_state_restore_target,
+        validate_snapshot_bytes as validate_chat_process_state_bytes,
+        CHAT_PROCESS_STATE_RELATIVE_PATH,
+    },
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
     },
@@ -26,7 +34,8 @@ use crate::{
 };
 
 static BACKUP_COUNTER: AtomicU64 = AtomicU64::new(0);
-const BACKUP_MANIFEST_VERSION: u32 = 3;
+const SCOPED_BACKUP_MANIFEST_VERSION: u32 = 3;
+const BACKUP_MANIFEST_VERSION: u32 = 4;
 
 const BACKUP_FILE_OVERHEAD_BYTES: u64 = 64 * 1024;
 const MANIFEST_BASE_OVERHEAD_BYTES: u64 = 1024 * 1024;
@@ -53,6 +62,14 @@ pub enum BackupScope {
     StateOnly,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckpointRole {
+    Current,
+    Shared,
+    Visibility,
+}
+
 impl BackupScope {
     fn tracks_runtime_files(self) -> bool {
         matches!(self, Self::Full | Self::Runtime | Self::RuntimeState)
@@ -64,6 +81,10 @@ impl BackupScope {
 
     fn tracks_archived_sessions(self) -> bool {
         matches!(self, Self::Full | Self::Sessions)
+    }
+
+    fn tracks_process_state(self) -> bool {
+        matches!(self, Self::RuntimeState)
     }
 
     fn tracked_databases(self) -> &'static [&'static str] {
@@ -81,6 +102,10 @@ impl BackupScope {
 pub struct BackupManifest {
     pub version: u32,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<CheckpointRole>,
     pub created_at_ms: u128,
     pub source_root: PathBuf,
     pub root_existed: bool,
@@ -90,9 +115,17 @@ pub struct BackupManifest {
     pub tracked_databases: Vec<String>,
     #[serde(default)]
     pub state_db_is_local: bool,
+    #[serde(default)]
+    pub tracked_process_state: bool,
     pub complete_sessions: bool,
     pub backup_dir: PathBuf,
     pub files: Vec<BackupFile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckpointBinding<'a> {
+    operation_id: &'a str,
+    role: CheckpointRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +224,12 @@ pub(crate) struct BackupCapacitySource<'a> {
     pub home: &'a Path,
     pub paths: &'a CodexPaths,
     pub scope: BackupScope,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdditionalCapacityDemand<'a> {
+    pub destination: &'a Path,
+    pub bytes: u64,
 }
 
 pub fn preflight_backup_capacity(
@@ -294,6 +333,34 @@ pub(crate) fn preflight_backup_capacity_for_sources(
     let available_bytes = available_backup_bytes(&destination_root)?;
 
     finish_capacity_preflight(required_bytes, available_bytes)
+}
+
+pub(crate) fn preflight_combined_capacity_for_sources(
+    destination_root: &Path,
+    sources: &[BackupCapacitySource<'_>],
+    additional: &[AdditionalCapacityDemand<'_>],
+) -> Result<Vec<BackupCapacityPreflight>, String> {
+    let destination_root = validate_absolute_root(destination_root, "backup destination root")
+        .map_err(|_| capacity_preflight_error())?;
+    if sources.is_empty() || validate_capacity_sources(&destination_root, sources).is_err() {
+        return Err(capacity_preflight_error());
+    }
+    let capacity = sources
+        .iter()
+        .map(|source| {
+            collect_backup_capacity_metadata(source.home, source.paths, source.scope)
+                .map_err(|_| capacity_preflight_error())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let checkpoint_peak =
+        estimate_backup_peak_without_reserve(&capacity).map_err(|_| capacity_preflight_error())?;
+    let mut demands = Vec::with_capacity(additional.len() + 1);
+    demands.push(AdditionalCapacityDemand {
+        destination: &destination_root,
+        bytes: checkpoint_peak,
+    });
+    demands.extend_from_slice(additional);
+    preflight_grouped_capacity(&demands)
 }
 
 fn validate_capacity_sources(
@@ -489,6 +556,15 @@ fn collect_backup_capacity_metadata(
         sources.push((home.join("auth.json"), PathBuf::from("auth.json")));
         sources.push((home.join("config.toml"), PathBuf::from("config.toml")));
     }
+    if scope.tracks_process_state() {
+        if let Some((_source, bytes)) = chat_process_state_backup_source(home).map_err(|_| ())? {
+            add_capacity_file_at(
+                &mut capacity,
+                bytes,
+                PathBuf::from(CHAT_PROCESS_STATE_RELATIVE_PATH),
+            )?;
+        }
+    }
     if scope.tracks_sessions() {
         sources.push((
             paths.session_index.clone(),
@@ -606,6 +682,22 @@ fn estimate_backup_peak_with_source_count(
     sources: &[BackupSourceCapacityMetadata],
     source_count: u64,
 ) -> Result<u64, ()> {
+    let peak_without_reserve =
+        estimate_backup_peak_without_reserve_with_source_count(sources, source_count)?;
+    required_capacity_with_reserve(peak_without_reserve)
+}
+
+fn estimate_backup_peak_without_reserve(
+    sources: &[BackupSourceCapacityMetadata],
+) -> Result<u64, ()> {
+    let source_count = u64::try_from(sources.len()).map_err(|_| ())?;
+    estimate_backup_peak_without_reserve_with_source_count(sources, source_count)
+}
+
+fn estimate_backup_peak_without_reserve_with_source_count(
+    sources: &[BackupSourceCapacityMetadata],
+    source_count: u64,
+) -> Result<u64, ()> {
     if sources.is_empty() || source_count == 0 {
         return Err(());
     }
@@ -636,9 +728,128 @@ fn estimate_backup_peak_with_source_count(
         .and_then(|value| value.checked_add(manifest_overhead))
         .and_then(|value| value.checked_add(sqlite_workspace))
         .ok_or(())?;
+    Ok(peak_without_reserve)
+}
+
+fn required_capacity_with_reserve(peak_without_reserve: u64) -> Result<u64, ()> {
     let percentage_reserve = percentage_ceil(peak_without_reserve, CAPACITY_RESERVE_PERCENT)?;
     let reserve = MIN_CAPACITY_RESERVE_BYTES.max(percentage_reserve);
     peak_without_reserve.checked_add(reserve).ok_or(())
+}
+
+#[derive(Debug)]
+struct VolumeCapacityDemand {
+    query_path: PathBuf,
+    bytes: u64,
+}
+
+fn preflight_grouped_capacity(
+    demands: &[AdditionalCapacityDemand<'_>],
+) -> Result<Vec<BackupCapacityPreflight>, String> {
+    let mut grouped = std::collections::BTreeMap::<String, VolumeCapacityDemand>::new();
+    for demand in demands {
+        if demand.bytes == 0 {
+            continue;
+        }
+        let (volume_key, query_path) = capacity_volume(demand.destination)?;
+        add_volume_capacity_demand(&mut grouped, volume_key, query_path, demand.bytes)?;
+    }
+    if grouped.is_empty() {
+        return Err(capacity_preflight_error());
+    }
+    let mut preflights = Vec::with_capacity(grouped.len());
+    for demand in grouped.into_values() {
+        let required_bytes =
+            required_capacity_with_reserve(demand.bytes).map_err(|_| capacity_preflight_error())?;
+        let available_bytes = available_backup_bytes(&demand.query_path)?;
+        preflights.push(finish_capacity_preflight(required_bytes, available_bytes)?);
+    }
+    Ok(preflights)
+}
+
+fn add_volume_capacity_demand(
+    grouped: &mut std::collections::BTreeMap<String, VolumeCapacityDemand>,
+    volume_key: String,
+    query_path: PathBuf,
+    bytes: u64,
+) -> Result<(), String> {
+    let entry = grouped.entry(volume_key).or_insert(VolumeCapacityDemand {
+        query_path,
+        bytes: 0,
+    });
+    entry.bytes = entry
+        .bytes
+        .checked_add(bytes)
+        .ok_or_else(capacity_preflight_error)?;
+    Ok(())
+}
+
+fn existing_capacity_ancestor(path: &Path) -> Result<PathBuf, String> {
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        return Err(capacity_preflight_error());
+    };
+    loop {
+        match fs::metadata(&candidate) {
+            Ok(metadata) => {
+                let resolved =
+                    fs::canonicalize(&candidate).map_err(|_| capacity_preflight_error())?;
+                if metadata.is_dir() {
+                    return Ok(resolved);
+                }
+                return resolved
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(capacity_preflight_error);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !candidate.pop() {
+                    return Err(capacity_preflight_error());
+                }
+            }
+            Err(_) => return Err(capacity_preflight_error()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn capacity_volume(path: &Path) -> Result<(String, PathBuf), String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let query_path = existing_capacity_ancestor(path)?;
+    let wide = query_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut buffer = vec![0_u16; 32_768];
+    let ok = unsafe {
+        GetVolumePathNameW(
+            wide.as_ptr(),
+            buffer.as_mut_ptr(),
+            u32::try_from(buffer.len()).map_err(|_| capacity_preflight_error())?,
+        )
+    };
+    if ok == 0 {
+        return Err(capacity_preflight_error());
+    }
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    let volume = std::ffi::OsString::from_wide(&buffer[..end]);
+    let key = volume.to_string_lossy().to_ascii_lowercase();
+    if key.is_empty() {
+        return Err(capacity_preflight_error());
+    }
+    Ok((key, query_path))
+}
+
+#[cfg(not(windows))]
+fn capacity_volume(_path: &Path) -> Result<(String, PathBuf), String> {
+    Err("backup capacity preflight is unsupported on this platform".to_string())
 }
 
 fn percentage_ceil(value: u64, percent: u64) -> Result<u64, ()> {
@@ -704,7 +915,14 @@ pub fn create_backup(
     reason: &str,
 ) -> Result<BackupManifest, String> {
     let paths = resolve_user_codex_paths(home)?;
-    create_scoped_backup_with_paths(home, destination_root, reason, paths, BackupScope::Full)
+    create_scoped_backup_with_paths(
+        home,
+        destination_root,
+        reason,
+        paths,
+        BackupScope::Full,
+        None,
+    )
 }
 
 pub fn create_local_backup(
@@ -718,6 +936,7 @@ pub fn create_local_backup(
         reason,
         local_codex_paths(home),
         BackupScope::Full,
+        None,
     )
 }
 
@@ -736,9 +955,17 @@ pub(crate) fn create_runtime_backup_with_paths(
     reason: &str,
     paths: CodexPaths,
 ) -> Result<BackupManifest, String> {
-    create_scoped_backup_with_paths(home, destination_root, reason, paths, BackupScope::Runtime)
+    create_scoped_backup_with_paths(
+        home,
+        destination_root,
+        reason,
+        paths,
+        BackupScope::Runtime,
+        None,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn create_runtime_state_backup_with_paths(
     home: &Path,
     destination_root: &Path,
@@ -751,6 +978,25 @@ pub(crate) fn create_runtime_state_backup_with_paths(
         reason,
         paths,
         BackupScope::RuntimeState,
+        None,
+    )
+}
+
+pub(crate) fn create_runtime_state_checkpoint_with_paths(
+    home: &Path,
+    destination_root: &Path,
+    reason: &str,
+    paths: CodexPaths,
+    operation_id: &str,
+    role: CheckpointRole,
+) -> Result<BackupManifest, String> {
+    create_scoped_backup_with_paths(
+        home,
+        destination_root,
+        reason,
+        paths,
+        BackupScope::RuntimeState,
+        Some(checkpoint_binding(operation_id, role)?),
     )
 }
 
@@ -769,7 +1015,14 @@ pub(crate) fn create_session_backup_with_paths(
     reason: &str,
     paths: CodexPaths,
 ) -> Result<BackupManifest, String> {
-    create_scoped_backup_with_paths(home, destination_root, reason, paths, BackupScope::Sessions)
+    create_scoped_backup_with_paths(
+        home,
+        destination_root,
+        reason,
+        paths,
+        BackupScope::Sessions,
+        None,
+    )
 }
 
 pub fn create_local_session_backup(
@@ -783,6 +1036,7 @@ pub fn create_local_session_backup(
         reason,
         local_codex_paths(home),
         BackupScope::Sessions,
+        None,
     )
 }
 
@@ -798,19 +1052,11 @@ pub fn create_state_backup(
         reason,
         paths,
         BackupScope::StateOnly,
+        None,
     )
 }
 
 pub(crate) fn create_backup_with_paths(
-    home: &Path,
-    destination_root: &Path,
-    reason: &str,
-    paths: CodexPaths,
-) -> Result<BackupManifest, String> {
-    create_scoped_backup_with_paths(home, destination_root, reason, paths, BackupScope::Full)
-}
-
-pub(crate) fn create_state_backup_with_paths(
     home: &Path,
     destination_root: &Path,
     reason: &str,
@@ -821,8 +1067,37 @@ pub(crate) fn create_state_backup_with_paths(
         destination_root,
         reason,
         paths,
-        BackupScope::StateOnly,
+        BackupScope::Full,
+        None,
     )
+}
+
+pub(crate) fn create_state_checkpoint_with_paths(
+    home: &Path,
+    destination_root: &Path,
+    reason: &str,
+    paths: CodexPaths,
+    operation_id: &str,
+    role: CheckpointRole,
+) -> Result<BackupManifest, String> {
+    create_scoped_backup_with_paths(
+        home,
+        destination_root,
+        reason,
+        paths,
+        BackupScope::StateOnly,
+        Some(checkpoint_binding(operation_id, role)?),
+    )
+}
+
+fn checkpoint_binding(
+    operation_id: &str,
+    role: CheckpointRole,
+) -> Result<CheckpointBinding<'_>, String> {
+    if operation_id.trim().is_empty() {
+        return Err("checkpoint operation ID is required".to_string());
+    }
+    Ok(CheckpointBinding { operation_id, role })
 }
 
 fn create_scoped_backup_with_paths(
@@ -831,6 +1106,7 @@ fn create_scoped_backup_with_paths(
     reason: &str,
     paths: CodexPaths,
     scope: BackupScope,
+    binding: Option<CheckpointBinding<'_>>,
 ) -> Result<BackupManifest, String> {
     let (home, sqlite_home) = validate_resolved_backup_paths(home, &paths)?;
     let destination_root = validate_absolute_root(destination_root, "backup destination root")?;
@@ -857,7 +1133,15 @@ fn create_scoped_backup_with_paths(
     fs::create_dir_all(&backup_dir)
         .map_err(|error| format!("failed to create backup dir: {error}"))?;
 
-    let result = create_backup_in_dir(&home, &backup_dir, reason, created_at_ms, paths, scope);
+    let result = create_backup_in_dir(
+        &home,
+        &backup_dir,
+        reason,
+        created_at_ms,
+        paths,
+        scope,
+        binding,
+    );
     finish_backup_creation_with_cleanup(&backup_dir, result, |path| fs::remove_dir_all(path))
 }
 
@@ -946,7 +1230,10 @@ fn verify_managed_full_backup(
         return Err("backup manifest directory does not match its container".to_string());
     }
     let is_full = manifest.version == 2
-        || (manifest.version == BACKUP_MANIFEST_VERSION && manifest.scope == BackupScope::Full);
+        || (matches!(
+            manifest.version,
+            SCOPED_BACKUP_MANIFEST_VERSION | BACKUP_MANIFEST_VERSION
+        ) && manifest.scope == BackupScope::Full);
     if !is_full {
         return Err("only persistent full backups can be deleted".to_string());
     }
@@ -973,17 +1260,19 @@ fn validate_directory_entry(
 
 pub(crate) fn cleanup_transient_checkpoints(
     destination_root: &Path,
+    terminal_record: &OperationRecord,
     manifests: &[BackupManifest],
 ) -> CheckpointCleanupSummary {
+    let transient = manifests
+        .iter()
+        .filter(|manifest| is_transient_checkpoint(manifest))
+        .collect::<Vec<_>>();
     let mut summary = CheckpointCleanupSummary {
-        attempted_count: manifests
-            .iter()
-            .filter(|manifest| is_transient_checkpoint(manifest))
-            .count(),
+        attempted_count: transient.len(),
         retained_count: manifests.len(),
         ..CheckpointCleanupSummary::default()
     };
-    if manifests.is_empty() {
+    if transient.is_empty() {
         return summary;
     }
     let root = match fs::canonicalize(destination_root) {
@@ -996,11 +1285,24 @@ pub(crate) fn cleanup_transient_checkpoints(
             return summary;
         }
     };
-
-    for manifest in manifests {
-        let cleanup = (|| {
-            if !is_transient_checkpoint(manifest) {
-                return Err("checkpoint scope is persistent".to_string());
+    let selected = (|| {
+        if !is_automatic_checkpoint_terminal(terminal_record)
+            || terminal_record.operation_id.trim().is_empty()
+            || !automatic_checkpoint_count_matches(terminal_record, transient.len())
+            || terminal_record.backup_dirs.len() != transient.len()
+        {
+            return Err("terminal record does not match the checkpoint set".to_string());
+        }
+        let mut selected = Vec::with_capacity(transient.len());
+        for manifest in &transient {
+            if terminal_record
+                .backup_dirs
+                .iter()
+                .filter(|path| *path == &manifest.backup_dir)
+                .count()
+                != 1
+            {
+                return Err("terminal record does not reference the checkpoint exactly".to_string());
             }
             let metadata = fs::symlink_metadata(&manifest.backup_dir)
                 .map_err(|_| "checkpoint directory is unavailable".to_string())?;
@@ -1012,20 +1314,42 @@ pub(crate) fn cleanup_transient_checkpoints(
             if directory.parent() != Some(root.as_path()) {
                 return Err("checkpoint directory is outside the managed backup root".to_string());
             }
-            let stored = read_backup_manifest(&directory)?;
-            if stored.version != BACKUP_MANIFEST_VERSION || stored != *manifest {
+            let mut stored = read_managed_checkpoint(&directory)?;
+            if stored.raw_version != BACKUP_MANIFEST_VERSION || stored.manifest != **manifest {
                 return Err("checkpoint manifest changed after creation".to_string());
             }
-            let bytes = managed_checkpoint_directory_size(&directory, &stored)?;
-            let verified = verify_backup(&directory)?;
-            if verified != stored {
-                return Err("checkpoint manifest changed during verification".to_string());
-            }
-            fs::remove_dir_all(&directory)
-                .map_err(|error| format!("failed to remove checkpoint directory: {error}"))?;
-            Ok(bytes)
-        })();
+            stored.bytes = managed_checkpoint_directory_size(&directory, &stored.manifest)?;
+            selected.push(stored);
+        }
+        let selected_refs = selected.iter().collect::<Vec<_>>();
+        if !checkpoint_selection_matches(terminal_record, &selected_refs) {
+            return Err("checkpoint binding does not match the terminal record".to_string());
+        }
+        Ok(selected)
+    })();
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            summary.failed_count = transient.len();
+            summary
+                .warnings
+                .push(format!("automatic checkpoints were retained: {error}"));
+            return summary;
+        }
+    };
 
+    for checkpoint in selected {
+        let cleanup = revalidate_managed_checkpoint(&root, &checkpoint).and_then(|current| {
+            if current.raw_version != checkpoint.raw_version
+                || current.manifest != checkpoint.manifest
+                || current.bytes != checkpoint.bytes
+            {
+                return Err("checkpoint changed during cleanup".to_string());
+            }
+            fs::remove_dir_all(&current.path)
+                .map_err(|error| format!("failed to remove checkpoint directory: {error}"))?;
+            Ok(current.bytes)
+        });
         match cleanup {
             Ok(bytes) => {
                 summary.reclaimed_count += 1;
@@ -1033,13 +1357,10 @@ pub(crate) fn cleanup_transient_checkpoints(
                 summary.retained_count = summary.retained_count.saturating_sub(1);
             }
             Err(error) => {
-                if is_transient_checkpoint(manifest) {
-                    summary.failed_count += 1;
-                }
-                summary.warnings.push(format!(
-                    "{} checkpoint was retained: {error}",
-                    manifest.reason
-                ));
+                summary.failed_count += 1;
+                summary
+                    .warnings
+                    .push(format!("automatic checkpoint was retained: {error}"));
             }
         }
     }
@@ -1047,19 +1368,35 @@ pub(crate) fn cleanup_transient_checkpoints(
 }
 
 fn is_transient_checkpoint(manifest: &BackupManifest) -> bool {
-    matches!(
-        (&*manifest.reason, manifest.scope),
-        (
-            "switch-runtime-current",
-            BackupScope::Runtime | BackupScope::RuntimeState
-        ) | (
-            "switch-runtime-shared",
-            BackupScope::Sessions | BackupScope::StateOnly
-        ) | (
-            "sync-current" | "sync-shared",
-            BackupScope::Sessions | BackupScope::StateOnly
-        ) | ("restore-sessions-visible", BackupScope::StateOnly)
-    )
+    manifest.version == BACKUP_MANIFEST_VERSION
+        && manifest
+            .operation_id
+            .as_deref()
+            .is_some_and(|operation_id| !operation_id.trim().is_empty())
+        && matches!(
+            (&*manifest.reason, manifest.scope, manifest.role),
+            (
+                "switch-runtime-current",
+                BackupScope::RuntimeState,
+                Some(CheckpointRole::Current)
+            ) | (
+                "switch-runtime-shared",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Shared)
+            ) | (
+                "sync-current",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Current)
+            ) | (
+                "sync-shared",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Shared)
+            ) | (
+                "restore-sessions-visible",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Visibility)
+            )
+        )
 }
 
 fn directory_size_without_links(root: &Path) -> Result<u64, String> {
@@ -1544,9 +1881,11 @@ fn checkpoint_selection_matches(
     checkpoints: &[&ManagedCheckpointDirectory],
 ) -> bool {
     if checkpoints.is_empty()
-        || checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.raw_version != checkpoints[0].raw_version)
+        || checkpoints.iter().any(|checkpoint| {
+            checkpoint.raw_version != BACKUP_MANIFEST_VERSION
+                || !is_transient_checkpoint(&checkpoint.manifest)
+                || checkpoint.manifest.operation_id.as_deref() != Some(record.operation_id.as_str())
+        })
         || record.completed_at_ms < record.started_at_ms
         || checkpoints.iter().any(|checkpoint| {
             checkpoint.manifest.created_at_ms < record.started_at_ms
@@ -1575,9 +1914,9 @@ fn checkpoint_selection_matches(
             OperationPhase::Complete,
         ) => {
             checkpoints.len() == 1
-                && checkpoints[0].raw_version == BACKUP_MANIFEST_VERSION
                 && checkpoints[0].manifest.reason == "restore-sessions-visible"
                 && checkpoints[0].manifest.scope == BackupScope::StateOnly
+                && checkpoints[0].manifest.role == Some(CheckpointRole::Visibility)
         }
         _ => checkpoint_pair_matches(record, checkpoints),
     }
@@ -1587,34 +1926,42 @@ fn prewrite_failure_checkpoints_match(
     action: OperationAction,
     checkpoints: &[&ManagedCheckpointDirectory],
 ) -> bool {
-    if !matches!(checkpoints.len(), 1 | 2)
-        || checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.raw_version != BACKUP_MANIFEST_VERSION)
-    {
+    if !matches!(checkpoints.len(), 1 | 2) {
         return false;
     }
-    let mut reasons = HashSet::new();
+    let mut roles = HashSet::new();
     checkpoints.iter().all(|checkpoint| {
-        reasons.insert(checkpoint.manifest.reason.as_str())
+        checkpoint
+            .manifest
+            .role
+            .is_some_and(|role| roles.insert(role))
             && matches!(
                 (
                     action,
                     checkpoint.manifest.reason.as_str(),
                     checkpoint.manifest.scope,
+                    checkpoint.manifest.role,
                 ),
                 (
                     OperationAction::SwitchRuntime,
                     "switch-runtime-current",
                     BackupScope::RuntimeState,
+                    Some(CheckpointRole::Current),
                 ) | (
                     OperationAction::SwitchRuntime,
                     "switch-runtime-shared",
                     BackupScope::StateOnly,
+                    Some(CheckpointRole::Shared),
                 ) | (
                     OperationAction::SyncSessions,
-                    "sync-current" | "sync-shared",
+                    "sync-current",
                     BackupScope::StateOnly,
+                    Some(CheckpointRole::Current),
+                ) | (
+                    OperationAction::SyncSessions,
+                    "sync-shared",
+                    BackupScope::StateOnly,
+                    Some(CheckpointRole::Shared),
                 )
             )
     })
@@ -1625,7 +1972,6 @@ fn checkpoint_pair_matches(
     checkpoints: &[&ManagedCheckpointDirectory],
 ) -> bool {
     if checkpoints.len() != 2
-        || checkpoints[0].raw_version != checkpoints[1].raw_version
         || record.completed_at_ms < record.started_at_ms
         || checkpoints.iter().any(|checkpoint| {
             checkpoint.manifest.created_at_ms < record.started_at_ms
@@ -1641,39 +1987,32 @@ fn checkpoint_pair_matches(
     {
         return false;
     }
-    let mut by_reason = checkpoints
+    let mut by_role = checkpoints
         .iter()
-        .map(|checkpoint| (checkpoint.manifest.reason.as_str(), *checkpoint))
+        .filter_map(|checkpoint| checkpoint.manifest.role.map(|role| (role, *checkpoint)))
         .collect::<HashMap<_, _>>();
-    let (current_reason, shared_reason) = match record.action {
-        OperationAction::SwitchRuntime => ("switch-runtime-current", "switch-runtime-shared"),
-        OperationAction::SyncSessions => ("sync-current", "sync-shared"),
-        _ => return false,
-    };
     let (Some(current), Some(shared)) = (
-        by_reason.remove(current_reason),
-        by_reason.remove(shared_reason),
+        by_role.remove(&CheckpointRole::Current),
+        by_role.remove(&CheckpointRole::Shared),
     ) else {
         return false;
     };
-    if !by_reason.is_empty() {
+    if !by_role.is_empty() {
         return false;
     }
-    match current.raw_version {
-        2 => true,
-        BACKUP_MANIFEST_VERSION => match record.action {
-            OperationAction::SwitchRuntime => matches!(
-                (current.manifest.scope, shared.manifest.scope),
-                (BackupScope::Runtime, BackupScope::Sessions)
-                    | (BackupScope::RuntimeState, BackupScope::StateOnly)
-            ),
-            OperationAction::SyncSessions => matches!(
-                (current.manifest.scope, shared.manifest.scope),
-                (BackupScope::Sessions, BackupScope::Sessions)
-                    | (BackupScope::StateOnly, BackupScope::StateOnly)
-            ),
-            _ => false,
-        },
+    match record.action {
+        OperationAction::SwitchRuntime => {
+            current.manifest.reason == "switch-runtime-current"
+                && current.manifest.scope == BackupScope::RuntimeState
+                && shared.manifest.reason == "switch-runtime-shared"
+                && shared.manifest.scope == BackupScope::StateOnly
+        }
+        OperationAction::SyncSessions => {
+            current.manifest.reason == "sync-current"
+                && current.manifest.scope == BackupScope::StateOnly
+                && shared.manifest.reason == "sync-shared"
+                && shared.manifest.scope == BackupScope::StateOnly
+        }
         _ => false,
     }
 }
@@ -1732,6 +2071,7 @@ fn create_backup_in_dir(
     created_at_ms: u128,
     paths: CodexPaths,
     scope: BackupScope,
+    binding: Option<CheckpointBinding<'_>>,
 ) -> Result<BackupManifest, String> {
     let root_existed = home.exists();
     let mut files = Vec::new();
@@ -1740,6 +2080,16 @@ fn create_backup_in_dir(
     if scope.tracks_runtime_files() {
         sources.push((home.join("auth.json"), PathBuf::from("auth.json")));
         sources.push((home.join("config.toml"), PathBuf::from("config.toml")));
+    }
+    if scope.tracks_process_state() {
+        if let Some(snapshot) = read_chat_process_state_snapshot(home)? {
+            files.push(encrypt_payload_bytes(
+                &snapshot.bytes,
+                &snapshot.path,
+                backup_dir,
+                Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH),
+            )?);
+        }
     }
     if scope.tracks_sessions() {
         sources.push((
@@ -1785,6 +2135,8 @@ fn create_backup_in_dir(
     let manifest = BackupManifest {
         version: BACKUP_MANIFEST_VERSION,
         reason: reason.to_string(),
+        operation_id: binding.map(|binding| binding.operation_id.to_string()),
+        role: binding.map(|binding| binding.role),
         created_at_ms,
         source_root: home.to_path_buf(),
         root_existed,
@@ -1795,6 +2147,7 @@ fn create_backup_in_dir(
             .map(|database| (*database).to_string())
             .collect(),
         state_db_is_local: paths.state_db == home.join("state_5.sqlite"),
+        tracked_process_state: scope.tracks_process_state(),
         complete_sessions: scope.tracks_sessions(),
         backup_dir: backup_dir.to_path_buf(),
         files,
@@ -1837,6 +2190,39 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, String> {
     Ok(manifest)
 }
 
+pub(crate) fn load_process_state_checkpoint(
+    manifest: &BackupManifest,
+    codex_home: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    if manifest.scope != BackupScope::RuntimeState || !manifest.tracked_process_state {
+        return Err("runtime checkpoint does not track ChatGPT process state".to_string());
+    }
+    let verified = verify_backup(&manifest.backup_dir)?;
+    if verified != *manifest {
+        return Err("runtime checkpoint changed after creation".to_string());
+    }
+    let checkpoint_file = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH));
+    let current = read_chat_process_state_snapshot(codex_home)?;
+    match (checkpoint_file, current) {
+        (None, None) => Ok(None),
+        (Some(file), Some(current)) => {
+            let encrypted = fs::read(&file.backup_path)
+                .map_err(|_| "runtime checkpoint process state is unavailable".to_string())?;
+            let checkpoint_bytes = unprotect(&encrypted)?;
+            if current.bytes != checkpoint_bytes {
+                return Err(
+                    "ChatGPT process state changed after the runtime checkpoint".to_string()
+                );
+            }
+            Ok(Some(checkpoint_bytes))
+        }
+        _ => Err("ChatGPT process state changed after the runtime checkpoint".to_string()),
+    }
+}
+
 fn read_backup_manifest(backup_dir: &Path) -> Result<BackupManifest, String> {
     let manifest_path = backup_dir.join("manifest.json");
     let raw = fs::read(&manifest_path)
@@ -1845,7 +2231,10 @@ fn read_backup_manifest(backup_dir: &Path) -> Result<BackupManifest, String> {
         .map_err(|error| format!("failed to parse backup manifest: {error}"))?;
     let mut manifest: BackupManifest = serde_json::from_value(value.clone())
         .map_err(|error| format!("failed to parse backup manifest: {error}"))?;
-    if !matches!(manifest.version, 2 | BACKUP_MANIFEST_VERSION) {
+    if !matches!(
+        manifest.version,
+        2 | SCOPED_BACKUP_MANIFEST_VERSION | BACKUP_MANIFEST_VERSION
+    ) {
         return Err(format!(
             "unsupported backup manifest version: {}",
             manifest.version
@@ -1869,12 +2258,12 @@ fn validate_manifest_contract(
                 .to_string(),
         );
     }
-    if manifest.version >= BACKUP_MANIFEST_VERSION {
+    if manifest.version >= SCOPED_BACKUP_MANIFEST_VERSION {
         let object = raw
             .as_object()
             .ok_or_else(|| "backup manifest must be a JSON object".to_string())?;
         if !object.contains_key("scope") || !object.contains_key("trackedDatabases") {
-            return Err("version 3 backup manifest is missing scope metadata".to_string());
+            return Err("scoped backup manifest is missing scope metadata".to_string());
         }
         let expected = manifest.scope.tracked_databases();
         let actual = manifest
@@ -1891,6 +2280,26 @@ fn validate_manifest_contract(
         if manifest.complete_sessions != manifest.scope.tracks_sessions() {
             return Err("backup manifest session scope is inconsistent".to_string());
         }
+    }
+    if manifest.version >= BACKUP_MANIFEST_VERSION {
+        let object = raw
+            .as_object()
+            .ok_or_else(|| "backup manifest must be a JSON object".to_string())?;
+        if !object.contains_key("trackedProcessState")
+            || manifest.tracked_process_state != manifest.scope.tracks_process_state()
+        {
+            return Err("backup manifest process-state scope is invalid".to_string());
+        }
+        match (&manifest.operation_id, manifest.role) {
+            (Some(operation_id), Some(_)) if !operation_id.trim().is_empty() => {}
+            (None, None) => {}
+            _ => return Err("checkpoint binding metadata is incomplete".to_string()),
+        }
+    } else if manifest.operation_id.is_some()
+        || manifest.role.is_some()
+        || manifest.tracked_process_state
+    {
+        return Err("legacy backup manifest contains unsupported checkpoint metadata".to_string());
     }
 
     let mut relative_paths = HashSet::new();
@@ -1922,6 +2331,9 @@ fn manifest_allows_file(manifest: &BackupManifest, relative_path: &Path) -> bool
     if matches!(relative, "auth.json" | "config.toml") {
         return scope.tracks_runtime_files();
     }
+    if relative == CHAT_PROCESS_STATE_RELATIVE_PATH {
+        return manifest.tracked_process_state;
+    }
     if relative == "session_index.jsonl" {
         return scope.tracks_sessions();
     }
@@ -1929,7 +2341,7 @@ fn manifest_allows_file(manifest: &BackupManifest, relative_path: &Path) -> bool
     if relative_path.starts_with(Path::new("sessions")) {
         return scope.tracks_sessions() && is_jsonl;
     }
-    manifest.version >= BACKUP_MANIFEST_VERSION
+    manifest.version >= SCOPED_BACKUP_MANIFEST_VERSION
         && scope.tracks_archived_sessions()
         && relative_path.starts_with(Path::new("archived_sessions"))
         && is_jsonl
@@ -2163,6 +2575,9 @@ fn stage_backup_payloads(
         let plaintext = unprotect(&encrypted)?;
         let plaintext_bytes = u64::try_from(plaintext.len())
             .map_err(|_| "staged backup payload size overflow".to_string())?;
+        if file.relative_path == Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH) {
+            validate_chat_process_state_bytes(plaintext_bytes)?;
+        }
         let plaintext_sha256 = format!("{:x}", Sha256::digest(&plaintext));
         let stage_path = stage.root.join(format!("{index:08}.payload"));
         let mut handle = open_restore_file(&stage_path, true)?;
@@ -2304,6 +2719,11 @@ fn remove_absent_core_files(
         tracked_files.push((Path::new("auth.json"), target_home.join("auth.json")));
         tracked_files.push((Path::new("config.toml"), target_home.join("config.toml")));
     }
+    if manifest.tracked_process_state {
+        if let Some(target) = existing_chat_process_state_restore_target(target_home)? {
+            tracked_files.push((Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH), target));
+        }
+    }
     if scope.tracks_sessions() {
         tracked_files.push((
             Path::new("session_index.jsonl"),
@@ -2421,7 +2841,21 @@ fn encrypt_payload(
         .map_err(|_| "backup payload exceeds the DPAPI size limit".to_string())?;
     ensure_encryptable_payload_size(plaintext_bytes)
         .map_err(|_| "backup payload exceeds the DPAPI size limit".to_string())?;
-    let encrypted = protect(&plaintext)?;
+    encrypt_payload_bytes(&plaintext, source, backup_dir, relative_path)
+}
+
+fn encrypt_payload_bytes(
+    plaintext: &[u8],
+    source: &Path,
+    backup_dir: &Path,
+    relative_path: &Path,
+) -> Result<BackupFile, String> {
+    validate_relative_path(relative_path)?;
+    let plaintext_bytes = u64::try_from(plaintext.len())
+        .map_err(|_| "backup payload exceeds the DPAPI size limit".to_string())?;
+    ensure_encryptable_payload_size(plaintext_bytes)
+        .map_err(|_| "backup payload exceeds the DPAPI size limit".to_string())?;
+    let encrypted = protect(plaintext)?;
     let backup_path = encrypted_payload_path(backup_dir, relative_path)?;
     atomic_write(&backup_path, &encrypted)?;
     let bytes = fs::metadata(&backup_path)
@@ -2458,13 +2892,16 @@ fn restore_target(
     if let Some(target) = sqlite_restore_target(paths, relative_path.to_string_lossy().as_ref()) {
         return Ok(target.to_path_buf());
     }
+    if relative_path == Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH) {
+        return chat_process_state_restore_target(target_home);
+    }
     Ok(target_home.join(relative_path))
 }
 
 fn remove_extra_session_files(manifest: &BackupManifest, target_home: &Path) -> Result<(), String> {
     let scope = manifest_scope(manifest);
     let mut roots = vec![Path::new("sessions")];
-    if manifest.version >= BACKUP_MANIFEST_VERSION && scope.tracks_archived_sessions() {
+    if manifest.version >= SCOPED_BACKUP_MANIFEST_VERSION && scope.tracks_archived_sessions() {
         roots.push(Path::new("archived_sessions"));
     }
     for relative_root in roots {
@@ -2500,6 +2937,11 @@ fn clear_known_codex_state(
         tracked_files.push(target_home.join("auth.json"));
         tracked_files.push(target_home.join("config.toml"));
     }
+    if manifest.tracked_process_state {
+        if let Some(target) = existing_chat_process_state_restore_target(target_home)? {
+            tracked_files.push(target);
+        }
+    }
     if scope.tracks_sessions() {
         tracked_files.push(paths.session_index.clone());
     }
@@ -2521,7 +2963,7 @@ fn clear_known_codex_state(
             fs::remove_dir_all(&sessions)
                 .map_err(|error| format!("failed to clear restored sessions directory: {error}"))?;
         }
-        if manifest.version >= BACKUP_MANIFEST_VERSION && scope.tracks_archived_sessions() {
+        if manifest.version >= SCOPED_BACKUP_MANIFEST_VERSION && scope.tracks_archived_sessions() {
             let archived = target_home.join("archived_sessions");
             if archived.is_dir() {
                 for path in walk_jsonl_files(&archived)? {
@@ -2669,7 +3111,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     use rusqlite::Connection;
@@ -2678,22 +3120,25 @@ mod tests {
     use crate::operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus};
 
     use super::{
-        add_capacity_file, available_backup_bytes, cleanup_automatic_checkpoints,
-        cleanup_automatic_checkpoints_with_remove, cleanup_transient_checkpoints,
-        collect_backup_capacity_metadata, create_backup, create_local_backup,
-        create_runtime_backup, create_runtime_backup_with_paths,
-        create_runtime_state_backup_with_paths, create_session_backup,
-        create_session_backup_with_paths, create_state_backup, delete_verified_full_backup,
+        add_capacity_file, add_volume_capacity_demand, available_backup_bytes,
+        cleanup_automatic_checkpoints, cleanup_automatic_checkpoints_with_remove,
+        cleanup_transient_checkpoints, collect_backup_capacity_metadata, create_backup,
+        create_local_backup, create_runtime_backup, create_runtime_backup_with_paths,
+        create_runtime_state_backup_with_paths, create_runtime_state_checkpoint_with_paths,
+        create_session_backup, create_session_backup_with_paths, create_state_backup,
+        create_state_checkpoint_with_paths, delete_verified_full_backup,
         ensure_encryptable_payload_size, ensure_roots_disjoint, estimate_backup_peak,
-        estimate_backup_peak_with_source_count, finish_backup_creation_with_cleanup,
-        finish_capacity_preflight, inspect_checkpoint_storage, list_recent_backups,
-        migrate_legacy_plaintext_auth, percentage_ceil, preflight_backup_capacity,
-        preflight_backup_capacity_for_sources, preflight_backup_capacity_with_paths,
-        restore_backup, restore_staged_backup, restore_verified_backup, sqlite_logical_bytes,
+        estimate_backup_peak_with_source_count, existing_capacity_ancestor,
+        finish_backup_creation_with_cleanup, finish_capacity_preflight, inspect_checkpoint_storage,
+        list_recent_backups, load_process_state_checkpoint, migrate_legacy_plaintext_auth,
+        percentage_ceil, preflight_backup_capacity, preflight_backup_capacity_for_sources,
+        preflight_backup_capacity_with_paths, required_capacity_with_reserve, restore_backup,
+        restore_staged_backup, restore_verified_backup, sqlite_logical_bytes,
         stage_backup_payloads, validate_directory_entry, verify_backup, BackupCapacitySource,
-        BackupManifest, BackupScope, BackupSourceCapacityMetadata, BACKUP_FILE_OVERHEAD_BYTES,
+        BackupManifest, BackupScope, BackupSourceCapacityMetadata, CheckpointRole,
+        VolumeCapacityDemand, BACKUP_FILE_OVERHEAD_BYTES, CHAT_PROCESS_STATE_RELATIVE_PATH,
         MANIFEST_BASE_OVERHEAD_BYTES, MANIFEST_ENTRY_OVERHEAD_BYTES, MAX_DPAPI_PAYLOAD_BYTES,
-        MIN_CAPACITY_RESERVE_BYTES,
+        MIN_CAPACITY_RESERVE_BYTES, SCOPED_BACKUP_MANIFEST_VERSION,
     };
 
     fn seed_home(home: &std::path::Path) -> std::path::PathBuf {
@@ -2793,6 +3238,42 @@ mod tests {
                 .collect(),
             counts: Default::default(),
         }
+    }
+
+    fn state_checkpoint(
+        home: &Path,
+        backup_root: &Path,
+        reason: &str,
+        operation_id: &str,
+        role: CheckpointRole,
+    ) -> BackupManifest {
+        create_state_checkpoint_with_paths(
+            home,
+            backup_root,
+            reason,
+            crate::codex_paths::local_codex_paths(home),
+            operation_id,
+            role,
+        )
+        .unwrap()
+    }
+
+    fn runtime_state_checkpoint(
+        home: &Path,
+        backup_root: &Path,
+        reason: &str,
+        operation_id: &str,
+        role: CheckpointRole,
+    ) -> BackupManifest {
+        create_runtime_state_checkpoint_with_paths(
+            home,
+            backup_root,
+            reason,
+            crate::codex_paths::local_codex_paths(home),
+            operation_id,
+            role,
+        )
+        .unwrap()
     }
 
     #[cfg(windows)]
@@ -2900,6 +3381,53 @@ mod tests {
             ..BackupSourceCapacityMetadata::default()
         };
         assert!(add_capacity_file(&mut capacity, 1).is_err());
+    }
+
+    #[test]
+    fn grouped_capacity_combines_same_volume_before_reserve_and_separates_other_volumes() {
+        let mut grouped = BTreeMap::<String, VolumeCapacityDemand>::new();
+        add_volume_capacity_demand(
+            &mut grouped,
+            "c:\\".to_string(),
+            PathBuf::from(r"C:\"),
+            1_000,
+        )
+        .unwrap();
+        add_volume_capacity_demand(
+            &mut grouped,
+            "c:\\".to_string(),
+            PathBuf::from(r"C:\sessions"),
+            2_000,
+        )
+        .unwrap();
+        add_volume_capacity_demand(
+            &mut grouped,
+            "d:\\".to_string(),
+            PathBuf::from(r"D:\"),
+            4_000,
+        )
+        .unwrap();
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped["c:\\"].bytes, 3_000);
+        assert_eq!(grouped["d:\\"].bytes, 4_000);
+        assert_eq!(
+            required_capacity_with_reserve(grouped["c:\\"].bytes).unwrap(),
+            3_000 + MIN_CAPACITY_RESERVE_BYTES
+        );
+        assert_eq!(
+            required_capacity_with_reserve(grouped["d:\\"].bytes).unwrap(),
+            4_000 + MIN_CAPACITY_RESERVE_BYTES
+        );
+
+        let overflow = add_volume_capacity_demand(
+            &mut grouped,
+            "c:\\".to_string(),
+            PathBuf::from(r"C:\"),
+            u64::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(overflow, "backup capacity preflight failed");
     }
 
     #[test]
@@ -3036,6 +3564,9 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         seed_archived_session(home.path(), "thread-archived", b"archived\n");
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(process_state, b"not-json").unwrap();
         let paths = crate::codex_paths::local_codex_paths(home.path());
 
         let full =
@@ -3086,6 +3617,7 @@ mod tests {
             BTreeSet::from([
                 "auth.json".to_string(),
                 "config.toml".to_string(),
+                "process_manager/chat_processes.json".to_string(),
                 "state_5.sqlite".to_string(),
             ])
         );
@@ -3103,7 +3635,7 @@ mod tests {
             BTreeSet::from(["state_5.sqlite".to_string()])
         );
         assert_eq!(state.file_count, 1);
-        assert_eq!(runtime_state.file_count, state.file_count + 2);
+        assert_eq!(runtime_state.file_count, state.file_count + 3);
         assert_eq!(sessions.file_count, state.file_count + 3);
         assert_eq!(runtime.file_count, sessions.file_count + 1);
         assert_eq!(full.file_count, runtime.file_count + 4);
@@ -3177,6 +3709,21 @@ mod tests {
         let _available = available_backup_bytes(&missing_child).unwrap();
 
         assert!(!missing_child.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capacity_query_uses_the_parent_of_an_existing_file() {
+        let destination = tempdir().unwrap();
+        let existing_file = destination.path().join("session_index.jsonl");
+        fs::write(&existing_file, b"index").unwrap();
+
+        let query_path = existing_capacity_ancestor(&existing_file).unwrap();
+        let expected_parent = fs::canonicalize(destination.path()).unwrap();
+
+        assert_eq!(query_path, expected_parent);
+        assert!(query_path.is_dir());
+        let _available = available_backup_bytes(&query_path).unwrap();
     }
 
     #[test]
@@ -3434,6 +3981,9 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         seed_archived_session(home.path(), "thread-archived", b"archived\n");
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(process_state, b"not-json").unwrap();
         let backup_root = tempdir().unwrap();
 
         let full = create_backup(home.path(), backup_root.path(), "full-scope").unwrap();
@@ -3494,6 +4044,7 @@ mod tests {
             ])
         );
         assert_eq!(runtime_state.scope, BackupScope::RuntimeState);
+        assert!(runtime_state.tracked_process_state);
         assert!(!runtime_state.complete_sessions);
         assert_eq!(
             serde_json::to_string(&runtime_state.scope).unwrap(),
@@ -3504,9 +4055,14 @@ mod tests {
             BTreeSet::from([
                 "auth.json".to_string(),
                 "config.toml".to_string(),
+                "process_manager/chat_processes.json".to_string(),
                 "state_5.sqlite".to_string(),
             ])
         );
+        assert!(!full.tracked_process_state);
+        assert!(!runtime.tracked_process_state);
+        assert!(!sessions.tracked_process_state);
+        assert!(!state.tracked_process_state);
         assert_eq!(sessions.scope, BackupScope::Sessions);
         assert_eq!(
             relative_paths(&sessions),
@@ -3546,6 +4102,29 @@ mod tests {
     }
 
     #[test]
+    fn current_manifest_requires_explicit_process_state_scope_metadata() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_runtime_state_backup_with_paths(
+            home.path(),
+            backup_root.path(),
+            "missing-process-state-scope",
+            crate::codex_paths::local_codex_paths(home.path()),
+        )
+        .unwrap();
+        let manifest_path = manifest.backup_dir.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("trackedProcessState");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error = verify_backup(&manifest.backup_dir).unwrap_err();
+
+        assert!(error.contains("process-state scope is invalid"), "{error}");
+    }
+
+    #[test]
     fn runtime_manifest_rejects_archived_session_payloads_outside_its_scope() {
         let home = tempdir().unwrap();
         seed_home(home.path());
@@ -3565,10 +4144,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_restore_leaves_sessions_and_index_untouched() {
+    fn runtime_state_restore_restores_process_state_and_leaves_sessions_untouched() {
         let home = tempdir().unwrap();
         let rollout = seed_home(home.path());
         let backup_root = tempdir().unwrap();
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        let original_process_state = vec![0_u8; 1024];
+        fs::write(&process_state, &original_process_state).unwrap();
         let original_auth = fs::read(home.path().join("auth.json")).unwrap();
         let original_config = fs::read(home.path().join("config.toml")).unwrap();
         let manifest = create_runtime_state_backup_with_paths(
@@ -3582,6 +4165,7 @@ mod tests {
 
         fs::write(home.path().join("auth.json"), "{}\n").unwrap();
         fs::write(home.path().join("config.toml"), "model = \"changed\"\n").unwrap();
+        fs::write(&process_state, b"[]").unwrap();
         fs::write(home.path().join("session_index.jsonl"), "changed-index\n").unwrap();
         fs::write(&rollout, "changed-session\n").unwrap();
         let extra_session = home.path().join("sessions/extra.jsonl");
@@ -3601,6 +4185,7 @@ mod tests {
             fs::read(home.path().join("config.toml")).unwrap(),
             original_config
         );
+        assert_eq!(fs::read(&process_state).unwrap(), original_process_state);
         assert_eq!(
             fs::read(home.path().join("session_index.jsonl")).unwrap(),
             b"changed-index\n"
@@ -3612,6 +4197,70 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state_count, 1);
+    }
+
+    #[test]
+    fn runtime_state_restore_removes_process_state_created_after_checkpoint() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_runtime_state_backup_with_paths(
+            home.path(),
+            backup_root.path(),
+            "runtime-state-rollback",
+            crate::codex_paths::local_codex_paths(home.path()),
+        )
+        .unwrap();
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(&process_state, b"[]").unwrap();
+
+        restore_backup(&manifest.backup_dir, home.path()).unwrap();
+
+        assert!(!process_state.exists());
+    }
+
+    #[test]
+    fn process_state_revalidation_rejects_same_length_checkpoint_drift() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(&process_state, b"not-json").unwrap();
+        let backup_root = tempdir().unwrap();
+        let manifest = create_runtime_state_backup_with_paths(
+            home.path(),
+            backup_root.path(),
+            "runtime-state-revalidate",
+            crate::codex_paths::local_codex_paths(home.path()),
+        )
+        .unwrap();
+        load_process_state_checkpoint(&manifest, home.path()).unwrap();
+
+        fs::write(&process_state, b"bad-json").unwrap();
+
+        let error = load_process_state_checkpoint(&manifest, home.path()).unwrap_err();
+        assert!(error.contains("changed after"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn process_state_revalidation_rejects_a_file_created_after_checkpoint() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_runtime_state_backup_with_paths(
+            home.path(),
+            backup_root.path(),
+            "runtime-state-revalidate",
+            crate::codex_paths::local_codex_paths(home.path()),
+        )
+        .unwrap();
+        let process_state = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(&process_state, b"[]").unwrap();
+
+        let error = load_process_state_checkpoint(&manifest, home.path()).unwrap_err();
+        assert!(error.contains("changed after"), "unexpected error: {error}");
     }
 
     #[test]
@@ -4425,6 +5074,33 @@ mod tests {
     }
 
     #[test]
+    fn v3_full_backup_remains_listable_restorable_and_deletable() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let backup = create_backup(home.path(), backup_root.path(), "v3-full").unwrap();
+        let manifest_path = backup.backup_dir.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value["version"] = serde_json::Value::from(SCOPED_BACKUP_MANIFEST_VERSION);
+        value.as_object_mut().unwrap().remove("operationId");
+        value.as_object_mut().unwrap().remove("role");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        fs::write(home.path().join("config.toml"), "model = \"changed\"\n").unwrap();
+        restore_backup(&backup.backup_dir, home.path()).unwrap();
+        assert!(fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("gpt-5.5"));
+        let listed = list_recent_backups(backup_root.path(), 8).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].backup_dir, backup.backup_dir);
+
+        delete_verified_full_backup(backup_root.path(), &backup.backup_dir).unwrap();
+        assert!(!backup.backup_dir.exists());
+    }
+
+    #[test]
     fn verified_full_backup_deletion_rejects_an_outside_directory() {
         let home = tempdir().unwrap();
         seed_home(home.path());
@@ -4500,14 +5176,33 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_session_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_session_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-transient";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let full = create_backup(current.path(), backup_root.path(), "manual-full-backup").unwrap();
+        let record = operation_for_checkpoints(
+            operation_id,
+            OperationAction::SyncSessions,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&current_checkpoint, &shared_checkpoint],
+        );
 
         let summary = cleanup_transient_checkpoints(
             backup_root.path(),
+            &record,
             &[
                 current_checkpoint.clone(),
                 shared_checkpoint.clone(),
@@ -4522,7 +5217,7 @@ mod tests {
         assert!(!current_checkpoint.backup_dir.exists());
         assert!(!shared_checkpoint.backup_dir.exists());
         assert!(full.backup_dir.exists());
-        assert_eq!(summary.warnings.len(), 1);
+        assert!(summary.warnings.is_empty());
     }
 
     #[test]
@@ -4532,16 +5227,27 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-cleanup-with-retained-entries";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let full = create_backup(current.path(), backup_root.path(), "manual-full-backup").unwrap();
         let unclassified = backup_root.path().join("unclassified");
         fs::create_dir(&unclassified).unwrap();
         fs::write(unclassified.join("unknown.bin"), b"retain").unwrap();
         let record = operation_for_checkpoints(
-            "sync-cleanup-with-retained-entries",
+            operation_id,
             OperationAction::SyncSessions,
             OperationStatus::Succeeded,
             OperationPhase::Complete,
@@ -4570,12 +5276,23 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-cleanup-remove-failure";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let record = operation_for_checkpoints(
-            "sync-cleanup-remove-failure",
+            operation_id,
             OperationAction::SyncSessions,
             OperationStatus::Succeeded,
             OperationPhase::Complete,
@@ -4608,8 +5325,20 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         let backup_root = tempdir().unwrap();
-        let checkpoint =
-            create_session_backup(home.path(), backup_root.path(), "sync-current").unwrap();
+        let checkpoint = state_checkpoint(
+            home.path(),
+            backup_root.path(),
+            "sync-current",
+            "sync-manifest-drift",
+            CheckpointRole::Current,
+        );
+        let record = operation_for_checkpoints(
+            "sync-manifest-drift",
+            OperationAction::SyncSessions,
+            OperationStatus::Failed,
+            OperationPhase::Backup,
+            &[&checkpoint],
+        );
         let mut stored: serde_json::Value =
             serde_json::from_slice(&fs::read(checkpoint.backup_dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -4620,8 +5349,11 @@ mod tests {
         )
         .unwrap();
 
-        let summary =
-            cleanup_transient_checkpoints(backup_root.path(), std::slice::from_ref(&checkpoint));
+        let summary = cleanup_transient_checkpoints(
+            backup_root.path(),
+            &record,
+            std::slice::from_ref(&checkpoint),
+        );
 
         assert_eq!(summary.reclaimed_count, 0);
         assert_eq!(summary.retained_count, 1);
@@ -4634,12 +5366,27 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         let backup_root = tempdir().unwrap();
-        let checkpoint =
-            create_session_backup(home.path(), backup_root.path(), "sync-current").unwrap();
+        let checkpoint = state_checkpoint(
+            home.path(),
+            backup_root.path(),
+            "sync-current",
+            "sync-extra-file",
+            CheckpointRole::Current,
+        );
+        let record = operation_for_checkpoints(
+            "sync-extra-file",
+            OperationAction::SyncSessions,
+            OperationStatus::Failed,
+            OperationPhase::Backup,
+            &[&checkpoint],
+        );
         fs::write(checkpoint.backup_dir.join("untracked.txt"), b"keep").unwrap();
 
-        let summary =
-            cleanup_transient_checkpoints(backup_root.path(), std::slice::from_ref(&checkpoint));
+        let summary = cleanup_transient_checkpoints(
+            backup_root.path(),
+            &record,
+            std::slice::from_ref(&checkpoint),
+        );
 
         assert_eq!(summary.reclaimed_count, 0);
         assert_eq!(summary.retained_count, 1);
@@ -4651,16 +5398,31 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         let backup_root = tempdir().unwrap();
-        let checkpoint =
-            create_session_backup(home.path(), backup_root.path(), "sync-current").unwrap();
+        let checkpoint = state_checkpoint(
+            home.path(),
+            backup_root.path(),
+            "sync-current",
+            "sync-payload-drift",
+            CheckpointRole::Current,
+        );
+        let record = operation_for_checkpoints(
+            "sync-payload-drift",
+            OperationAction::SyncSessions,
+            OperationStatus::Failed,
+            OperationPhase::Backup,
+            &[&checkpoint],
+        );
         let payload = &checkpoint.files[0].backup_path;
         let mut bytes = fs::read(payload).unwrap();
         bytes[0] ^= 0xff;
         fs::write(payload, &bytes).unwrap();
         assert_eq!(fs::metadata(payload).unwrap().len(), bytes.len() as u64);
 
-        let summary =
-            cleanup_transient_checkpoints(backup_root.path(), std::slice::from_ref(&checkpoint));
+        let summary = cleanup_transient_checkpoints(
+            backup_root.path(),
+            &record,
+            std::slice::from_ref(&checkpoint),
+        );
 
         assert_eq!(summary.reclaimed_count, 0);
         assert_eq!(summary.retained_count, 1);
@@ -4672,29 +5434,33 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cleanup_retains_a_pair_with_a_same_size_archived_payload_bitflip() {
+    fn explicit_cleanup_retains_a_pair_with_a_same_size_payload_bitflip() {
         let current = tempdir().unwrap();
         let shared = tempdir().unwrap();
         seed_home(current.path());
         seed_home(shared.path());
-        seed_archived_session(current.path(), "current-archived", b"current archive\n");
-        seed_archived_session(shared.path(), "shared-archived", b"shared archive\n");
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_session_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_session_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
-        let payload = &current_checkpoint
-            .files
-            .iter()
-            .find(|file| file.relative_path.starts_with("archived_sessions"))
-            .unwrap()
-            .backup_path;
+        let operation_id = "sync-corrupt-explicit-cleanup";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
+        let payload = &current_checkpoint.files[0].backup_path;
         let mut bytes = fs::read(payload).unwrap();
         bytes[0] ^= 0xff;
         fs::write(payload, &bytes).unwrap();
         let record = operation_for_checkpoints(
-            "sync-corrupt-explicit-cleanup",
+            operation_id,
             OperationAction::SyncSessions,
             OperationStatus::Succeeded,
             OperationPhase::Complete,
@@ -4719,13 +5485,32 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-state-only";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
+        let record = operation_for_checkpoints(
+            operation_id,
+            OperationAction::SyncSessions,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&current_checkpoint, &shared_checkpoint],
+        );
 
         let summary = cleanup_transient_checkpoints(
             backup_root.path(),
+            &record,
             &[current_checkpoint.clone(), shared_checkpoint.clone()],
         );
 
@@ -4740,12 +5525,27 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         let backup_root = tempdir().unwrap();
-        let checkpoint =
-            create_state_backup(home.path(), backup_root.path(), "restore-sessions-visible")
-                .unwrap();
+        let operation_id = "restore-visible-complete";
+        let checkpoint = state_checkpoint(
+            home.path(),
+            backup_root.path(),
+            "restore-sessions-visible",
+            operation_id,
+            CheckpointRole::Visibility,
+        );
+        let record = operation_for_checkpoints(
+            operation_id,
+            OperationAction::RestoreVisibility,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&checkpoint],
+        );
 
-        let summary =
-            cleanup_transient_checkpoints(backup_root.path(), std::slice::from_ref(&checkpoint));
+        let summary = cleanup_transient_checkpoints(
+            backup_root.path(),
+            &record,
+            std::slice::from_ref(&checkpoint),
+        );
 
         assert_eq!(summary.reclaimed_count, 1);
         assert_eq!(summary.retained_count, 0);
@@ -4754,7 +5554,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_switch_pair_requires_a_proven_terminal_before_cleanup() {
+    fn legacy_v2_switch_pair_is_retained_even_with_a_success_terminal() {
         let current = tempdir().unwrap();
         let shared = tempdir().unwrap();
         seed_home(current.path());
@@ -4810,15 +5610,15 @@ mod tests {
         let status =
             inspect_checkpoint_storage(backup_root.path(), std::slice::from_ref(&succeeded))
                 .unwrap();
-        assert_eq!(status.reclaimable_count, 2, "{status:?}");
-        assert!(status.reclaimable_bytes > 0);
+        assert_eq!(status.reclaimable_count, 0, "{status:?}");
+        assert_eq!(status.retained_count, 2);
 
         let summary =
             cleanup_automatic_checkpoints(backup_root.path(), std::slice::from_ref(&succeeded))
                 .unwrap();
-        assert_eq!(summary.reclaimed_count, 2);
-        assert!(!backup_dirs[0].exists());
-        assert!(!backup_dirs[1].exists());
+        assert_eq!(summary.reclaimed_count, 0);
+        assert!(backup_dirs[0].exists());
+        assert!(backup_dirs[1].exists());
     }
 
     #[test]
@@ -4828,13 +5628,24 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_session_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_session_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-succeeded";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let full = create_backup(current.path(), backup_root.path(), "restore-safety").unwrap();
         let record = OperationRecord {
-            operation_id: "sync-succeeded".to_string(),
+            operation_id: operation_id.to_string(),
             action: OperationAction::SyncSessions,
             status: OperationStatus::Succeeded,
             phase: OperationPhase::Complete,
@@ -4862,10 +5673,21 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_session_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_session_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-unique";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let started_at_ms = current_checkpoint
             .created_at_ms
             .min(shared_checkpoint.created_at_ms)
@@ -4875,7 +5697,7 @@ mod tests {
             .max(shared_checkpoint.created_at_ms)
             .saturating_add(1);
         let record = OperationRecord {
-            operation_id: "sync-unique".to_string(),
+            operation_id: operation_id.to_string(),
             action: OperationAction::SyncSessions,
             status: OperationStatus::Succeeded,
             phase: OperationPhase::Complete,
@@ -4919,16 +5741,118 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cleanup_requires_exact_manifest_operation_ids_and_roles() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        seed_home(current.path());
+        seed_home(shared.path());
+
+        let wrong_id_root = tempdir().unwrap();
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            wrong_id_root.path(),
+            "sync-current",
+            "manifest-operation",
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            wrong_id_root.path(),
+            "sync-shared",
+            "manifest-operation",
+            CheckpointRole::Shared,
+        );
+        let wrong_id_record = operation_for_checkpoints(
+            "different-operation",
+            OperationAction::SyncSessions,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&current_checkpoint, &shared_checkpoint],
+        );
+        let wrong_id_status =
+            inspect_checkpoint_storage(wrong_id_root.path(), &[wrong_id_record]).unwrap();
+        assert_eq!(wrong_id_status.reclaimable_count, 0);
+        assert_eq!(wrong_id_status.retained_count, 2);
+
+        let wrong_role_root = tempdir().unwrap();
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            wrong_role_root.path(),
+            "sync-current",
+            "wrong-role-operation",
+            CheckpointRole::Shared,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            wrong_role_root.path(),
+            "sync-shared",
+            "wrong-role-operation",
+            CheckpointRole::Current,
+        );
+        let wrong_role_record = operation_for_checkpoints(
+            "wrong-role-operation",
+            OperationAction::SyncSessions,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&current_checkpoint, &shared_checkpoint],
+        );
+        let wrong_role_status =
+            inspect_checkpoint_storage(wrong_role_root.path(), &[wrong_role_record]).unwrap();
+        assert_eq!(wrong_role_status.reclaimable_count, 0);
+        assert_eq!(wrong_role_status.retained_count, 2);
+    }
+
+    #[test]
+    fn unbound_v3_checkpoint_cannot_be_claimed_by_a_new_terminal_record() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let checkpoint =
+            create_state_backup(home.path(), backup_root.path(), "sync-current").unwrap();
+        let manifest_path = checkpoint.backup_dir.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value["version"] = serde_json::Value::from(SCOPED_BACKUP_MANIFEST_VERSION);
+        value.as_object_mut().unwrap().remove("operationId");
+        value.as_object_mut().unwrap().remove("role");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let record = operation_for_checkpoints(
+            "arbitrary-new-terminal",
+            OperationAction::SyncSessions,
+            OperationStatus::Failed,
+            OperationPhase::Backup,
+            &[&checkpoint],
+        );
+
+        let status = inspect_checkpoint_storage(backup_root.path(), &[record]).unwrap();
+
+        assert_eq!(status.reclaimable_count, 0);
+        assert_eq!(status.retained_count, 1);
+        assert!(checkpoint.backup_dir.exists());
+    }
+
+    #[test]
     fn terminal_cleanup_rejects_aliases_for_manifest_backup_paths() {
         let current = tempdir().unwrap();
         let shared = tempdir().unwrap();
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_checkpoint =
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_checkpoint =
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-path-alias";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let alias = |manifest: &BackupManifest| {
             manifest
                 .backup_dir
@@ -4936,7 +5860,7 @@ mod tests {
                 .join(manifest.backup_dir.file_name().unwrap())
         };
         let record = OperationRecord {
-            operation_id: "sync-path-alias".to_string(),
+            operation_id: operation_id.to_string(),
             action: OperationAction::SyncSessions,
             status: OperationStatus::Succeeded,
             phase: OperationPhase::Complete,
@@ -5003,12 +5927,23 @@ mod tests {
         seed_home(current.path());
         seed_home(shared.path());
         let backup_root = tempdir().unwrap();
-        let current_state =
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap();
-        let shared_state =
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap();
+        let operation_id = "sync-state-only";
+        let current_state = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "sync-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_state = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "sync-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
         let state_record = OperationRecord {
-            operation_id: "sync-state-only".to_string(),
+            operation_id: operation_id.to_string(),
             action: OperationAction::SyncSessions,
             status: OperationStatus::Succeeded,
             phase: OperationPhase::Complete,
@@ -5058,15 +5993,20 @@ mod tests {
     }
 
     #[test]
-    fn failed_backup_phase_cleanup_accepts_one_or_two_strict_v3_checkpoints() {
+    fn failed_backup_phase_cleanup_accepts_one_or_two_bound_v4_checkpoints() {
         let current = tempdir().unwrap();
         let shared = tempdir().unwrap();
         seed_home(current.path());
         seed_home(shared.path());
 
         let single_root = tempdir().unwrap();
-        let single =
-            create_state_backup(current.path(), single_root.path(), "sync-current").unwrap();
+        let single = state_checkpoint(
+            current.path(),
+            single_root.path(),
+            "sync-current",
+            "sync-prewrite-single",
+            CheckpointRole::Current,
+        );
         let single_record = operation_for_checkpoints(
             "sync-prewrite-single",
             OperationAction::SyncSessions,
@@ -5085,15 +6025,20 @@ mod tests {
         assert!(!single.backup_dir.exists());
 
         let pair_root = tempdir().unwrap();
-        let current_checkpoint = create_runtime_state_backup_with_paths(
+        let current_checkpoint = runtime_state_checkpoint(
             current.path(),
             pair_root.path(),
             "switch-runtime-current",
-            crate::codex_paths::local_codex_paths(current.path()),
-        )
-        .unwrap();
-        let shared_checkpoint =
-            create_state_backup(shared.path(), pair_root.path(), "switch-runtime-shared").unwrap();
+            "switch-prewrite-pair",
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            pair_root.path(),
+            "switch-runtime-shared",
+            "switch-prewrite-pair",
+            CheckpointRole::Shared,
+        );
         let pair_record = operation_for_checkpoints(
             "switch-prewrite-pair",
             OperationAction::SwitchRuntime,
@@ -5113,13 +6058,13 @@ mod tests {
         seed_home(shared.path());
 
         let mixed_root = tempdir().unwrap();
-        let current_checkpoint = create_runtime_state_backup_with_paths(
+        let current_checkpoint = runtime_state_checkpoint(
             current.path(),
             mixed_root.path(),
             "switch-runtime-current",
-            crate::codex_paths::local_codex_paths(current.path()),
-        )
-        .unwrap();
+            "switch-prewrite-mixed",
+            CheckpointRole::Current,
+        );
         let shared_checkpoint =
             create_session_backup(shared.path(), mixed_root.path(), "switch-runtime-shared")
                 .unwrap();
@@ -5155,7 +6100,13 @@ mod tests {
         assert_eq!(legacy_status.reclaimable_count, 0);
 
         let apply_root = tempdir().unwrap();
-        let apply = create_state_backup(current.path(), apply_root.path(), "sync-current").unwrap();
+        let apply = state_checkpoint(
+            current.path(),
+            apply_root.path(),
+            "sync-current",
+            "sync-apply-failed",
+            CheckpointRole::Current,
+        );
         let apply_record = operation_for_checkpoints(
             "sync-apply-failed",
             OperationAction::SyncSessions,
@@ -5204,9 +6155,13 @@ mod tests {
         let home = tempdir().unwrap();
         seed_home(home.path());
         let backup_root = tempdir().unwrap();
-        let checkpoint =
-            create_state_backup(home.path(), backup_root.path(), "restore-sessions-visible")
-                .unwrap();
+        let checkpoint = state_checkpoint(
+            home.path(),
+            backup_root.path(),
+            "restore-sessions-visible",
+            "restore-visible-complete",
+            CheckpointRole::Visibility,
+        );
         let record = operation_for_checkpoints(
             "restore-visible-complete",
             OperationAction::RestoreVisibility,

@@ -1,5 +1,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+#[cfg(any(windows, test))]
+use std::sync::Mutex;
 #[cfg(windows)]
 use std::{
     ffi::OsString,
@@ -14,9 +16,12 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GetLastError, ERROR_NO_MORE_FILES, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME,
+        HANDLE, INVALID_HANDLE_VALUE,
     },
-    Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+    Storage::{
+        FileSystem::FILE_ATTRIBUTE_REPARSE_POINT, Packaging::Appx::GetApplicationUserModelId,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -33,6 +38,35 @@ use windows_sys::Win32::{
 const GRACEFUL_CLOSE_POLL_ATTEMPTS: usize = 80;
 #[cfg(windows)]
 const GRACEFUL_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const LAUNCH_VERIFY_POLL_ATTEMPTS: usize = 80;
+#[cfg(windows)]
+const LAUNCH_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(125);
+#[cfg(windows)]
+const MAX_APPLICATION_USER_MODEL_ID_LEN: u32 = 4_096;
+#[cfg(any(windows, test))]
+const TRUSTED_CHATGPT_AUMIDS: &[&str] = &[
+    "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT",
+    "OpenAI.Codex_2p2nqsd0c76g0!App",
+];
+
+#[cfg(windows)]
+static CHATGPT_LAUNCH_TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatGptLaunchStatus {
+    Launched,
+    AlreadyRunning,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatGptLaunchResult {
+    pub status: ChatGptLaunchStatus,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -46,12 +80,21 @@ pub struct CodexProcess {
 
 #[cfg(windows)]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    Ok(managed_process_tree(&snapshot_processes()?))
+    list_codex_process_inventory().map(|(managed, _)| managed)
 }
 
 #[cfg(windows)]
 pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    Ok(standalone_codex_processes(&snapshot_processes()?))
+    list_codex_process_inventory().map(|(_, standalone)| standalone)
+}
+
+#[cfg(windows)]
+pub fn list_codex_process_inventory() -> Result<(Vec<CodexProcess>, Vec<CodexProcess>), String> {
+    let snapshot = snapshot_processes()?;
+    Ok((
+        managed_process_tree(&snapshot),
+        standalone_codex_processes(&snapshot),
+    ))
 }
 
 #[cfg(not(windows))]
@@ -62,6 +105,82 @@ pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
 #[cfg(not(windows))]
 pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn list_codex_process_inventory() -> Result<(Vec<CodexProcess>, Vec<CodexProcess>), String> {
+    Err("ChatGPT process control is not supported on this platform".to_string())
+}
+
+#[cfg(windows)]
+pub fn cache_chatgpt_launch_target() -> Result<(), String> {
+    let mut cached = CHATGPT_LAUNCH_TARGET
+        .lock()
+        .map_err(|_| "managed ChatGPT launch target is unavailable".to_string())?;
+    *cached = None;
+    let processes =
+        snapshot_processes().map_err(|_| "managed ChatGPT launch target is unavailable")?;
+    let target = resolve_launch_target_with(&processes, application_user_model_id)
+        .map_err(LaunchTargetError::message)?;
+    *cached = Some(target);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn cache_chatgpt_launch_target() -> Result<(), String> {
+    Err("ChatGPT launch is not supported on this platform".to_string())
+}
+
+#[cfg(windows)]
+pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
+    let target = match take_cached_launch_target_with(&CHATGPT_LAUNCH_TARGET, || {
+        discover_registered_chatgpt_launch_target()
+    }) {
+        Ok(target) => target,
+        Err(_) => {
+            return ChatGptLaunchResult::failed(
+                "The managed ChatGPT Windows app identity could not be discovered.",
+            )
+        }
+    };
+    launch_chatgpt_with(
+        &target,
+        snapshot_processes,
+        application_user_model_id,
+        || activate_chatgpt_application(&target),
+        || thread::sleep(LAUNCH_VERIFY_POLL_INTERVAL),
+        LAUNCH_VERIFY_POLL_ATTEMPTS,
+    )
+}
+
+#[cfg(not(windows))]
+pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
+    ChatGptLaunchResult::failed("ChatGPT launch is not supported on this platform.")
+}
+
+impl ChatGptLaunchResult {
+    #[cfg(any(windows, test))]
+    fn launched() -> Self {
+        Self {
+            status: ChatGptLaunchStatus::Launched,
+            message: None,
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn already_running() -> Self {
+        Self {
+            status: ChatGptLaunchStatus::AlreadyRunning,
+            message: None,
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: ChatGptLaunchStatus::Failed,
+            message: Some(message.into()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -205,6 +324,278 @@ fn process_creation_time_from_handle(handle: HANDLE) -> Option<u64> {
         return None;
     }
     Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchTargetError {
+    Missing,
+    Conflict,
+}
+
+#[cfg(windows)]
+impl LaunchTargetError {
+    fn message(self) -> String {
+        match self {
+            Self::Missing => "managed ChatGPT launch target is unavailable".to_string(),
+            Self::Conflict => "managed ChatGPT launch target is ambiguous".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn application_user_model_id(process: &CodexProcess) -> Result<String, ()> {
+    let guard = ProcessIdentityGuard::open(process)?;
+    let mut length = 0_u32;
+    let status = unsafe { GetApplicationUserModelId(guard.0, &mut length, std::ptr::null_mut()) };
+    if status != ERROR_INSUFFICIENT_BUFFER
+        || !(2..=MAX_APPLICATION_USER_MODEL_ID_LEN).contains(&length)
+    {
+        return Err(());
+    }
+
+    let mut buffer = vec![0_u16; length as usize];
+    let status = unsafe { GetApplicationUserModelId(guard.0, &mut length, buffer.as_mut_ptr()) };
+    if status != 0 || length < 2 || length as usize > buffer.len() {
+        return Err(());
+    }
+    let used = length as usize;
+    if buffer[used - 1] != 0 || buffer[..used - 1].contains(&0) {
+        return Err(());
+    }
+    String::from_utf16(&buffer[..used - 1])
+        .map_err(|_| ())
+        .and_then(|value| validate_application_user_model_id(value).ok_or(()))
+}
+
+#[cfg(any(windows, test))]
+fn validate_application_user_model_id(value: String) -> Option<String> {
+    TRUSTED_CHATGPT_AUMIDS
+        .iter()
+        .any(|trusted| trusted.eq_ignore_ascii_case(&value))
+        .then_some(value)
+}
+
+#[cfg(any(windows, test))]
+fn resolve_registered_launch_target_with<Check>(
+    mut is_registered: Check,
+) -> Result<String, LaunchTargetError>
+where
+    Check: FnMut(&str) -> bool,
+{
+    let mut matches = TRUSTED_CHATGPT_AUMIDS
+        .iter()
+        .copied()
+        .filter(|candidate| is_registered(candidate));
+    let target = matches.next().ok_or(LaunchTargetError::Missing)?;
+    if matches.next().is_some() {
+        return Err(LaunchTargetError::Conflict);
+    }
+    Ok(target.to_string())
+}
+
+#[cfg(any(windows, test))]
+fn take_cached_launch_target_with<Discover>(
+    cache: &Mutex<Option<String>>,
+    mut discover: Discover,
+) -> Result<String, LaunchTargetError>
+where
+    Discover: FnMut() -> Result<String, LaunchTargetError>,
+{
+    let cached = cache.lock().map_err(|_| LaunchTargetError::Missing)?.take();
+    match cached {
+        Some(target) => {
+            validate_application_user_model_id(target).ok_or(LaunchTargetError::Missing)
+        }
+        None => discover().and_then(|target| {
+            validate_application_user_model_id(target).ok_or(LaunchTargetError::Missing)
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn registered_chatgpt_launch_targets() -> Result<Vec<String>, ()> {
+    use windows::{core::HSTRING, ApplicationModel::AppInfo};
+
+    Ok(TRUSTED_CHATGPT_AUMIDS
+        .iter()
+        .copied()
+        .filter(|candidate| AppInfo::GetFromAppUserModelId(&HSTRING::from(*candidate)).is_ok())
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(windows)]
+fn discover_registered_chatgpt_launch_target() -> Result<String, LaunchTargetError> {
+    let registered = registered_chatgpt_launch_targets().map_err(|_| LaunchTargetError::Missing)?;
+    resolve_registered_launch_target_with(|candidate| {
+        registered
+            .iter()
+            .any(|registered| registered.eq_ignore_ascii_case(candidate))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn resolve_launch_target_with<Query>(
+    processes: &[CodexProcess],
+    mut query_aumid: Query,
+) -> Result<String, LaunchTargetError>
+where
+    Query: FnMut(&CodexProcess) -> Result<String, ()>,
+{
+    let roots = managed_app_roots(processes);
+    if roots.is_empty() {
+        return Err(LaunchTargetError::Missing);
+    }
+
+    let mut resolved: Option<String> = None;
+    for root in roots {
+        let aumid = query_aumid(&root)
+            .ok()
+            .and_then(validate_application_user_model_id)
+            .ok_or(LaunchTargetError::Missing)?;
+        if let Some(existing) = resolved.as_ref() {
+            if !existing.eq_ignore_ascii_case(&aumid) {
+                return Err(LaunchTargetError::Conflict);
+            }
+        } else {
+            resolved = Some(aumid);
+        }
+    }
+    resolved.ok_or(LaunchTargetError::Missing)
+}
+
+#[cfg(any(windows, test))]
+fn has_matching_managed_root_with<Query>(
+    processes: &[CodexProcess],
+    target: &str,
+    query_aumid: &mut Query,
+) -> Result<bool, ()>
+where
+    Query: FnMut(&CodexProcess) -> Result<String, ()>,
+{
+    let mut unverified_root = false;
+    for root in managed_app_roots(processes) {
+        match query_aumid(&root)
+            .ok()
+            .and_then(validate_application_user_model_id)
+        {
+            Some(aumid) if aumid.eq_ignore_ascii_case(target) => return Ok(true),
+            Some(_) => {}
+            None => unverified_root = true,
+        }
+    }
+    if unverified_root {
+        Err(())
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn launch_chatgpt_with<List, Query, Activate, Wait>(
+    target: &str,
+    mut list_processes: List,
+    mut query_aumid: Query,
+    mut activate: Activate,
+    mut wait: Wait,
+    poll_attempts: usize,
+) -> ChatGptLaunchResult
+where
+    List: FnMut() -> Result<Vec<CodexProcess>, String>,
+    Query: FnMut(&CodexProcess) -> Result<String, ()>,
+    Activate: FnMut() -> Result<(), ()>,
+    Wait: FnMut(),
+{
+    let running = match list_processes() {
+        Ok(processes) => has_matching_managed_root_with(&processes, target, &mut query_aumid),
+        Err(_) => Err(()),
+    };
+    match running {
+        Ok(true) => return ChatGptLaunchResult::already_running(),
+        Ok(false) => {}
+        Err(()) => {
+            return ChatGptLaunchResult::failed(
+                "The managed ChatGPT process inventory could not be verified.",
+            )
+        }
+    }
+
+    if activate().is_err() {
+        return ChatGptLaunchResult::failed(
+            "ChatGPT could not be activated using the captured Windows app identity.",
+        );
+    }
+
+    for attempt in 0..poll_attempts {
+        if let Ok(processes) = list_processes() {
+            if has_matching_managed_root_with(&processes, target, &mut query_aumid) == Ok(true) {
+                return ChatGptLaunchResult::launched();
+            }
+        }
+        if attempt + 1 < poll_attempts {
+            wait();
+        }
+    }
+    ChatGptLaunchResult::failed(
+        "ChatGPT activation did not produce a verified managed process before timeout.",
+    )
+}
+
+#[cfg(windows)]
+fn activate_chatgpt_application(aumid: &str) -> Result<(), ()> {
+    use windows::{
+        core::{IUnknown, PCWSTR},
+        Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
+                COINIT_APARTMENTTHREADED,
+            },
+            UI::Shell::{
+                ApplicationActivationManager, IApplicationActivationManager, AO_NOERRORUI,
+            },
+        },
+    };
+
+    struct ComInitialization(bool);
+    impl Drop for ComInitialization {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+        return Err(());
+    }
+    let _initialization = ComInitialization(initialized.is_ok());
+    let manager: IApplicationActivationManager = unsafe {
+        CoCreateInstance(
+            &ApplicationActivationManager,
+            None::<&IUnknown>,
+            CLSCTX_LOCAL_SERVER,
+        )
+    }
+    .map_err(|_| ())?;
+    let app_id = aumid
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let empty_arguments = [0_u16];
+    unsafe {
+        manager.ActivateApplication(
+            PCWSTR(app_id.as_ptr()),
+            PCWSTR(empty_arguments.as_ptr()),
+            AO_NOERRORUI,
+        )
+    }
+    .map(|_| ())
+    .map_err(|_| ())
 }
 
 #[cfg(windows)]
@@ -391,6 +782,33 @@ fn managed_process_tree(processes: &[CodexProcess]) -> Vec<CodexProcess> {
         .collect()
 }
 
+#[cfg(any(windows, test))]
+fn managed_app_roots(processes: &[CodexProcess]) -> Vec<CodexProcess> {
+    let by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    processes
+        .iter()
+        .filter(|process| is_managed_app_root(&process.image_name))
+        .filter(|process| {
+            let mut visited = HashSet::new();
+            let mut parent_pid = process.parent_pid;
+            while parent_pid != 0 && visited.insert(parent_pid) {
+                let Some(parent) = by_pid.get(&parent_pid) else {
+                    break;
+                };
+                if is_managed_app_root(&parent.image_name) {
+                    return false;
+                }
+                parent_pid = parent.parent_pid;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
 fn standalone_codex_processes(processes: &[CodexProcess]) -> Vec<CodexProcess> {
     let managed_pids = managed_process_tree(processes)
         .into_iter()
@@ -423,12 +841,22 @@ fn is_managed_app_root(image_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        close_codex_processes_with, decode_process_name, managed_process_tree,
-        standalone_codex_processes, CodexProcess, TaskkillResult,
+        close_codex_processes_with, decode_process_name, launch_chatgpt_with, managed_app_roots,
+        managed_process_tree, resolve_launch_target_with, resolve_registered_launch_target_with,
+        standalone_codex_processes, take_cached_launch_target_with, ChatGptLaunchStatus,
+        CodexProcess, LaunchTargetError, TaskkillResult, TRUSTED_CHATGPT_AUMIDS,
     };
     #[cfg(windows)]
-    use super::{system_tool_path, GRACEFUL_CLOSE_POLL_ATTEMPTS, GRACEFUL_CLOSE_POLL_INTERVAL};
-    use std::{cell::RefCell, collections::VecDeque, fs};
+    use super::{
+        discover_registered_chatgpt_launch_target, registered_chatgpt_launch_targets,
+        system_tool_path, GRACEFUL_CLOSE_POLL_ATTEMPTS, GRACEFUL_CLOSE_POLL_INTERVAL,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        fs,
+        sync::Mutex,
+    };
 
     fn process(image_name: &str, pid: u32) -> CodexProcess {
         child_process(image_name, pid, 0)
@@ -482,6 +910,300 @@ mod tests {
                 chatgpt,
             ]),
             vec![standalone_codex]
+        );
+    }
+
+    #[test]
+    fn launch_target_roots_exclude_managed_descendants() {
+        let root = process("ChatGPT.exe", 1000);
+        let child = child_process("ChatGPT.exe", 2000, 1000);
+        let host = child_process("other.exe", 3000, 2000);
+        let grandchild = child_process("OpenAI.Codex.exe", 4000, 3000);
+        let independent = child_process("OpenAI.Codex.exe", 5000, 42);
+
+        assert_eq!(
+            managed_app_roots(&[grandchild, independent.clone(), host, child, root.clone(),]),
+            vec![independent, root]
+        );
+    }
+
+    #[test]
+    fn launch_target_accepts_one_identity_across_multiple_roots() {
+        let processes = vec![
+            process("ChatGPT.exe", 1000),
+            process("OpenAI.Codex.exe", 2000),
+        ];
+
+        let target =
+            resolve_launch_target_with(&processes, |_| Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string()))
+                .unwrap();
+
+        assert_eq!(target, TRUSTED_CHATGPT_AUMIDS[1]);
+    }
+
+    #[test]
+    fn launch_target_fails_closed_for_missing_or_conflicting_identities() {
+        assert_eq!(
+            resolve_launch_target_with(&[], |_| Ok("unexpected".to_string())),
+            Err(LaunchTargetError::Missing)
+        );
+        assert_eq!(
+            resolve_launch_target_with(&[process("ChatGPT.exe", 1000)], |_| Err(())),
+            Err(LaunchTargetError::Missing)
+        );
+        assert_eq!(
+            resolve_launch_target_with(
+                &[
+                    process("ChatGPT.exe", 1000),
+                    process("OpenAI.Codex.exe", 2000),
+                ],
+                |process| {
+                    Ok(if process.pid == 1000 {
+                        TRUSTED_CHATGPT_AUMIDS[0]
+                    } else {
+                        TRUSTED_CHATGPT_AUMIDS[1]
+                    }
+                    .to_string())
+                },
+            ),
+            Err(LaunchTargetError::Conflict)
+        );
+    }
+
+    #[test]
+    fn registered_launch_discovery_accepts_one_trusted_identity_and_rejects_ambiguity() {
+        assert_eq!(
+            resolve_registered_launch_target_with(|candidate| {
+                candidate.eq_ignore_ascii_case(TRUSTED_CHATGPT_AUMIDS[1])
+            })
+            .unwrap(),
+            TRUSTED_CHATGPT_AUMIDS[1]
+        );
+        assert_eq!(
+            resolve_registered_launch_target_with(|_| false),
+            Err(LaunchTargetError::Missing)
+        );
+        assert_eq!(
+            resolve_registered_launch_target_with(|_| true),
+            Err(LaunchTargetError::Conflict)
+        );
+    }
+
+    #[test]
+    fn cached_launch_target_is_consumed_and_discovery_results_are_not_reused() {
+        let cache = Mutex::new(Some(TRUSTED_CHATGPT_AUMIDS[1].to_string()));
+        let discoveries = Cell::new(0);
+
+        let captured = take_cached_launch_target_with(&cache, || {
+            discoveries.set(discoveries.get() + 1);
+            Ok(TRUSTED_CHATGPT_AUMIDS[0].to_string())
+        })
+        .unwrap();
+        let first_discovery = take_cached_launch_target_with(&cache, || {
+            discoveries.set(discoveries.get() + 1);
+            Ok(TRUSTED_CHATGPT_AUMIDS[0].to_string())
+        })
+        .unwrap();
+        let second_discovery = take_cached_launch_target_with(&cache, || {
+            discoveries.set(discoveries.get() + 1);
+            Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string())
+        })
+        .unwrap();
+
+        assert_eq!(captured, TRUSTED_CHATGPT_AUMIDS[1]);
+        assert_eq!(first_discovery, TRUSTED_CHATGPT_AUMIDS[0]);
+        assert_eq!(second_discovery, TRUSTED_CHATGPT_AUMIDS[1]);
+        assert_eq!(discoveries.get(), 2);
+        assert_eq!(*cache.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn cached_or_discovered_launch_target_must_remain_trusted() {
+        let stale_cache = Mutex::new(Some("Untrusted.App_123!App".to_string()));
+        assert_eq!(
+            take_cached_launch_target_with(&stale_cache, || {
+                Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string())
+            }),
+            Err(LaunchTargetError::Missing)
+        );
+
+        let empty_cache = Mutex::new(None);
+        assert_eq!(
+            take_cached_launch_target_with(&empty_cache, || {
+                Ok("Untrusted.App_123!App".to_string())
+            }),
+            Err(LaunchTargetError::Missing)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "queries current-user AppInfo registrations without launching or closing ChatGPT"]
+    fn live_discovers_trusted_chatgpt_appinfo_without_process_mutation() {
+        let registered = registered_chatgpt_launch_targets()
+            .expect("current-user AppInfo registration discovery should complete");
+        assert!(registered.iter().all(|candidate| {
+            TRUSTED_CHATGPT_AUMIDS
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(candidate))
+        }));
+
+        let discovered = discover_registered_chatgpt_launch_target();
+        match registered.as_slice() {
+            [] => assert_eq!(discovered, Err(LaunchTargetError::Missing)),
+            [target] => assert_eq!(discovered.as_deref(), Ok(target.as_str())),
+            _ => assert_eq!(discovered, Err(LaunchTargetError::Conflict)),
+        }
+    }
+
+    #[test]
+    fn launch_returns_already_running_without_activation() {
+        let activations = RefCell::new(0);
+        let result = launch_chatgpt_with(
+            TRUSTED_CHATGPT_AUMIDS[1],
+            || Ok(vec![process("ChatGPT.exe", 1000)]),
+            |_| Ok(TRUSTED_CHATGPT_AUMIDS[1].to_ascii_lowercase()),
+            || {
+                *activations.borrow_mut() += 1;
+                Ok(())
+            },
+            || panic!("already-running detection must not wait"),
+            2,
+        );
+
+        assert_eq!(result.status, ChatGptLaunchStatus::AlreadyRunning);
+        assert_eq!(result.message, None);
+        assert_eq!(*activations.borrow(), 0);
+    }
+
+    #[test]
+    fn cached_noop_launch_returns_already_running_without_rediscovery_or_activation() {
+        let cache = Mutex::new(Some(TRUSTED_CHATGPT_AUMIDS[1].to_string()));
+        let target = take_cached_launch_target_with(&cache, || {
+            panic!("a captured no-op launch target must be consumed before discovery")
+        })
+        .unwrap();
+        let activations = Cell::new(0);
+
+        let result = launch_chatgpt_with(
+            &target,
+            || Ok(vec![process("OpenAI.Codex.exe", 1000)]),
+            |_| Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string()),
+            || {
+                activations.set(activations.get() + 1);
+                Ok(())
+            },
+            || panic!("already-running no-op launch must not wait"),
+            2,
+        );
+
+        assert_eq!(result.status, ChatGptLaunchStatus::AlreadyRunning);
+        assert_eq!(result.message, None);
+        assert_eq!(activations.get(), 0);
+        assert_eq!(*cache.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn launch_reports_activation_failure_without_exposing_details() {
+        let result = launch_chatgpt_with(
+            TRUSTED_CHATGPT_AUMIDS[1],
+            || Ok(Vec::new()),
+            |_| Err(()),
+            || Err(()),
+            || panic!("activation failure must not poll"),
+            2,
+        );
+
+        assert_eq!(result.status, ChatGptLaunchStatus::Failed);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("ChatGPT could not be activated using the captured Windows app identity.")
+        );
+    }
+
+    #[test]
+    fn launch_waits_for_a_matching_managed_root() {
+        let listings = RefCell::new(VecDeque::from([
+            Ok(Vec::new()),
+            Ok(vec![child_process("codex.exe", 2000, 42)]),
+            Ok(vec![process("ChatGPT.exe", 1000)]),
+        ]));
+        let activations = RefCell::new(0);
+        let waits = RefCell::new(0);
+
+        let result = launch_chatgpt_with(
+            TRUSTED_CHATGPT_AUMIDS[1],
+            || {
+                listings
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected listing")
+            },
+            |_| Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string()),
+            || {
+                *activations.borrow_mut() += 1;
+                Ok(())
+            },
+            || *waits.borrow_mut() += 1,
+            2,
+        );
+
+        assert_eq!(result.status, ChatGptLaunchStatus::Launched);
+        assert_eq!(result.message, None);
+        assert_eq!(*activations.borrow(), 1);
+        assert_eq!(*waits.borrow(), 1);
+        assert!(listings.borrow().is_empty());
+    }
+
+    #[test]
+    fn launch_timeout_is_typed_and_bounded() {
+        let listings = RefCell::new(VecDeque::from([
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+        ]));
+        let waits = RefCell::new(0);
+
+        let result = launch_chatgpt_with(
+            TRUSTED_CHATGPT_AUMIDS[1],
+            || {
+                listings
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected listing")
+            },
+            |_| Err(()),
+            || Ok(()),
+            || *waits.borrow_mut() += 1,
+            2,
+        );
+
+        assert_eq!(result.status, ChatGptLaunchStatus::Failed);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("ChatGPT activation did not produce a verified managed process before timeout.")
+        );
+        assert_eq!(*waits.borrow(), 1);
+        assert!(listings.borrow().is_empty());
+    }
+
+    #[test]
+    fn launch_result_serializes_status_in_camel_case_and_null_message() {
+        let result = launch_chatgpt_with(
+            TRUSTED_CHATGPT_AUMIDS[1],
+            || Ok(vec![process("ChatGPT.exe", 1000)]),
+            |_| Ok(TRUSTED_CHATGPT_AUMIDS[1].to_string()),
+            || panic!("already-running detection must not activate"),
+            || panic!("already-running detection must not wait"),
+            1,
+        );
+
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({
+                "status": "alreadyRunning",
+                "message": null,
+            })
         );
     }
 

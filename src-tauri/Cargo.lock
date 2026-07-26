@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "codex-switch"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "reqwest 0.12.28",
@@ -355,6 +355,7 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "url",
  "walkdir",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
