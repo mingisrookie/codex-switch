@@ -156,10 +156,10 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 - 只合并存在正文 JSONL 的会话；只有 SQLite 行但找不到 JSONL 正文的孤儿记录会跳过，避免把不可打开的空会话同步出去。
 - 合并 `session_index.jsonl`，让不同运行态看到同一批历史会话。
 - 修复重复会话的缺失 JSONL / 错误 `rollout_path`；同一会话 ID 存在多份 JSONL 时优先使用 SQLite 当前指向的活动文件，并只沿严格前缀关系选择更完整的独立版本。
-- 热同步和运行态切换都不会只为 provider 变化重写已经存在且内容等价的 live JSONL；provider 可更新到 SQLite，只有实际写入目标的 JSONL 才归一元数据。比较历史完整性时忽略这个运行态字段，避免把相同正文误判为冲突。
+- 热同步不会只为 provider 变化触碰既有 live JSONL，也不会改变既有 row。关闭态运行态切换则必须让 SQLite 与 JSONL 首条 `session_meta.payload.model_provider` 同时匹配目标 provider，因为 Codex Remote 的默认会话枚举会扫描 JSONL 元数据。若既有正文只差 provider，工具保留原文件并原子发布一个 provider 已归一、文件名仍符合官方 `rollout-<timestamp>-<thread-id>.jsonl` 形态的完整副本，再把 SQLite 活动路径指向该副本；相同内容/provider 的后续切换直接复用。
 - 每次真正写 JSONL 前重新计算 live source/target relation，不执行已经过时的 `Create/Import` 判断。source 快照必须通过完整尾行、session ID、长度与 SHA-256 的前后稳定性校验；发现漂移时只做有界重试，无法冻结则 fail closed。判定为 `Unchanged` 时在返回前还会复检 source version 与 live relation，`Deny` 遇到任何晚到变化都零写入并 fail closed。
-- JSONL 生产路径不修改任何已有文件。Create 与 imported 文件先在同目录临时文件中完成 provider 元数据归一并同步，再用 atomic hard-link no-clobber 发布；若目标抢先出现则重新比较，不能覆盖对方。允许替换时，目标是严格旧前缀或内容分叉都会按稳定 source SHA-256 生成并发布完整 imported JSONL；旧目标的 bytes/hash/mtime 保持不变。
-- SQLite 活动文件选择是独立策略：current→shared 和 ChatGPT 已关闭的双向切换使用 `SelectMostComplete`，可在完整新文件发布后推进既有 `rollout_path`；只有 hot shared→current 使用 `PreserveExisting`，既有 thread 在 `existing_thread_rollout_path` / `copy_rollout_file` 前直接 duplicate+continue，不读取、写入或发布 target candidate，`copied_session_files = 0`，并保留原 `rollout_path`、provider、title 与旧 writer 可见性。hot 新 thread 仍正常插入，使用已发布文件路径、source row 可用字段和 current provider。
+- JSONL 生产路径不修改任何已有文件。Create、imported 与关闭态 provider 副本先在同目录临时文件中完成元数据归一并同步，再用 atomic hard-link no-clobber 发布；若目标抢先出现则重新比较，不能覆盖对方。允许替换时，目标是严格旧前缀或内容分叉都会按稳定 source SHA-256 生成并发布完整 imported JSONL；旧目标的 bytes/hash/mtime 保持不变。
+- SQLite 活动文件选择是独立策略：current→shared 和 ChatGPT 已关闭的双向切换使用 `SelectMostComplete`；关闭态若目标 provider 不同，provider 已匹配且 Remote 可识别的完整副本优先成为活动 `rollout_path`。只有 hot shared→current 使用 `PreserveExisting`，既有 thread 在 `existing_thread_rollout_path` / `copy_rollout_file` 前直接 duplicate+continue，不读取、写入或发布 target candidate，`copied_session_files = 0`，并保留原 `rollout_path`、provider、title 与旧 writer 可见性。hot 新 thread 仍正常插入，使用已发布文件路径、source row 可用字段和 current provider。
 - `session_index.jsonl` 按目标运行态执行显式策略：热同步的 live current 使用 `Skip`，新 thread 可见性由 SQLite 事务插入提供，既有 row 保持 current 状态；关闭态或工具独占的 shared index 重新读取后生成完整 merged bytes，并用同目录 `atomic_write` 原子替换；`Deny` 只校验、零写入。无效或半截 JSON 一律 fail closed。
 - 已归档会话默认跳过同步，不会自动写回当前 Codex Home，也不会自动从 shared-sessions 清理。
 

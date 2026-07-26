@@ -4,6 +4,12 @@
 
 ## 结论
 
+### 2026-07-26 Remote 可见性更正
+
+后续手机 Remote 实测推翻了本文“provider 只更新 SQLite 即可”的假设：本机 319 个交互会话中，Remote 恰好只显示 SQLite 与 JSONL 首条 `session_meta.payload.model_provider` 都为 `openai` 的 3 个会话；把一条不匹配 JSONL 修正为 `openai` 后，隔离 `codex app-server thread/list` 立即从同一 fixture 枚举到该会话。默认会话枚举会扫描 JSONL 元数据，SQLite-only provider 更新会让历史在切换回账号态后被过滤。
+
+当前修复保持本文的零 in-place 安全边界，但修正了关闭态策略：provider 不匹配时不改写旧文件，而是原子发布 provider 已归一、文件名仍符合官方 rollout 形态的完整副本，并让 SQLite 指向它；相同内容/provider 幂等复用。hot shared→current 的 `PreserveExisting` 仍保持完全不触碰既有 live thread。下文关于 `v0.2.1` 的 SQLite-only 结论属于当时发布行为，不再代表当前正确合同。
+
 当前分支已经把问题从“长时间无响应的黑盒切换”改造成“后台执行、页面内展示真实阶段、失败可归因”的任务流，并针对切换后的磁盘争用修复了三个主要放大器：无变化历史 JSONL 的批量重写、切换结束后的全量会话/备份扫描，以及已经终结的切换/同步检查点长期累积。
 
 本审查在 PR 前的本地候选结论是 **GO for PR**。完整前端/Rust 门禁、隔离临时目录回归、三视口真实渲染、依赖与文本审计、elevated/non-elevated updater 安全测试以及 Windows release 产物合同均已通过。当时 `v0.2.0` 仍不能在远端交付闭环完成前发布：PR/CI、合并、tag CI、Release 重下载校验和真实 `v0.1.9 -> v0.2.0` 一键更新 smoke 是最后的阻断门禁。

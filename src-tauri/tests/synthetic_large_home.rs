@@ -34,7 +34,7 @@ struct SyntheticHomes {
 }
 
 #[test]
-fn synthetic_large_home_provider_sync_preserves_existing_jsonl() {
+fn synthetic_large_home_provider_sync_publishes_provider_variants() {
     let homes = create_synthetic_homes(CI_SESSION_COUNT, CI_SESSION_BYTES);
     let before = snapshot_sessions(homes.current.path());
 
@@ -49,10 +49,19 @@ fn synthetic_large_home_provider_sync_preserves_existing_jsonl() {
             .unwrap();
     let after = snapshot_sessions(homes.current.path());
 
-    assert_quiescent_result(&result);
-    assert_snapshots_unchanged(&before, &after);
+    assert_provider_publish_result(&result, CI_SESSION_COUNT);
+    assert_original_snapshots_preserved(&before, &after);
+    assert_eq!(after.len(), CI_SESSION_COUNT * 2);
     assert_eq!(imported_file_count(&after), 0);
     assert_all_providers(homes.current.path(), TARGET_PROVIDER, CI_SESSION_COUNT);
+    assert_active_rollout_providers(homes.current.path(), TARGET_PROVIDER, CI_SESSION_COUNT);
+
+    let repeated =
+        sync_shared_to_user_home(homes.shared.path(), homes.current.path(), TARGET_PROVIDER)
+            .unwrap();
+    let repeated_snapshot = snapshot_sessions(homes.current.path());
+    assert_provider_publish_result(&repeated, 0);
+    assert_snapshots_equal(&after, &repeated_snapshot);
 }
 
 #[test]
@@ -82,10 +91,12 @@ fn benchmark_synthetic_large_home_provider_sync() {
         result.copied_session_files
     );
 
-    assert_quiescent_result(&result);
-    assert_snapshots_unchanged(&before, &after);
+    assert_provider_publish_result(&result, session_count);
+    assert_original_snapshots_preserved(&before, &after);
+    assert_eq!(after.len(), session_count * 2);
     assert_eq!(imported_file_count(&after), 0);
     assert_all_providers(homes.current.path(), TARGET_PROVIDER, session_count);
+    assert_active_rollout_providers(homes.current.path(), TARGET_PROVIDER, session_count);
 }
 
 fn create_synthetic_homes(session_count: usize, bytes_per_file: usize) -> SyntheticHomes {
@@ -97,9 +108,9 @@ fn create_synthetic_homes(session_count: usize, bytes_per_file: usize) -> Synthe
     let mut current_rows = Vec::with_capacity(session_count);
     let mut shared_rows = Vec::with_capacity(session_count);
     for index in 0..session_count {
-        let id = format!("synthetic-thread-{index:04}");
+        let id = format!("019f0000-0000-7000-8000-{index:012x}");
         let relative = PathBuf::from(format!(
-            "sessions/2026/07/26/rollout-synthetic-{index:04}.jsonl"
+            "sessions/2026/07/26/rollout-2026-07-26T12-00-00-{id}.jsonl"
         ));
         let current_path = current.path().join(&relative);
         let shared_path = shared.path().join(&relative);
@@ -223,26 +234,25 @@ fn snapshot_sessions(home: &Path) -> Vec<FileSnapshot> {
         .collect()
 }
 
-fn assert_quiescent_result(result: &SessionSyncResult) {
+fn assert_provider_publish_result(result: &SessionSyncResult, copied_session_files: usize) {
     assert_eq!(result.inserted_threads, 0);
-    assert_eq!(result.copied_session_files, 0);
+    assert_eq!(result.copied_session_files, copied_session_files);
 }
 
-fn assert_snapshots_unchanged(before: &[FileSnapshot], after: &[FileSnapshot]) {
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "current JSONL file count changed"
-    );
-    assert_eq!(
-        total_bytes(after),
-        total_bytes(before),
-        "current JSONL byte count changed"
-    );
-    for (before_file, after_file) in before.iter().zip(after) {
+fn assert_original_snapshots_preserved(before: &[FileSnapshot], after: &[FileSnapshot]) {
+    for before_file in before {
+        let after_file = after
+            .iter()
+            .find(|after_file| after_file.relative_path == before_file.relative_path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "original JSONL disappeared: {}",
+                    before_file.relative_path.display()
+                )
+            });
         assert_eq!(
             after_file.relative_path, before_file.relative_path,
-            "current JSONL path set changed"
+            "original JSONL path changed"
         );
         assert_eq!(
             after_file.bytes,
@@ -263,6 +273,20 @@ fn assert_snapshots_unchanged(before: &[FileSnapshot], after: &[FileSnapshot]) {
             before_file.relative_path.display()
         );
     }
+}
+
+fn assert_snapshots_equal(before: &[FileSnapshot], after: &[FileSnapshot]) {
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "current JSONL file count changed"
+    );
+    assert_eq!(
+        total_bytes(before),
+        total_bytes(after),
+        "current JSONL byte count changed"
+    );
+    assert_original_snapshots_preserved(before, after);
 }
 
 fn total_bytes(snapshots: &[FileSnapshot]) -> u64 {
@@ -307,6 +331,35 @@ fn assert_all_providers(home: &Path, expected: &str, expected_count: usize) {
         .unwrap();
     assert_eq!(total, expected_count);
     assert_eq!(matching, expected_count);
+}
+
+fn assert_active_rollout_providers(home: &Path, expected: &str, expected_count: usize) {
+    let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
+    let mut statement = conn
+        .prepare("SELECT id, rollout_path FROM threads ORDER BY id")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), expected_count);
+    for (id, rollout_path) in rows {
+        let path = PathBuf::from(rollout_path);
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(file_name.ends_with(&format!("-{id}.jsonl")));
+        let first_line = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let value: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(value["payload"]["id"], id);
+        assert_eq!(value["payload"]["model_provider"], expected);
+    }
 }
 
 fn benchmark_value(name: &str, default: usize) -> usize {

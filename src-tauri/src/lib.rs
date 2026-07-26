@@ -1,4 +1,5 @@
 pub mod backup;
+mod chat_process_state;
 pub mod codex_home;
 pub mod codex_paths;
 mod commands;

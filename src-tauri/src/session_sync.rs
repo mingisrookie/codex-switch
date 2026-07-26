@@ -91,6 +91,7 @@ struct TableColumn {
 struct RolloutCopy {
     path: String,
     copied: bool,
+    provider_normalized: bool,
     source_meta: SessionMeta,
 }
 
@@ -357,25 +358,36 @@ pub(crate) fn sync_shared_to_user_home_hot_with_policy(
 pub(crate) fn runtime_switch_session_files_are_unchanged_with_paths(
     current: &CodexPaths,
     shared: &CodexPaths,
+    target_provider: Option<&str>,
 ) -> Result<bool, String> {
     if !shared.state_db.is_file() {
         return Ok(false);
     }
     let current = root_from_paths(current.clone());
     let shared = root_from_paths(shared.clone());
-    Ok(session_root_files_are_unchanged(&current, &shared)?
-        && session_root_files_are_unchanged(&shared, &current)?)
+    Ok(session_root_files_are_unchanged(&current, &shared, None)?
+        && session_root_files_are_unchanged(&shared, &current, target_provider)?)
 }
 
 fn session_root_files_are_unchanged(
     source_root: &SyncRoot,
     target_root: &SyncRoot,
+    target_provider: Option<&str>,
 ) -> Result<bool, String> {
     let source_conn = open_source_conn(source_root)?;
     let source_scan = read_source_threads(source_root, source_conn.as_ref())?;
     for thread in &source_scan.threads {
-        if plan_rollout_file(target_root, thread)?.writes_session_file() {
+        let action = plan_rollout_file(target_root, thread)?;
+        if action.writes_session_file() {
             return Ok(false);
+        }
+        if let Some(target_provider) = target_provider {
+            let provider_matches = session_file_meta(action.target_path())?
+                .and_then(|meta| meta.model_provider)
+                .is_some_and(|provider| provider == target_provider);
+            if !provider_matches {
+                return Ok(false);
+            }
         }
     }
     Ok(
@@ -550,10 +562,14 @@ fn sync_sessions_in_transaction(
             stable_thread.meta = copied_rollout.source_meta.clone();
             if existing_thread {
                 duplicate_threads += 1;
-                let selected_rollout = select_target_rollout_path(
-                    existing_rollout.as_deref(),
-                    copied_rollout.path.as_str(),
-                )?;
+                let selected_rollout = if copied_rollout.provider_normalized {
+                    copied_rollout.path.clone()
+                } else {
+                    select_target_rollout_path(
+                        existing_rollout.as_deref(),
+                        copied_rollout.path.as_str(),
+                    )?
+                };
                 let provider_for_thread = if policy.update_existing_provider
                     || (copied_rollout.copied && copied_rollout.path == selected_rollout)
                 {
@@ -1090,7 +1106,8 @@ fn copy_rollout_file(
         allow_existing_replacement || file_write_policy == SessionFileWritePolicy::Deny;
     for attempt in 0..SOURCE_STABILITY_ATTEMPTS {
         let plan = plan_stable_rollout_file(target_root, thread, publish_extensions)?;
-        let action = plan.action;
+        let (action, provider_normalized) =
+            provider_rollout_action(plan.action, &plan.source, provider_id)?;
         let source = plan.source;
         if action.writes_session_file() && file_write_policy == SessionFileWritePolicy::Deny {
             return Err(
@@ -1103,8 +1120,15 @@ fn copy_rollout_file(
         let result = match &action {
             RolloutFileAction::Unchanged(_) => {
                 let rechecked = plan_stable_rollout_file(target_root, thread, publish_extensions)?;
-                if rechecked.action == action && rechecked.source.version == source.version {
-                    return Ok(rollout_copy(&target_path, false, &rechecked.source));
+                let (rechecked_action, rechecked_provider_normalized) =
+                    provider_rollout_action(rechecked.action, &rechecked.source, provider_id)?;
+                if rechecked_action == action && rechecked.source.version == source.version {
+                    return Ok(rollout_copy(
+                        &target_path,
+                        false,
+                        rechecked_provider_normalized,
+                        &rechecked.source,
+                    ));
                 }
                 last_source_change = Some(source_changed(
                     "the source or target changed before an unchanged plan was finalized",
@@ -1120,12 +1144,35 @@ fn copy_rollout_file(
                     &source.version,
                 ) {
                     Ok(true) => {
-                        return Ok(rollout_copy(&target_path, true, &source));
+                        return Ok(rollout_copy(
+                            &target_path,
+                            true,
+                            provider_normalized,
+                            &source,
+                        ));
                     }
                     Err(error) => Err(error),
                     Ok(false) => match stable_source_relation_to_target(&source, &target_path)? {
                         SessionFileRelation::Equal | SessionFileRelation::RightExtendsLeft => {
-                            return Ok(rollout_copy(&target_path, false, &source));
+                            let provider_matches = if provider_normalized {
+                                let provider_id = provider_id
+                                    .ok_or_else(|| "normalized provider is missing".to_string())?;
+                                session_file_meta(&target_path)?
+                                    .and_then(|meta| meta.model_provider)
+                                    .is_some_and(|provider| provider == provider_id)
+                            } else {
+                                true
+                            };
+                            if !provider_matches {
+                                Ok(None)
+                            } else {
+                                return Ok(rollout_copy(
+                                    &target_path,
+                                    false,
+                                    provider_normalized,
+                                    &source,
+                                ));
+                            }
                         }
                         SessionFileRelation::LeftExtendsRight => {
                             if publish_extensions && matches!(&action, RolloutFileAction::Create(_))
@@ -1135,7 +1182,12 @@ fn copy_rollout_file(
                                 Err("target imported session JSONL is shorter than its content hash"
                                     .to_string())
                             } else {
-                                return Ok(rollout_copy(&target_path, false, &source));
+                                return Ok(rollout_copy(
+                                    &target_path,
+                                    false,
+                                    provider_normalized,
+                                    &source,
+                                ));
                             }
                         }
                         SessionFileRelation::Divergent
@@ -1168,12 +1220,43 @@ fn copy_rollout_file(
     }))
 }
 
-fn rollout_copy(target: &Path, copied: bool, source: &StableSourceData) -> RolloutCopy {
+fn rollout_copy(
+    target: &Path,
+    copied: bool,
+    provider_normalized: bool,
+    source: &StableSourceData,
+) -> RolloutCopy {
     RolloutCopy {
         path: target.to_string_lossy().to_string(),
         copied,
+        provider_normalized,
         source_meta: source.version.meta.clone(),
     }
+}
+
+fn provider_rollout_action(
+    action: RolloutFileAction,
+    source: &StableSourceData,
+    provider_id: Option<&str>,
+) -> Result<(RolloutFileAction, bool), String> {
+    let Some(provider_id) = provider_id else {
+        return Ok((action, false));
+    };
+    let target_path = action.target_path();
+    let remote_compatible = is_remote_rollout_path(target_path, &source.version.meta.id);
+    if action.writes_session_file() && remote_compatible {
+        return Ok((action, true));
+    }
+    if matches!(action, RolloutFileAction::Unchanged(_))
+        && remote_compatible
+        && session_file_meta(target_path)?
+            .and_then(|meta| meta.model_provider)
+            .is_some_and(|provider| provider == provider_id)
+    {
+        return Ok((action, true));
+    }
+
+    provider_rollout_variant(target_path, source, provider_id).map(|action| (action, true))
 }
 
 fn create_session_file_if_absent(
@@ -1275,6 +1358,80 @@ fn set_imported_file_name(target_path: &mut PathBuf, source_hash: &[u8]) {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     target_path.set_file_name(format!("{stem}-imported-{hash_suffix}.jsonl"));
+}
+
+fn provider_rollout_variant(
+    target_path: &Path,
+    source: &StableSourceData,
+    provider_id: &str,
+) -> Result<RolloutFileAction, String> {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "session rollout path must have a UTF-8 file name".to_string())?;
+    let date = file_name
+        .strip_prefix("rollout-")
+        .and_then(|name| name.get(..10))
+        .filter(|date| valid_rollout_date(date))
+        .map(ToOwned::to_owned)
+        .or_else(|| rollout_date_from_parent(target_path))
+        .ok_or_else(|| {
+            format!(
+                "session rollout path does not contain a valid date: {}",
+                target_path.display()
+            )
+        })?;
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| "session rollout path must have a parent".to_string())?;
+
+    for sequence in 0_u16..256 {
+        let mut hasher = Sha256::new();
+        hasher.update(provider_id.as_bytes());
+        hasher.update(sequence.to_le_bytes());
+        for line_hash in &source.normalized_line_hashes {
+            hasher.update(line_hash);
+        }
+        let hash = hasher.finalize();
+        let seconds = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]) % 86_400;
+        let hour = seconds / 3_600;
+        let minute = (seconds % 3_600) / 60;
+        let second = seconds % 60;
+        let candidate = parent.join(format!(
+            "rollout-{date}T{hour:02}-{minute:02}-{second:02}-{}.jsonl",
+            source.version.meta.id
+        ));
+        if candidate == target_path {
+            continue;
+        }
+        if !candidate.exists() {
+            return Ok(RolloutFileAction::Create(candidate));
+        }
+        let provider_matches = session_file_meta(&candidate)?
+            .and_then(|meta| meta.model_provider)
+            .is_some_and(|provider| provider == provider_id);
+        let relation = stable_source_relation_to_target(source, &candidate)?;
+        if provider_matches
+            && matches!(
+                relation,
+                SessionFileRelation::Equal | SessionFileRelation::RightExtendsLeft
+            )
+        {
+            return Ok(RolloutFileAction::Unchanged(candidate));
+        }
+    }
+    Err(format!(
+        "failed to allocate a provider-normalized session JSONL beside {}",
+        target_path.display()
+    ))
+}
+
+fn rollout_date_from_parent(path: &Path) -> Option<String> {
+    let day = path.parent()?.file_name()?.to_str()?;
+    let month = path.parent()?.parent()?.file_name()?.to_str()?;
+    let year = path.parent()?.parent()?.parent()?.file_name()?.to_str()?;
+    let date = format!("{year}-{month}-{day}");
+    valid_rollout_date(&date).then_some(date)
 }
 
 fn stable_source_relation_to_target(
@@ -1471,6 +1628,39 @@ fn imported_base_stem(stem: &str) -> &str {
         break;
     }
     base
+}
+
+fn is_remote_rollout_path(path: &Path, thread_id: &str) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(timestamp) = file_name
+        .strip_prefix("rollout-")
+        .and_then(|name| name.strip_suffix(&format!("-{thread_id}.jsonl")))
+    else {
+        return false;
+    };
+    valid_rollout_timestamp(timestamp)
+}
+
+fn valid_rollout_date(date: &str) -> bool {
+    date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+fn valid_rollout_timestamp(timestamp: &str) -> bool {
+    timestamp.len() == 19
+        && timestamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 | 13 | 16 => byte == b'-',
+                10 => byte == b'T',
+                _ => byte.is_ascii_digit(),
+            })
 }
 
 fn session_file_relation(left: &Path, right: &Path) -> Result<SessionFileRelation, String> {
@@ -2148,7 +2338,7 @@ mod tests {
         let target = tempdir().unwrap();
         let source_jsonl = source
             .path()
-            .join("sessions/2026/06/23/rollout-thread-a.jsonl");
+            .join("sessions/2026/06/23/rollout-2026-06-23T12-00-00-thread-a.jsonl");
         fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
         fs::write(
             &source_jsonl,
@@ -2182,7 +2372,7 @@ mod tests {
         assert_eq!(result.copied_session_files, 1);
         let target_jsonl = target
             .path()
-            .join("sessions/2026/06/23/rollout-thread-a.jsonl");
+            .join("sessions/2026/06/23/rollout-2026-06-23T12-00-00-thread-a.jsonl");
         let jsonl = fs::read_to_string(&target_jsonl).unwrap();
         assert!(jsonl.contains(r#""model_provider":"openai""#));
         assert!(jsonl.contains("do not rewrite openai_custom in content"));
@@ -3010,8 +3200,7 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"thread-hot","model_provider":"openai_custom"}}"#,
         )
         .unwrap();
-        let live_bytes =
-            br#"{"type":"session_meta","payload":{"id":"thread-hot","model_provider":"openai"}}"#;
+        let live_bytes = br#"{"type":"session_meta","payload":{"id":"thread-hot","model_provider":"openai_custom"}}"#;
         fs::write(&home_jsonl, live_bytes).unwrap();
         create_db(
             &shared.path().join("state_5.sqlite"),
@@ -3021,17 +3210,29 @@ mod tests {
             &home.path().join("state_5.sqlite"),
             &[("thread-hot", home_jsonl.to_str().unwrap())],
         );
+        set_provider(home.path(), "openai_custom");
 
-        sync_shared_to_user_home_hot(shared.path(), home.path(), "openai").unwrap();
+        let result = sync_shared_to_user_home_hot(shared.path(), home.path(), "openai").unwrap();
 
+        assert_eq!(result.copied_session_files, 0);
         assert_eq!(fs::read(&home_jsonl).unwrap(), live_bytes);
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let (provider, rollout_path): (String, String) = conn
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = 'thread-hot'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai_custom");
+        assert_eq!(std::path::PathBuf::from(rollout_path), home_jsonl);
     }
 
     #[test]
-    fn provider_switch_updates_sqlite_without_rewriting_unchanged_existing_jsonl() {
+    fn closed_provider_switch_publishes_matching_jsonl_without_rewriting_history() {
         let shared = tempdir().unwrap();
         let home = tempdir().unwrap();
-        let relative = "sessions/2026/07/25/rollout-thread-existing.jsonl";
+        let relative = "sessions/2026/07/25/rollout-2026-07-25T12-00-00-thread-existing.jsonl";
         let shared_jsonl = shared.path().join(relative);
         let home_jsonl = home.path().join(relative);
         fs::create_dir_all(shared_jsonl.parent().unwrap()).unwrap();
@@ -3056,21 +3257,63 @@ mod tests {
 
         let result = sync_shared_to_user_home(shared.path(), home.path(), "openai_custom").unwrap();
 
-        assert_eq!(result.copied_session_files, 0);
+        assert_eq!(result.copied_session_files, 1);
         assert_eq!(fs::read(&home_jsonl).unwrap(), existing_bytes.as_bytes());
         assert_eq!(
             fs::metadata(&home_jsonl).unwrap().modified().unwrap(),
             modified_before
         );
         let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
-        let provider: String = conn
+        let (provider, rollout_path): (String, String) = conn
             .query_row(
-                "SELECT model_provider FROM threads WHERE id = 'thread-existing'",
+                "SELECT model_provider, rollout_path FROM threads WHERE id = 'thread-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai_custom");
+        let provider_rollout = std::path::PathBuf::from(rollout_path);
+        assert_ne!(provider_rollout, home_jsonl);
+        assert!(super::is_remote_rollout_path(
+            &provider_rollout,
+            "thread-existing"
+        ));
+        let provider_bytes = fs::read_to_string(&provider_rollout).unwrap();
+        assert!(provider_bytes.contains(r#""model_provider":"openai_custom""#));
+        assert!(provider_bytes.contains("unchanged history"));
+        drop(conn);
+
+        let repeated =
+            sync_shared_to_user_home(shared.path(), home.path(), "openai_custom").unwrap();
+        assert_eq!(repeated.copied_session_files, 0);
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let repeated_path: String = conn
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = 'thread-existing'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(provider, "openai_custom");
+        assert_eq!(std::path::PathBuf::from(repeated_path), provider_rollout);
+        drop(conn);
+
+        let switched_back = sync_shared_to_user_home(shared.path(), home.path(), "openai").unwrap();
+        assert_eq!(switched_back.copied_session_files, 0);
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let (provider, rollout_path): (String, String) = conn
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = 'thread-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+        assert_eq!(std::path::PathBuf::from(rollout_path), home_jsonl);
+        assert_eq!(fs::read(&home_jsonl).unwrap(), existing_bytes.as_bytes());
+        assert_eq!(
+            fs::metadata(&home_jsonl).unwrap().modified().unwrap(),
+            modified_before
+        );
     }
 
     #[test]
@@ -3283,7 +3526,7 @@ mod tests {
     fn provider_only_metadata_change_does_not_create_an_imported_conflict() {
         let source = tempdir().unwrap();
         let target = tempdir().unwrap();
-        let relative = "sessions/2026/07/19/rollout-thread-provider.jsonl";
+        let relative = "sessions/2026/07/19/rollout-2026-07-19T12-00-00-thread-provider.jsonl";
         let source_jsonl = source.path().join(relative);
         let target_jsonl = target.path().join(relative);
         fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
@@ -3335,6 +3578,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(std::path::PathBuf::from(rollout_path), target_jsonl);
+    }
+
+    #[test]
+    fn closed_provider_sync_republishes_legacy_imported_name_for_remote() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let thread_id = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a6";
+        let relative =
+            format!("sessions/2026/07/23/rollout-2026-07-23T11-03-59-{thread_id}-imported.jsonl");
+        let source_jsonl = source.path().join(&relative);
+        let target_jsonl = target.path().join(&relative);
+        fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
+        fs::create_dir_all(target_jsonl.parent().unwrap()).unwrap();
+        let bytes = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"openai\"}}}}\n"
+        );
+        fs::write(&source_jsonl, &bytes).unwrap();
+        fs::write(&target_jsonl, &bytes).unwrap();
+        create_official_like_db(
+            &source.path().join("state_5.sqlite"),
+            &[(thread_id, source_jsonl.to_str().unwrap())],
+        );
+        create_official_like_db(
+            &target.path().join("state_5.sqlite"),
+            &[(thread_id, target_jsonl.to_str().unwrap())],
+        );
+
+        let result = sync_shared_to_user_home(source.path(), target.path(), "openai").unwrap();
+
+        assert_eq!(result.copied_session_files, 1);
+        assert_eq!(fs::read_to_string(&target_jsonl).unwrap(), bytes);
+        let conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let rollout_path: String = conn
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollout_path = std::path::PathBuf::from(rollout_path);
+        assert_ne!(rollout_path, target_jsonl);
+        assert!(super::is_remote_rollout_path(&rollout_path, thread_id));
+        let published = fs::read_to_string(rollout_path).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(published.trim()).unwrap();
+        assert_eq!(meta["payload"]["id"], thread_id);
+        assert_eq!(meta["payload"]["model_provider"], "openai");
     }
 
     #[test]

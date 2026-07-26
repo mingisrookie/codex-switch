@@ -540,8 +540,11 @@ fn build_runtime_switch_plan(
         || active.confidence != RuntimeConfidence::Exact;
     let shared_paths = local_codex_paths(shared_home);
     let session_file_write_policy = if requires_change
-        && runtime_switch_session_files_are_unchanged_with_paths(&codex_paths, &shared_paths)?
-    {
+        && runtime_switch_session_files_are_unchanged_with_paths(
+            &codex_paths,
+            &shared_paths,
+            Some(&session_provider),
+        )? {
         SessionFileWritePolicy::Deny
     } else {
         SessionFileWritePolicy::Allow
@@ -635,12 +638,15 @@ pub(crate) fn preflight_hot_session_sync_with_paths(
     current_paths: &CodexPaths,
     shared_paths: &CodexPaths,
 ) -> Result<HotSessionSyncPlan, String> {
-    let session_file_write_policy =
-        if runtime_switch_session_files_are_unchanged_with_paths(current_paths, shared_paths)? {
-            SessionFileWritePolicy::Deny
-        } else {
-            SessionFileWritePolicy::Allow
-        };
+    let session_file_write_policy = if runtime_switch_session_files_are_unchanged_with_paths(
+        current_paths,
+        shared_paths,
+        None,
+    )? {
+        SessionFileWritePolicy::Deny
+    } else {
+        SessionFileWritePolicy::Allow
+    };
     Ok(HotSessionSyncPlan {
         session_file_write_policy,
     })
@@ -1060,10 +1066,10 @@ mod tests {
         let backup_root = tempdir().unwrap();
         let current_rollout = current
             .path()
-            .join("sessions/2026/07/26/rollout-current.jsonl");
+            .join("sessions/2026/07/26/rollout-2026-07-26T12-00-00-thread-current.jsonl");
         let shared_rollout = shared
             .path()
-            .join("sessions/2026/07/26/rollout-shared.jsonl");
+            .join("sessions/2026/07/26/rollout-2026-07-26T12-01-00-thread-shared.jsonl");
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
         let current_bytes = br#"{"type":"session_meta","payload":{"id":"thread-current"}}"#;
@@ -1099,7 +1105,7 @@ mod tests {
         let imported_to_current = fs::read_to_string(
             current
                 .path()
-                .join("sessions/2026/07/26/rollout-shared.jsonl"),
+                .join("sessions/2026/07/26/rollout-2026-07-26T12-01-00-thread-shared.jsonl"),
         )
         .unwrap();
         assert!(imported_to_current.contains("\"id\":\"thread-shared\""));
@@ -1107,7 +1113,7 @@ mod tests {
         let imported_to_shared = fs::read_to_string(
             shared
                 .path()
-                .join("sessions/2026/07/26/rollout-current.jsonl"),
+                .join("sessions/2026/07/26/rollout-2026-07-26T12-00-00-thread-current.jsonl"),
         )
         .unwrap();
         assert!(imported_to_shared.contains("\"id\":\"thread-current\""));
@@ -1159,13 +1165,13 @@ mod tests {
         let shared = tempdir().unwrap();
         let current_rollout = home
             .path()
-            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
+            .join("sessions/2026/07/26/rollout-2026-07-26T12-02-00-thread-drift.jsonl");
         let shared_rollout = shared
             .path()
-            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
+            .join("sessions/2026/07/26/rollout-2026-07-26T12-02-00-thread-drift.jsonl");
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
-        let original = br#"{"type":"session_meta","payload":{"id":"thread-drift"}}"#;
+        let original = br#"{"type":"session_meta","payload":{"id":"thread-drift","model_provider":"openai_custom"}}"#;
         fs::write(&current_rollout, original).unwrap();
         fs::write(&shared_rollout, original).unwrap();
         create_state_db(home.path(), "thread-drift", &current_rollout);
@@ -1306,14 +1312,19 @@ mod tests {
     #[test]
     fn switching_back_to_account_restores_account_auth_and_config_without_relay_provider() {
         let home = tempdir().unwrap();
-        let rollout = home.path().join("sessions/2026/06/23/rollout-a.jsonl");
+        let thread_id = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a6";
+        let rollout = home.path().join(format!(
+            "sessions/2026/06/23/rollout-2026-06-23T12-00-00-{thread_id}.jsonl"
+        ));
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"openai\"}}}}"
+            ),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), thread_id, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1327,6 +1338,17 @@ mod tests {
         let store_root = tempdir().unwrap();
         let store = RuntimeStore::new(store_root.path().join("runtimes"));
         store.import_plus_from_home(home.path(), false).unwrap();
+        let relay_rollout = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"openai_custom\"}}}}"
+        );
+        fs::write(&rollout, &relay_rollout).unwrap();
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE threads SET model_provider = 'openai_custom' WHERE id = ?1",
+            [thread_id],
+        )
+        .unwrap();
+        drop(conn);
         fs::write(
             home.path().join("config.toml"),
             concat!(
@@ -1362,6 +1384,27 @@ mod tests {
         assert!(restored_config.contains("new-command"));
         let restored_doc = restored_config.parse::<toml_edit::DocumentMut>().unwrap();
         assert!(restored_doc.get("model_provider").is_none());
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), relay_rollout);
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let (provider, rollout_path): (String, String) = conn
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+        let rollout_path = std::path::PathBuf::from(rollout_path);
+        assert_ne!(rollout_path, rollout);
+        assert!(rollout_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(&format!("-{thread_id}.jsonl")));
+        let published = fs::read_to_string(rollout_path).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(published.trim()).unwrap();
+        assert_eq!(meta["payload"]["id"], thread_id);
+        assert_eq!(meta["payload"]["model_provider"], "openai");
     }
 
     #[test]

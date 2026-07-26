@@ -13,6 +13,12 @@
 
 ## 结论
 
+### 2026-07-26 Remote 可见性更正
+
+手机 Remote 与隔离 `codex app-server thread/list` 实测证明：关闭态只更新 SQLite provider 不足以恢复历史，JSONL 首条 `session_meta.payload.model_provider` 也参与默认枚举过滤。所以下方“每次切换只落 SQLite”的原始合同已被实测推翻。
+
+当前合同改为：hot shared→current 继续不触碰既有 live thread；ChatGPT 已关闭的运行态切换若发现 provider 不一致，则保留旧 JSONL，原子发布 provider 已归一且 Remote 可识别的完整 rollout，并更新 SQLite 活动路径；相同内容/provider 直接复用。CC-Switch 的 source 稳定复检、备份账本和只改匹配记录原则仍值得借鉴，但不能再据此排除关闭态 provider rollout。
+
 CC-Switch 值得借鉴的是迁移纪律，不是把它的 provider bucket 算法直接搬进每次运行态切换。
 
 它把历史统一设计成一次性、显式 opt-in、目录绑定、有 marker、有备份账本的迁移；只修改真正匹配来源 provider 的记录，并在写 JSONL 前复检 mtime 和长度。SQLite 使用 Online Backup 后再在 transaction 中更新匹配行。这些原则适合任何高风险会话迁移。

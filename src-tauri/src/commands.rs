@@ -27,6 +27,7 @@ use crate::{
         BackupManifest, BackupScope, BackupSummary, CheckpointCleanupReceipt,
         CheckpointCleanupSummary, CheckpointStorageStatus, RestoreResult,
     },
+    chat_process_state::repair_after_chatgpt_shutdown,
     codex_home::{scan_codex_home as scan_home, CodexHomeStatus},
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
@@ -520,6 +521,9 @@ fn switch_runtime_blocking(
             || close_codex().map(|_| ()),
             |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
         )?;
+        if plan.requires_change() {
+            repair_after_chatgpt_shutdown(&current_home)?;
+        }
         match switch_runtime_files_preflighted_with_progress(
             &store,
             &current_home,

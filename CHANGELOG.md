@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- 运行态切换在确认 ChatGPT 完全退出后校验其 `process_manager/chat_processes.json`。若关闭期间留下截断、全 NUL 或错误结构的瞬态状态，切换会原子重建为空数组并复核。
+- 修复从中转站切回 ChatGPT 账号态后手机 Remote 只剩少量新会话的问题。关闭态切换不再只更新 SQLite provider；当既有 JSONL 的 `session_meta.payload.model_provider` 不匹配目标 provider，工具会保留原文件、原子发布 Remote 可识别的 provider 归一副本，并把活动 `rollout_path` 与 `threads.model_provider` 一起切到目标 provider。相同正文/provider 的副本会幂等复用，热同步仍不触碰既有 live 会话。
+
 ## v0.2.1 - 2026-07-26
 
 ### 备份与数据安全
