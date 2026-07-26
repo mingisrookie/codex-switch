@@ -9,7 +9,7 @@
 - 临时点只在终态日志成功落盘后释放：成功、切换完整回滚、typed `Failed + Backup` 写入前失败，以及恢复可见成功；Apply/回滚/日志失败、无法复核或清理失败时保留。删除前重新验证完整 manifest、路径、文件集合、大小与 payload SHA-256。
 - 备份区新增占用审计与页面内安全释放任务流，显示目录总占用、可证明回收的字节/数量、安全保留数量、最近结果和警告；显式 cleanup 还支持严格 v3 写入前失败的一根/两根临时点和恢复可见单根 `StateOnly`，legacy v2 只兼容旧成功/完整回滚双根。cleanup 在 plan 与 execute 两阶段都重新验证完整 payload SHA-256，计划后发生任何漂移都保留目录并 fail closed；全程不按年龄、数量、mtime 或空间阈值猜测删除。
 - cleanup Summary、Receipt 与操作记录新增 `attemptedCount` / `failedCount`。只有计划内目录在执行期 revalidate 或 remove 失败才计入失败、触发页面“部分完成”和 Failed 日志；Full、孤儿、unclassified 等安全保留 warning 仅作说明，`failedCount = 0` 时仍为成功。对应 Rust 与前端测试同时覆盖“有保留说明但成功”和“无 warning 但真实删除失败”。
-- 真实受控 UI 清理已将 `%APPDATA%\codex-switch\backups` 从 `21` 个目录、`6,327,089,609` bytes 降到 `17` 个目录、`2,693,977,957` bytes，计划项 `4/4` 删除并回收 `3,633,111,652` bytes，紧邻操作的 C 盘空闲实测增加 `3,637,547,008` bytes。首次执行使用旧候选 UI，因把安全保留 warning 当作 partial 而留下历史 Failed 记录；该历史不篡改，语义 bug 已由上述字段与测试修复。剩余 17 项继续安全保留，不自动删除。
+- 真实受控 UI 清理已将 `%APPDATA%\codex-switch\backups` 从 `21` 个目录、`6,327,089,609` bytes 降到 `17` 个目录、`2,693,977,957` bytes，计划项 `4/4` 删除并回收 `3,633,111,652` bytes，紧邻操作的 C 盘空闲实测增加 `3,637,547,008` bytes。首次执行使用旧候选 UI，因把安全保留 warning 当作 partial 而留下历史 Failed 记录；该历史不篡改，语义 bug 已由上述字段与测试修复。发布闭环后的最终 cleanup 为 `0 attempted / 0 failed / Succeeded / Complete`，剩余 17 项继续安全保留，不自动删除。
 - 已验证 Full 与兼容 legacy v2 恢复点新增页面内“删除恢复点”：显式二次确认、受管根直接子目录限制、删除前强校验、回收字节回执和 `deleteBackup` 操作审计。手工 full backup、硬删除和恢复 safety backup 仍不自动删除。
 - Full/Sessions 备份和会话硬删除覆盖 `archived_sessions/`；runtime/state scope 保持原有窄边界。备份创建失败时如果 partial 目录清理也失败，错误不再吞掉该残留。
 - 容量 fail-fast 从运行态切换扩展到会话热同步、会话硬删除、恢复可见、full restore safety 和手工 full backup。估算按每个 source 的真实 `CodexPaths + BackupScope` 累加 payload、DPAPI 与 manifest 开销，使用最大的 SQLite workspace，并保留至少 2 GiB 或 15% 的安全余量。
@@ -25,24 +25,25 @@
 - 普通会话同步改为 async Tauri command + `spawn_blocking`，容量扫描、备份、SQLite/JSONL 合并和终态清理不再占用异步 IPC 线程。备份域已有扫描进行中时，后续 mutation 的刷新请求会排队再跑一次，避免长期展示 mutation 前的占用和操作记录。
 - hot shared→current 对既有 thread 现在零 target candidate I/O：不再重复读取、hash、写入或发布异名 imported 文件，也不会制造 orphan；重复热同步的该分支 `copied_session_files = 0`，直接减少同步耗时、ChatGPT 文件观察/索引压力和 C 盘会话目录增长。
 - 关闭请求监听改为应用挂载时预注册；注册未完成或失败时切换 fail closed，切换 invoke 前同步激活门禁且不弹确认框。切换完成后进入独立 runtime refresh pending 状态，确认当前运行态前禁用再次切换；mutation 错误、刷新错误和 unknown 终态使用单一且保守的页面反馈。
-- Full 删除、检查点释放、配置和所有确认继续使用页面内流程；生产 UI 统一 Lucide、禁止 emoji，新增 `public/favicon.ico`。三种目标尺寸的视觉 QA 未发现页面级 overflow、native dialog 或 emoji；最终发布产物仍需复验。
+- Full 删除、检查点释放、配置和所有确认继续使用页面内流程；生产 UI 统一 Lucide、禁止 emoji，新增 `public/favicon.ico`。三种目标尺寸的视觉 QA 未发现页面级 overflow、native dialog 或 emoji；正式 Release 资产随后通过真实自动更新并重启进入 ChatGPT Switch。
 - Relay `/models` 验证现在拒绝空模型列表，并要求配置的 model ID 与 `data[].id` 精确匹配；错误不会回显 API Key 或响应正文，同一次失败只进入一个页面错误面，不再重复显示。
 - Relay 当前态精确匹配纳入 provider `base_url`。修改已激活 Relay 的地址后会显示待重新应用，不再把旧地址误判为当前配置。
 - 正式 Tauri 窗口最小宽度降到 390px，使 820px/520px 响应式布局在 EXE 中真实可达；会话表是可聚焦、可命名的横向滚动区域。
 - 缺少 `auth.json` 或 `config.toml` 时，运行态页面会直接提示先打开 ChatGPT 完成登录并刷新；切换按钮旁持续说明会关闭 ChatGPT，不增加确认弹窗。
-- updater 下载连接超时为 30 秒、总超时为 10 分钟；helper readiness 超时执行 kill + wait，staging 清理使用有界重试。已发布 v0.2.0 的首跳仍受旧 120 秒总超时约束，`v0.2.0 -> v0.2.1` 必须由真实一键更新 smoke 证明。
+- updater 下载连接超时为 30 秒、总超时为 10 分钟；helper readiness 超时执行 kill + wait，staging 清理使用有界重试。正式 v0.2.0（SHA-256 `42012…A65A`）已在隔离 UIA 中真实点击“立即更新”：约 `2.086s` 出现并点击，旧进程约 `89.103s` 后 exit `0`，`105.1s` 内无手工替换地安装并重启 v0.2.1；目标为 `2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`、版本 `0.2.1`，staging/install leftovers 均为 `0`。
 - Windows release profile 固定为 `opt-level = "z"`、LTO、单 codegen unit、`panic = "abort"` 与 strip symbols。新增 `scripts/pack-windows-release.ps1`：验证固定官方 UPX 5.2.0/EXE SHA-256，只压缩 raw 副本，依次执行 raw contract、`--best --lzma`、`upx -t`、packed contract、PE32+ x64/双版本和 3,000,000 bytes 硬门禁；CI 固定官方 ZIP/EXE 两级 SHA-256，并只上传 packed 的裸 `codex-switch.exe`。
 
 ### 回归证据
 
 - 新增隔离合成大 Home 回归：64 个等价 JSONL 在 provider 切换后保持文件数、bytes、SHA-256 与 mtime 不变，零复制、零 imported 副本，只更新对应 SQLite provider。可选 ignored benchmark 支持环境变量放大规模。
 - 增加容量边界、archived sessions 覆盖、损坏候选回填、list/delete 同强校验、额外文件/hash 漂移排除、256 个显式 Full 管理上限、独立 CLI、Relay 空列表/模型匹配与单一错误面、手工 full backup、source 稳定性、完整 hash-named import、旧目标 bytes/hash/mtime 不变、atomic no-clobber create、hot `PreserveExisting` 的既有 thread 零 candidate I/O/零 orphan/`copied_session_files = 0`、closed `SelectMostComplete`、旧 writer 继续可见、既有 rollout/provider/title 保留、新 thread 插入、index hot `Skip`/完整原子替换/`Deny` 零写、`Unchanged` 终前复检、cleanup plan/execute 完整 SHA、`planningSessions` / `cleaningCheckpoints` 阶段、typed prewrite/恢复可见临时点释放、legacy v2 严格双根证明、备份刷新排队、关闭门禁、runtime refresh pending、updater 超时/清理和页面内任务流测试。
-- 发布打包本地临时候选从 raw `5,955,584` bytes 得到 packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`），同一 raw 重复打包 hash 一致。该结果只证明当前本地链路；最终 tag-CI 资产大小/hash、Release 重下载合同和真实 `v0.2.0 -> v0.2.1` 一键更新仍待发布闭环确认。
+- 发布打包本地临时候选从 raw `5,955,584` bytes 得到 packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`），同一 raw 重复打包 hash 一致；它只作为历史候选，不是正式 Release。PR #5 已从工作提交 `702dc37` 合并为 `3b4f440`；PR CI `30194264349` / `30194276794`、main CI `30194772843`、annotated tag `v0.2.1` 指向的 tag CI `30195207004` 均通过。[正式 v0.2.1 Release](https://github.com/mingisrookie/codex-switch/releases/tag/v0.2.1) 是 latest stable、非 draft，且只有一个 `codex-switch.exe`：`2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`、PE32+ x64、`FileVersion/ProductVersion = 0.2.1`、`upx -t` 通过；Release 回下载与 tag-CI artifact 的 hash/bytes 完全一致，两个 ignored live GitHub 合同测试各 `1 passed`。
 
 ### 兼容性与已知边界
 
 - 继续只发布 Windows x64 `codex-switch.exe`；当前不按年龄、数量、mtime 或容量阈值自动 prune。持久 Full 可由用户逐个确认删除，但失败、孤儿和无证据目录仍会占用磁盘。
 - 热同步仍不是跨 SQLite、JSONL 和 `session_index.jsonl` 的单一 durable transaction；实际进入 Create/Import 的路径会先发布完整 JSONL 且不会产生半尾。hot shared→current 对既有 thread 在文件处理前直接跳过，保持零 target candidate I/O、零 orphan 和 `copied_session_files = 0`；closed `SelectMostComplete` 才会在发布后推进既有引用。合成回归也不等于真实 ChatGPT 重索引 wall-clock 已量化归零。
+- 本机 Microsoft Defender Product/Feature disabled，扫描命令未能形成通过证据；上述 release contract、hash、`upx -t` 与真实更新闭环不能替代或冒充 Defender 扫描通过。
 
 ## v0.2.0 - 2026-07-26
 

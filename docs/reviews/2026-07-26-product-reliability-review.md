@@ -28,11 +28,21 @@
 
 临时点在终态日志持久化后才释放：成功、切换完整回滚、typed `Failed + Backup` 写入前失败，以及恢复可见成功。显式 cleanup 支持严格 v3 prewrite 一根/两根和 restore-visible 单根，legacy v2 仅兼容旧成功/完整回滚双根；plan 与 execute 两阶段都重新强校验完整 payload SHA-256，计划后漂移 fail closed，不按年龄、数量、mtime 或容量猜测。cleanup Summary、Receipt 与新操作记录都包含 `attemptedCount` / `failedCount`；只有计划内目录在执行期 revalidate/remove 失败才是 partial/Failed，Full、孤儿、unclassified 等安全保留 warning 只作说明。持久 Full 列表只在用户请求时加载，最多返回 256 项；列表和删除共用 managed-full 强校验，extra file/hash drift 不显示为 verified 且保持不动。手工 Full、hard delete、restore safety 不自动删，但通过校验的 Full/legacy v2 可在页面内显式确认删除并写审计。Full/Sessions 与硬删除覆盖 `archived_sessions/`，runtime/state scope 不扩大。
 
-前端在挂载时预注册关闭门禁，未 ready 时切换 fail closed；切换后 runtime refresh pending 期间禁用两个切换入口。mutation 错误只出现一次，Relay 验证失败不再由局部与全局路径重复显示；unknown 终态保守提示先不要重新打开 ChatGPT。Full 删除、配置、确认与错误均留在页面内。v0.2.1 下载器采用 30 秒连接、10 分钟总超时，并补 helper kill + wait 与 cleanup retry；但已发布 v0.2.0 的首跳仍是 120 秒，必须用真实 `v0.2.0 -> v0.2.1` smoke 证明。
+前端在挂载时预注册关闭门禁，未 ready 时切换 fail closed；切换后 runtime refresh pending 期间禁用两个切换入口。mutation 错误只出现一次，Relay 验证失败不再由局部与全局路径重复显示；unknown 终态保守提示先不要重新打开 ChatGPT。Full 删除、配置、确认与错误均留在页面内。v0.2.1 下载器采用 30 秒连接、10 分钟总超时，并补 helper kill + wait 与 cleanup retry；已发布 v0.2.0 的首跳虽然仍受 120 秒总超时约束，但真实 `v0.2.0 -> v0.2.1` smoke 已在该窗口内完成。
 
 发布首跳的资产链也已收窄：Cargo release 固定 `opt-level = "z"`、LTO、单 codegen unit、`panic = "abort"`、strip symbols；`scripts/pack-windows-release.ps1` 固定官方 UPX 5.2.0，只压缩 raw 副本，并要求 raw+packed contract、`upx -t`、PE32+ x64/双版本和 3,000,000 bytes 硬门禁。CI 固定 ZIP SHA-256 `B471EBF1B7F20F4A89150264ED9A008A2A5BFD247F3C6D1184A75BB59CA08F5D` 与 `upx.exe` SHA-256 `F4C0CC7ACA0F1FF0D0B750E966B44139F2FA1A2DB7281F48FC52194400712E1D`，只上传 packed 的裸 `codex-switch.exe`。
 
-**BLOCK 状态更新：会话 JSONL/index 原地写入风险、hot-rollout P1、显式 cleanup plan/execute 完整 SHA P1、warning/partial 终态语义和 Relay 重复错误均已修复，不再作为当前候选的阻断项。整体交付仍等待 tag-CI packed artifact、正式 Release 重下载闭环，以及真实 `v0.2.0 -> v0.2.1` 一键更新首跳验证。**
+### v0.2.1 发布闭环已完成
+
+- [PR #5](https://github.com/mingisrookie/codex-switch/pull/5) 已从工作提交 `702dc37` 合并为 `3b4f440`；PR CI [30194264349](https://github.com/mingisrookie/codex-switch/actions/runs/30194264349) / [30194276794](https://github.com/mingisrookie/codex-switch/actions/runs/30194276794)、main CI [30194772843](https://github.com/mingisrookie/codex-switch/actions/runs/30194772843) 与 tag CI [30195207004](https://github.com/mingisrookie/codex-switch/actions/runs/30195207004) 均成功。
+- annotated tag `v0.2.1` 指向 merge commit `3b4f440`。[ChatGPT Switch v0.2.1](https://github.com/mingisrookie/codex-switch/releases/tag/v0.2.1) 是 latest stable、非 draft，且只有一个 `codex-switch.exe` 资产。
+- tag-CI artifact 与 Release 资产均为 `2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`、PE32+ x64、`FileVersion/ProductVersion = 0.2.1`，`upx -t` 通过；Release 重下载的 hash/bytes 与 tag artifact 完全一致。
+- `live_github_release_contract_is_compatible` 与 `live_github_asset_download_contract_is_compatible` 两个 ignored live GitHub 合同测试分别执行且各 `1 passed`。
+- 正式 v0.2.0（SHA-256 `42012…A65A`）已在隔离环境由 UI Automation 真实点击“立即更新”：约 `2.086s` 出现并点击，旧进程约 `89.103s` 后 exit `0`，`105.1s` 内自动替换并重启 ChatGPT Switch；目标文件为上述正式 v0.2.1 bytes/hash/version，staging/install leftovers 均为 `0`，没有手工替换。
+- 发布后的最终 cleanup 为 `0 attempted / 0 failed / Succeeded / Complete`；已验证没有新的可回收临时点，既有 `17` 项继续按证据安全保留。
+- 本机 Microsoft Defender Product/Feature disabled，相关命令无法形成扫描通过证据；本节只记录 release contract、hash、`upx -t` 和真实更新闭环，不将它们误写成 Defender 扫描通过。
+
+**CLOSED 状态更新：会话 JSONL/index 原地写入风险、hot-rollout P1、显式 cleanup plan/execute 完整 SHA P1、warning/partial 终态语义和 Relay 重复错误均已修复；PR/main/tag CI、tag-CI packed artifact、正式 Release 回下载合同和真实 `v0.2.0 -> v0.2.1` 一键更新首跳均已完成，本轮产品交付闭环关闭。**
 
 **Hot-rollout P1 已关闭。** `SessionSyncPolicy.existing_rollout_path = ExistingRolloutPathPolicy::PreserveExisting` 现在只用于 hot shared→current；既有 live thread 在任何 target rollout 查询或候选复制前就直接跳过，而不是先发布一个不抢占活动路径的文件。`hot_sync_keeps_the_live_rollout_visible_when_a_longer_different_name_arrives` 同时持有旧 writer、执行同步、再写入并断言 `copied_session_files = 0`、异名 candidate 不存在、DB 的 rollout/provider/title 不变且新增尾部可见；`hot_sync_preserves_active_rollout_when_shorter_candidate_has_a_different_name` 同样断言零复制、candidate 不存在并保留既有 provider/path。`source_database_rollout_advances_to_a_strictly_more_complete_candidate` 则保留 `ExistingRolloutPathPolicy::SelectMostComplete` 在非 hot/关闭态推进更完整引用的能力。
 
@@ -42,9 +52,9 @@
 
 清理前只读基线为 `%APPDATA%\codex-switch\backups` 共 `21` 个目录、`6,327,089,609` bytes；严格读取 `operations.jsonl` 并按 action/status/phase、目录引用、reason、source root、scope 与 manifest 交叉验证后，`4` 个目录、`3,633,111,652` bytes 可证明属于已终结临时点。
 
-真实受控 UI 清理随后完成：目录从 `21` 降到 `17`，总量从 `6,327,089,609` 降到 `2,693,977,957` bytes，计划中的 `4/4` 项均删除，回收 `3,633,111,652` bytes；紧邻操作的 C 盘 free 实测增加 `3,637,547,008` bytes。首次执行用的是修复前候选 UI，它因保留 warning 把界面误标为 partial、把日志写成 Failed；这个历史事实和旧日志都不篡改。后续实现以 `failedCount` 而非 warnings 决定 terminal，并有 Rust/前端测试。剩余 17 项继续安全保留，不自动删除。
+真实受控 UI 清理随后完成：目录从 `21` 降到 `17`，总量从 `6,327,089,609` 降到 `2,693,977,957` bytes，计划中的 `4/4` 项均删除，回收 `3,633,111,652` bytes；紧邻操作的 C 盘 free 实测增加 `3,637,547,008` bytes。首次执行用的是修复前候选 UI，它因保留 warning 把界面误标为 partial、把日志写成 Failed；这个历史事实和旧日志都不篡改。后续实现以 `failedCount` 而非 warnings 决定 terminal，并有 Rust/前端测试。发布闭环后的最终 cleanup 为 `0 attempted / 0 failed / Succeeded / Complete`；剩余 17 项继续安全保留，不自动删除。
 
-v0.2.1 发布门禁必须额外证明：success/rolledBack/prewrite/restore-visible 与 Apply/rollback/log-failure 的保留矩阵；cleanup plan/execute 完整 SHA、`attemptedCount` / `failedCount` 语义与漂移 fail closed；Full list/delete 同强校验、extra/hash drift 排除、按需 256 项和绝不自动删 Full；active/archived 备份/恢复/硬删除；source 稳定性、hash-named 完整 import、旧目标 bytes/hash/mtime 不变、hot `PreserveExisting` 的 existing thread 零 candidate I/O/零 orphan/`copied_session_files = 0`、closed `SelectMostComplete`、旧 writer 可继续写、既有 rollout/provider/title 保留、新 thread 插入、index hot `Skip`/完整原子替换/`Deny` 零写与 `Unchanged` 终前复检；关闭门禁、runtime refresh pending、unknown 终态与 Relay 单一错误面；三尺寸最终产物无 overflow/dialog/emoji；tag-CI packed artifact 的最终大小/hash、Release 重下载合同；以及真实 `v0.2.0 -> v0.2.1` updater 首跳。
+v0.2.1 发布门禁已覆盖并证明：success/rolledBack/prewrite/restore-visible 与 Apply/rollback/log-failure 的保留矩阵；cleanup plan/execute 完整 SHA、`attemptedCount` / `failedCount` 语义与漂移 fail closed；Full list/delete 同强校验、extra/hash drift 排除、按需 256 项和绝不自动删 Full；active/archived 备份/恢复/硬删除；source 稳定性、hash-named 完整 import、旧目标 bytes/hash/mtime 不变、hot `PreserveExisting` 的 existing thread 零 candidate I/O/零 orphan/`copied_session_files = 0`、closed `SelectMostComplete`、旧 writer 可继续写、既有 rollout/provider/title 保留、新 thread 插入、index hot `Skip`/完整原子替换/`Deny` 零写与 `Unchanged` 终前复检；关闭门禁、runtime refresh pending、unknown 终态与 Relay 单一错误面；三尺寸最终产物无 overflow/dialog/emoji；tag-CI packed artifact 的最终大小/hash、Release 重下载合同；以及真实 `v0.2.0 -> v0.2.1` updater 首跳。Defender 因本机功能禁用未形成通过证据，不列入已证明项。
 
 ## 审查依据
 
@@ -173,12 +183,12 @@ v0.2.1 发布门禁必须额外证明：success/rolledBack/prewrite/restore-visi
 4. **慢链路更新与 helper 清理**
    - v0.2.1 下载器将连接超时与总超时分离为 30 秒和 10 分钟。
    - helper readiness 超时后显式 kill + wait，staging 删除使用有界重试，避免僵尸 helper 或瞬时文件占用留下残留。
-   - 该改动不能反向改变已发布 v0.2.0 的 120 秒下载器；首跳必须以真实更新 smoke 证明。
+   - 该改动不能反向改变已发布 v0.2.0 的 120 秒下载器；真实首跳已在约 `105.1s` 内完成自动替换、重启和零残留验证。
 
 5. **最终资产只发布经过双合同的 packed EXE**
    - Cargo release profile 使用 `opt-level = "z"`、LTO、单 codegen unit、`panic = "abort"` 和 strip symbols。
    - 固定 UPX 5.2.0 仅压缩 raw 副本；raw/packed 都跑 release contract，packed 另跑 `upx -t`、PE32+ x64/双版本和 3,000,000 bytes 上限。
-   - 本地临时候选为 raw `5,955,584` bytes、packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`），重复打包一致；最终 tag-CI hash/尺寸、Release 重下载和真实 v0.2.0 首跳仍未由该本地证据替代。
+   - 本地临时候选 raw `5,955,584` bytes → packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`）重复打包一致，但只作为历史候选；最终 tag-CI/Release 资产为 `2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`，回下载合同与真实 v0.2.0 首跳均已完成。
 
 ### 可访问性
 
@@ -230,8 +240,9 @@ v0.2.1 发布门禁必须额外证明：success/rolledBack/prewrite/restore-visi
 | G10 Windows 产物 | Tauri release build 成功；PE `ProductVersion/FileVersion`、资产名、SHA-256、体积和 `npm run check:release` 一致 | 通过：15,129,600 bytes；双版本 0.2.0；本地 SHA-256 `d9e7b8ce1a576635ddd3c46060b4020c5c28fdc90414c4314b3ba473b3c5fa94`；Authenticode `NotSigned` |
 | G11 交付闭环 | PR CI 绿并合并；tag `v0.2.0`；Release 资产重下载校验；两个 live GitHub 合同测试；真实 v0.1.9 一键更新；PR #2 留说明并关闭 | 发布后通过；commit、run、资产 digest 与隔离 UIA 证据见上方 addendum |
 | G12 文本卫生 | 生产源码无 emoji、native dialog、手写 SVG、乱码和异常替换字符；`git diff --check` 通过 | 通过 |
+| G13 v0.2.1 补丁闭环 | PR/main/tag CI；packed 单资产；Release 回下载；两个 live GitHub 合同；真实 v0.2.0 一键更新；最终 cleanup | 通过：merge `3b4f440`、tag run `30195207004`、资产 `2,214,400` bytes / `8F6E…020C`、UIA `105.1s` 内自动重启、leftovers `0`、cleanup `0 attempted / 0 failed / Succeeded / Complete`；Defender disabled，不计为扫描通过 |
 
-上表 G10 是已发布 v0.2.0 的历史 raw 产物证据，不应改写。v0.2.1 已新增 fixed-profile + pinned-UPX packed 链，本地临时候选 `5,955,584 -> 2,228,224` bytes、SHA-256 `4DDC…CED7A` 只证明当前工作树；最终尺寸/hash 必须来自 tag CI 并在 Release 重下载后复核。
+上表 G10 是已发布 v0.2.0 的历史 raw 产物证据，不应改写。v0.2.1 已新增 fixed-profile + pinned-UPX packed 链；本地临时候选 `5,955,584 -> 2,228,224` bytes、SHA-256 `4DDC…CED7A` 只作为历史候选。最终 tag-CI 与 Release 回下载资产均为 `2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`，并已完成双向一致性复核。
 
 ### elevated self-update 为什么仍是发布门禁
 
@@ -285,7 +296,7 @@ Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DA
 
 ### v0.2.x: updater 与供应链
 
-- v0.2.1 已将下载连接/总超时调整为 30 秒/10 分钟并补 helper kill + wait、cleanup retry；发布前必须完成真实 v0.2.0 首跳验证，之后版本才能受益于新超时。
+- v0.2.1 已将下载连接/总超时调整为 30 秒/10 分钟并补 helper kill + wait、cleanup retry；真实 v0.2.0 首跳已完成，后续版本可使用新超时合同。
 - 在受限 DACL 已验证的基础上继续收紧 helper/asset 的不可变句柄与替换时身份复检；无法证明时保持 elevated self-update fail closed。
 - 引入 Windows Authenticode 签名；签名前 Release 必须同时发布 SHA-256 并明确“未签名”。
 - 固定依赖版本、保留 lockfile，建立依赖漏洞的可利用性审查记录。
@@ -297,9 +308,9 @@ Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DA
 - JSONL 去重方案必须考虑 DPAPI 密文非确定性，不能把明文内容哈希暴露到公共日志。
 - 任何增量方案都必须能从单个 manifest 验证并完整恢复，不能依赖猜测目录状态。
 
-## 发布建议
+## 发布结论
 
-本节是 PR 前发布建议。G11 已按上方发布后 addendum 完成，`v0.2.0` 已发布；二次审计发现的补丁项必须在 `v0.2.1` 独立通过本地、PR/main/tag CI、Release 重下载和隔离一键更新闭环后，才能宣告本轮产品目标完成。发布说明应明确：
+本节原为 PR 前发布建议。G11 已按上方发布后 addendum 完成，`v0.2.0` 已发布；二次审计发现的补丁项也已由 `v0.2.1` 独立通过本地、PR/main/tag CI、Release 重下载和隔离一键更新闭环，本轮产品目标已完成。发布说明应明确：
 
 - 已修复 UI 卡死和切后全量历史触碰；
 - changed switch 固定 `RuntimeState + StateOnly`、普通 sync 固定双 `StateOnly`，会话差异通过零 in-place `Allow` 与完整文件原子发布处理，不再扩大为 Runtime/Sessions；
@@ -310,6 +321,7 @@ Windows 定向测试已实际创建受保护 staging 和子文件：父目录 DA
 - 自动清理成功/完整回滚、typed prewrite 和恢复可见临时点；显式 cleanup 的 plan/execute 都复检完整 SHA；Apply/回滚/日志失败、孤儿与无证据目录保留，且不按年龄/数量/mtime prune；
 - cleanup 的 `attemptedCount` / `failedCount` 区分实际执行失败与安全保留 warning；真实受控 UI 已从 21 目录/6,327,089,609 bytes 清到 17 目录/2,693,977,957 bytes，4/4 删除、回收 3,633,111,652 bytes，剩余 17 项不自动删；旧候选产生的 partial/Failed 历史记录不改写；
 - Full/Sessions 与 hard delete 覆盖 `archived_sessions/`；列表/删除使用同一强校验，extra/hash drift 不展示 verified，按需最多 256 个已验证 Full 可页面内显式管理，手工/hard-delete/restore-safety Full 不自动删；
-- v0.2.1 的 30 秒连接/10 分钟下载超时只影响升级后的下载器，必须单列真实 `v0.2.0 -> v0.2.1` 首跳 smoke；
-- 发布资产使用固定 profile 与 pinned UPX copy-only pipeline，CI 只上传 packed `codex-switch.exe`；本地 `2,228,224` bytes / `4DDC…CED7A` 不能冒充最终 tag-CI/Release 资产；
+- v0.2.1 的 30 秒连接/10 分钟下载超时只影响升级后的下载器；真实 `v0.2.0 -> v0.2.1` 首跳已在 `105.1s` 内自动替换并重启，且零 staging/install leftovers；
+- 发布资产使用固定 profile 与 pinned UPX copy-only pipeline，CI 只上传 packed `codex-switch.exe`；本地 `2,228,224` bytes / `4DDC…CED7A` 只是历史候选，最终 tag-CI/Release 资产为 `2,214,400` bytes / `8F6E…020C`；
 - EXE 是否完成 Authenticode 签名。
+- Microsoft Defender 因本机 Product/Feature disabled 未形成扫描通过证据，不能把 release contract 或 `upx -t` 冒充为 Defender 扫描。

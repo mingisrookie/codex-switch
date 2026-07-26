@@ -70,11 +70,13 @@ ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 
 
 ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装后台服务、不设置自启动项，也不会在运行期间周期轮询。检查源固定为本仓库最新正式 GitHub Release，draft 和 prerelease 不参与比较；网络失败不会阻塞其他功能。发现新版后点击“立即更新”，应用会下载固定的 Windows x64 EXE、核对 GitHub 资产大小和 SHA-256，在受限 staging 中准备 helper、plan 和持久化 journal，退出当前进程后替换原 EXE，再自动启动新版本；启动失败或检测到未完成阶段时会验证并恢复旧版本。v0.2.1 下载器使用 30 秒连接超时和 10 分钟总超时，helper readiness 超时会执行 kill + wait，staging 清理使用有界重试。正常 helper 的显式完成/回滚启动仍会闭合恢复；管理员权限进程若在 helper 之外无参数重启，不会扫描 `%TEMP%` 自动续跑，避免接受低完整性进程预造的恢复计划。
 
-> v0.1.6 本身尚未包含 updater，因此从 v0.1.6 升级到 v0.1.7 需要最后一次手动替换；从 v0.1.7 开始，后续版本可在应用内一键更新。已发布 v0.2.0 内置的首跳下载器仍是 120 秒总超时，10 分钟合同只有升级到 v0.2.1 后才生效；`v0.2.0 -> v0.2.1` 必须以真实一键更新 smoke 为准，不能只凭新版本源码宣称首跳已修复。
+> v0.1.6 本身尚未包含 updater，因此从 v0.1.6 升级到 v0.1.7 需要最后一次手动替换；从 v0.1.7 开始，后续版本可在应用内一键更新。已发布 v0.2.0 内置的首跳下载器仍是 120 秒总超时，10 分钟合同只有升级到 v0.2.1 后才生效。本次已用正式 v0.2.0（SHA-256 `42012…A65A`）在隔离环境完成真实 UI Automation 首跳：约 `2.086s` 出现并点击“立即更新”，旧进程约 `89.103s` 后以 exit code `0` 退出，`105.1s` 内自动替换并重启 ChatGPT Switch；目标文件为 `2,214,400` bytes、SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`、版本 `0.2.1`，staging/install leftovers 均为 `0`，没有手工替换。
 
 当前仍只构建和发布 Windows x64 `codex-switch.exe`。更新发现和版本比较保持平台中立，EXE 替换收敛在 Windows 平台边界，为未来 macOS/Linux 的独立安装策略留出接口；这不代表当前版本已经支持非 Windows 平台。
 
-`v0.2.1` 候选的发布链先使用体积优先的 Cargo release profile（`opt-level = "z"`、LTO、单 codegen unit、`panic = "abort"`、strip symbols）构建 raw EXE，再对副本使用固定官方 UPX 5.2.0 执行 `--best --lzma`。raw 与 packed 文件都必须通过 release contract，packed 文件还必须通过 `upx -t`、PE32+ x64、`ProductVersion` / `FileVersion` 和 3,000,000 bytes 硬门禁；CI 只上传 packed 的裸 `codex-switch.exe`。本地临时候选为 raw `5,955,584` bytes、packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`），但这不是最终 Release：最终 tag-CI 资产的大小/hash、重下载合同及真实 `v0.2.0 -> v0.2.1` 一键更新仍须在发布闭环中确认。
+`v0.2.1` 发布链使用体积优先的 Cargo release profile（`opt-level = "z"`、LTO、单 codegen unit、`panic = "abort"`、strip symbols）构建 raw EXE，再对副本使用固定官方 UPX 5.2.0 执行 `--best --lzma`。raw 与 packed 文件都通过 release contract，packed 文件还通过 `upx -t`、PE32+ x64、`ProductVersion` / `FileVersion` 和 3,000,000 bytes 硬门禁；CI 只上传 packed 的裸 `codex-switch.exe`。本地临时候选 raw `5,955,584` bytes → packed `2,228,224` bytes（SHA-256 `4DDC…CED7A`）仅是历史候选，不是正式资产。
+
+[PR #5](https://github.com/mingisrookie/codex-switch/pull/5) 已从工作提交 `702dc37` 合并为 `3b4f440`；PR CI `30194264349` / `30194276794`、main CI `30194772843` 与 tag CI `30195207004` 均通过。annotated tag `v0.2.1` 指向 `3b4f440`；[v0.2.1 Release](https://github.com/mingisrookie/codex-switch/releases/tag/v0.2.1) 是 latest stable、非 draft，唯一资产 `codex-switch.exe` 为 `2,214,400` bytes，SHA-256 `8F6EA219A53BB3395F039327A3CD3827B53EE67B8DAF4B130E60235940A3020C`，PE32+ x64、`FileVersion/ProductVersion = 0.2.1` 且 `upx -t` 通过。Release 回下载与 tag-CI artifact 的 hash/bytes 完全一致，两个 ignored live GitHub 合同测试各 `1 passed`，上述真实 v0.2.0 首跳也已完成。
 
 ## 快速使用
 
@@ -233,7 +235,7 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 
 当前版本**不按年龄、目录数量、mtime 或空间阈值猜测清理**。Apply/回滚/日志失败、孤儿目录、损坏或无法分类的 manifest、缺少终态证据的旧快照全部保留；显式 cleanup 在 plan 与 execute 两阶段都会重新解析严格操作记录，并对完整 manifest、受管路径、文件集合、大小与完整 payload SHA-256 做强复检，计划后任何漂移都 fail closed。只有执行期复检或删除真正失败时，回执才会出现 `failedCount > 0`，页面显示部分完成且操作历史记为 Failed；纯保留 warning 仍是“清理完成（有保留说明）”。持久 Full 不参与自动释放，只能由用户逐个确认删除；创建备份时若 partial 目录清理也失败，错误会同时报告而不再吞掉残留。
 
-2026-07-26 的受控页面清理已把真实备份根从 `21` 个目录、`6,327,089,609` bytes 降到 `17` 个目录、`2,693,977,957` bytes：计划中的 `4/4` 个检查点均删除，回收 `3,633,111,652` bytes，紧邻操作的 C 盘空闲空间测得增加 `3,637,547,008` bytes。首次执行使用的是修复前候选 UI，它把安全保留 warning 误标为“部分完成”，并留下历史 Failed 日志；该历史不改写。现有 `attemptedCount` / `failedCount` 语义和前后端回归已修复此问题，剩余 `17` 项继续保留且不会自动删除。
+2026-07-26 的受控页面清理已把真实备份根从 `21` 个目录、`6,327,089,609` bytes 降到 `17` 个目录、`2,693,977,957` bytes：计划中的 `4/4` 个检查点均删除，回收 `3,633,111,652` bytes，紧邻操作的 C 盘空闲空间测得增加 `3,637,547,008` bytes。首次执行使用的是修复前候选 UI，它把安全保留 warning 误标为“部分完成”，并留下历史 Failed 日志；该历史不改写。现有 `attemptedCount` / `failedCount` 语义和前后端回归已修复此问题；发布闭环后的最终 cleanup 为 `0 attempted / 0 failed / Succeeded / Complete`，剩余 `17` 项继续保留且不会自动删除。
 
 ## 文件位置
 
@@ -308,6 +310,7 @@ Codex 会话存储说明：
 - 操作记录只保存 action、阶段、终态、操作 ID、备份目录和计数，不保存凭据、请求正文或自由文本错误。
 - 会话管理里的删除是硬删除；工具会先备份并支持失败补偿，同时清理四个受管 SQLite 中可识别的 thread 关联。操作前仍需在页面内确认选择范围。
 - 自更新 staging 名来自 Windows CSPRNG；目录创建时按当前 token 是否 elevated 应用受限 DACL，并持有目录句柄。helper 以持久化阶段 journal、目标/备份 hash 和 Tauri Ready ACK 决定继续、完成或回滚；elevated 无参数启动不会从 `%TEMP%` 自动发现并执行恢复计划。
+- 本机 Microsoft Defender 的 Product/Feature 处于 disabled 状态，相关命令无法形成“扫描通过”证据；Release 的 hash、合同、`upx -t` 和真实更新验证不应被误述为 Defender 扫描结果。
 - 生产 UI 不使用 emoji、`window.alert`、`window.confirm`、`window.prompt` 或原生 `<dialog>`；配置、确认、进度、Full 删除和失败都在页面内呈现，图标统一使用 Lucide。切换关闭门禁必须在挂载时预注册，运行态刷新完成前不得允许再次切换。
 
 ## 开发
