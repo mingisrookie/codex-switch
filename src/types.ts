@@ -338,6 +338,8 @@ export type SessionSyncResult = {
   skippedMissingSessionFiles: number;
   skippedArchivedThreads: number;
   mergedSessionIndexEntries: number;
+  persistentSessionBytesAdded: number;
+  persistentSessionBytesReclaimed: number;
   rolledBack?: boolean;
   warnings?: string[];
   checkpointCleanup?: CheckpointCleanupSummary;
@@ -353,6 +355,19 @@ export type RuntimeSwitchResult = {
   rolledBack: boolean;
   warnings?: string[];
   checkpointCleanup?: CheckpointCleanupSummary;
+  chatProcessStateRepaired: boolean;
+  chatgptLaunch: ChatGptLaunchResult;
+};
+
+export type ChatGptLaunchStatus =
+  | 'launched'
+  | 'alreadyRunning'
+  | 'failed'
+  | 'notRequested';
+
+export type ChatGptLaunchResult = {
+  status: ChatGptLaunchStatus;
+  message: string | null;
 };
 
 export type RuntimeSwitchPhase =
@@ -362,12 +377,14 @@ export type RuntimeSwitchPhase =
   | 'verifyingRelay'
   | 'backingUpCurrent'
   | 'backingUpShared'
+  | 'repairingAppState'
   | 'syncingToShared'
   | 'applyingRuntime'
   | 'syncingToCurrent'
   | 'verifying'
   | 'rollingBack'
   | 'cleaningCheckpoints'
+  | 'launchingApp'
   | 'complete'
   | 'failed';
 

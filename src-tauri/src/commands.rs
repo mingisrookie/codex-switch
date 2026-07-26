@@ -19,13 +19,14 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::{
     backup::{
         cleanup_automatic_checkpoints as cleanup_checkpoint_storage, cleanup_transient_checkpoints,
-        create_backup_with_paths, create_state_backup_with_paths, delete_verified_full_backup,
+        create_backup_with_paths, create_state_checkpoint_with_paths, delete_verified_full_backup,
         inspect_checkpoint_storage as inspect_checkpoint_storage_at,
         list_recent_backups as list_backup_snapshots, migrate_legacy_plaintext_auth,
         preflight_backup_capacity_for_sources, preflight_backup_capacity_with_paths,
-        restore_backup as restore_backup_snapshot, verify_backup, BackupCapacitySource,
-        BackupManifest, BackupScope, BackupSummary, CheckpointCleanupReceipt,
-        CheckpointCleanupSummary, CheckpointStorageStatus, RestoreResult,
+        preflight_combined_capacity_for_sources, restore_backup as restore_backup_snapshot,
+        verify_backup, AdditionalCapacityDemand, BackupCapacitySource, BackupManifest, BackupScope,
+        BackupSummary, CheckpointCleanupReceipt, CheckpointCleanupSummary, CheckpointRole,
+        CheckpointStorageStatus, RestoreResult,
     },
     codex_home::{scan_codex_home as scan_home, CodexHomeStatus},
     codex_paths::{
@@ -36,8 +37,9 @@ use crate::{
         OperationRecord, OperationStatus,
     },
     process_control::{
-        close_codex_processes as close_codex, list_codex_processes as list_processes,
-        list_standalone_codex_processes as list_standalone_processes, CodexProcess,
+        cache_chatgpt_launch_target, close_codex_processes as close_codex, launch_cached_chatgpt,
+        list_codex_process_inventory as list_process_inventory,
+        list_codex_processes as list_processes, CodexProcess,
     },
     relay_verify::verify_relay,
     runtime_store::{
@@ -46,8 +48,8 @@ use crate::{
     runtime_switcher::{
         preflight_hot_session_sync_with_paths, preflight_runtime_session_sync_with_paths,
         preflight_runtime_switch, switch_runtime_files_preflighted_with_progress,
-        sync_home_with_shared_preflighted_with_paths, BackupReceiptSummary, RuntimeSwitchOutcome,
-        RuntimeSwitchPhase, RuntimeSwitchResult,
+        sync_home_with_shared_preflighted_with_paths, BackupReceiptSummary, ChatGptLaunchReceipt,
+        ChatGptLaunchStatus, RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
     },
     session_manager::{
         delete_managed_sessions_detailed_with_prepare as delete_sessions,
@@ -59,7 +61,7 @@ use crate::{
         build_sync_dry_run, scan_sessions as scan_session_inventory,
         scan_sessions_local as scan_local_session_inventory, SessionInventory, SyncDryRun,
     },
-    session_sync::SessionSyncResult,
+    session_sync::{cleanup_obsolete_provider_slots, SessionSyncResult},
     skill_manager::{
         install_skill_at, list_skills_at, save_skill_config_at, SkillConfigInput, SkillId,
         SkillMutationReceipt, SkillStatus,
@@ -413,6 +415,16 @@ pub async fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
 }
 
 #[tauri::command]
+pub async fn launch_chatgpt() -> Result<ChatGptLaunchReceipt, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        Ok(ChatGptLaunchReceipt::from(launch_cached_chatgpt()))
+    })
+    .await
+    .map_err(|_| "ChatGPT launch worker failed".to_string())?
+}
+
+#[tauri::command]
 pub async fn switch_runtime(
     runtime_id: String,
     on_progress: Channel<RuntimeSwitchProgress>,
@@ -475,6 +487,7 @@ fn switch_runtime_blocking(
     };
     let mut failure_backups = Vec::new();
     let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
+    let mut failure_operation_id = None;
     let mut checkpoint_root = None;
     emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::PlanningSessions, None);
     let mut result = (|| {
@@ -484,6 +497,7 @@ fn switch_runtime_blocking(
         checkpoint_root = Some(backup_root.clone());
         let shared_home = default_shared_sessions_root()?;
         let shared_paths = local_codex_paths(&shared_home);
+        let mut launch_target_captured = false;
         let plan = prepare_runtime_switch_before_close(
             runtime_id == RELAY_RUNTIME_ID,
             || {
@@ -493,7 +507,15 @@ fn switch_runtime_blocking(
                 Ok((plan, requires_change))
             },
             |plan| {
-                preflight_backup_capacity_for_sources(
+                let session_demands = plan.session_storage_plan().demands();
+                let additional = session_demands
+                    .iter()
+                    .map(|demand| AdditionalCapacityDemand {
+                        destination: &demand.destination,
+                        bytes: demand.bytes,
+                    })
+                    .collect::<Vec<_>>();
+                preflight_combined_capacity_for_sources(
                     &backup_root,
                     &[
                         BackupCapacitySource {
@@ -507,6 +529,7 @@ fn switch_runtime_blocking(
                             scope: plan.shared_backup_scope(),
                         },
                     ],
+                    &additional,
                 )?;
                 preflight_runtime_session_sync_with_paths(plan.codex_paths(), &shared_paths)
             },
@@ -516,10 +539,27 @@ fn switch_runtime_blocking(
                 store.mark_verified(RELAY_RUNTIME_ID)?;
                 Ok(())
             },
-            || list_managed_processes_for_closed_mutation("switching runtimes"),
+            || {
+                let processes = list_managed_processes_for_closed_mutation("switching runtimes")?;
+                capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+                    // The pre-close inventory is the only point at which the
+                    // running package identity may be captured. The post-close
+                    // inventory must not erase it.
+                    let _ = cache_chatgpt_launch_target();
+                });
+                Ok(processes)
+            },
             || close_codex().map(|_| ()),
             |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
         )?;
+        if !plan.requires_change() {
+            // A no-op does not enter the process-close gate, so capture the
+            // currently running package identity here before the controlled
+            // launcher consumes it or falls back to registered-app discovery.
+            capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+                let _ = cache_chatgpt_launch_target();
+            });
+        }
         match switch_runtime_files_preflighted_with_progress(
             &store,
             &current_home,
@@ -530,6 +570,7 @@ fn switch_runtime_blocking(
         ) {
             Ok(receipt) => Ok(receipt),
             Err(failure) => {
+                failure_operation_id = failure.operation_id;
                 failure_backups = failure.backups;
                 failure_outcome = failure.outcome;
                 Err(failure.message)
@@ -546,33 +587,95 @@ fn switch_runtime_blocking(
                     "fromShared".to_string(),
                     receipt.from_shared.inserted_threads,
                 ),
+                (
+                    "chatProcessStateRepaired".to_string(),
+                    usize::from(receipt.chat_process_state_repaired),
+                ),
             ]),
         ),
         Err(_) => (
-            attempt_id.as_str(),
+            failure_operation_id
+                .as_deref()
+                .unwrap_or(attempt_id.as_str()),
             failure_backups.as_slice(),
             BTreeMap::new(),
         ),
     };
-    let terminal_recorded =
-        record_runtime_switch_result(id, started, &result, backups, counts, failure_outcome)
-            .is_ok();
+    let terminal_record =
+        record_runtime_switch_result(id, started, &result, backups, counts, failure_outcome).ok();
+    let terminal_recorded = terminal_record.is_some();
     match &mut result {
-        Ok(receipt) if receipt.changed => {
-            if terminal_recorded {
-                emit_runtime_switch_progress(
-                    &on_progress,
-                    RuntimeSwitchPhase::CleaningCheckpoints,
-                    None,
+        Ok(receipt) => {
+            if receipt.changed {
+                if terminal_recorded {
+                    emit_runtime_switch_progress(
+                        &on_progress,
+                        RuntimeSwitchPhase::CleaningCheckpoints,
+                        None,
+                    );
+                }
+                let cleanup = release_transient_checkpoints(
+                    checkpoint_root.as_deref(),
+                    terminal_record.as_ref(),
+                    receipt.backup_manifests.as_slice(),
                 );
+                receipt.warnings.extend(cleanup.warnings.clone());
+                receipt.checkpoint_cleanup = cleanup;
+                if terminal_recorded
+                    && (!receipt.to_shared.obsolete_provider_slots.is_empty()
+                        || !receipt.from_shared.obsolete_provider_slots.is_empty())
+                {
+                    match (managed_codex_home(), default_shared_sessions_root()) {
+                        (Ok(current_home), Ok(shared_home)) => {
+                            match resolve_user_codex_paths(&current_home) {
+                                Ok(current_paths) => {
+                                    let shared_paths = local_codex_paths(&shared_home);
+                                    let to_shared_gc = cleanup_obsolete_provider_slots(
+                                        &receipt.to_shared.obsolete_provider_slots,
+                                        &current_paths,
+                                        &shared_paths,
+                                    );
+                                    receipt.to_shared.persistent_session_bytes_reclaimed = receipt
+                                        .to_shared
+                                        .persistent_session_bytes_reclaimed
+                                        .saturating_add(to_shared_gc.reclaimed_bytes);
+                                    receipt.warnings.extend(to_shared_gc.warnings);
+                                    let from_shared_gc = cleanup_obsolete_provider_slots(
+                                        &receipt.from_shared.obsolete_provider_slots,
+                                        &current_paths,
+                                        &shared_paths,
+                                    );
+                                    receipt.from_shared.persistent_session_bytes_reclaimed =
+                                        receipt
+                                            .from_shared
+                                            .persistent_session_bytes_reclaimed
+                                            .saturating_add(from_shared_gc.reclaimed_bytes);
+                                    receipt.warnings.extend(from_shared_gc.warnings);
+                                }
+                                Err(_) => receipt
+                                    .warnings
+                                    .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
+                            }
+                        }
+                        _ => receipt
+                            .warnings
+                            .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
+                    }
+                }
             }
-            let cleanup = release_transient_checkpoints(
-                checkpoint_root.as_deref(),
-                terminal_recorded,
-                receipt.backup_manifests.as_slice(),
-            );
-            receipt.warnings.extend(cleanup.warnings.clone());
-            receipt.checkpoint_cleanup = cleanup;
+            if successful_switch_requests_chatgpt_launch(receipt.changed) {
+                if terminal_recorded {
+                    emit_runtime_switch_progress(
+                        &on_progress,
+                        RuntimeSwitchPhase::LaunchingApp,
+                        None,
+                    );
+                }
+                receipt.chatgpt_launch =
+                    launch_chatgpt_after_durable_terminal(terminal_recorded, || {
+                        ChatGptLaunchReceipt::from(launch_cached_chatgpt())
+                    });
+            }
         }
         Err(error)
             if failed_runtime_switch_checkpoints_are_releasable(
@@ -589,7 +692,7 @@ fn switch_runtime_blocking(
             }
             let cleanup = release_transient_checkpoints(
                 checkpoint_root.as_deref(),
-                terminal_recorded,
+                terminal_record.as_ref(),
                 failure_backups.as_slice(),
             );
             append_warnings_to_error(error, &cleanup.warnings);
@@ -598,6 +701,42 @@ fn switch_runtime_blocking(
     }
     emit_runtime_switch_terminal(&on_progress, &result, failure_outcome);
     result
+}
+
+fn capture_chatgpt_launch_target_once<Capture>(captured: &mut bool, capture: Capture)
+where
+    Capture: FnOnce(),
+{
+    if *captured {
+        return;
+    }
+    capture();
+    *captured = true;
+}
+
+fn successful_switch_requests_chatgpt_launch(_changed: bool) -> bool {
+    // Product contract: both an applied switch and a successful no-op finish
+    // by bringing ChatGPT to a running state.
+    true
+}
+
+fn launch_chatgpt_after_durable_terminal<Launch>(
+    terminal_recorded: bool,
+    launch: Launch,
+) -> ChatGptLaunchReceipt
+where
+    Launch: FnOnce() -> ChatGptLaunchReceipt,
+{
+    if !terminal_recorded {
+        return ChatGptLaunchReceipt {
+            status: ChatGptLaunchStatus::Failed,
+            message: Some(
+                "ChatGPT was not launched because the runtime switch terminal record could not be persisted."
+                    .to_string(),
+            ),
+        };
+    }
+    launch()
 }
 
 fn prepare_runtime_switch_before_close<Plan, Prepare, Capacity, Verify, List, Close, Progress>(
@@ -625,8 +764,17 @@ where
             verify_relay_connection,
             list_managed_processes,
             close_managed_processes,
-            progress,
+            &mut progress,
         )?;
+        progress(
+            RuntimeSwitchPhase::PlanningSessions,
+            Some("Rechecking the closed-session write set and disk capacity".to_string()),
+        );
+        let (closed_plan, closed_requires_change) = prepare_switch()?;
+        if closed_requires_change {
+            verify_backup_capacity(&closed_plan)?;
+        }
+        return Ok(closed_plan);
     } else if verify_relay_first {
         progress(RuntimeSwitchPhase::VerifyingRelay, None);
         verify_relay_connection()?;
@@ -768,6 +916,8 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
                     &backup_root,
                     "sync-current",
                     current_paths.clone(),
+                    &operation_id,
+                    CheckpointRole::Current,
                 )
             },
         )?;
@@ -777,6 +927,8 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
             &backup_root,
             "sync-shared",
             shared_paths.clone(),
+            &operation_id,
+            CheckpointRole::Shared,
         )?;
         backups.push(shared_backup.clone());
         ensure_codex_paths_unchanged("session sync", &current_home, &current_paths)?;
@@ -816,31 +968,58 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
     })();
     match &mut result {
         Ok(receipt) => {
-            let terminal_recorded = record_success_result(
+            let terminal_record = record_success_result(
                 &operation_id,
                 OperationAction::SyncSessions,
                 started,
                 &backups,
                 sync_counts(&receipt.result),
             )
-            .is_ok();
+            .ok();
+            let terminal_recorded = terminal_record.is_some();
             let cleanup = release_transient_checkpoints(
                 checkpoint_root.as_deref(),
-                terminal_recorded,
+                terminal_record.as_ref(),
                 backups.as_slice(),
             );
             receipt.warnings.extend(cleanup.warnings.clone());
             receipt.checkpoint_cleanup = cleanup;
+            if terminal_recorded && !receipt.result.obsolete_provider_slots.is_empty() {
+                match (managed_codex_home(), default_shared_sessions_root()) {
+                    (Ok(current_home), Ok(shared_home)) => {
+                        match resolve_user_codex_paths(&current_home) {
+                            Ok(current_paths) => {
+                                let shared_paths = local_codex_paths(&shared_home);
+                                let gc = cleanup_obsolete_provider_slots(
+                                    &receipt.result.obsolete_provider_slots,
+                                    &current_paths,
+                                    &shared_paths,
+                                );
+                                receipt.result.persistent_session_bytes_reclaimed = receipt
+                                    .result
+                                    .persistent_session_bytes_reclaimed
+                                    .saturating_add(gc.reclaimed_bytes);
+                                receipt.warnings.extend(gc.warnings);
+                            }
+                            Err(_) => receipt
+                                .warnings
+                                .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
+                        }
+                    }
+                    _ => receipt
+                        .warnings
+                        .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
+                }
+            }
         }
         Err(error) => {
             let status = failure_status.unwrap_or_else(|| terminal_status(error));
-            let terminal_recorded =
-                record_sync_failure(&operation_id, status, failure_phase, started, &backups)
-                    .is_ok();
+            let terminal_record =
+                record_sync_failure(&operation_id, status, failure_phase, started, &backups).ok();
             if failure_phase == OperationPhase::Backup && !backups.is_empty() {
                 let cleanup = release_transient_checkpoints(
                     checkpoint_root.as_deref(),
-                    terminal_recorded,
+                    terminal_record.as_ref(),
                     backups.as_slice(),
                 );
                 append_warnings_to_error(error, &cleanup.warnings);
@@ -901,7 +1080,7 @@ pub fn restore_sessions_visible(ids: Vec<String>) -> Result<SessionMutationRecei
         let backup_root = default_backup_root()?;
         checkpoint_root = Some(backup_root.clone());
         let current_home = managed_codex_home()?;
-        match restore_visible(&current_home, &backup_root, &ids, || {
+        match restore_visible(&current_home, &backup_root, &ids, &operation_id, || {
             ensure_codex_closed("restoring session visibility")
         }) {
             Ok(result) => Ok(result),
@@ -1471,27 +1650,29 @@ fn create_hot_sync_backup_with_paths(
     backup_root: &Path,
     reason: &str,
     paths: CodexPaths,
+    operation_id: &str,
+    role: CheckpointRole,
 ) -> Result<BackupManifest, String> {
-    create_state_backup_with_paths(home, backup_root, reason, paths)
+    create_state_checkpoint_with_paths(home, backup_root, reason, paths, operation_id, role)
 }
 
 fn release_transient_checkpoints(
     backup_root: Option<&Path>,
-    terminal_recorded: bool,
+    terminal_record: Option<&OperationRecord>,
     backups: &[BackupManifest],
 ) -> CheckpointCleanupSummary {
     if backups.is_empty() {
         return CheckpointCleanupSummary::default();
     }
-    if !terminal_recorded {
+    let Some(terminal_record) = terminal_record else {
         return CheckpointCleanupSummary {
             retained_count: backups.len(),
             warnings: vec!["终态记录未能持久化；临时检查点已保留".to_string()],
             ..CheckpointCleanupSummary::default()
         };
-    }
+    };
     match backup_root {
-        Some(root) => cleanup_transient_checkpoints(root, backups),
+        Some(root) => cleanup_transient_checkpoints(root, terminal_record, backups),
         None => CheckpointCleanupSummary {
             retained_count: backups.len(),
             warnings: vec![
@@ -1559,7 +1740,8 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
 }
 
 fn ensure_codex_closed(action: &str) -> Result<(), String> {
-    ensure_codex_closed_from_processes(action, list_processes()?, list_standalone_processes()?)
+    let (managed, standalone) = list_process_inventory()?;
+    ensure_codex_closed_from_processes(action, managed, standalone)
 }
 
 fn ensure_codex_paths_unchanged(
@@ -1594,9 +1776,9 @@ fn ensure_codex_closed_from_processes(
 }
 
 fn list_managed_processes_for_closed_mutation(action: &str) -> Result<Vec<CodexProcess>, String> {
-    let standalone = list_standalone_processes()?;
+    let (managed, standalone) = list_process_inventory()?;
     if standalone.is_empty() {
-        list_processes()
+        Ok(managed)
     } else {
         Err(format!(
             "a standalone Codex CLI is still running; close it before {action}"
@@ -1716,11 +1898,11 @@ fn finish_session_mutation_with_log(
 ) -> Result<SessionMutationReceipt, String> {
     match result {
         Ok(result) => {
-            let terminal_recorded = log
+            let terminal_record = log
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|log| {
-                    append_operation_record_to(
+                    append_operation_record_receipt_to(
                         log,
                         &operation_id,
                         action,
@@ -1733,12 +1915,13 @@ fn finish_session_mutation_with_log(
                         mutation_counts(&result),
                     )
                 })
-                .is_ok();
+                .ok();
+            let terminal_recorded = terminal_record.is_some();
             let mut warnings = Vec::new();
             let checkpoint_cleanup = if action == OperationAction::RestoreVisibility {
                 let cleanup = release_transient_checkpoints(
                     checkpoint_root,
-                    terminal_recorded,
+                    terminal_record.as_ref(),
                     &result.backups,
                 );
                 if result.backups.is_empty() && !terminal_recorded {
@@ -1808,7 +1991,7 @@ fn record_runtime_switch_result<T>(
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
     failure_outcome: RuntimeSwitchOutcome,
-) -> Result<(), String> {
+) -> Result<OperationRecord, String> {
     record_runtime_switch_result_to_log(
         &operation_log()?,
         operation_id,
@@ -1828,7 +2011,7 @@ fn record_runtime_switch_result_to_log<T>(
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
     failure_outcome: RuntimeSwitchOutcome,
-) -> Result<(), String> {
+) -> Result<OperationRecord, String> {
     let terminal = match result {
         Ok(_) => OperationTerminal {
             status: OperationStatus::Succeeded,
@@ -1853,7 +2036,7 @@ fn record_runtime_switch_result_to_log<T>(
             },
         },
     };
-    append_operation_record_to(
+    append_operation_record_receipt_to(
         log,
         operation_id,
         OperationAction::SwitchRuntime,
@@ -1870,7 +2053,7 @@ fn record_sync_failure(
     phase: OperationPhase,
     started_at_ms: u128,
     backups: &[BackupManifest],
-) -> Result<(), String> {
+) -> Result<OperationRecord, String> {
     record_sync_failure_to_log(
         &operation_log()?,
         operation_id,
@@ -1888,8 +2071,8 @@ fn record_sync_failure_to_log(
     phase: OperationPhase,
     started_at_ms: u128,
     backups: &[BackupManifest],
-) -> Result<(), String> {
-    append_operation_record_to(
+) -> Result<OperationRecord, String> {
+    append_operation_record_receipt_to(
         log,
         operation_id,
         OperationAction::SyncSessions,
@@ -1943,7 +2126,7 @@ fn record_success_result(
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
-) -> Result<(), String> {
+) -> Result<OperationRecord, String> {
     append_operation_record(
         operation_id,
         action,
@@ -1971,7 +2154,7 @@ fn append_operation_record(
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
-) -> Result<(), String> {
+) -> Result<OperationRecord, String> {
     let phase = operation_phase(&action, &status);
     append_operation_record_with_phase(
         operation_id,
@@ -1992,8 +2175,8 @@ fn append_operation_record_with_phase(
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
-) -> Result<(), String> {
-    append_operation_record_to(
+) -> Result<OperationRecord, String> {
+    append_operation_record_receipt_to(
         &operation_log()?,
         operation_id,
         action,
@@ -2013,7 +2196,28 @@ fn append_operation_record_to(
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
 ) -> Result<(), String> {
-    log.append(&OperationRecord {
+    append_operation_record_receipt_to(
+        log,
+        operation_id,
+        action,
+        terminal,
+        started_at_ms,
+        backups,
+        counts,
+    )
+    .map(|_| ())
+}
+
+fn append_operation_record_receipt_to(
+    log: &OperationLog,
+    operation_id: &str,
+    action: OperationAction,
+    terminal: OperationTerminal,
+    started_at_ms: u128,
+    backups: &[BackupManifest],
+    counts: BTreeMap<String, usize>,
+) -> Result<OperationRecord, String> {
+    let record = OperationRecord {
         operation_id: operation_id.to_string(),
         action,
         status: terminal.status,
@@ -2025,9 +2229,12 @@ fn append_operation_record_to(
             .map(|backup| backup.backup_dir.clone())
             .collect(),
         counts,
-    })
+    };
+    log.append(&record)?;
+    Ok(record)
 }
 
+#[derive(Debug, Clone, Copy)]
 struct OperationTerminal {
     status: OperationStatus,
     phase: OperationPhase,
@@ -2111,7 +2318,9 @@ mod tests {
 
     use crate::{
         backup::{
-            create_backup, create_runtime_state_backup_with_paths, create_state_backup, BackupScope,
+            create_backup, create_runtime_state_backup_with_paths,
+            create_runtime_state_checkpoint_with_paths, create_state_backup,
+            create_state_checkpoint_with_paths, BackupScope, CheckpointRole,
         },
         codex_paths::resolve_user_codex_paths,
         operation_log::{OperationAction, OperationLog, OperationPhase, OperationStatus},
@@ -2121,19 +2330,21 @@ mod tests {
 
     use super::{
         acquire_mutation_lock_at, after_capacity_preflight, append_operation_record_to,
-        checkpoint_cleanup_counts, checkpoint_cleanup_terminal, cleanup_automatic_checkpoints,
-        close_codex_processes, compensate_failed_hot_sync, create_full_backup,
-        default_codex_home_from_env, delete_backup, delete_backup_at, emit_runtime_switch_terminal,
-        ensure_codex_closed_from_processes, ensure_codex_paths_unchanged,
-        failed_runtime_switch_checkpoints_are_releasable, finish_session_mutation_with_log,
-        get_app_status, inspect_checkpoint_storage, list_backups, list_backups_at,
+        capture_chatgpt_launch_target_once, checkpoint_cleanup_counts, checkpoint_cleanup_terminal,
+        cleanup_automatic_checkpoints, close_codex_processes, compensate_failed_hot_sync,
+        create_full_backup, default_codex_home_from_env, delete_backup, delete_backup_at,
+        emit_runtime_switch_terminal, ensure_codex_closed_from_processes,
+        ensure_codex_paths_unchanged, failed_runtime_switch_checkpoints_are_releasable,
+        finish_session_mutation_with_log, get_app_status, inspect_checkpoint_storage,
+        launch_chatgpt, launch_chatgpt_after_durable_terminal, list_backups, list_backups_at,
         preflight_before_process_gate, prepare_runtime_switch_before_close, record_result_to_log,
         record_runtime_switch_result_to_log, record_sync_failure_to_log,
-        release_transient_checkpoints, run_runtime_switch_preflight, switch_runtime,
-        sync_all_sessions, validate_backup_selection, BackupDeleteReceipt, BackupReceiptSummary,
-        CheckpointCleanupReceipt, CreateFullBackupReceipt, MutationCoordinator, OperationTerminal,
-        RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
-        MAX_LISTED_FULL_BACKUPS,
+        release_transient_checkpoints, run_runtime_switch_preflight,
+        successful_switch_requests_chatgpt_launch, switch_runtime, sync_all_sessions,
+        validate_backup_selection, BackupDeleteReceipt, BackupReceiptSummary, ChatGptLaunchReceipt,
+        ChatGptLaunchStatus, CheckpointCleanupReceipt, CreateFullBackupReceipt,
+        MutationCoordinator, OperationTerminal, RuntimeSwitchOutcome, RuntimeSwitchPhase,
+        RuntimeSwitchProgress, RuntimeSwitchResult, MAX_LISTED_FULL_BACKUPS,
     };
 
     #[cfg(windows)]
@@ -2199,6 +2410,18 @@ mod tests {
         }
 
         assert_future(close_codex_processes());
+    }
+
+    #[test]
+    fn chatgpt_launch_command_remains_async() {
+        fn assert_future<F>(future: F)
+        where
+            F: Future<Output = Result<ChatGptLaunchReceipt, String>> + Send,
+        {
+            drop(future);
+        }
+
+        assert_future(launch_chatgpt());
     }
 
     #[test]
@@ -2619,13 +2842,21 @@ mod tests {
             parent_pid: 42,
             creation_time_100ns: Some(1),
         };
-        let mut relay_listings = VecDeque::from([Ok(vec![root]), Ok(Vec::new())]);
+        let mut relay_listings: VecDeque<Result<Vec<CodexProcess>, String>> =
+            VecDeque::from([Ok(vec![root]), Ok(Vec::new())]);
+        let relay_captured = Cell::new(false);
         let relay_closed = Cell::new(false);
         let mut relay_phases = Vec::new();
         run_runtime_switch_preflight(
             true,
             || Ok(()),
-            || relay_listings.pop_front().expect("unexpected listing"),
+            || {
+                let processes = relay_listings.pop_front().expect("unexpected listing")?;
+                if !processes.is_empty() {
+                    relay_captured.set(true);
+                }
+                Ok(processes)
+            },
             || {
                 relay_closed.set(true);
                 Ok(())
@@ -2633,6 +2864,7 @@ mod tests {
             |phase, _| relay_phases.push(phase),
         )
         .unwrap();
+        assert!(relay_captured.get());
         assert!(relay_closed.get());
         assert_eq!(
             relay_phases,
@@ -2664,7 +2896,9 @@ mod tests {
             parent_pid: 42,
             creation_time_100ns: Some(1),
         };
-        let listings = RefCell::new(VecDeque::from([Ok(vec![root]), Ok(Vec::new())]));
+        let listings: RefCell<VecDeque<Result<Vec<CodexProcess>, String>>> =
+            RefCell::new(VecDeque::from([Ok(vec![root]), Ok(Vec::new())]));
+        let mut launch_target_captured = false;
 
         let plan = prepare_runtime_switch_before_close(
             true,
@@ -2682,10 +2916,14 @@ mod tests {
             },
             || {
                 calls.borrow_mut().push("list");
-                listings
+                let processes = listings
                     .borrow_mut()
                     .pop_front()
-                    .expect("unexpected listing")
+                    .expect("unexpected listing")?;
+                capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+                    calls.borrow_mut().push("capture");
+                });
+                Ok(processes)
             },
             || {
                 calls.borrow_mut().push("close");
@@ -2697,6 +2935,9 @@ mod tests {
                 }
                 RuntimeSwitchPhase::DetectingApp => calls.borrow_mut().push("phase:detectingApp"),
                 RuntimeSwitchPhase::ClosingApp => calls.borrow_mut().push("phase:closingApp"),
+                RuntimeSwitchPhase::PlanningSessions => {
+                    calls.borrow_mut().push("phase:planningSessions")
+                }
                 _ => panic!("unexpected pre-close phase"),
             },
         )
@@ -2712,11 +2953,86 @@ mod tests {
                 "relay",
                 "phase:detectingApp",
                 "list",
+                "capture",
                 "phase:closingApp",
                 "close",
                 "list",
+                "phase:planningSessions",
+                "config",
+                "capacity",
             ]
         );
+    }
+
+    #[test]
+    fn chatgpt_launch_target_capture_runs_only_on_the_first_process_listing() {
+        let capture_calls = Cell::new(0);
+        let mut captured = false;
+
+        capture_chatgpt_launch_target_once(&mut captured, || {
+            capture_calls.set(capture_calls.get() + 1);
+        });
+        capture_chatgpt_launch_target_once(&mut captured, || {
+            capture_calls.set(capture_calls.get() + 1);
+        });
+
+        assert!(captured);
+        assert_eq!(capture_calls.get(), 1);
+    }
+
+    #[test]
+    fn chatgpt_launch_requires_a_durable_terminal_and_preserves_typed_failures() {
+        let launch_calls = Cell::new(0);
+        let terminal_failure = launch_chatgpt_after_durable_terminal(false, || {
+            launch_calls.set(launch_calls.get() + 1);
+            ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::Launched,
+                message: None,
+            }
+        });
+
+        assert_eq!(launch_calls.get(), 0);
+        assert_eq!(terminal_failure.status, ChatGptLaunchStatus::Failed);
+        assert!(terminal_failure
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("terminal record"));
+
+        let activation_failure = launch_chatgpt_after_durable_terminal(true, || {
+            launch_calls.set(launch_calls.get() + 1);
+            ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::Failed,
+                message: Some("injected activation failure".to_string()),
+            }
+        });
+
+        assert_eq!(launch_calls.get(), 1);
+        assert_eq!(
+            activation_failure,
+            ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::Failed,
+                message: Some("injected activation failure".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn successful_noop_switch_still_requests_chatgpt_and_preserves_already_running() {
+        assert!(successful_switch_requests_chatgpt_launch(false));
+
+        let launch_calls = Cell::new(0);
+        let receipt = launch_chatgpt_after_durable_terminal(true, || {
+            launch_calls.set(launch_calls.get() + 1);
+            ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::AlreadyRunning,
+                message: None,
+            }
+        });
+
+        assert_eq!(launch_calls.get(), 1);
+        assert_eq!(receipt.status, ChatGptLaunchStatus::AlreadyRunning);
+        assert_eq!(receipt.message, None);
     }
 
     #[test]
@@ -2747,7 +3063,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_account_no_op_skips_capacity_detection_and_close() {
+    fn exact_account_no_op_skips_close_but_captures_the_launch_target() {
         let plan = prepare_runtime_switch_before_close(
             false,
             || Ok((false, false)),
@@ -2760,6 +3076,15 @@ mod tests {
         .unwrap();
 
         assert!(!plan);
+        let capture_calls = Cell::new(0);
+        let mut launch_target_captured = false;
+        if !plan {
+            capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+                capture_calls.set(capture_calls.get() + 1);
+            });
+        }
+        assert!(launch_target_captured);
+        assert_eq!(capture_calls.get(), 1);
     }
 
     #[test]
@@ -2869,26 +3194,36 @@ mod tests {
             let shared = tempdir().unwrap();
             let backup_root = tempdir().unwrap();
             let log_root = tempdir().unwrap();
-            let current_checkpoint = create_runtime_state_backup_with_paths(
+            let operation_id = format!("switch-prewrite-{checkpoint_count}");
+            let current_checkpoint = create_runtime_state_checkpoint_with_paths(
                 current.path(),
                 backup_root.path(),
                 "switch-runtime-current",
                 resolve_user_codex_paths(current.path()).unwrap(),
+                &operation_id,
+                CheckpointRole::Current,
             )
             .unwrap();
             let mut checkpoints = vec![current_checkpoint];
             if checkpoint_count == 2 {
                 checkpoints.push(
-                    create_state_backup(shared.path(), backup_root.path(), "switch-runtime-shared")
-                        .unwrap(),
+                    create_state_checkpoint_with_paths(
+                        shared.path(),
+                        backup_root.path(),
+                        "switch-runtime-shared",
+                        resolve_user_codex_paths(shared.path()).unwrap(),
+                        &operation_id,
+                        CheckpointRole::Shared,
+                    )
+                    .unwrap(),
                 );
             }
             let log = OperationLog::new(log_root.path().join("operations.jsonl"));
             let result: Result<(), String> = Err("injected prewrite failure".to_string());
 
-            record_runtime_switch_result_to_log(
+            let record = record_runtime_switch_result_to_log(
                 &log,
-                &format!("switch-prewrite-{checkpoint_count}"),
+                &operation_id,
                 1,
                 &result,
                 &checkpoints,
@@ -2896,8 +3231,11 @@ mod tests {
                 RuntimeSwitchOutcome::FailedBeforeWrite,
             )
             .unwrap();
-            let cleanup =
-                release_transient_checkpoints(Some(backup_root.path()), true, &checkpoints);
+            let cleanup = release_transient_checkpoints(
+                Some(backup_root.path()),
+                Some(&record),
+                &checkpoints,
+            );
 
             assert_eq!(cleanup.reclaimed_count, checkpoint_count);
             assert_eq!(cleanup.retained_count, 0);
@@ -2919,12 +3257,28 @@ mod tests {
         let backup_root = tempdir().unwrap();
         let log_root = tempdir().unwrap();
         let checkpoints = vec![
-            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap(),
-            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap(),
+            create_state_checkpoint_with_paths(
+                current.path(),
+                backup_root.path(),
+                "sync-current",
+                resolve_user_codex_paths(current.path()).unwrap(),
+                "sync-prewrite",
+                CheckpointRole::Current,
+            )
+            .unwrap(),
+            create_state_checkpoint_with_paths(
+                shared.path(),
+                backup_root.path(),
+                "sync-shared",
+                resolve_user_codex_paths(shared.path()).unwrap(),
+                "sync-prewrite",
+                CheckpointRole::Shared,
+            )
+            .unwrap(),
         ];
         let log = OperationLog::new(log_root.path().join("operations.jsonl"));
 
-        record_sync_failure_to_log(
+        let record = record_sync_failure_to_log(
             &log,
             "sync-prewrite",
             OperationStatus::Failed,
@@ -2933,7 +3287,8 @@ mod tests {
             &checkpoints,
         )
         .unwrap();
-        let cleanup = release_transient_checkpoints(Some(backup_root.path()), true, &checkpoints);
+        let cleanup =
+            release_transient_checkpoints(Some(backup_root.path()), Some(&record), &checkpoints);
 
         assert_eq!(cleanup.reclaimed_count, 2);
         assert_eq!(cleanup.retained_count, 0);
@@ -2972,7 +3327,7 @@ mod tests {
 
         let cleanup = release_transient_checkpoints(
             Some(backup_root.path()),
-            terminal_recorded,
+            None,
             std::slice::from_ref(&checkpoint),
         );
 
@@ -3024,10 +3379,13 @@ mod tests {
         let current = tempdir().unwrap();
         let backup_root = tempdir().unwrap();
         let log_root = tempdir().unwrap();
-        let checkpoint = create_state_backup(
+        let checkpoint = create_state_checkpoint_with_paths(
             current.path(),
             backup_root.path(),
             "restore-sessions-visible",
+            resolve_user_codex_paths(current.path()).unwrap(),
+            "restore-visible-success",
+            CheckpointRole::Visibility,
         )
         .unwrap();
         let checkpoint_dir = checkpoint.backup_dir.clone();
@@ -3065,10 +3423,13 @@ mod tests {
         let current = tempdir().unwrap();
         let backup_root = tempdir().unwrap();
         let invalid_log_path = tempdir().unwrap();
-        let checkpoint = create_state_backup(
+        let checkpoint = create_state_checkpoint_with_paths(
             current.path(),
             backup_root.path(),
             "restore-sessions-visible",
+            resolve_user_codex_paths(current.path()).unwrap(),
+            "restore-visible-log-failure",
+            CheckpointRole::Visibility,
         )
         .unwrap();
         let checkpoint_dir = checkpoint.backup_dir.clone();

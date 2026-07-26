@@ -14,9 +14,9 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     backup::{
-        create_backup_with_paths, create_state_backup_with_paths, ensure_roots_disjoint,
+        create_backup_with_paths, create_state_checkpoint_with_paths, ensure_roots_disjoint,
         preflight_backup_capacity_for_sources, preflight_backup_capacity_with_paths,
-        restore_backup, BackupCapacitySource, BackupManifest, BackupScope,
+        restore_backup, BackupCapacitySource, BackupManifest, BackupScope, CheckpointRole,
     },
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
@@ -459,13 +459,20 @@ fn restore_sessions_visible_detailed(
     backup_root: &Path,
     ids: &[String],
 ) -> Result<SessionMutationResult, SessionMutationFailure> {
-    restore_sessions_visible_detailed_with_prepare(codex_home, backup_root, ids, || Ok(()))
+    restore_sessions_visible_detailed_with_prepare(
+        codex_home,
+        backup_root,
+        ids,
+        "restore-visible-test",
+        || Ok(()),
+    )
 }
 
 pub(crate) fn restore_sessions_visible_detailed_with_prepare<Prepare>(
     codex_home: &Path,
     backup_root: &Path,
     ids: &[String],
+    operation_id: &str,
     prepare: Prepare,
 ) -> Result<SessionMutationResult, SessionMutationFailure>
 where
@@ -475,6 +482,7 @@ where
         codex_home,
         backup_root,
         ids,
+        operation_id,
         preflight_visibility_backup_capacity,
         prepare,
         ensure_codex_still_closed,
@@ -497,6 +505,7 @@ where
         codex_home,
         backup_root,
         ids,
+        "restore-visible-capacity-test",
         preflight_capacity,
         prepare,
         ensure_codex_still_closed,
@@ -521,6 +530,7 @@ where
         codex_home,
         backup_root,
         ids,
+        "restore-visible-gates-test",
         preflight_capacity,
         prepare,
         final_gate,
@@ -531,6 +541,7 @@ fn restore_sessions_visible_inner<Capacity, Prepare, FinalGate>(
     codex_home: &Path,
     backup_root: &Path,
     ids: &[String],
+    operation_id: &str,
     preflight_capacity: Capacity,
     prepare: Prepare,
     final_gate: FinalGate,
@@ -552,11 +563,13 @@ where
         .map_err(SessionMutationFailure::before_backup)?;
     prepare().map_err(SessionMutationFailure::before_backup)?;
     result.backups.push(
-        create_state_backup_with_paths(
+        create_state_checkpoint_with_paths(
             codex_home,
             backup_root,
             "restore-sessions-visible",
             paths.clone(),
+            operation_id,
+            CheckpointRole::Visibility,
         )
         .map_err(SessionMutationFailure::before_backup)?,
     );

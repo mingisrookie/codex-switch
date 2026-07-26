@@ -10,6 +10,7 @@ import type {
   CodexProcess,
   DashboardData,
   BackupSummary,
+  ChatGptLaunchResult,
   ManagedSessionInventory,
   RelayRuntimeInput,
   RestoreResult,
@@ -163,6 +164,10 @@ export function switchRuntime(
 ) {
   const onProgressChannel = new Channel<RuntimeSwitchProgress>(onProgress);
   return invoke<RuntimeSwitchResult>('switch_runtime', { runtimeId, onProgress: onProgressChannel });
+}
+
+export function launchChatgpt() {
+  return invoke<ChatGptLaunchResult>('launch_chatgpt');
 }
 
 export function syncAllSessions() {

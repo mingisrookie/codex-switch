@@ -11,21 +11,67 @@ use toml_edit::DocumentMut;
 
 use crate::{
     backup::{
-        create_runtime_state_backup_with_paths, create_state_backup_with_paths, restore_backup,
-        BackupManifest, BackupScope, CheckpointCleanupSummary,
+        create_runtime_state_checkpoint_with_paths, create_state_checkpoint_with_paths,
+        load_process_state_checkpoint, restore_backup, BackupManifest, BackupScope,
+        CheckpointCleanupSummary, CheckpointRole,
     },
+    chat_process_state::repair_after_shutdown,
     codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
     config_patch::{plan_runtime_config_patch, ConfigPatchPlan, RuntimeConfigKind},
     file_ops::atomic_write,
     operation_log::operation_id,
+    process_control::{
+        ChatGptLaunchResult as ProcessChatGptLaunchResult,
+        ChatGptLaunchStatus as ProcessChatGptLaunchStatus,
+    },
     runtime_store::{RuntimeConfidence, RuntimeFiles, RuntimeKind, RuntimeMetadata, RuntimeStore},
     session_sync::{
-        preflight_session_database, runtime_switch_session_files_are_unchanged_with_paths,
+        plan_runtime_session_storage_with_paths, preflight_session_database,
+        runtime_switch_session_files_are_unchanged_with_paths,
         sync_shared_to_user_home_hot_with_paths, sync_shared_to_user_home_hot_with_policy,
         sync_shared_to_user_home_with_policy, sync_user_home_to_shared_with_policy,
-        SessionFileWritePolicy, SessionSyncResult,
+        RuntimeSessionStoragePlan, SessionFileWritePolicy, SessionSyncResult,
     },
 };
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatGptLaunchStatus {
+    Launched,
+    AlreadyRunning,
+    Failed,
+    NotRequested,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatGptLaunchReceipt {
+    pub status: ChatGptLaunchStatus,
+    pub message: Option<String>,
+}
+
+impl ChatGptLaunchReceipt {
+    fn not_requested() -> Self {
+        Self {
+            status: ChatGptLaunchStatus::NotRequested,
+            message: None,
+        }
+    }
+}
+
+impl From<ProcessChatGptLaunchResult> for ChatGptLaunchReceipt {
+    fn from(result: ProcessChatGptLaunchResult) -> Self {
+        let status = match result.status {
+            ProcessChatGptLaunchStatus::Launched => ChatGptLaunchStatus::Launched,
+            ProcessChatGptLaunchStatus::AlreadyRunning => ChatGptLaunchStatus::AlreadyRunning,
+            ProcessChatGptLaunchStatus::Failed => ChatGptLaunchStatus::Failed,
+        };
+        Self {
+            status,
+            message: result.message,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +113,8 @@ pub struct RuntimeSwitchResult {
     pub rolled_back: bool,
     pub warnings: Vec<String>,
     pub checkpoint_cleanup: CheckpointCleanupSummary,
+    pub chat_process_state_repaired: bool,
+    pub chatgpt_launch: ChatGptLaunchReceipt,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -78,12 +126,14 @@ pub enum RuntimeSwitchPhase {
     VerifyingRelay,
     BackingUpCurrent,
     BackingUpShared,
+    RepairingAppState,
     SyncingToShared,
     ApplyingRuntime,
     SyncingToCurrent,
     Verifying,
     RollingBack,
     CleaningCheckpoints,
+    LaunchingApp,
     Complete,
     Failed,
 }
@@ -101,6 +151,7 @@ pub struct RuntimeSwitchFailure {
     pub message: String,
     pub backups: Vec<BackupManifest>,
     pub outcome: RuntimeSwitchOutcome,
+    pub operation_id: Option<String>,
 }
 
 pub(crate) struct RuntimeSwitchPlan {
@@ -112,6 +163,7 @@ pub(crate) struct RuntimeSwitchPlan {
     codex_paths: CodexPaths,
     requires_change: bool,
     session_file_write_policy: SessionFileWritePolicy,
+    session_storage_plan: RuntimeSessionStoragePlan,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +194,10 @@ impl RuntimeSwitchPlan {
     pub(crate) fn shared_backup_scope(&self) -> BackupScope {
         BackupScope::StateOnly
     }
+
+    pub(crate) fn session_storage_plan(&self) -> &RuntimeSessionStoragePlan {
+        &self.session_storage_plan
+    }
 }
 
 impl HotSessionSyncPlan {
@@ -156,6 +212,7 @@ impl RuntimeSwitchFailure {
             message,
             backups,
             outcome: RuntimeSwitchOutcome::FailedBeforeWrite,
+            operation_id: None,
         }
     }
 
@@ -168,6 +225,7 @@ impl RuntimeSwitchFailure {
             message,
             backups,
             outcome: RuntimeSwitchOutcome::RolledBack,
+            operation_id: None,
         }
     }
 
@@ -176,7 +234,13 @@ impl RuntimeSwitchFailure {
             message,
             backups,
             outcome: RuntimeSwitchOutcome::RollbackFailed,
+            operation_id: None,
         }
+    }
+
+    fn for_operation(mut self, operation_id: &str) -> Self {
+        self.operation_id = Some(operation_id.to_string());
+        self
     }
 }
 
@@ -226,6 +290,7 @@ pub fn switch_runtime_files_detailed_with_progress(
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
     let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
         .map_err(RuntimeSwitchFailure::before_backup)?;
+    let plan_operation_id = plan.operation_id.clone();
     let mut verify_processes_closed = verify_runtime_processes_closed;
     switch_runtime_files_from_plan(
         store,
@@ -239,6 +304,7 @@ pub fn switch_runtime_files_detailed_with_progress(
         &mut verify_processes_closed,
         on_progress,
     )
+    .map_err(|failure| failure.for_operation(&plan_operation_id))
 }
 
 pub(crate) fn preflight_runtime_switch(
@@ -282,6 +348,7 @@ pub(crate) fn switch_runtime_files_preflighted_with_progress(
     plan: RuntimeSwitchPlan,
     on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
+    let plan_operation_id = plan.operation_id.clone();
     let mut verify_processes_closed = verify_runtime_processes_closed;
     switch_runtime_files_from_plan(
         store,
@@ -295,6 +362,7 @@ pub(crate) fn switch_runtime_files_preflighted_with_progress(
         &mut verify_processes_closed,
         on_progress,
     )
+    .map_err(|failure| failure.for_operation(&plan_operation_id))
 }
 
 #[cfg(test)]
@@ -329,6 +397,7 @@ fn switch_runtime_files_with_failure_and_progress_detailed(
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
     let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
         .map_err(RuntimeSwitchFailure::before_backup)?;
+    let plan_operation_id = plan.operation_id.clone();
     let mut verify_processes_closed = verify_runtime_processes_closed;
     switch_runtime_files_from_plan(
         store,
@@ -342,6 +411,7 @@ fn switch_runtime_files_with_failure_and_progress_detailed(
         &mut verify_processes_closed,
         on_progress,
     )
+    .map_err(|failure| failure.for_operation(&plan_operation_id))
 }
 
 #[cfg(test)]
@@ -356,6 +426,7 @@ fn switch_runtime_files_with_process_gate_detailed(
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
     let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
         .map_err(RuntimeSwitchFailure::before_backup)?;
+    let plan_operation_id = plan.operation_id.clone();
     switch_runtime_files_from_plan(
         store,
         RuntimeSwitchRoots {
@@ -368,6 +439,7 @@ fn switch_runtime_files_with_process_gate_detailed(
         verify_processes_closed,
         on_progress,
     )
+    .map_err(|failure| failure.for_operation(&plan_operation_id))
 }
 
 fn switch_runtime_files_from_plan(
@@ -409,33 +481,48 @@ fn switch_runtime_files_from_plan(
             rolled_back: false,
             warnings: Vec::new(),
             checkpoint_cleanup: CheckpointCleanupSummary::default(),
+            chat_process_state_repaired: false,
+            chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
         });
     }
     ensure_runtime_paths_unchanged(codex_home, &plan.codex_paths)
         .map_err(RuntimeSwitchFailure::before_backup)?;
     let shared_paths = local_codex_paths(shared_home);
+    ensure_runtime_session_plan_unchanged(&plan, &shared_paths)
+        .map_err(RuntimeSwitchFailure::before_backup)?;
 
     on_progress(RuntimeSwitchPhase::BackingUpCurrent);
-    let current_backup = create_runtime_state_backup_with_paths(
+    let current_backup = create_runtime_state_checkpoint_with_paths(
         codex_home,
         backup_root,
         "switch-runtime-current",
         plan.codex_paths.clone(),
+        &operation_id,
+        CheckpointRole::Current,
     )
     .map_err(RuntimeSwitchFailure::before_backup)?;
     on_progress(RuntimeSwitchPhase::BackingUpShared);
-    let shared_backup = create_state_backup_with_paths(
+    let shared_backup = create_state_checkpoint_with_paths(
         shared_home,
         backup_root,
         "switch-runtime-shared",
         shared_paths.clone(),
+        &operation_id,
+        CheckpointRole::Shared,
     )
     .map_err(|message| RuntimeSwitchFailure::new(message, vec![current_backup.clone()]))?;
     let backups = vec![current_backup.clone(), shared_backup.clone()];
 
     verify_processes_closed()
         .map_err(|message| RuntimeSwitchFailure::new(message, backups.clone()))?;
+    ensure_runtime_session_plan_unchanged(&plan, &shared_paths)
+        .map_err(|message| RuntimeSwitchFailure::new(message, backups.clone()))?;
     let applied = (|| {
+        on_progress(RuntimeSwitchPhase::RepairingAppState);
+        let checkpoint_process_state = load_process_state_checkpoint(&current_backup, codex_home)?;
+        verify_processes_closed()?;
+        let chat_process_state_repaired =
+            repair_after_shutdown(codex_home, checkpoint_process_state.as_deref())?;
         on_progress(RuntimeSwitchPhase::SyncingToShared);
         ensure_runtime_paths_unchanged(codex_home, &plan.codex_paths)?;
         ensure_shared_sessions_with_paths(&plan.codex_paths, &shared_paths)?;
@@ -481,24 +568,36 @@ fn switch_runtime_files_from_plan(
             return Err("runtime verification did not match the requested target".to_string());
         }
         let runtime = store.mark_used(&runtime_id)?;
-        Ok((runtime, to_shared, from_shared))
+        Ok((runtime, to_shared, from_shared, chat_process_state_repaired))
     })();
 
     match applied {
-        Ok((runtime, to_shared, from_shared)) => Ok(RuntimeSwitchResult {
-            operation_id,
-            changed: true,
-            runtime,
-            backups: backups.iter().map(BackupReceiptSummary::from).collect(),
-            backup_manifests: backups,
-            to_shared,
-            from_shared,
-            rolled_back: false,
-            warnings: Vec::new(),
-            checkpoint_cleanup: CheckpointCleanupSummary::default(),
-        }),
+        Ok((runtime, to_shared, from_shared, chat_process_state_repaired)) => {
+            Ok(RuntimeSwitchResult {
+                operation_id,
+                changed: true,
+                runtime,
+                backups: backups.iter().map(BackupReceiptSummary::from).collect(),
+                backup_manifests: backups,
+                to_shared,
+                from_shared,
+                rolled_back: false,
+                warnings: Vec::new(),
+                checkpoint_cleanup: CheckpointCleanupSummary::default(),
+                chat_process_state_repaired,
+                chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
+            })
+        }
         Err(error) => {
             on_progress(RuntimeSwitchPhase::RollingBack);
+            if let Err(gate_error) = verify_processes_closed() {
+                return Err(RuntimeSwitchFailure::rollback_failed(
+                    format!(
+                        "{error}; rollback was not attempted because ChatGPT/Codex activity resumed: {gate_error}"
+                    ),
+                    backups,
+                ));
+            }
             let current_restore = restore_backup(&current_backup.backup_dir, codex_home);
             let shared_restore = restore_backup(&shared_backup.backup_dir, shared_home);
             match (current_restore, shared_restore) {
@@ -521,6 +620,25 @@ fn switch_runtime_files_from_plan(
     }
 }
 
+fn ensure_runtime_session_plan_unchanged(
+    plan: &RuntimeSwitchPlan,
+    shared_paths: &CodexPaths,
+) -> Result<(), String> {
+    let observed = plan_runtime_session_storage_with_paths(
+        &plan.codex_paths,
+        shared_paths,
+        &plan.session_provider,
+    )?;
+    if observed == plan.session_storage_plan {
+        Ok(())
+    } else {
+        Err(
+            "session write set changed after the closed-session capacity check; retry the runtime switch"
+                .to_string(),
+        )
+    }
+}
+
 fn build_runtime_switch_plan(
     store: &RuntimeStore,
     runtime_id: &str,
@@ -539,9 +657,12 @@ fn build_runtime_switch_plan(
     let requires_change = active.active_runtime_id.as_deref() != Some(runtime_id)
         || active.confidence != RuntimeConfidence::Exact;
     let shared_paths = local_codex_paths(shared_home);
-    let session_file_write_policy = if requires_change
-        && runtime_switch_session_files_are_unchanged_with_paths(&codex_paths, &shared_paths)?
-    {
+    let session_storage_plan = if requires_change {
+        plan_runtime_session_storage_with_paths(&codex_paths, &shared_paths, &session_provider)?
+    } else {
+        RuntimeSessionStoragePlan::default()
+    };
+    let session_file_write_policy = if requires_change && session_storage_plan.is_empty() {
         SessionFileWritePolicy::Deny
     } else {
         SessionFileWritePolicy::Allow
@@ -555,6 +676,7 @@ fn build_runtime_switch_plan(
         codex_paths,
         requires_change,
         session_file_write_policy,
+        session_storage_plan,
     })
 }
 
@@ -568,8 +690,7 @@ fn ensure_runtime_paths_unchanged(codex_home: &Path, expected: &CodexPaths) -> R
 
 #[cfg(not(test))]
 fn verify_runtime_processes_closed() -> Result<(), String> {
-    let managed = crate::process_control::list_codex_processes()?;
-    let standalone = crate::process_control::list_standalone_codex_processes()?;
+    let (managed, standalone) = crate::process_control::list_codex_process_inventory()?;
     match (managed.is_empty(), standalone.is_empty()) {
         (true, true) => Ok(()),
         (false, true) => Err(
@@ -635,12 +756,15 @@ pub(crate) fn preflight_hot_session_sync_with_paths(
     current_paths: &CodexPaths,
     shared_paths: &CodexPaths,
 ) -> Result<HotSessionSyncPlan, String> {
-    let session_file_write_policy =
-        if runtime_switch_session_files_are_unchanged_with_paths(current_paths, shared_paths)? {
-            SessionFileWritePolicy::Deny
-        } else {
-            SessionFileWritePolicy::Allow
-        };
+    let session_file_write_policy = if runtime_switch_session_files_are_unchanged_with_paths(
+        current_paths,
+        shared_paths,
+        None,
+    )? {
+        SessionFileWritePolicy::Deny
+    } else {
+        SessionFileWritePolicy::Allow
+    };
     Ok(HotSessionSyncPlan {
         session_file_write_policy,
     })
@@ -669,6 +793,16 @@ pub(crate) fn sync_home_with_shared_preflighted_with_paths(
             SessionFileWritePolicy::Deny,
         )?,
     };
+    let persistent_session_bytes_added = to_shared
+        .persistent_session_bytes_added
+        .checked_add(from_shared.persistent_session_bytes_added)
+        .ok_or_else(|| "session storage accounting overflowed".to_string())?;
+    let persistent_session_bytes_reclaimed = to_shared
+        .persistent_session_bytes_reclaimed
+        .checked_add(from_shared.persistent_session_bytes_reclaimed)
+        .ok_or_else(|| "session storage accounting overflowed".to_string())?;
+    let mut obsolete_provider_slots = to_shared.obsolete_provider_slots.clone();
+    obsolete_provider_slots.extend(from_shared.obsolete_provider_slots.clone());
     Ok(SessionSyncResult {
         inserted_threads: to_shared.inserted_threads + from_shared.inserted_threads,
         copied_session_files: to_shared.copied_session_files + from_shared.copied_session_files,
@@ -679,6 +813,9 @@ pub(crate) fn sync_home_with_shared_preflighted_with_paths(
             + from_shared.skipped_archived_threads,
         merged_session_index_entries: to_shared.merged_session_index_entries
             + from_shared.merged_session_index_entries,
+        persistent_session_bytes_added,
+        persistent_session_bytes_reclaimed,
+        obsolete_provider_slots,
     })
 }
 
@@ -775,6 +912,9 @@ fn empty_sync_result() -> SessionSyncResult {
         skipped_missing_session_files: 0,
         skipped_archived_threads: 0,
         merged_session_index_entries: 0,
+        persistent_session_bytes_added: 0,
+        persistent_session_bytes_reclaimed: 0,
+        obsolete_provider_slots: Vec::new(),
     }
 }
 
@@ -811,6 +951,13 @@ mod tests {
         SwitchFailurePoint,
     };
 
+    const THREAD_A: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a6";
+    const THREAD_FAST: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a7";
+    const THREAD_CURRENT: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a8";
+    const THREAD_SHARED: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a9";
+    const THREAD_FAST_DRIFT: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4aa";
+    const THREAD_DRIFT: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4ab";
+
     fn create_state_db(home: &std::path::Path, id: &str, rollout_path: &std::path::Path) {
         let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
         conn.execute(
@@ -836,7 +983,7 @@ mod tests {
         );
 
         let rollout = home.path().join("sessions/rollout-a.jsonl");
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         preflight_runtime_session_sync(home.path(), shared.path()).unwrap();
 
         fs::write(shared.path().join("state_5.sqlite"), b"not sqlite").unwrap();
@@ -860,12 +1007,15 @@ mod tests {
     #[test]
     fn switches_runtime_files_and_keeps_sessions_synced_through_shared_home() {
         let home = tempdir().unwrap();
-        let rollout = home.path().join("sessions/2026/06/23/rollout-a.jsonl");
+        let legacy_relative = format!(
+            "sessions/2026/06/23/rollout-2026-06-23T11-00-00-{THREAD_A}-imported-deadbeef.jsonl"
+        );
+        let rollout = home.path().join(&legacy_relative);
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
-        let rollout_bytes = br#"{"type":"session_meta","payload":{"id":"thread-a"}}"#;
-        fs::write(&rollout, rollout_bytes).unwrap();
+        let rollout_bytes = format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#);
+        fs::write(&rollout, &rollout_bytes).unwrap();
         let rollout_modified_before = fs::metadata(&rollout).unwrap().modified().unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -908,6 +1058,7 @@ mod tests {
             vec![
                 RuntimeSwitchPhase::BackingUpCurrent,
                 RuntimeSwitchPhase::BackingUpShared,
+                RuntimeSwitchPhase::RepairingAppState,
                 RuntimeSwitchPhase::SyncingToShared,
                 RuntimeSwitchPhase::ApplyingRuntime,
                 RuntimeSwitchPhase::SyncingToCurrent,
@@ -952,6 +1103,7 @@ mod tests {
             assert!(!wire.contains(forbidden), "{forbidden} leaked into IPC");
         }
         assert!(wire.contains("\"trackedDatabaseCount\""));
+        assert!(wire.contains("\"chatgptLaunch\":{\"status\":\"notRequested\",\"message\":null}"));
         assert!(fs::read_to_string(home.path().join("auth.json"))
             .unwrap()
             .contains("sk-fake-relay"));
@@ -960,28 +1112,31 @@ mod tests {
         assert!(!switched_config.contains("env_key ="));
         assert!(!switched_config.contains("api_key ="));
         let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
-        let provider: String = conn
+        let (provider, active_rollout): (String, String) = conn
             .query_row(
-                "SELECT model_provider FROM threads WHERE id = 'thread-a'",
-                [],
-                |row| row.get(0),
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                [THREAD_A],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(provider, "openai_custom");
-        assert_eq!(fs::read(&rollout).unwrap(), rollout_bytes);
+        let active_rollout = std::path::PathBuf::from(active_rollout);
+        assert_ne!(active_rollout, fs::canonicalize(&rollout).unwrap());
+        let active_name = active_rollout.file_name().unwrap().to_string_lossy();
+        assert!(active_name.starts_with("rollout-2026-06-23T"));
+        assert!(active_name.ends_with(&format!("-{THREAD_A}.jsonl")));
+        assert!(!active_name.contains("-imported-"));
+        assert!(fs::read_to_string(&active_rollout)
+            .unwrap()
+            .contains("\"model_provider\":\"openai_custom\""));
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), rollout_bytes);
         assert_eq!(
             fs::metadata(&rollout).unwrap().modified().unwrap(),
             rollout_modified_before
         );
         assert!(shared.path().join("state_5.sqlite").exists());
-        assert!(shared
-            .path()
-            .join("sessions/2026/06/23/rollout-a.jsonl")
-            .exists());
-        assert!(home
-            .path()
-            .join("sessions/2026/06/23/rollout-a.jsonl")
-            .exists());
+        assert!(shared.path().join(&legacy_relative).exists());
+        assert!(home.path().join(&legacy_relative).exists());
     }
 
     #[test]
@@ -996,11 +1151,12 @@ mod tests {
             .join("sessions/2026/07/26/rollout-fast-path.jsonl");
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
-        let rollout_bytes = br#"{"type":"session_meta","payload":{"id":"thread-fast"}}"#;
-        fs::write(&current_rollout, rollout_bytes).unwrap();
-        fs::write(&shared_rollout, rollout_bytes).unwrap();
-        create_state_db(home.path(), "thread-fast", &current_rollout);
-        create_state_db(shared.path(), "thread-fast", &shared_rollout);
+        let rollout_bytes =
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_FAST}"}}}}"#);
+        fs::write(&current_rollout, &rollout_bytes).unwrap();
+        fs::write(&shared_rollout, &rollout_bytes).unwrap();
+        create_state_db(home.path(), THREAD_FAST, &current_rollout);
+        create_state_db(shared.path(), THREAD_FAST, &shared_rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1041,8 +1197,8 @@ mod tests {
                     && !file.relative_path.starts_with("sessions")
             })
         }));
-        assert_eq!(fs::read(&current_rollout).unwrap(), rollout_bytes);
-        assert_eq!(fs::read(&shared_rollout).unwrap(), rollout_bytes);
+        assert_eq!(fs::read_to_string(&current_rollout).unwrap(), rollout_bytes);
+        assert_eq!(fs::read_to_string(&shared_rollout).unwrap(), rollout_bytes);
         assert_eq!(
             fs::metadata(&current_rollout).unwrap().modified().unwrap(),
             current_modified
@@ -1066,12 +1222,14 @@ mod tests {
             .join("sessions/2026/07/26/rollout-shared.jsonl");
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
-        let current_bytes = br#"{"type":"session_meta","payload":{"id":"thread-current"}}"#;
-        let shared_bytes = br#"{"type":"session_meta","payload":{"id":"thread-shared"}}"#;
-        fs::write(&current_rollout, current_bytes).unwrap();
-        fs::write(&shared_rollout, shared_bytes).unwrap();
-        create_state_db(current.path(), "thread-current", &current_rollout);
-        create_state_db(shared.path(), "thread-shared", &shared_rollout);
+        let current_bytes =
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_CURRENT}"}}}}"#);
+        let shared_bytes =
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_SHARED}"}}}}"#);
+        fs::write(&current_rollout, &current_bytes).unwrap();
+        fs::write(&shared_rollout, &shared_bytes).unwrap();
+        create_state_db(current.path(), THREAD_CURRENT, &current_rollout);
+        create_state_db(shared.path(), THREAD_SHARED, &shared_rollout);
         let current_paths = resolve_user_codex_paths(current.path()).unwrap();
         let shared_paths = local_codex_paths(shared.path());
         let plan = preflight_hot_session_sync_with_paths(&current_paths, &shared_paths).unwrap();
@@ -1094,15 +1252,18 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.copied_session_files, 2);
-        assert_eq!(fs::read(&current_rollout).unwrap(), current_bytes);
-        assert_eq!(fs::read(&shared_rollout).unwrap(), shared_bytes);
-        let imported_to_current = fs::read_to_string(
-            current
-                .path()
-                .join("sessions/2026/07/26/rollout-shared.jsonl"),
-        )
-        .unwrap();
-        assert!(imported_to_current.contains("\"id\":\"thread-shared\""));
+        assert_eq!(fs::read_to_string(&current_rollout).unwrap(), current_bytes);
+        assert_eq!(fs::read_to_string(&shared_rollout).unwrap(), shared_bytes);
+        let current_conn = Connection::open(current.path().join("state_5.sqlite")).unwrap();
+        let imported_to_current: String = current_conn
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                [THREAD_SHARED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let imported_to_current = fs::read_to_string(imported_to_current).unwrap();
+        assert!(imported_to_current.contains(THREAD_SHARED));
         assert!(imported_to_current.contains("\"model_provider\":\"openai\""));
         let imported_to_shared = fs::read_to_string(
             shared
@@ -1110,7 +1271,7 @@ mod tests {
                 .join("sessions/2026/07/26/rollout-current.jsonl"),
         )
         .unwrap();
-        assert!(imported_to_shared.contains("\"id\":\"thread-current\""));
+        assert!(imported_to_shared.contains(THREAD_CURRENT));
     }
 
     #[test]
@@ -1125,17 +1286,18 @@ mod tests {
             .join("sessions/2026/07/26/rollout-fast-drift.jsonl");
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
-        let original = br#"{"type":"session_meta","payload":{"id":"thread-fast-drift"}}"#;
-        fs::write(&current_rollout, original).unwrap();
-        fs::write(&shared_rollout, original).unwrap();
-        create_state_db(current.path(), "thread-fast-drift", &current_rollout);
-        create_state_db(shared.path(), "thread-fast-drift", &shared_rollout);
+        let original =
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_FAST_DRIFT}"}}}}"#);
+        fs::write(&current_rollout, &original).unwrap();
+        fs::write(&shared_rollout, &original).unwrap();
+        create_state_db(current.path(), THREAD_FAST_DRIFT, &current_rollout);
+        create_state_db(shared.path(), THREAD_FAST_DRIFT, &shared_rollout);
         let current_paths = resolve_user_codex_paths(current.path()).unwrap();
         let shared_paths = local_codex_paths(shared.path());
         let plan = preflight_hot_session_sync_with_paths(&current_paths, &shared_paths).unwrap();
         assert_eq!(plan.backup_scope(), BackupScope::StateOnly);
         let grown = [
-            original.as_slice(),
+            original.as_bytes(),
             b"\n{\"type\":\"response_item\",\"payload\":{\"text\":\"late\"}}\n",
         ]
         .concat();
@@ -1149,7 +1311,7 @@ mod tests {
             error.contains("changed after fast-path planning"),
             "{error}"
         );
-        assert_eq!(fs::read(&shared_rollout).unwrap(), original);
+        assert_eq!(fs::read_to_string(&shared_rollout).unwrap(), original);
         assert_eq!(fs::read(&current_rollout).unwrap(), grown);
     }
 
@@ -1157,19 +1319,21 @@ mod tests {
     fn fast_path_late_jsonl_drift_fails_before_session_file_writes() {
         let home = tempdir().unwrap();
         let shared = tempdir().unwrap();
-        let current_rollout = home
-            .path()
-            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
-        let shared_rollout = shared
-            .path()
-            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
+        let current_rollout = home.path().join(format!(
+            "sessions/2026/07/26/rollout-2026-07-26T12-00-00-{THREAD_DRIFT}.jsonl"
+        ));
+        let shared_rollout = shared.path().join(format!(
+            "sessions/2026/07/26/rollout-2026-07-26T12-00-00-{THREAD_DRIFT}.jsonl"
+        ));
         fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
-        let original = br#"{"type":"session_meta","payload":{"id":"thread-drift"}}"#;
-        fs::write(&current_rollout, original).unwrap();
-        fs::write(&shared_rollout, original).unwrap();
-        create_state_db(home.path(), "thread-drift", &current_rollout);
-        create_state_db(shared.path(), "thread-drift", &shared_rollout);
+        let original = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{THREAD_DRIFT}","model_provider":"openai_custom"}}}}"#
+        );
+        fs::write(&current_rollout, &original).unwrap();
+        fs::write(&shared_rollout, &original).unwrap();
+        create_state_db(home.path(), THREAD_DRIFT, &current_rollout);
+        create_state_db(shared.path(), THREAD_DRIFT, &shared_rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1192,7 +1356,7 @@ mod tests {
         let plan =
             preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path(), shared.path()).unwrap();
         let late = [
-            original.as_slice(),
+            original.as_bytes(),
             b"\n{\"type\":\"response_item\",\"payload\":{\"text\":\"late\"}}\n",
         ]
         .concat();
@@ -1211,12 +1375,15 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(failure.outcome, RuntimeSwitchOutcome::RolledBack);
-        assert!(failure.message.contains("changed after fast-path planning"));
-        assert_eq!(failure.backups[0].scope, BackupScope::RuntimeState);
-        assert_eq!(failure.backups[1].scope, BackupScope::StateOnly);
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::FailedBeforeWrite);
+        assert_eq!(
+            failure.message,
+            "session write set changed after the closed-session capacity check; retry the runtime switch"
+        );
+        assert!(failure.backups.is_empty());
+        assert!(fs::read_dir(backup_root.path()).unwrap().next().is_none());
         assert_eq!(fs::read(&current_rollout).unwrap(), late);
-        assert_eq!(fs::read(&shared_rollout).unwrap(), original);
+        assert_eq!(fs::read_to_string(&shared_rollout).unwrap(), original);
         assert_eq!(
             fs::metadata(&current_rollout).unwrap().modified().unwrap(),
             current_modified
@@ -1228,16 +1395,16 @@ mod tests {
     }
 
     #[test]
-    fn process_restart_before_final_current_write_rolls_back_without_syncing_to_current() {
+    fn process_restart_before_final_current_write_blocks_rollback_without_syncing_to_current() {
         let home = tempdir().unwrap();
         let rollout = home.path().join("sessions/2026/06/23/rollout-a.jsonl");
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         let original_auth =
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#.to_vec();
         let original_config = b"model = \"gpt-5.5\"\n".to_vec();
@@ -1270,7 +1437,7 @@ mod tests {
             &mut || {
                 let call = gate_calls.get() + 1;
                 gate_calls.set(call);
-                if call == 3 {
+                if call >= 3 {
                     Err("standalone Codex CLI restarted".to_string())
                 } else {
                     Ok(())
@@ -1280,15 +1447,16 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(gate_calls.get(), 3);
-        assert_eq!(error.outcome, RuntimeSwitchOutcome::RolledBack);
+        assert_eq!(gate_calls.get(), 4);
+        assert_eq!(error.outcome, RuntimeSwitchOutcome::RollbackFailed);
+        assert!(error.message.contains("rollback was not attempted"));
         assert_eq!(
             phases,
             vec![
                 RuntimeSwitchPhase::BackingUpCurrent,
                 RuntimeSwitchPhase::BackingUpShared,
+                RuntimeSwitchPhase::RepairingAppState,
                 RuntimeSwitchPhase::SyncingToShared,
-                RuntimeSwitchPhase::ApplyingRuntime,
                 RuntimeSwitchPhase::RollingBack,
             ]
         );
@@ -1300,7 +1468,7 @@ mod tests {
             fs::read(home.path().join("config.toml")).unwrap(),
             original_config
         );
-        assert!(!shared.path().join("state_5.sqlite").exists());
+        assert!(shared.path().join("state_5.sqlite").exists());
     }
 
     #[test]
@@ -1310,10 +1478,10 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1339,6 +1507,11 @@ mod tests {
             ),
         )
         .unwrap();
+        let process_state = home
+            .path()
+            .join(crate::chat_process_state::CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        fs::write(&process_state, vec![0_u8; 4096]).unwrap();
         let backup_root = tempdir().unwrap();
         let shared = tempdir().unwrap();
 
@@ -1352,6 +1525,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.runtime.id, PLUS_RUNTIME_ID);
+        assert!(result.chat_process_state_repaired);
+        assert_eq!(fs::read(&process_state).unwrap(), b"[]");
+        assert!(result.backup_manifests[0].tracked_process_state);
         assert!(fs::read_to_string(home.path().join("auth.json"))
             .unwrap()
             .contains("fake-plus"));
@@ -1371,10 +1547,12 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a","model_provider":"openai"}}"#,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}","model_provider":"openai"}}}}"#
+            ),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1385,6 +1563,12 @@ mod tests {
             "model = \"gpt-5.5\"\nmodel_instructions_file = \"global\"\n",
         )
         .unwrap();
+        let process_state = home
+            .path()
+            .join(crate::chat_process_state::CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        let original_process_state = vec![0_u8; 4096];
+        fs::write(&process_state, &original_process_state).unwrap();
         let original_auth = fs::read(home.path().join("auth.json")).unwrap();
         let original_config = fs::read(home.path().join("config.toml")).unwrap();
         let original_rollout = fs::read(&rollout).unwrap();
@@ -1422,6 +1606,7 @@ mod tests {
             vec![
                 RuntimeSwitchPhase::BackingUpCurrent,
                 RuntimeSwitchPhase::BackingUpShared,
+                RuntimeSwitchPhase::RepairingAppState,
                 RuntimeSwitchPhase::SyncingToShared,
                 RuntimeSwitchPhase::ApplyingRuntime,
                 RuntimeSwitchPhase::RollingBack,
@@ -1437,6 +1622,7 @@ mod tests {
             fs::read(home.path().join("config.toml")).unwrap(),
             original_config
         );
+        assert_eq!(fs::read(&process_state).unwrap(), original_process_state);
         assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
         assert!(!shared.join("state_5.sqlite").exists());
         assert_eq!(
@@ -1454,10 +1640,12 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-current","model_provider":"openai"}}"#,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{THREAD_CURRENT}","model_provider":"openai"}}}}"#
+            ),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-current", &rollout);
+        create_state_db(home.path(), THREAD_CURRENT, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
@@ -1486,9 +1674,9 @@ mod tests {
             .join("sessions/2026/07/12/rollout-shared.jsonl");
         fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
         let original_shared_rollout =
-            br#"{"type":"session_meta","payload":{"id":"thread-shared"}}"#;
-        fs::write(&shared_rollout, original_shared_rollout).unwrap();
-        create_state_db(shared.path(), "thread-shared", &shared_rollout);
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_SHARED}"}}}}"#);
+        fs::write(&shared_rollout, &original_shared_rollout).unwrap();
+        create_state_db(shared.path(), THREAD_SHARED, &shared_rollout);
         let backup_root = tempdir().unwrap();
         let mut phases = Vec::new();
 
@@ -1508,6 +1696,7 @@ mod tests {
             vec![
                 RuntimeSwitchPhase::BackingUpCurrent,
                 RuntimeSwitchPhase::BackingUpShared,
+                RuntimeSwitchPhase::RepairingAppState,
                 RuntimeSwitchPhase::SyncingToShared,
                 RuntimeSwitchPhase::ApplyingRuntime,
                 RuntimeSwitchPhase::RollingBack,
@@ -1526,7 +1715,10 @@ mod tests {
             fs::read(home.path().join("auth.json")).unwrap(),
             original_auth
         );
-        assert_eq!(fs::read(&shared_rollout).unwrap(), original_shared_rollout);
+        assert_eq!(
+            fs::read_to_string(&shared_rollout).unwrap(),
+            original_shared_rollout
+        );
         assert!(shared
             .path()
             .join("sessions/2026/07/13/rollout-current.jsonl")
@@ -1541,7 +1733,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(thread_ids, vec!["thread-shared"]);
+        assert_eq!(thread_ids, vec![THREAD_SHARED]);
     }
 
     #[test]
@@ -1551,10 +1743,10 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saved-account"}}"#,
@@ -1594,16 +1786,22 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saved-account"}}"#,
         )
         .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let process_state = home
+            .path()
+            .join(crate::chat_process_state::CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(process_state.parent().unwrap()).unwrap();
+        let corrupt_process_state = vec![0_u8; 128];
+        fs::write(&process_state, &corrupt_process_state).unwrap();
         let store_root = tempdir().unwrap();
         let store = RuntimeStore::new(store_root.path().join("runtimes"));
         store.import_plus_from_home(home.path(), false).unwrap();
@@ -1625,6 +1823,8 @@ mod tests {
         .unwrap();
 
         assert!(!result.changed);
+        assert!(!result.chat_process_state_repaired);
+        assert_eq!(fs::read(process_state).unwrap(), corrupt_process_state);
         assert!(result.backups.is_empty());
         assert!(phases.is_empty());
         assert!(fs::read_dir(backup_root.path()).unwrap().next().is_none());
@@ -1677,10 +1877,10 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saved-account"}}"#,
@@ -1733,10 +1933,10 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         fs::write(
             home.path().join("auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saved-account"}}"#,
@@ -1791,10 +1991,10 @@ mod tests {
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         fs::write(
             &rollout,
-            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{THREAD_A}"}}}}"#),
         )
         .unwrap();
-        create_state_db(home.path(), "thread-a", &rollout);
+        create_state_db(home.path(), THREAD_A, &rollout);
         let shared = tempdir().unwrap();
 
         let first = sync_home_with_shared(home.path(), shared.path()).unwrap();

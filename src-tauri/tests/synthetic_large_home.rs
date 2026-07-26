@@ -34,7 +34,7 @@ struct SyntheticHomes {
 }
 
 #[test]
-fn synthetic_large_home_provider_sync_preserves_existing_jsonl() {
+fn synthetic_large_home_provider_sync_preserves_original_jsonl_and_adds_bounded_slots() {
     let homes = create_synthetic_homes(CI_SESSION_COUNT, CI_SESSION_BYTES);
     let before = snapshot_sessions(homes.current.path());
 
@@ -49,10 +49,12 @@ fn synthetic_large_home_provider_sync_preserves_existing_jsonl() {
             .unwrap();
     let after = snapshot_sessions(homes.current.path());
 
-    assert_quiescent_result(&result);
-    assert_snapshots_unchanged(&before, &after);
+    assert_quiescent_result(&result, CI_SESSION_COUNT);
+    assert_original_snapshots_unchanged(&before, &after);
+    assert_eq!(after.len(), CI_SESSION_COUNT * 2);
     assert_eq!(imported_file_count(&after), 0);
     assert_all_providers(homes.current.path(), TARGET_PROVIDER, CI_SESSION_COUNT);
+    assert_active_jsonl_providers(homes.current.path(), TARGET_PROVIDER, CI_SESSION_COUNT);
 }
 
 #[test]
@@ -82,10 +84,12 @@ fn benchmark_synthetic_large_home_provider_sync() {
         result.copied_session_files
     );
 
-    assert_quiescent_result(&result);
-    assert_snapshots_unchanged(&before, &after);
+    assert_quiescent_result(&result, session_count);
+    assert_original_snapshots_unchanged(&before, &after);
+    assert_eq!(after.len(), session_count * 2);
     assert_eq!(imported_file_count(&after), 0);
     assert_all_providers(homes.current.path(), TARGET_PROVIDER, session_count);
+    assert_active_jsonl_providers(homes.current.path(), TARGET_PROVIDER, session_count);
 }
 
 fn create_synthetic_homes(session_count: usize, bytes_per_file: usize) -> SyntheticHomes {
@@ -97,9 +101,9 @@ fn create_synthetic_homes(session_count: usize, bytes_per_file: usize) -> Synthe
     let mut current_rows = Vec::with_capacity(session_count);
     let mut shared_rows = Vec::with_capacity(session_count);
     for index in 0..session_count {
-        let id = format!("synthetic-thread-{index:04}");
+        let id = format!("019f8ced-fc55-7a93-8cc5-{index:012x}");
         let relative = PathBuf::from(format!(
-            "sessions/2026/07/26/rollout-synthetic-{index:04}.jsonl"
+            "sessions/2026/07/26/rollout-2026-07-26T12-00-00-{id}.jsonl"
         ));
         let current_path = current.path().join(&relative);
         let shared_path = shared.path().join(&relative);
@@ -223,26 +227,20 @@ fn snapshot_sessions(home: &Path) -> Vec<FileSnapshot> {
         .collect()
 }
 
-fn assert_quiescent_result(result: &SessionSyncResult) {
+fn assert_quiescent_result(result: &SessionSyncResult, expected_copies: usize) {
     assert_eq!(result.inserted_threads, 0);
-    assert_eq!(result.copied_session_files, 0);
+    assert_eq!(result.copied_session_files, expected_copies);
 }
 
-fn assert_snapshots_unchanged(before: &[FileSnapshot], after: &[FileSnapshot]) {
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "current JSONL file count changed"
-    );
-    assert_eq!(
-        total_bytes(after),
-        total_bytes(before),
-        "current JSONL byte count changed"
-    );
-    for (before_file, after_file) in before.iter().zip(after) {
+fn assert_original_snapshots_unchanged(before: &[FileSnapshot], after: &[FileSnapshot]) {
+    for before_file in before {
+        let after_file = after
+            .iter()
+            .find(|candidate| candidate.relative_path == before_file.relative_path)
+            .expect("original current JSONL disappeared");
         assert_eq!(
             after_file.relative_path, before_file.relative_path,
-            "current JSONL path set changed"
+            "original current JSONL path changed"
         );
         assert_eq!(
             after_file.bytes,
@@ -265,6 +263,29 @@ fn assert_snapshots_unchanged(before: &[FileSnapshot], after: &[FileSnapshot]) {
     }
 }
 
+fn assert_active_jsonl_providers(home: &Path, expected: &str, expected_count: usize) {
+    let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
+    let mut statement = conn
+        .prepare("SELECT rollout_path FROM threads ORDER BY id")
+        .unwrap();
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(paths.len(), expected_count);
+    for path in paths {
+        let first_line = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let value: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(value["payload"]["model_provider"].as_str(), Some(expected));
+    }
+}
+
 fn total_bytes(snapshots: &[FileSnapshot]) -> u64 {
     snapshots.iter().map(|snapshot| snapshot.bytes).sum()
 }
@@ -282,15 +303,15 @@ fn imported_file_count(snapshots: &[FileSnapshot]) -> usize {
 }
 
 fn changed_mtime_count(before: &[FileSnapshot], after: &[FileSnapshot]) -> usize {
-    let compared = before
+    before
         .iter()
-        .zip(after)
-        .filter(|(before_file, after_file)| {
-            before_file.relative_path != after_file.relative_path
-                || before_file.modified != after_file.modified
+        .filter(|before_file| {
+            after
+                .iter()
+                .find(|after_file| after_file.relative_path == before_file.relative_path)
+                .is_none_or(|after_file| after_file.modified != before_file.modified)
         })
-        .count();
-    compared + before.len().abs_diff(after.len())
+        .count()
 }
 
 fn assert_all_providers(home: &Path, expected: &str, expected_count: usize) {
