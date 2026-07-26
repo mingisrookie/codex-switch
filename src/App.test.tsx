@@ -1,13 +1,26 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DashboardData, RuntimeSwitchProgress, RuntimeSwitchResult, UpdateInstallReceipt } from './types';
+import type {
+  BackupDeleteReceipt,
+  BackupDashboardData,
+  CheckpointCleanupReceipt,
+  CreateFullBackupReceipt,
+  DashboardData,
+  RuntimeDashboardData,
+  RuntimeSwitchProgress,
+  RuntimeSwitchResult,
+  UpdateInstallReceipt,
+} from './types';
 
 const apiMocks = vi.hoisted(() => ({
   getAppStatus: vi.fn(),
   getUpdateStartupNotice: vi.fn(),
   checkForUpdates: vi.fn(),
   installUpdate: vi.fn(),
+  cleanupAutomaticCheckpoints: vi.fn(),
+  createFullBackup: vi.fn(),
+  deleteBackup: vi.fn(),
   importPlusRuntime: vi.fn(),
   upsertRelayRuntime: vi.fn(),
   verifyRelayRuntime: vi.fn(),
@@ -97,6 +110,18 @@ function dashboardData(): DashboardData {
         fileCount: 4, totalBytes: 4096, verified: true, completeSessions: true,
       }],
     },
+    backupStorage: {
+      status: 'ready',
+      data: {
+        totalCount: 19,
+        totalBytes: 4_165_388_250,
+        reclaimableCount: 2,
+        reclaimableBytes: 1_471_410_293,
+        retainedCount: 17,
+        warnings: [],
+        lastCleanup: null,
+      },
+    },
     operations: {
       status: 'ready',
       data: [{
@@ -118,6 +143,15 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function retainReactClickHandler(element: HTMLElement) {
+  const propsKey = Object.keys(element).find((key) => key.startsWith('__reactProps$'));
+  const props = propsKey
+    ? (element as unknown as Record<string, { onClick?: () => void }>)[propsKey]
+    : undefined;
+  if (typeof props?.onClick !== 'function') throw new Error('React click handler is unavailable');
+  return props.onClick;
+}
+
 describe('App release-hardening UI', () => {
   beforeEach(() => {
     for (const mock of Object.values(apiMocks)) {
@@ -137,7 +171,20 @@ describe('App release-hardening UI', () => {
       sessions: initial.sessions,
       managedSessions: initial.managedSessions,
     });
-    apiMocks.loadBackupDashboard.mockResolvedValue({ backups: initial.backups });
+    apiMocks.loadBackupDashboard.mockResolvedValue({
+      backups: initial.backups,
+      backupStorage: initial.backupStorage,
+      operations: initial.operations,
+    });
+    apiMocks.cleanupAutomaticCheckpoints.mockResolvedValue({
+      operationId: 'cleanup-default',
+      attemptedCount: 2,
+      failedCount: 0,
+      reclaimedCount: 2,
+      reclaimedBytes: 1_471_410_293,
+      retainedCount: 17,
+      warnings: [],
+    });
     apiMocks.getUpdateStartupNotice.mockResolvedValue(null);
     apiMocks.getAppStatus.mockResolvedValue({
       appName: 'ChatGPT Switch', version: '0.1.5', phase: 'hardened-mvp',
@@ -159,6 +206,36 @@ describe('App release-hardening UI', () => {
     apiMocks.dryRunAllSessions.mockResolvedValue({
       toShared: { sourceThreads: 429, targetThreads: 400, newThreads: 2, duplicateThreads: 427 },
       toCurrent: { sourceThreads: 400, targetThreads: 429, newThreads: 1, duplicateThreads: 399 },
+    });
+    apiMocks.createFullBackup.mockResolvedValue({
+      operationId: 'backup-default',
+      backups: [
+        {
+          backupDir: 'C:\\backups\\manual-current-default',
+          sourceRoot: 'C:\\Users\\alice\\.codex',
+          reason: 'manual-full-backup',
+          createdAtMs: 20,
+          scope: 'full',
+          trackedDatabaseCount: 4,
+          completeSessions: true,
+        },
+        {
+          backupDir: 'C:\\backups\\manual-shared-default',
+          sourceRoot: 'C:\\Users\\alice\\AppData\\Roaming\\codex-switch\\shared-sessions',
+          reason: 'manual-full-backup',
+          createdAtMs: 21,
+          scope: 'full',
+          trackedDatabaseCount: 4,
+          completeSessions: true,
+        },
+      ],
+      warnings: [],
+    });
+    apiMocks.deleteBackup.mockResolvedValue({
+      operationId: 'delete-backup-default',
+      backupDir: 'C:\\backups\\safe-1',
+      reclaimedBytes: 4096,
+      warnings: [],
     });
     vi.restoreAllMocks();
   });
@@ -214,6 +291,55 @@ describe('App release-hardening UI', () => {
     fireEvent.click(install);
     expect(await screen.findByText('digest mismatch')).toBeTruthy();
     await waitFor(() => expect((screen.getByRole('button', { name: '立即更新' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it('starts only one pending update flow on a same-tick double click', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<UpdateInstallReceipt>();
+    apiMocks.installUpdate.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const install = await screen.findByRole('button', { name: '立即更新' });
+    act(() => {
+      install.click();
+      install.click();
+    });
+
+    expect(apiMocks.installUpdate).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole('region', { name: '发现新版本' })).toHaveLength(1);
+    expect((screen.getByRole('button', { name: '正在下载并安装…' }) as HTMLButtonElement).disabled)
+      .toBe(true);
+
+    pending.reject(new Error('injected update failure'));
+    await screen.findByText('injected update failure');
+  });
+
+  it('serializes update installation against a retained mutation handler in the same tick', async () => {
+    apiMocks.checkForUpdates.mockResolvedValue({
+      currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
+      releaseNotes: null, checkedAtMs: 10,
+    });
+    const pending = deferred<UpdateInstallReceipt>();
+    apiMocks.installUpdate.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const install = await screen.findByRole('button', { name: '立即更新' });
+    const switchButton = screen.getByRole('button', { name: '切换到 ChatGPT 账号' });
+    const retainedSwitch = retainReactClickHandler(switchButton);
+    act(() => {
+      install.click();
+      retainedSwitch();
+    });
+
+    expect(apiMocks.installUpdate).toHaveBeenCalledTimes(1);
+    expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
+    expect(screen.queryByRole('region', { name: '运行态切换进度' })).toBeNull();
+
+    pending.reject(new Error('injected update failure'));
+    await screen.findByText('injected update failure');
   });
 
   it('disables local mutations while update installation is pending', async () => {
@@ -373,6 +499,7 @@ describe('App release-hardening UI', () => {
     expect(within(relay).getByText('当前运行')).toBeTruthy();
     expect(within(relay).getByText('已验证')).toBeTruthy();
     expect((within(relay).getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByText('切换前会先关闭 ChatGPT')).toHaveLength(2);
   });
 
   it('loads the independent skills page only after the user opens its tab', async () => {
@@ -544,6 +671,7 @@ describe('App release-hardening UI', () => {
     fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
     expect(await within(panel).findByText('relay store unavailable')).toBeTruthy();
+    expect(screen.getAllByText('relay store unavailable')).toHaveLength(1);
     await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
     const saveEnabledBeforeRefresh = !(within(panel).getByRole('button', { name: '保存中转站' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('history refresh failed'));
@@ -591,6 +719,25 @@ describe('App release-hardening UI', () => {
 
     expect((await screen.findByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: '立即同步' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows the inline ChatGPT login next step when auth or config is missing', async () => {
+    const data = dashboardData();
+    if (data.codexHome.status !== 'ready') throw new Error('fixture mismatch');
+    data.codexHome.data.authJson.exists = false;
+    data.codexHome.data.configToml.exists = false;
+
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const notice = await screen.findByRole('region', { name: '需要完成 ChatGPT 登录' });
+    expect(within(notice).getByRole('heading', {
+      name: '先打开 ChatGPT 完成登录，再回到这里刷新',
+    })).toBeTruthy();
+    expect(within(notice).queryByText(/Codex/i)).toBeNull();
+    const safety = screen.getByRole('complementary', { name: '安全检查' });
+    expect(within(safety).getByText('ChatGPT 数据文件：缺失')).toBeTruthy();
+    expect(within(safety).queryByText(/Codex/i)).toBeNull();
+    expect((screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('keeps relay verification and backup recovery available when Codex Home itself is damaged', async () => {
@@ -666,7 +813,7 @@ describe('App release-hardening UI', () => {
     const failed = dashboardData();
     if (failed.operations.status !== 'ready') throw new Error('fixture mismatch');
     failed.operations.data = [{
-      operationId: 'sync-failed-1', action: 'syncSessions', status: 'rolledBack', phase: 'rollback',
+      operationId: 'sync-failed-1', action: 'syncSessions', status: 'failed', phase: 'apply',
       startedAtMs: 20, completedAtMs: 21, backupDirs: ['C:\\backups\\sync-failed'], counts: {},
     }];
     const load = vi.fn()
@@ -683,7 +830,7 @@ describe('App release-hardening UI', () => {
     pendingRefresh.resolve(failed);
     const history = await screen.findByRole('complementary', { name: '操作历史' });
     expect(within(history).getByText('sync-failed-1')).toBeTruthy();
-    expect(within(history).getByText('已回滚')).toBeTruthy();
+    expect(within(history).getByText('失败')).toBeTruthy();
     expect(syncEnabledBeforeRefresh).toBe(true);
   });
 
@@ -697,9 +844,476 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     expect(await screen.findByText('session-sync')).toBeTruthy();
-    expect(screen.getByText('最近 5 份已验证快照')).toBeTruthy();
+    expect(screen.getByText('已验证完整备份会持续保留，可逐份恢复或删除')).toBeTruthy();
     expect(screen.getByText('来源：C:\\shared-sessions')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: /^恢复此备份/ })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: /^删除恢复点/ })).toHaveLength(2);
+    expect(screen.getByText(/普通同步与切换只创建覆盖实际写集的轻量临时检查点/)).toBeTruthy();
+    expect(screen.getByText(/Backup 阶段写入前失败、恢复可见成功等可证明终态会自动释放/)).toBeTruthy();
+  });
+
+  it('keeps verified full backups beyond the first five browsable and manageable', async () => {
+    const data = dashboardData();
+    if (data.backups.status !== 'ready') throw new Error('fixture mismatch');
+    for (let index = 2; index <= 7; index += 1) {
+      data.backups.data.push({
+        backupDir: `C:\\backups\\safe-${index}`,
+        sourceRoot: index % 2 === 0 ? 'C:\\shared-sessions' : 'C:\\Users\\alice\\.codex',
+        reason: 'manual-full-backup',
+        createdAtMs: 10 - index,
+        fileCount: 8,
+        totalBytes: 8192,
+        verified: true,
+        completeSessions: true,
+      });
+    }
+    data.backups.data.push({
+      backupDir: 'C:\\backups\\unverified',
+      sourceRoot: 'C:\\Users\\alice\\.codex',
+      reason: 'manual-full-backup',
+      createdAtMs: 1,
+      fileCount: 8,
+      totalBytes: 8192,
+      verified: false,
+      completeSessions: true,
+    });
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const list = await screen.findByRole('region', { name: '已验证完整备份，共 7 份' });
+    expect(list.className).toContain('backup-list');
+    expect(within(list).getAllByRole('button', { name: /^恢复此备份/ })).toHaveLength(7);
+    expect(within(list).getAllByRole('button', { name: /^删除恢复点/ })).toHaveLength(7);
+    fireEvent.click(within(list).getByRole('button', { name: /删除恢复点.*safe-7/ }));
+    const confirmation = screen.getByRole('region', { name: '删除此恢复点' });
+    expect(within(confirmation).getByText('路径：C:\\backups\\safe-7')).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '取消' }));
+    expect(apiMocks.deleteBackup).not.toHaveBeenCalled();
+    expect(within(list).queryByText('C:\\backups\\unverified')).toBeNull();
+  });
+
+  it('cancels backup deletion inline without invoking the backend', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const deleteButton = await screen.findByRole('button', { name: /^删除恢复点/ });
+    fireEvent.click(deleteButton);
+
+    const confirmation = screen.getByRole('region', { name: '删除此恢复点' });
+    expect(within(confirmation).getByText(
+      '这会永久删除备份本身；删除后无法从 ChatGPT Switch 恢复。当前 ChatGPT 数据不会被删除。',
+    )).toBeTruthy();
+    expect(within(confirmation).getByText('路径：C:\\backups\\safe-1')).toBeTruthy();
+    expect(apiMocks.deleteBackup).not.toHaveBeenCalled();
+
+    fireEvent.click(within(confirmation).getByRole('button', { name: '取消' }));
+
+    expect(screen.queryByRole('region', { name: '删除此恢复点' })).toBeNull();
+    expect(apiMocks.deleteBackup).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /^删除恢复点/ })).toBeTruthy();
+  });
+
+  it('deletes a verified backup once, disables backup actions while busy, and refreshes the list', async () => {
+    const pending = deferred<BackupDeleteReceipt>();
+    apiMocks.deleteBackup.mockReturnValue(pending.promise);
+    const refreshed = dashboardData();
+    if (
+      refreshed.backups.status !== 'ready'
+      || refreshed.operations.status !== 'ready'
+      || refreshed.backupStorage.status !== 'ready'
+    ) throw new Error('fixture mismatch');
+    refreshed.backups.data = [];
+    refreshed.operations.data = [{
+      operationId: 'delete-backup-1',
+      action: 'deleteBackup',
+      status: 'succeeded',
+      phase: 'complete',
+      startedAtMs: 20,
+      completedAtMs: 21,
+      backupDirs: ['C:\\backups\\safe-1'],
+      counts: { reclaimedBytes: 4096 },
+    }];
+    apiMocks.loadBackupDashboard.mockResolvedValueOnce({
+      backups: refreshed.backups,
+      backupStorage: refreshed.backupStorage,
+      operations: refreshed.operations,
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /^删除恢复点/ }));
+    const confirmation = screen.getByRole('region', { name: '删除此恢复点' });
+    const confirmDelete = within(confirmation).getByRole('button', { name: '确认删除恢复点' });
+    act(() => {
+      confirmDelete.click();
+      confirmDelete.click();
+    });
+
+    expect(apiMocks.deleteBackup).toHaveBeenCalledTimes(1);
+    expect(apiMocks.deleteBackup).toHaveBeenCalledWith('C:\\backups\\safe-1', true);
+    expect(screen.getByText('删除恢复点处理中')).toBeTruthy();
+    expect((screen.getByRole('button', { name: /^恢复此备份/ }) as HTMLButtonElement).disabled)
+      .toBe(true);
+    expect((screen.getByRole('button', { name: /^删除恢复点/ }) as HTMLButtonElement).disabled)
+      .toBe(true);
+
+    pending.resolve({
+      operationId: 'delete-backup-1',
+      backupDir: 'C:\\backups\\safe-1',
+      reclaimedBytes: 4096,
+      warnings: [],
+    });
+
+    expect(await screen.findByText('恢复点已删除')).toBeTruthy();
+    expect(screen.getByText('操作 ID：delete-backup-1')).toBeTruthy();
+    expect(screen.getByText('已回收：4.0 KiB')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^删除恢复点/ })).toBeNull());
+    const history = screen.getByRole('complementary', { name: '操作历史' });
+    expect(within(history).getByText('删除恢复点')).toBeTruthy();
+  });
+
+  it('keeps a backup available when deletion fails', async () => {
+    apiMocks.deleteBackup.mockRejectedValue(new Error('backup changed during verification'));
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /^删除恢复点/ }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除恢复点' }));
+
+    expect(await screen.findByText('backup changed during verification')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+    const backupPanel = screen.getByRole('complementary', { name: '备份与恢复' });
+    expect(within(backupPanel).getByRole('button', { name: /^删除恢复点/ })).toBeTruthy();
+    expect(within(backupPanel).getByText('C:\\backups\\safe-1')).toBeTruthy();
+  });
+
+  it('creates a full backup with immediate loading, typed receipt, and one background refresh', async () => {
+    const pending = deferred<CreateFullBackupReceipt>();
+    apiMocks.createFullBackup.mockReturnValue(pending.promise);
+    const refreshed = dashboardData();
+    if (refreshed.operations.status !== 'ready') throw new Error('fixture mismatch');
+    refreshed.operations.data = [{
+      operationId: 'backup-manual-1',
+      action: 'createBackup',
+      status: 'succeeded',
+      phase: 'complete',
+      startedAtMs: 19,
+      completedAtMs: 21,
+      backupDirs: [
+        'C:\\backups\\manual-current-1',
+        'C:\\backups\\manual-shared-1',
+      ],
+      counts: { backupFiles: 8 },
+    }];
+    apiMocks.loadBackupDashboard.mockResolvedValueOnce({
+      backups: refreshed.backups,
+      operations: refreshed.operations,
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const create = await screen.findByRole('button', { name: '创建完整备份' });
+    act(() => {
+      create.click();
+      create.click();
+    });
+
+    expect(apiMocks.createFullBackup).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '正在创建完整备份' })).toBeTruthy();
+    expect(screen.getByText('创建完整备份处理中')).toBeTruthy();
+    pending.resolve({
+      operationId: 'backup-manual-1',
+      backups: [
+        {
+          backupDir: 'C:\\backups\\manual-current-1',
+          sourceRoot: 'C:\\Users\\alice\\.codex',
+          reason: 'manual-full-backup',
+          createdAtMs: 20,
+          scope: 'full',
+          trackedDatabaseCount: 4,
+          completeSessions: true,
+        },
+        {
+          backupDir: 'C:\\backups\\manual-shared-1',
+          sourceRoot: 'C:\\Users\\alice\\AppData\\Roaming\\codex-switch\\shared-sessions',
+          reason: 'manual-full-backup',
+          createdAtMs: 21,
+          scope: 'full',
+          trackedDatabaseCount: 4,
+          completeSessions: true,
+        },
+      ],
+      warnings: ['ChatGPT 已关闭'],
+    });
+
+    expect(await screen.findByText('完整备份已创建')).toBeTruthy();
+    expect(screen.getByText('操作 ID：backup-manual-1')).toBeTruthy();
+    expect(screen.getByText('备份：2')).toBeTruthy();
+    expect(screen.getByText('来源 1：C:\\Users\\alice\\.codex · 受管数据库：4')).toBeTruthy();
+    expect(screen.getByText(
+      '来源 2：C:\\Users\\alice\\AppData\\Roaming\\codex-switch\\shared-sessions · 受管数据库：4',
+    )).toBeTruthy();
+    expect(screen.getByText('备份路径：C:\\backups\\manual-current-1')).toBeTruthy();
+    expect(screen.getByText('备份路径：C:\\backups\\manual-shared-1')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+    const history = screen.getByRole('complementary', { name: '操作历史' });
+    expect(within(history).getByText('backup-manual-1')).toBeTruthy();
+    expect(within(history).getByText('创建完整备份')).toBeTruthy();
+  });
+
+  it('shows an honest indeterminate inline task while reclaiming proven automatic checkpoints', async () => {
+    const pending = deferred<CheckpointCleanupReceipt>();
+    apiMocks.cleanupAutomaticCheckpoints.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    const cleanup = await screen.findByRole('button', { name: '安全释放 1.4 GiB' });
+    act(() => {
+      cleanup.click();
+      cleanup.click();
+    });
+
+    expect(apiMocks.cleanupAutomaticCheckpoints).toHaveBeenCalledTimes(1);
+    const flow = screen.getByRole('region', { name: '自动检查点清理进度' });
+    expect(within(flow).getByText('正在执行安全清理任务')).toBeTruthy();
+    expect(within(flow).getByRole('status').textContent).toContain('正在核对持久化终态');
+    expect(within(flow).queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('button', { name: '正在安全释放' })).toBeNull();
+    expect(screen.getByText('清理自动检查点处理中')).toBeTruthy();
+
+    pending.resolve({
+      operationId: 'cleanup-1',
+      attemptedCount: 2,
+      failedCount: 0,
+      reclaimedCount: 2,
+      reclaimedBytes: 1_471_410_293,
+      retainedCount: 17,
+      warnings: [],
+    });
+
+    expect(await within(flow).findByText('安全清理任务已完成')).toBeTruthy();
+    expect(within(flow).getByText(/已释放 1.4 GiB/)).toBeTruthy();
+    expect(await screen.findByText('操作 ID：cleanup-1')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+  });
+
+  it('keeps checkpoint cleanup failures inline without opening a native dialog', async () => {
+    const confirm = vi.spyOn(window, 'confirm');
+    const alert = vi.spyOn(window, 'alert');
+    const prompt = vi.spyOn(window, 'prompt');
+    apiMocks.cleanupAutomaticCheckpoints.mockRejectedValue(new Error('operation log is damaged'));
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '安全释放 1.4 GiB' }));
+
+    const flow = await screen.findByRole('region', { name: '自动检查点清理进度' });
+    expect(await within(flow).findByText('安全清理任务未完成')).toBeTruthy();
+    expect(within(flow).getByRole('alert').textContent).toContain('operation log is damaged');
+    expect(confirm).not.toHaveBeenCalled();
+    expect(alert).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+    expect(document.querySelector('dialog')).toBeNull();
+  });
+
+  it('treats retained informational warnings as success when every planned cleanup succeeds', async () => {
+    apiMocks.cleanupAutomaticCheckpoints.mockResolvedValue({
+      operationId: 'cleanup-with-notes',
+      attemptedCount: 4,
+      failedCount: 0,
+      reclaimedCount: 4,
+      reclaimedBytes: 3_633_111_652,
+      retainedCount: 18,
+      warnings: ['未分类目录继续安全保留'],
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '安全释放 1.4 GiB' }));
+
+    const flow = await screen.findByRole('region', { name: '自动检查点清理进度' });
+    expect(await within(flow).findByText('安全清理任务已完成（有保留说明）')).toBeTruthy();
+    expect(screen.getByText('自动检查点清理完成（有保留说明）')).toBeTruthy();
+    expect(screen.getByText('计划：4')).toBeTruthy();
+    expect(screen.getByText('失败：0')).toBeTruthy();
+    expect(screen.getByText('安全保留：18')).toBeTruthy();
+    expect(screen.getByText('警告：未分类目录继续安全保留')).toBeTruthy();
+    expect(screen.queryByText('自动检查点部分完成')).toBeNull();
+  });
+
+  it('labels real checkpoint deletion failures as partial even without warning text', async () => {
+    apiMocks.cleanupAutomaticCheckpoints.mockResolvedValue({
+      operationId: 'cleanup-partial',
+      attemptedCount: 2,
+      failedCount: 1,
+      reclaimedCount: 1,
+      reclaimedBytes: 1024,
+      retainedCount: 18,
+      warnings: [],
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '安全释放 1.4 GiB' }));
+
+    const flow = await screen.findByRole('region', { name: '自动检查点清理进度' });
+    expect(await within(flow).findByText('安全清理任务部分完成')).toBeTruthy();
+    expect(screen.getByText('自动检查点部分完成')).toBeTruthy();
+    expect(screen.getByText('计划：2')).toBeTruthy();
+    expect(screen.getByText('失败：1')).toBeTruthy();
+    expect(screen.queryByText('自动检查点清理完成（有保留说明）')).toBeNull();
+  });
+
+  it('queues a fresh backup scan when another mutation finishes during an older scan', async () => {
+    const firstRefresh = deferred<BackupDashboardData>();
+    const secondRefresh = deferred<BackupDashboardData>();
+    apiMocks.syncAllSessions.mockResolvedValue({
+      operationId: 'sync-after-cleanup',
+      backups: [],
+      insertedThreads: 0,
+      copiedSessionFiles: 0,
+      duplicateThreads: 0,
+      skippedMissingSessionFiles: 0,
+      skippedArchivedThreads: 0,
+      mergedSessionIndexEntries: 0,
+      warnings: [],
+    });
+    render(<App />);
+
+    await screen.findByRole('article', { name: 'ChatGPT 账号态' });
+    fireEvent.click(screen.getByRole('button', { name: '会话' }));
+    await screen.findByRole('heading', { name: '会话管理' });
+    await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '运行态' }));
+    fireEvent.click(await screen.findByRole('button', { name: '加载备份' }));
+    await screen.findByRole('button', { name: '安全释放 1.4 GiB' });
+    expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1);
+
+    apiMocks.loadBackupDashboard
+      .mockReturnValueOnce(firstRefresh.promise)
+      .mockReturnValueOnce(secondRefresh.promise);
+    fireEvent.click(screen.getByRole('button', { name: '安全释放 1.4 GiB' }));
+    await screen.findByText('操作 ID：cleanup-default');
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole('button', { name: '立即同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始同步' }));
+    await screen.findByText('操作 ID：sync-after-cleanup');
+
+    const stale = dashboardData();
+    firstRefresh.resolve({
+      backups: stale.backups,
+      backupStorage: stale.backupStorage,
+      operations: stale.operations,
+    });
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(3));
+
+    const fresh = dashboardData();
+    if (fresh.backupStorage.status !== 'ready') throw new Error('fixture mismatch');
+    fresh.backupStorage.data = {
+      ...fresh.backupStorage.data,
+      totalCount: 17,
+      totalBytes: 2_693_977_957,
+      reclaimableCount: 0,
+      reclaimableBytes: 0,
+    };
+    secondRefresh.resolve({
+      backups: fresh.backups,
+      backupStorage: fresh.backupStorage,
+      operations: fresh.operations,
+    });
+
+    expect(await screen.findByRole('button', {
+      name: '没有可安全释放的检查点',
+    })).toBeTruthy();
+  });
+
+  it('refreshes durable backup history after full backup creation fails', async () => {
+    const refreshed = dashboardData();
+    if (refreshed.backups.status !== 'ready' || refreshed.operations.status !== 'ready') {
+      throw new Error('fixture mismatch');
+    }
+    refreshed.backups.data = [{
+      backupDir: 'C:\\backups\\manual-current-partial',
+      sourceRoot: 'C:\\Users\\alice\\.codex',
+      reason: 'manual-full-current',
+      createdAtMs: 20,
+      fileCount: 4,
+      totalBytes: 4096,
+      verified: true,
+      completeSessions: true,
+    }];
+    refreshed.operations.data = [{
+      operationId: 'backup-manual-failed',
+      action: 'createBackup',
+      status: 'failed',
+      phase: 'apply',
+      startedAtMs: 19,
+      completedAtMs: 21,
+      backupDirs: ['C:\\backups\\manual-current-partial'],
+      counts: {},
+    }];
+    apiMocks.createFullBackup.mockRejectedValue(new Error('shared backup failed'));
+    apiMocks.loadBackupDashboard.mockResolvedValueOnce({
+      backups: refreshed.backups,
+      operations: refreshed.operations,
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '创建完整备份' }));
+
+    expect(await screen.findByText('shared backup failed')).toBeTruthy();
+    await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
+    const history = screen.getByRole('complementary', { name: '操作历史' });
+    expect(within(history).getByText('backup-manual-failed')).toBeTruthy();
+    expect(within(history).getByText('C:\\backups\\manual-current-partial')).toBeTruthy();
+    expect(within(history).getByText('失败')).toBeTruthy();
+  });
+
+  it('serializes same-tick backup retries with a synchronous in-flight guard', async () => {
+    const data = dashboardData();
+    data.backups = { status: 'error', error: 'backup index unavailable' };
+    const pending = deferred<BackupDashboardData>();
+    apiMocks.loadBackupDashboard.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const retry = await screen.findByRole('button', { name: '重试' });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+
+    expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('备份列表扫描中...')).toBeTruthy();
+    const refreshed = dashboardData();
+    pending.resolve({
+      backups: refreshed.backups,
+      backupStorage: refreshed.backupStorage,
+      operations: refreshed.operations,
+    });
+    await waitFor(() => expect(screen.getByText('已验证完整备份会持续保留，可逐份恢复或删除')).toBeTruthy());
+  });
+
+  it('does not start a full backup while a backup scan is in flight in the same tick', async () => {
+    const data = dashboardData();
+    data.backups = { status: 'error', error: 'backup index unavailable' };
+    const pending = deferred<BackupDashboardData>();
+    apiMocks.loadBackupDashboard.mockReturnValue(pending.promise);
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const retry = await screen.findByRole('button', { name: '重试' });
+    const create = screen.getByRole('button', { name: '创建完整备份' });
+    act(() => {
+      retry.click();
+      create.click();
+    });
+
+    expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1);
+    expect(apiMocks.createFullBackup).not.toHaveBeenCalled();
+    expect((screen.getByRole('button', { name: '创建完整备份' }) as HTMLButtonElement).disabled).toBe(true);
+
+    const refreshed = dashboardData();
+    pending.resolve({
+      backups: refreshed.backups,
+      backupStorage: refreshed.backupStorage,
+      operations: refreshed.operations,
+    });
+    await waitFor(() => {
+      expect((screen.getByRole('button', { name: '创建完整备份' }) as HTMLButtonElement).disabled)
+        .toBe(false);
+    });
   });
 
   it('does not conflate loading or failed domains with empty saved state', async () => {
@@ -710,7 +1324,7 @@ describe('App release-hardening UI', () => {
 
     const account = await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     expect(within(account).getAllByText('不可用').length).toBeGreaterThan(0);
-    const backupPanel = screen.getByRole('complementary', { name: '备份恢复' });
+    const backupPanel = screen.getByRole('complementary', { name: '备份与恢复' });
     expect(within(backupPanel).getByText('backup index unavailable')).toBeTruthy();
     expect(within(backupPanel).queryByText('没有可恢复的已验证备份。')).toBeNull();
   });
@@ -809,6 +1423,59 @@ describe('App release-hardening UI', () => {
     expect(await screen.findByText('切换完成，可以重新打开 ChatGPT。会话索引将在打开会话页时刷新。')).toBeTruthy();
   });
 
+  it('keeps both runtime switches disabled until the post-switch runtime scan finishes', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    const plusRuntime = dashboard.runtimes.data[0];
+    const runtimeRefresh = deferred<RuntimeDashboardData>();
+    apiMocks.loadRuntimeDashboard.mockReturnValue(runtimeRefresh.promise);
+    apiMocks.switchRuntime.mockImplementation(async (_runtimeId, onProgress) => {
+      onProgress({ phase: 'detectingApp', timestampMs: 100 });
+      onProgress({ phase: 'complete', timestampMs: 110 });
+      return {
+        operationId: 'switch-refresh-pending',
+        changed: true,
+        runtime: plusRuntime,
+        backups: [],
+        rolledBack: false,
+        toShared: emptySyncResult(),
+        fromShared: emptySyncResult(),
+      };
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+    await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByText('正在确认当前运行态')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement).disabled)
+      .toBe(true);
+    expect((screen.getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled)
+      .toBe(true);
+
+    const refreshed = dashboardData();
+    if (refreshed.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    refreshed.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'mode',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 111,
+    };
+    runtimeRefresh.resolve({
+      codexHome: refreshed.codexHome,
+      runtimes: refreshed.runtimes,
+      runtimeStatus: refreshed.runtimeStatus,
+      operations: refreshed.operations,
+    });
+
+    await waitFor(() => expect(screen.queryByText('正在确认当前运行态')).toBeNull());
+    expect((screen.getByRole('button', { name: '重新应用 ChatGPT 账号' }) as HTMLButtonElement).disabled)
+      .toBe(false);
+    expect((screen.getByRole('button', { name: '切换到中转站' }) as HTMLButtonElement).disabled)
+      .toBe(false);
+  });
+
   it('serializes same-tick switch clicks and waits for command completion before scanning stale sessions', async () => {
     const dashboard = dashboardData();
     dashboard.backups = { status: 'error', error: 'backup index unavailable' };
@@ -861,6 +1528,149 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
   });
 
+  it('ignores progress from an older switch after a newer switch has started', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
+    const first = deferred<RuntimeSwitchResult>();
+    const second = deferred<RuntimeSwitchResult>();
+    const progress: Array<(event: RuntimeSwitchProgress) => void> = [];
+    apiMocks.switchRuntime
+      .mockImplementationOnce((_runtimeId, callback) => {
+        progress.push(callback);
+        return first.promise;
+      })
+      .mockImplementationOnce((_runtimeId, callback) => {
+        progress.push(callback);
+        return second.promise;
+      });
+    const plusDashboard = dashboardData();
+    if (plusDashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    plusDashboard.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'exact',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 20,
+    };
+    apiMocks.loadRuntimeDashboard.mockResolvedValue({
+      codexHome: plusDashboard.codexHome,
+      runtimes: plusDashboard.runtimes,
+      runtimeStatus: plusDashboard.runtimeStatus,
+      operations: plusDashboard.operations,
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+    first.resolve({
+      operationId: 'switch-first',
+      changed: true,
+      runtime: dashboard.runtimes.data[0],
+      backups: [],
+      rolledBack: false,
+      toShared: emptySyncResult(),
+      fromShared: emptySyncResult(),
+    });
+    const relayButton = await screen.findByRole('button', { name: '切换到中转站' });
+    fireEvent.click(relayButton);
+    expect(await screen.findByRole('heading', { name: '正在切换到API 中转站' })).toBeTruthy();
+
+    act(() => progress[0]({
+      phase: 'failed',
+      timestampMs: 30,
+      message: 'stale first switch event',
+      outcome: 'failedBeforeWrite',
+    }));
+
+    expect(screen.queryByText('stale first switch event')).toBeNull();
+    expect(screen.getByRole('heading', { name: '正在切换到API 中转站' })).toBeTruthy();
+    second.resolve({
+      operationId: 'switch-second',
+      changed: true,
+      runtime: dashboard.runtimes.data[1],
+      backups: [],
+      rolledBack: false,
+      toShared: emptySyncResult(),
+      fromShared: emptySyncResult(),
+    });
+    expect(await screen.findByText('操作 ID：switch-second')).toBeTruthy();
+  });
+
+  it('registers the close guard before enabling a switch and blocks close only while it runs', async () => {
+    const registration = deferred<() => void>();
+    const pendingSwitch = deferred<RuntimeSwitchResult>();
+    let closeHandler: ((event: { preventDefault: () => void }) => void) | undefined;
+    const registerCloseGuard = vi.fn((handler: typeof closeHandler) => {
+      closeHandler = handler;
+      return registration.promise;
+    });
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    if (dashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    dashboard.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'exact',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 20,
+    };
+    apiMocks.switchRuntime.mockReturnValue(pendingSwitch.promise);
+
+    render(
+      <App
+        loadDashboard={() => Promise.resolve(dashboard)}
+        registerCloseGuard={registerCloseGuard}
+      />,
+    );
+
+    const switchButton = await screen.findByRole('button', { name: '切换到中转站' });
+    expect((switchButton as HTMLButtonElement).disabled).toBe(true);
+    registration.resolve(() => undefined);
+    await waitFor(() => expect((switchButton as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(switchButton);
+    const during = { preventDefault: vi.fn() };
+    act(() => closeHandler?.(during));
+    expect(during.preventDefault).toHaveBeenCalledTimes(1);
+
+    pendingSwitch.resolve({
+      operationId: 'switch-close-guard',
+      changed: true,
+      runtime: dashboard.runtimes.data[1],
+      backups: [],
+      rolledBack: false,
+      toShared: emptySyncResult(),
+      fromShared: emptySyncResult(),
+    });
+    expect(await screen.findByText('操作 ID：switch-close-guard')).toBeTruthy();
+
+    const after = { preventDefault: vi.fn() };
+    act(() => closeHandler?.(after));
+    expect(after.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the window close guard cannot be registered', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    dashboard.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'exact',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 20,
+    };
+    render(
+      <App
+        loadDashboard={() => Promise.resolve(dashboard)}
+        registerCloseGuard={() => Promise.reject(new Error('listener unavailable'))}
+      />,
+    );
+
+    expect(await screen.findByText(/窗口保护初始化失败/)).toBeTruthy();
+    expect((screen.getByRole('button', { name: '切换到中转站' }) as HTMLButtonElement).disabled)
+      .toBe(true);
+    expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
+  });
+
   it('marks backups stale after the current snapshot even when switching fails before mutation', async () => {
     const pendingSwitch = deferred<RuntimeSwitchResult>();
     let onProgress!: (event: RuntimeSwitchProgress) => void;
@@ -887,13 +1697,25 @@ describe('App release-hardening UI', () => {
       });
       pendingSwitch.reject(new Error('shared backup failed'));
     });
-    await screen.findAllByText('shared backup failed');
+    expect(await screen.findByText(/shared backup failed/)).toBeTruthy();
+    expect(screen.getAllByText(/shared backup failed/)).toHaveLength(1);
     await waitFor(() => expect(loadBackups.disabled).toBe(false));
 
     fireEvent.click(loadBackups);
     await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(1));
     expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
-  });
+});
+
+function emptySyncResult() {
+  return {
+    insertedThreads: 0,
+    copiedSessionFiles: 0,
+    duplicateThreads: 0,
+    skippedMissingSessionFiles: 0,
+    skippedArchivedThreads: 0,
+    mergedSessionIndexEntries: 0,
+  };
+}
 
   it('loads runtime state first, then sessions and backups only on demand', async () => {
     const dashboard = dashboardData();
@@ -988,6 +1810,58 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.closeCodexProcesses).toHaveBeenCalled());
     expect(apiMocks.deleteManagedSessions).toHaveBeenCalledWith(['thread-a'], true);
     expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('does not present a restore-visible checkpoint after the backend has reclaimed it', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.managedSessions.status !== 'ready') throw new Error('fixture mismatch');
+    dashboard.managedSessions.data.sessions = [{
+      id: 'thread-restore', title: '待恢复', preview: null, modelProvider: 'openai',
+      updatedAt: 1, updatedAtMs: 1000, archived: true, archivedAt: 1000, scope: 'current',
+      current: {
+        home: 'C:\\Users\\alice\\.codex', rolloutPath: 'sessions/thread-restore.jsonl',
+        sessionFile: 'sessions/thread-restore.jsonl', archived: true, archivedAt: 1000,
+        updatedAt: 1, updatedAtMs: 1000,
+      },
+      shared: null,
+    }];
+    dashboard.managedSessions.data.totalCount = 1;
+    dashboard.managedSessions.data.archivedCount = 1;
+    apiMocks.restoreSessionsVisible.mockResolvedValue({
+      operationId: 'restore-visible-1',
+      selectedCount: 1,
+      backups: [{
+        backupDir: 'C:\\backups\\restore-visible-1',
+        sourceRoot: 'C:\\Users\\alice\\.codex',
+        reason: 'restore-visible',
+        createdAtMs: 20,
+        scope: 'stateOnly',
+        trackedDatabaseCount: 1,
+        completeSessions: false,
+      }],
+      deletedThreads: 0,
+      deletedSessionFiles: 0,
+      removedSessionIndexEntries: 0,
+      restoredThreads: 1,
+      checkpointCleanup: {
+        attemptedCount: 1,
+        failedCount: 0,
+        reclaimedCount: 1,
+        reclaimedBytes: 4096,
+        retainedCount: 0,
+        warnings: [],
+      },
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '会话' }));
+    fireEvent.click(screen.getByLabelText(/^选择 thread-restore/));
+    fireEvent.click(screen.getByRole('button', { name: '恢复可见' }));
+
+    expect(await screen.findByText('操作 ID：restore-visible-1')).toBeTruthy();
+    expect(screen.getByText('临时检查点已释放：4.0 KiB')).toBeTruthy();
+    expect(screen.queryByText('备份：1')).toBeNull();
+    expect(screen.queryByText('备份路径：C:\\backups\\restore-visible-1')).toBeNull();
   });
 
   it('restores only a verified backup after explicit confirmation', async () => {

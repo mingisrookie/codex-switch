@@ -13,6 +13,7 @@ import {
   Search,
   Settings2,
   ShieldCheck,
+  Trash2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { RuntimeKind, RuntimeSwitchPhase, RuntimeSwitchProgress } from './types';
@@ -36,6 +37,7 @@ type Step = {
 };
 
 const steps: Step[] = [
+  { phase: 'planningSessions', label: '规划会话写集', icon: Search },
   { phase: 'verifyingRelay', label: '验证中转站', icon: RadioTower, relayOnly: true },
   { phase: 'detectingApp', label: '检测 ChatGPT', icon: Search },
   { phase: 'closingApp', label: '关闭 ChatGPT', icon: MonitorX, optional: true },
@@ -45,6 +47,7 @@ const steps: Step[] = [
   { phase: 'applyingRuntime', label: '应用运行态', icon: Settings2 },
   { phase: 'syncingToCurrent', label: '同步回本机', icon: CloudDownload },
   { phase: 'verifying', label: '校验切换结果', icon: ShieldCheck },
+  { phase: 'cleaningCheckpoints', label: '释放临时检查点', icon: Trash2 },
 ];
 
 export function RuntimeSwitchProgressPanel({
@@ -154,6 +157,7 @@ function stepState(
 ) {
   if (flow.status === 'succeeded') return observed.has(step.phase) ? 'done' : 'skipped';
   if (flow.status === 'failed' && flow.failedPhase === step.phase) return 'failed';
+  if (flow.status === 'failed' && observed.has(step.phase)) return 'done';
   if (observed.has(step.phase) && index !== currentIndex) return 'done';
   if (index === currentIndex && flow.status === 'running') return 'active';
   if (index === currentIndex && flow.status === 'failed') return 'failed';
@@ -172,5 +176,6 @@ function stepStatusLabel(state: string, optional = false) {
 function failureLabel(outcome: RuntimeSwitchProgress['outcome']) {
   if (outcome === 'rolledBack') return '切换失败，已恢复切换前状态';
   if (outcome === 'rollbackFailed') return '切换失败且自动恢复未完成，请先不要重新打开 ChatGPT';
-  return '切换在写入前失败，ChatGPT 数据未变更';
+  if (outcome === 'failedBeforeWrite') return '切换在写入前失败，ChatGPT 数据未变更';
+  return '切换失败，但未收到可验证的终态；请先不要重新打开 ChatGPT';
 }

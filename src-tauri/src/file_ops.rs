@@ -46,6 +46,27 @@ pub fn atomic_copy(source: &Path, target: &Path) -> Result<u64, String> {
     result
 }
 
+pub fn atomic_create<F>(path: &Path, writer: F) -> Result<bool, String>
+where
+    F: FnOnce(&mut File) -> Result<(), String>,
+{
+    ensure_parent(path)?;
+    let temp_path = unique_temp_path(path)?;
+    let result = (|| {
+        let mut file = create_new(&temp_path)?;
+        writer(&mut file)?;
+        file.sync_all()
+            .map_err(|error| format!("failed to flush created file: {error}"))?;
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(format!("failed to publish created file: {error}")),
+        }
+    })();
+    let _ = fs::remove_file(&temp_path);
+    result
+}
+
 pub fn atomic_rewrite<F>(path: &Path, writer: F) -> Result<(), String>
 where
     F: FnOnce(&mut File) -> Result<(), String>,
@@ -196,7 +217,9 @@ fn replace_path(source: &Path, target: &Path) -> Result<(), String> {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{atomic_write, walk_jsonl_files};
+    use std::io::Write;
+
+    use super::{atomic_create, atomic_write, walk_jsonl_files};
 
     #[test]
     fn jsonl_walk_propagates_directory_errors() {
@@ -205,6 +228,23 @@ mod tests {
         let error = walk_jsonl_files(&temp.path().join("missing")).unwrap_err();
 
         assert!(error.contains("failed to walk JSONL directory"), "{error}");
+    }
+
+    #[test]
+    fn atomic_create_never_replaces_a_file_that_appeared_first() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("session.jsonl");
+        std::fs::write(&target, b"live").unwrap();
+
+        let created = atomic_create(&target, |output| {
+            output
+                .write_all(b"stale")
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert!(!created);
+        assert_eq!(std::fs::read(&target).unwrap(), b"live");
     }
 
     #[cfg(windows)]

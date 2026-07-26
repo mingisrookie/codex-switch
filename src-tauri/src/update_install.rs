@@ -21,7 +21,8 @@ use std::{
 const UPDATE_ASSET_NAME: &str = "codex-switch.exe";
 const UPDATE_URL_PREFIX: &str = "https://github.com/mingisrookie/codex-switch/releases/download/";
 const MAX_UPDATE_BYTES: u64 = 64 * 1024 * 1024;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const UPDATE_DIR_PREFIX: &str = "codex-switch-update-";
 const UPDATE_PLAN_SCHEMA: u32 = 1;
 const APPLY_UPDATE_ARG: &str = "--codex-switch-apply-update";
@@ -37,6 +38,8 @@ const STARTUP_ACK_ATTEMPTS: usize = 150;
 const STARTUP_ACK_INTERVAL: Duration = Duration::from_millis(100);
 const HELPER_READY_ATTEMPTS: usize = 150;
 const LEGACY_HELPER_ACK_GRACE: Duration = Duration::from_secs(16);
+const STAGING_CLEANUP_ATTEMPTS: usize = 40;
+const STAGING_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const CLEANUP_LEASE_TIMEOUT_MS: u32 = 30_000;
 
@@ -554,7 +557,7 @@ fn prepare_update() -> Result<UpdateInstallReceipt, String> {
 
     drop(staging_guard);
     if result.is_err() {
-        let _ = remove_staging_dir(&staging_dir);
+        remove_staging_with_retries(&staging_dir);
     }
     result
 }
@@ -878,6 +881,7 @@ fn lease_name_for_target(target: &Path) -> Result<String, String> {
 #[cfg(windows)]
 fn download_asset(asset: &ValidatedAsset, staged_exe: &Path) -> Result<(), String> {
     let client = Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_TIMEOUT)
         .redirect(Policy::custom(github_asset_redirect))
         .build()
@@ -1674,16 +1678,21 @@ fn wait_for_helper_ready(child: &mut std::process::Child, ready_path: &Path) -> 
         if ready_path.is_file() {
             return Ok(());
         }
-        if child
-            .try_wait()
-            .map_err(|_| "failed to monitor the update helper".to_string())?
-            .is_some()
-        {
-            return Err("the update helper failed its safety preflight".to_string());
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return Err("the update helper failed its safety preflight".to_string());
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("failed to monitor the update helper".to_string());
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
+    let _ = child.wait();
     Err("timed out waiting for the update helper safety preflight".to_string())
 }
 
@@ -1818,11 +1827,11 @@ fn startup_cleanup_delay(staging_dir: &Path) -> Duration {
 }
 
 fn remove_staging_with_retries(staging_dir: &Path) {
-    for _ in 0..10 {
+    for _ in 0..STAGING_CLEANUP_ATTEMPTS {
         if remove_staging_dir(staging_dir).is_ok() || !staging_dir.exists() {
             return;
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(STAGING_CLEANUP_INTERVAL);
     }
 }
 
@@ -2108,6 +2117,13 @@ mod tests {
         .unwrap();
         assert_eq!(validated.sha256, digest);
         assert_eq!(validated.size, 10);
+    }
+
+    #[test]
+    fn download_budget_does_not_restore_the_two_minute_failure_window() {
+        assert!(DOWNLOAD_CONNECT_TIMEOUT < DOWNLOAD_TIMEOUT);
+        assert!(DOWNLOAD_TIMEOUT > Duration::from_secs(120));
+        assert!(DOWNLOAD_TIMEOUT >= Duration::from_secs(10 * 60));
     }
 
     #[test]

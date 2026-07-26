@@ -49,8 +49,18 @@ pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Ok(managed_process_tree(&snapshot_processes()?))
 }
 
+#[cfg(windows)]
+pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    Ok(standalone_codex_processes(&snapshot_processes()?))
+}
+
 #[cfg(not(windows))]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    Err("ChatGPT process control is not supported on this platform".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
 }
 
@@ -294,7 +304,11 @@ where
     let failed_pids = survivors
         .iter()
         .filter_map(|process| {
-            (kill_process(process, true) == TaskkillResult::Failed).then_some(process.pid)
+            if process.creation_time_100ns.is_none() {
+                Some(process.pid)
+            } else {
+                (kill_process(process, true) == TaskkillResult::Failed).then_some(process.pid)
+            }
         })
         .collect::<Vec<_>>();
     let survivors = managed_survivors(
@@ -325,20 +339,24 @@ fn managed_survivors(
 ) -> Vec<CodexProcess> {
     snapshot
         .iter()
-        .filter(|process| {
-            managed_processes
-                .get(&process.pid)
-                .is_some_and(|managed| same_process_identity(managed, process))
+        .filter_map(|process| {
+            let managed = managed_processes.get(&process.pid)?;
+            if managed.parent_pid != process.parent_pid
+                || !managed.image_name.eq_ignore_ascii_case(&process.image_name)
+            {
+                return None;
+            }
+            match (managed.creation_time_100ns, process.creation_time_100ns) {
+                (Some(expected), Some(observed)) if expected != observed => None,
+                (Some(_), Some(_)) => Some(process.clone()),
+                _ => {
+                    let mut unverified = process.clone();
+                    unverified.creation_time_100ns = None;
+                    Some(unverified)
+                }
+            }
         })
-        .cloned()
         .collect()
-}
-
-fn same_process_identity(left: &CodexProcess, right: &CodexProcess) -> bool {
-    left.pid == right.pid
-        && left.parent_pid == right.parent_pid
-        && left.image_name.eq_ignore_ascii_case(&right.image_name)
-        && left.creation_time_100ns == right.creation_time_100ns
 }
 
 #[cfg(any(windows, test))]
@@ -373,6 +391,21 @@ fn managed_process_tree(processes: &[CodexProcess]) -> Vec<CodexProcess> {
         .collect()
 }
 
+fn standalone_codex_processes(processes: &[CodexProcess]) -> Vec<CodexProcess> {
+    let managed_pids = managed_process_tree(processes)
+        .into_iter()
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    processes
+        .iter()
+        .filter(|process| {
+            process.image_name.eq_ignore_ascii_case("codex.exe")
+                && !managed_pids.contains(&process.pid)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(any(windows, test))]
 fn decode_process_name(buffer: &[u16]) -> String {
     let end = buffer
@@ -390,8 +423,8 @@ fn is_managed_app_root(image_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        close_codex_processes_with, decode_process_name, managed_process_tree, CodexProcess,
-        TaskkillResult,
+        close_codex_processes_with, decode_process_name, managed_process_tree,
+        standalone_codex_processes, CodexProcess, TaskkillResult,
     };
     #[cfg(windows)]
     use super::{system_tool_path, GRACEFUL_CLOSE_POLL_ATTEMPTS, GRACEFUL_CLOSE_POLL_INTERVAL};
@@ -431,6 +464,24 @@ mod tests {
                 chatgpt.clone(),
             ]),
             vec![host_grandchild, codex_child, legacy_root, chatgpt,]
+        );
+    }
+
+    #[test]
+    fn standalone_codex_detection_excludes_managed_descendants_and_never_targets_them() {
+        let chatgpt = process("ChatGPT.exe", 1000);
+        let managed_codex = child_process("codex.exe", 2000, 1000);
+        let standalone_codex = child_process("CoDeX.ExE", 3000, 42);
+        let codex_switch = child_process("codex-switch.exe", 4000, 42);
+
+        assert_eq!(
+            standalone_codex_processes(&[
+                managed_codex,
+                standalone_codex.clone(),
+                codex_switch,
+                chatgpt,
+            ]),
+            vec![standalone_codex]
         );
     }
 
@@ -577,6 +628,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(*killed.borrow(), vec![(1234, false)]);
+        assert!(listings.borrow().is_empty());
+    }
+
+    #[test]
+    fn root_exit_with_an_unverifiable_descendant_fails_closed_without_forcing_it() {
+        let root = process("ChatGPT.exe", 1234);
+        let helper = child_process("renderer-helper.exe", 5678, 1234);
+        let mut unverifiable_helper = helper.clone();
+        unverifiable_helper.creation_time_100ns = None;
+        let listings = RefCell::new(VecDeque::from([
+            Ok(vec![root, helper]),
+            Ok(vec![unverifiable_helper.clone()]),
+            Ok(vec![unverifiable_helper]),
+        ]));
+        let killed = RefCell::new(Vec::new());
+
+        let error = close_codex_processes_with(
+            || {
+                listings
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected listing")
+            },
+            |process, force| {
+                killed.borrow_mut().push((process.pid, force));
+                TaskkillResult::Succeeded
+            },
+            || panic!("zero poll attempts should not wait"),
+            0,
+        )
+        .expect_err("an unverifiable managed descendant must block the mutation");
+
+        assert_eq!(*killed.borrow(), vec![(1234, false)]);
+        assert!(error.contains("still running PID(s): 5678"), "{error}");
+        assert!(
+            error.contains("taskkill failed for PID(s): 5678"),
+            "{error}"
+        );
         assert!(listings.borrow().is_empty());
     }
 

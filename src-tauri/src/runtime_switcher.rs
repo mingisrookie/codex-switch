@@ -10,17 +10,48 @@ use serde::Serialize;
 use toml_edit::DocumentMut;
 
 use crate::{
-    backup::{create_local_session_backup, create_runtime_backup, restore_backup, BackupManifest},
-    codex_paths::{local_codex_paths, resolve_user_codex_paths},
+    backup::{
+        create_runtime_state_backup_with_paths, create_state_backup_with_paths, restore_backup,
+        BackupManifest, BackupScope, CheckpointCleanupSummary,
+    },
+    codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
     config_patch::{plan_runtime_config_patch, ConfigPatchPlan, RuntimeConfigKind},
     file_ops::atomic_write,
     operation_log::operation_id,
     runtime_store::{RuntimeConfidence, RuntimeFiles, RuntimeKind, RuntimeMetadata, RuntimeStore},
     session_sync::{
-        preflight_session_database, sync_shared_to_user_home, sync_shared_to_user_home_hot,
-        sync_user_home_to_shared, SessionSyncResult,
+        preflight_session_database, runtime_switch_session_files_are_unchanged_with_paths,
+        sync_shared_to_user_home_hot_with_paths, sync_shared_to_user_home_hot_with_policy,
+        sync_shared_to_user_home_with_policy, sync_user_home_to_shared_with_policy,
+        SessionFileWritePolicy, SessionSyncResult,
     },
 };
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupReceiptSummary {
+    pub backup_dir: PathBuf,
+    pub source_root: PathBuf,
+    pub reason: String,
+    pub created_at_ms: u128,
+    pub scope: BackupScope,
+    pub tracked_database_count: usize,
+    pub complete_sessions: bool,
+}
+
+impl From<&BackupManifest> for BackupReceiptSummary {
+    fn from(manifest: &BackupManifest) -> Self {
+        Self {
+            backup_dir: manifest.backup_dir.clone(),
+            source_root: manifest.source_root.clone(),
+            reason: manifest.reason.clone(),
+            created_at_ms: manifest.created_at_ms,
+            scope: manifest.scope,
+            tracked_database_count: manifest.tracked_databases.len(),
+            complete_sessions: manifest.complete_sessions,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,15 +59,20 @@ pub struct RuntimeSwitchResult {
     pub operation_id: String,
     pub changed: bool,
     pub runtime: RuntimeMetadata,
-    pub backups: Vec<BackupManifest>,
+    pub backups: Vec<BackupReceiptSummary>,
+    #[serde(skip)]
+    pub(crate) backup_manifests: Vec<BackupManifest>,
     pub to_shared: SessionSyncResult,
     pub from_shared: SessionSyncResult,
     pub rolled_back: bool,
+    pub warnings: Vec<String>,
+    pub checkpoint_cleanup: CheckpointCleanupSummary,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeSwitchPhase {
+    PlanningSessions,
     DetectingApp,
     ClosingApp,
     VerifyingRelay,
@@ -47,6 +83,7 @@ pub enum RuntimeSwitchPhase {
     SyncingToCurrent,
     Verifying,
     RollingBack,
+    CleaningCheckpoints,
     Complete,
     Failed,
 }
@@ -72,13 +109,44 @@ pub(crate) struct RuntimeSwitchPlan {
     runtime: RuntimeMetadata,
     config_plan: ConfigPatchPlan,
     session_provider: String,
-    sqlite_home: PathBuf,
+    codex_paths: CodexPaths,
     requires_change: bool,
+    session_file_write_policy: SessionFileWritePolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HotSessionSyncPlan {
+    session_file_write_policy: SessionFileWritePolicy,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeSwitchRoots<'a> {
+    codex_home: &'a Path,
+    backup_root: &'a Path,
+    shared_home: &'a Path,
 }
 
 impl RuntimeSwitchPlan {
     pub(crate) fn requires_change(&self) -> bool {
         self.requires_change
+    }
+
+    pub(crate) fn codex_paths(&self) -> &CodexPaths {
+        &self.codex_paths
+    }
+
+    pub(crate) fn current_backup_scope(&self) -> BackupScope {
+        BackupScope::RuntimeState
+    }
+
+    pub(crate) fn shared_backup_scope(&self) -> BackupScope {
+        BackupScope::StateOnly
+    }
+}
+
+impl HotSessionSyncPlan {
+    pub(crate) fn backup_scope(&self) -> BackupScope {
+        BackupScope::StateOnly
     }
 }
 
@@ -156,15 +224,19 @@ pub fn switch_runtime_files_detailed_with_progress(
     shared_home: &Path,
     on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
-    let plan = build_runtime_switch_plan(store, runtime_id, codex_home)
+    let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
         .map_err(RuntimeSwitchFailure::before_backup)?;
+    let mut verify_processes_closed = verify_runtime_processes_closed;
     switch_runtime_files_from_plan(
         store,
-        codex_home,
-        backup_root,
-        shared_home,
+        RuntimeSwitchRoots {
+            codex_home,
+            backup_root,
+            shared_home,
+        },
         SwitchFailurePoint::None,
         plan,
+        &mut verify_processes_closed,
         on_progress,
     )
 }
@@ -173,16 +245,25 @@ pub(crate) fn preflight_runtime_switch(
     store: &RuntimeStore,
     runtime_id: &str,
     codex_home: &Path,
+    shared_home: &Path,
 ) -> Result<RuntimeSwitchPlan, String> {
-    build_runtime_switch_plan(store, runtime_id, codex_home)
+    build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
 }
 
+#[cfg(test)]
 pub(crate) fn preflight_runtime_session_sync(
     codex_home: &Path,
     shared_home: &Path,
 ) -> Result<(), String> {
     let current = resolve_user_codex_paths(codex_home)?;
     let shared = local_codex_paths(shared_home);
+    preflight_runtime_session_sync_with_paths(&current, &shared)
+}
+
+pub(crate) fn preflight_runtime_session_sync_with_paths(
+    current: &CodexPaths,
+    shared: &CodexPaths,
+) -> Result<(), String> {
     if !current.state_db.is_file() {
         return Err("state_5.sqlite is required before switching runtimes".to_string());
     }
@@ -201,13 +282,17 @@ pub(crate) fn switch_runtime_files_preflighted_with_progress(
     plan: RuntimeSwitchPlan,
     on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
+    let mut verify_processes_closed = verify_runtime_processes_closed;
     switch_runtime_files_from_plan(
         store,
-        codex_home,
-        backup_root,
-        shared_home,
+        RuntimeSwitchRoots {
+            codex_home,
+            backup_root,
+            shared_home,
+        },
         SwitchFailurePoint::None,
         plan,
+        &mut verify_processes_closed,
         on_progress,
     )
 }
@@ -242,28 +327,62 @@ fn switch_runtime_files_with_failure_and_progress_detailed(
     failure_point: SwitchFailurePoint,
     on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
-    let plan = build_runtime_switch_plan(store, runtime_id, codex_home)
+    let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
+        .map_err(RuntimeSwitchFailure::before_backup)?;
+    let mut verify_processes_closed = verify_runtime_processes_closed;
+    switch_runtime_files_from_plan(
+        store,
+        RuntimeSwitchRoots {
+            codex_home,
+            backup_root,
+            shared_home,
+        },
+        failure_point,
+        plan,
+        &mut verify_processes_closed,
+        on_progress,
+    )
+}
+
+#[cfg(test)]
+fn switch_runtime_files_with_process_gate_detailed(
+    store: &RuntimeStore,
+    runtime_id: &str,
+    codex_home: &Path,
+    backup_root: &Path,
+    shared_home: &Path,
+    verify_processes_closed: &mut dyn FnMut() -> Result<(), String>,
+    on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
+) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
+    let plan = build_runtime_switch_plan(store, runtime_id, codex_home, shared_home)
         .map_err(RuntimeSwitchFailure::before_backup)?;
     switch_runtime_files_from_plan(
         store,
-        codex_home,
-        backup_root,
-        shared_home,
-        failure_point,
+        RuntimeSwitchRoots {
+            codex_home,
+            backup_root,
+            shared_home,
+        },
+        SwitchFailurePoint::None,
         plan,
+        verify_processes_closed,
         on_progress,
     )
 }
 
 fn switch_runtime_files_from_plan(
     store: &RuntimeStore,
-    codex_home: &Path,
-    backup_root: &Path,
-    shared_home: &Path,
+    roots: RuntimeSwitchRoots<'_>,
     failure_point: SwitchFailurePoint,
     mut plan: RuntimeSwitchPlan,
+    verify_processes_closed: &mut dyn FnMut() -> Result<(), String>,
     on_progress: &mut dyn FnMut(RuntimeSwitchPhase),
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
+    let RuntimeSwitchRoots {
+        codex_home,
+        backup_root,
+        shared_home,
+    } = roots;
     let operation_id = plan.operation_id.clone();
     let runtime_id = plan.runtime.id.clone();
     if !plan.requires_change {
@@ -284,47 +403,53 @@ fn switch_runtime_files_from_plan(
                 .load_metadata(&runtime_id)
                 .map_err(RuntimeSwitchFailure::before_backup)?,
             backups: Vec::new(),
+            backup_manifests: Vec::new(),
             to_shared: empty_sync_result(),
             from_shared: empty_sync_result(),
             rolled_back: false,
+            warnings: Vec::new(),
+            checkpoint_cleanup: CheckpointCleanupSummary::default(),
         });
     }
-    let current_paths =
-        resolve_user_codex_paths(codex_home).map_err(RuntimeSwitchFailure::before_backup)?;
-    if current_paths.sqlite_home != plan.sqlite_home {
-        return Err(RuntimeSwitchFailure::before_backup(
-            "SQLite root changed during switch preflight; retry".to_string(),
-        ));
-    }
+    ensure_runtime_paths_unchanged(codex_home, &plan.codex_paths)
+        .map_err(RuntimeSwitchFailure::before_backup)?;
+    let shared_paths = local_codex_paths(shared_home);
 
     on_progress(RuntimeSwitchPhase::BackingUpCurrent);
-    let current_backup = create_runtime_backup(codex_home, backup_root, "switch-runtime-current")
-        .map_err(RuntimeSwitchFailure::before_backup)?;
+    let current_backup = create_runtime_state_backup_with_paths(
+        codex_home,
+        backup_root,
+        "switch-runtime-current",
+        plan.codex_paths.clone(),
+    )
+    .map_err(RuntimeSwitchFailure::before_backup)?;
     on_progress(RuntimeSwitchPhase::BackingUpShared);
-    let shared_backup =
-        create_local_session_backup(shared_home, backup_root, "switch-runtime-shared")
-            .map_err(|message| RuntimeSwitchFailure::new(message, vec![current_backup.clone()]))?;
+    let shared_backup = create_state_backup_with_paths(
+        shared_home,
+        backup_root,
+        "switch-runtime-shared",
+        shared_paths.clone(),
+    )
+    .map_err(|message| RuntimeSwitchFailure::new(message, vec![current_backup.clone()]))?;
     let backups = vec![current_backup.clone(), shared_backup.clone()];
 
-    #[cfg(not(test))]
-    if !crate::process_control::list_codex_processes()
-        .map_err(|message| RuntimeSwitchFailure::new(message, backups.clone()))?
-        .is_empty()
-    {
-        return Err(RuntimeSwitchFailure::new(
-            "ChatGPT started during switch preflight; close it and retry before files are changed"
-                .to_string(),
-            backups,
-        ));
-    }
+    verify_processes_closed()
+        .map_err(|message| RuntimeSwitchFailure::new(message, backups.clone()))?;
     let applied = (|| {
         on_progress(RuntimeSwitchPhase::SyncingToShared);
-        ensure_shared_sessions(codex_home, shared_home)?;
-        let to_shared = sync_user_home_to_shared(codex_home, shared_home)?;
+        ensure_runtime_paths_unchanged(codex_home, &plan.codex_paths)?;
+        ensure_shared_sessions_with_paths(&plan.codex_paths, &shared_paths)?;
+        let to_shared = sync_user_home_to_shared_with_policy(
+            &plan.codex_paths,
+            &shared_paths,
+            plan.session_file_write_policy,
+        )?;
         let (config_plan, session_provider) =
             runtime_config_plan_for_home(&plan.runtime, &plan.runtime_files, codex_home)?;
         plan.config_plan = config_plan;
         plan.session_provider = session_provider;
+        ensure_runtime_paths_unchanged(codex_home, &plan.codex_paths)?;
+        verify_processes_closed()?;
         on_progress(RuntimeSwitchPhase::ApplyingRuntime);
         atomic_write(&codex_home.join("auth.json"), &plan.runtime_files.auth_json)?;
         atomic_write(
@@ -340,9 +465,14 @@ fn switch_runtime_files_from_plan(
         if failure_point == SwitchFailurePoint::AfterRuntimeFiles {
             return Err("injected failure after runtime files".to_string());
         }
+        verify_processes_closed()?;
         on_progress(RuntimeSwitchPhase::SyncingToCurrent);
-        let from_shared =
-            sync_shared_to_user_home(shared_home, codex_home, &plan.session_provider)?;
+        let from_shared = sync_shared_to_user_home_with_policy(
+            &shared_paths,
+            &plan.codex_paths,
+            &plan.session_provider,
+            plan.session_file_write_policy,
+        )?;
         on_progress(RuntimeSwitchPhase::Verifying);
         let verified = store.detect_active_runtime(codex_home)?;
         if verified.active_runtime_id.as_deref() != Some(runtime_id.as_str())
@@ -359,10 +489,13 @@ fn switch_runtime_files_from_plan(
             operation_id,
             changed: true,
             runtime,
-            backups,
+            backups: backups.iter().map(BackupReceiptSummary::from).collect(),
+            backup_manifests: backups,
             to_shared,
             from_shared,
             rolled_back: false,
+            warnings: Vec::new(),
+            checkpoint_cleanup: CheckpointCleanupSummary::default(),
         }),
         Err(error) => {
             on_progress(RuntimeSwitchPhase::RollingBack);
@@ -370,7 +503,9 @@ fn switch_runtime_files_from_plan(
             let shared_restore = restore_backup(&shared_backup.backup_dir, shared_home);
             match (current_restore, shared_restore) {
                 (Ok(_), Ok(_)) => Err(RuntimeSwitchFailure::rolled_back(
-                    format!("{error}; rolled back to verified snapshots"),
+                    format!(
+                        "{error}; rolled back runtime and database state to verified snapshots; monotonic session JSONL/index additions may remain for retry"
+                    ),
                     backups,
                 )),
                 (current, shared) => Err(RuntimeSwitchFailure::rollback_failed(
@@ -390,6 +525,7 @@ fn build_runtime_switch_plan(
     store: &RuntimeStore,
     runtime_id: &str,
     codex_home: &Path,
+    shared_home: &Path,
 ) -> Result<RuntimeSwitchPlan, String> {
     let operation_id = operation_id("switch-runtime")?;
     let codex_paths = resolve_user_codex_paths(codex_home)?;
@@ -402,15 +538,58 @@ fn build_runtime_switch_plan(
     let active = store.detect_active_runtime(codex_home)?;
     let requires_change = active.active_runtime_id.as_deref() != Some(runtime_id)
         || active.confidence != RuntimeConfidence::Exact;
+    let shared_paths = local_codex_paths(shared_home);
+    let session_file_write_policy = if requires_change
+        && runtime_switch_session_files_are_unchanged_with_paths(&codex_paths, &shared_paths)?
+    {
+        SessionFileWritePolicy::Deny
+    } else {
+        SessionFileWritePolicy::Allow
+    };
     Ok(RuntimeSwitchPlan {
         operation_id,
         runtime_files,
         runtime,
         config_plan,
         session_provider,
-        sqlite_home: codex_paths.sqlite_home,
+        codex_paths,
         requires_change,
+        session_file_write_policy,
     })
+}
+
+fn ensure_runtime_paths_unchanged(codex_home: &Path, expected: &CodexPaths) -> Result<(), String> {
+    if resolve_user_codex_paths(codex_home)? == *expected {
+        Ok(())
+    } else {
+        Err("Codex paths changed during runtime switch preflight; retry".to_string())
+    }
+}
+
+#[cfg(not(test))]
+fn verify_runtime_processes_closed() -> Result<(), String> {
+    let managed = crate::process_control::list_codex_processes()?;
+    let standalone = crate::process_control::list_standalone_codex_processes()?;
+    match (managed.is_empty(), standalone.is_empty()) {
+        (true, true) => Ok(()),
+        (false, true) => Err(
+            "ChatGPT started during runtime switch; close it and retry before files are changed"
+                .to_string(),
+        ),
+        (true, false) => Err(
+            "Codex CLI started during runtime switch; close it and retry before files are changed"
+                .to_string(),
+        ),
+        (false, false) => Err(
+            "ChatGPT and Codex CLI started during runtime switch; close them and retry before files are changed"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn verify_runtime_processes_closed() -> Result<(), String> {
+    Ok(())
 }
 
 fn runtime_config_plan_for_home(
@@ -434,10 +613,62 @@ pub fn sync_home_with_shared(
     codex_home: &Path,
     shared_home: &Path,
 ) -> Result<SessionSyncResult, String> {
-    let session_provider = session_provider_from_home(codex_home)?;
-    ensure_shared_sessions(codex_home, shared_home)?;
-    let to_shared = sync_user_home_to_shared(codex_home, shared_home)?;
-    let from_shared = sync_shared_to_user_home_hot(shared_home, codex_home, &session_provider)?;
+    let current_paths = resolve_user_codex_paths(codex_home)?;
+    let shared_paths = local_codex_paths(shared_home);
+    sync_home_with_shared_with_paths(&current_paths, &shared_paths)
+}
+
+pub(crate) fn sync_home_with_shared_with_paths(
+    current_paths: &CodexPaths,
+    shared_paths: &CodexPaths,
+) -> Result<SessionSyncResult, String> {
+    sync_home_with_shared_preflighted_with_paths(
+        current_paths,
+        shared_paths,
+        HotSessionSyncPlan {
+            session_file_write_policy: SessionFileWritePolicy::Allow,
+        },
+    )
+}
+
+pub(crate) fn preflight_hot_session_sync_with_paths(
+    current_paths: &CodexPaths,
+    shared_paths: &CodexPaths,
+) -> Result<HotSessionSyncPlan, String> {
+    let session_file_write_policy =
+        if runtime_switch_session_files_are_unchanged_with_paths(current_paths, shared_paths)? {
+            SessionFileWritePolicy::Deny
+        } else {
+            SessionFileWritePolicy::Allow
+        };
+    Ok(HotSessionSyncPlan {
+        session_file_write_policy,
+    })
+}
+
+pub(crate) fn sync_home_with_shared_preflighted_with_paths(
+    current_paths: &CodexPaths,
+    shared_paths: &CodexPaths,
+    plan: HotSessionSyncPlan,
+) -> Result<SessionSyncResult, String> {
+    let session_provider = session_provider_from_home(&current_paths.codex_home)?;
+    ensure_shared_sessions_with_paths(current_paths, shared_paths)?;
+    let to_shared = sync_user_home_to_shared_with_policy(
+        current_paths,
+        shared_paths,
+        plan.session_file_write_policy,
+    )?;
+    let from_shared = match plan.session_file_write_policy {
+        SessionFileWritePolicy::Allow => {
+            sync_shared_to_user_home_hot_with_paths(shared_paths, current_paths, &session_provider)?
+        }
+        SessionFileWritePolicy::Deny => sync_shared_to_user_home_hot_with_policy(
+            shared_paths,
+            current_paths,
+            &session_provider,
+            SessionFileWritePolicy::Deny,
+        )?,
+    };
     Ok(SessionSyncResult {
         inserted_threads: to_shared.inserted_threads + from_shared.inserted_threads,
         copied_session_files: to_shared.copied_session_files + from_shared.copied_session_files,
@@ -451,16 +682,19 @@ pub fn sync_home_with_shared(
     })
 }
 
-fn ensure_shared_sessions(codex_home: &Path, shared_home: &Path) -> Result<(), String> {
-    fs::create_dir_all(shared_home)
+fn ensure_shared_sessions_with_paths(
+    current_paths: &CodexPaths,
+    shared_paths: &CodexPaths,
+) -> Result<(), String> {
+    fs::create_dir_all(&shared_paths.codex_home)
         .map_err(|error| format!("failed to create shared sessions dir: {error}"))?;
-    let shared_db = shared_home.join("state_5.sqlite");
+    let shared_db = &shared_paths.state_db;
     if !shared_db.exists() {
-        let source_db = resolve_user_codex_paths(codex_home)?.state_db;
+        let source_db = &current_paths.state_db;
         if !source_db.exists() {
             return Err("state_5.sqlite is required before syncing shared sessions".to_string());
         }
-        initialize_shared_database(&source_db, &shared_db)?;
+        initialize_shared_database(source_db, shared_db)?;
     }
     Ok(())
 }
@@ -553,22 +787,28 @@ fn restore_status(result: Result<crate::backup::RestoreResult, String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{cell::Cell, fs};
 
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use crate::backup::BackupScope;
     use crate::runtime_store::{
         RelayRuntimeInput, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID,
     };
+    use crate::{
+        backup::{create_state_backup, BackupScope},
+        codex_paths::{local_codex_paths, resolve_user_codex_paths},
+    };
 
     use super::{
-        preflight_runtime_session_sync, preflight_runtime_switch, switch_runtime_files,
+        preflight_hot_session_sync_with_paths, preflight_runtime_session_sync,
+        preflight_runtime_switch, switch_runtime_files,
         switch_runtime_files_detailed_with_progress,
         switch_runtime_files_preflighted_with_progress,
-        switch_runtime_files_with_failure_and_progress_detailed, sync_home_with_shared,
-        RuntimeSwitchOutcome, RuntimeSwitchPhase, SwitchFailurePoint,
+        switch_runtime_files_with_failure_and_progress_detailed,
+        switch_runtime_files_with_process_gate_detailed, sync_home_with_shared,
+        sync_home_with_shared_preflighted_with_paths, RuntimeSwitchOutcome, RuntimeSwitchPhase,
+        SwitchFailurePoint,
     };
 
     fn create_state_db(home: &std::path::Path, id: &str, rollout_path: &std::path::Path) {
@@ -653,7 +893,7 @@ mod tests {
         let shared = tempdir().unwrap();
         let mut phases = Vec::new();
 
-        let result = switch_runtime_files_detailed_with_progress(
+        let mut result = switch_runtime_files_detailed_with_progress(
             &store,
             RELAY_RUNTIME_ID,
             home.path(),
@@ -676,18 +916,42 @@ mod tests {
         );
         assert_eq!(result.runtime.id, RELAY_RUNTIME_ID);
         assert_eq!(result.backups.len(), 2);
-        assert_eq!(result.backups[0].scope, BackupScope::Runtime);
-        assert_eq!(result.backups[1].scope, BackupScope::Sessions);
-        assert!(result.backups.iter().all(|backup| {
+        assert_eq!(result.backups[0].scope, BackupScope::RuntimeState);
+        assert_eq!(result.backups[1].scope, BackupScope::StateOnly);
+        assert!(result
+            .backups
+            .iter()
+            .all(|backup| backup.tracked_database_count == 1));
+        assert!(result.backup_manifests.iter().all(|backup| {
             backup.tracked_databases == vec!["state_5.sqlite"]
                 && !backup.files.iter().any(|file| {
-                    matches!(
-                        file.relative_path.to_string_lossy().as_ref(),
-                        "goals_1.sqlite" | "memories_1.sqlite" | "logs_2.sqlite"
-                    )
+                    file.relative_path == std::path::Path::new("session_index.jsonl")
+                        || file.relative_path.starts_with("sessions")
+                        || matches!(
+                            file.relative_path.to_string_lossy().as_ref(),
+                            "goals_1.sqlite" | "memories_1.sqlite" | "logs_2.sqlite"
+                        )
                 })
         }));
         assert!(result.backups[0].backup_dir.join("manifest.json").exists());
+        let sample_file = result.backup_manifests[0].files.first().unwrap().clone();
+        result.backup_manifests[0].files = vec![sample_file; 4_096];
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(
+            wire.len() < 16_384,
+            "compact switch receipt grew to {} bytes",
+            wire.len()
+        );
+        for forbidden in [
+            "\"files\"",
+            "\"sourcePath\"",
+            "\"backupPath\"",
+            "\"sha256\"",
+            "\"trackedDatabases\"",
+        ] {
+            assert!(!wire.contains(forbidden), "{forbidden} leaked into IPC");
+        }
+        assert!(wire.contains("\"trackedDatabaseCount\""));
         assert!(fs::read_to_string(home.path().join("auth.json"))
             .unwrap()
             .contains("sk-fake-relay"));
@@ -718,6 +982,325 @@ mod tests {
             .path()
             .join("sessions/2026/06/23/rollout-a.jsonl")
             .exists());
+    }
+
+    #[test]
+    fn equivalent_session_files_use_state_only_switch_checkpoints() {
+        let home = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let current_rollout = home
+            .path()
+            .join("sessions/2026/07/26/rollout-fast-path.jsonl");
+        let shared_rollout = shared
+            .path()
+            .join("sessions/2026/07/26/rollout-fast-path.jsonl");
+        fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
+        fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
+        let rollout_bytes = br#"{"type":"session_meta","payload":{"id":"thread-fast"}}"#;
+        fs::write(&current_rollout, rollout_bytes).unwrap();
+        fs::write(&shared_rollout, rollout_bytes).unwrap();
+        create_state_db(home.path(), "thread-fast", &current_rollout);
+        create_state_db(shared.path(), "thread-fast", &shared_rollout);
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let store_root = tempdir().unwrap();
+        let store = RuntimeStore::new(store_root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+        store
+            .upsert_relay(
+                RelayRuntimeInput {
+                    base_url: "relay.example.com".to_string(),
+                    api_key: "sk-fake-relay".to_string(),
+                    model: "gpt-5.5".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let backup_root = tempdir().unwrap();
+        let current_modified = fs::metadata(&current_rollout).unwrap().modified().unwrap();
+        let shared_modified = fs::metadata(&shared_rollout).unwrap().modified().unwrap();
+
+        let result = switch_runtime_files(
+            &store,
+            RELAY_RUNTIME_ID,
+            home.path(),
+            backup_root.path(),
+            shared.path(),
+        )
+        .unwrap();
+
+        assert_eq!(result.backups[0].scope, BackupScope::RuntimeState);
+        assert_eq!(result.backups[1].scope, BackupScope::StateOnly);
+        assert!(result.backup_manifests.iter().all(|backup| {
+            backup.files.iter().all(|file| {
+                file.relative_path != std::path::Path::new("session_index.jsonl")
+                    && !file.relative_path.starts_with("sessions")
+            })
+        }));
+        assert_eq!(fs::read(&current_rollout).unwrap(), rollout_bytes);
+        assert_eq!(fs::read(&shared_rollout).unwrap(), rollout_bytes);
+        assert_eq!(
+            fs::metadata(&current_rollout).unwrap().modified().unwrap(),
+            current_modified
+        );
+        assert_eq!(
+            fs::metadata(&shared_rollout).unwrap().modified().unwrap(),
+            shared_modified
+        );
+    }
+
+    #[test]
+    fn changed_hot_sync_uses_state_only_checkpoints_while_copying_monotonic_files() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let backup_root = tempdir().unwrap();
+        let current_rollout = current
+            .path()
+            .join("sessions/2026/07/26/rollout-current.jsonl");
+        let shared_rollout = shared
+            .path()
+            .join("sessions/2026/07/26/rollout-shared.jsonl");
+        fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
+        fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
+        let current_bytes = br#"{"type":"session_meta","payload":{"id":"thread-current"}}"#;
+        let shared_bytes = br#"{"type":"session_meta","payload":{"id":"thread-shared"}}"#;
+        fs::write(&current_rollout, current_bytes).unwrap();
+        fs::write(&shared_rollout, shared_bytes).unwrap();
+        create_state_db(current.path(), "thread-current", &current_rollout);
+        create_state_db(shared.path(), "thread-shared", &shared_rollout);
+        let current_paths = resolve_user_codex_paths(current.path()).unwrap();
+        let shared_paths = local_codex_paths(shared.path());
+        let plan = preflight_hot_session_sync_with_paths(&current_paths, &shared_paths).unwrap();
+
+        assert_eq!(plan.backup_scope(), BackupScope::StateOnly);
+        let checkpoints = [
+            create_state_backup(current.path(), backup_root.path(), "sync-current").unwrap(),
+            create_state_backup(shared.path(), backup_root.path(), "sync-shared").unwrap(),
+        ];
+        assert!(checkpoints.iter().all(|checkpoint| {
+            checkpoint.scope == BackupScope::StateOnly
+                && checkpoint.files.iter().all(|file| {
+                    file.relative_path != std::path::Path::new("session_index.jsonl")
+                        && !file.relative_path.starts_with("sessions")
+                })
+        }));
+
+        let result =
+            sync_home_with_shared_preflighted_with_paths(&current_paths, &shared_paths, plan)
+                .unwrap();
+
+        assert_eq!(result.copied_session_files, 2);
+        assert_eq!(fs::read(&current_rollout).unwrap(), current_bytes);
+        assert_eq!(fs::read(&shared_rollout).unwrap(), shared_bytes);
+        let imported_to_current = fs::read_to_string(
+            current
+                .path()
+                .join("sessions/2026/07/26/rollout-shared.jsonl"),
+        )
+        .unwrap();
+        assert!(imported_to_current.contains("\"id\":\"thread-shared\""));
+        assert!(imported_to_current.contains("\"model_provider\":\"openai\""));
+        let imported_to_shared = fs::read_to_string(
+            shared
+                .path()
+                .join("sessions/2026/07/26/rollout-current.jsonl"),
+        )
+        .unwrap();
+        assert!(imported_to_shared.contains("\"id\":\"thread-current\""));
+    }
+
+    #[test]
+    fn hot_sync_fast_path_rejects_rollout_drift_without_touching_shared_payload() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let current_rollout = current
+            .path()
+            .join("sessions/2026/07/26/rollout-fast-drift.jsonl");
+        let shared_rollout = shared
+            .path()
+            .join("sessions/2026/07/26/rollout-fast-drift.jsonl");
+        fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
+        fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
+        let original = br#"{"type":"session_meta","payload":{"id":"thread-fast-drift"}}"#;
+        fs::write(&current_rollout, original).unwrap();
+        fs::write(&shared_rollout, original).unwrap();
+        create_state_db(current.path(), "thread-fast-drift", &current_rollout);
+        create_state_db(shared.path(), "thread-fast-drift", &shared_rollout);
+        let current_paths = resolve_user_codex_paths(current.path()).unwrap();
+        let shared_paths = local_codex_paths(shared.path());
+        let plan = preflight_hot_session_sync_with_paths(&current_paths, &shared_paths).unwrap();
+        assert_eq!(plan.backup_scope(), BackupScope::StateOnly);
+        let grown = [
+            original.as_slice(),
+            b"\n{\"type\":\"response_item\",\"payload\":{\"text\":\"late\"}}\n",
+        ]
+        .concat();
+        fs::write(&current_rollout, &grown).unwrap();
+
+        let error =
+            sync_home_with_shared_preflighted_with_paths(&current_paths, &shared_paths, plan)
+                .unwrap_err();
+
+        assert!(
+            error.contains("changed after fast-path planning"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&shared_rollout).unwrap(), original);
+        assert_eq!(fs::read(&current_rollout).unwrap(), grown);
+    }
+
+    #[test]
+    fn fast_path_late_jsonl_drift_fails_before_session_file_writes() {
+        let home = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let current_rollout = home
+            .path()
+            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
+        let shared_rollout = shared
+            .path()
+            .join("sessions/2026/07/26/rollout-late-drift.jsonl");
+        fs::create_dir_all(current_rollout.parent().unwrap()).unwrap();
+        fs::create_dir_all(shared_rollout.parent().unwrap()).unwrap();
+        let original = br#"{"type":"session_meta","payload":{"id":"thread-drift"}}"#;
+        fs::write(&current_rollout, original).unwrap();
+        fs::write(&shared_rollout, original).unwrap();
+        create_state_db(home.path(), "thread-drift", &current_rollout);
+        create_state_db(shared.path(), "thread-drift", &shared_rollout);
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#,
+        )
+        .unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let store_root = tempdir().unwrap();
+        let store = RuntimeStore::new(store_root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+        store
+            .upsert_relay(
+                RelayRuntimeInput {
+                    base_url: "relay.example.com".to_string(),
+                    api_key: "sk-fake-relay".to_string(),
+                    model: "gpt-5.5".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let plan =
+            preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path(), shared.path()).unwrap();
+        let late = [
+            original.as_slice(),
+            b"\n{\"type\":\"response_item\",\"payload\":{\"text\":\"late\"}}\n",
+        ]
+        .concat();
+        fs::write(&current_rollout, &late).unwrap();
+        let current_modified = fs::metadata(&current_rollout).unwrap().modified().unwrap();
+        let shared_modified = fs::metadata(&shared_rollout).unwrap().modified().unwrap();
+        let backup_root = tempdir().unwrap();
+
+        let failure = switch_runtime_files_preflighted_with_progress(
+            &store,
+            home.path(),
+            backup_root.path(),
+            shared.path(),
+            plan,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::RolledBack);
+        assert!(failure.message.contains("changed after fast-path planning"));
+        assert_eq!(failure.backups[0].scope, BackupScope::RuntimeState);
+        assert_eq!(failure.backups[1].scope, BackupScope::StateOnly);
+        assert_eq!(fs::read(&current_rollout).unwrap(), late);
+        assert_eq!(fs::read(&shared_rollout).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&current_rollout).unwrap().modified().unwrap(),
+            current_modified
+        );
+        assert_eq!(
+            fs::metadata(&shared_rollout).unwrap().modified().unwrap(),
+            shared_modified
+        );
+    }
+
+    #[test]
+    fn process_restart_before_final_current_write_rolls_back_without_syncing_to_current() {
+        let home = tempdir().unwrap();
+        let rollout = home.path().join("sessions/2026/06/23/rollout-a.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+        )
+        .unwrap();
+        create_state_db(home.path(), "thread-a", &rollout);
+        let original_auth =
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-plus"}}"#.to_vec();
+        let original_config = b"model = \"gpt-5.5\"\n".to_vec();
+        fs::write(home.path().join("auth.json"), &original_auth).unwrap();
+        fs::write(home.path().join("config.toml"), &original_config).unwrap();
+
+        let store_root = tempdir().unwrap();
+        let store = RuntimeStore::new(store_root.path().join("runtimes"));
+        store.import_plus_from_home(home.path(), false).unwrap();
+        store
+            .upsert_relay(
+                RelayRuntimeInput {
+                    base_url: "relay.example.com".to_string(),
+                    api_key: "sk-fake-relay".to_string(),
+                    model: "gpt-5.5".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let backup_root = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let gate_calls = Cell::new(0);
+        let mut phases = Vec::new();
+        let error = switch_runtime_files_with_process_gate_detailed(
+            &store,
+            RELAY_RUNTIME_ID,
+            home.path(),
+            backup_root.path(),
+            shared.path(),
+            &mut || {
+                let call = gate_calls.get() + 1;
+                gate_calls.set(call);
+                if call == 3 {
+                    Err("standalone Codex CLI restarted".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |phase| phases.push(phase),
+        )
+        .unwrap_err();
+
+        assert_eq!(gate_calls.get(), 3);
+        assert_eq!(error.outcome, RuntimeSwitchOutcome::RolledBack);
+        assert_eq!(
+            phases,
+            vec![
+                RuntimeSwitchPhase::BackingUpCurrent,
+                RuntimeSwitchPhase::BackingUpShared,
+                RuntimeSwitchPhase::SyncingToShared,
+                RuntimeSwitchPhase::ApplyingRuntime,
+                RuntimeSwitchPhase::RollingBack,
+            ]
+        );
+        assert_eq!(
+            fs::read(home.path().join("auth.json")).unwrap(),
+            original_auth
+        );
+        assert_eq!(
+            fs::read(home.path().join("config.toml")).unwrap(),
+            original_config
+        );
+        assert!(!shared.path().join("state_5.sqlite").exists());
     }
 
     #[test]
@@ -782,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_after_runtime_files_are_written_restores_current_and_shared_snapshots() {
+    fn failure_after_runtime_files_restores_state_but_keeps_monotonic_session_files() {
         let home = tempdir().unwrap();
         let rollout = home.path().join("sessions/2026/07/13/rollout-a.jsonl");
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();
@@ -856,6 +1439,10 @@ mod tests {
         );
         assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
         assert!(!shared.join("state_5.sqlite").exists());
+        assert_eq!(
+            fs::read(shared.join("sessions/2026/07/13/rollout-a.jsonl")).unwrap(),
+            original_rollout
+        );
     }
 
     #[test]
@@ -940,7 +1527,7 @@ mod tests {
             original_auth
         );
         assert_eq!(fs::read(&shared_rollout).unwrap(), original_shared_rollout);
-        assert!(!shared
+        assert!(shared
             .path()
             .join("sessions/2026/07/13/rollout-current.jsonl")
             .exists());
@@ -1023,7 +1610,8 @@ mod tests {
         let backup_root = tempdir().unwrap();
         let shared = tempdir().unwrap();
 
-        let plan = preflight_runtime_switch(&store, PLUS_RUNTIME_ID, home.path()).unwrap();
+        let plan =
+            preflight_runtime_switch(&store, PLUS_RUNTIME_ID, home.path(), shared.path()).unwrap();
         assert!(!plan.requires_change());
         let mut phases = Vec::new();
         let result = switch_runtime_files_preflighted_with_progress(
@@ -1054,7 +1642,9 @@ mod tests {
         let store_root = tempdir().unwrap();
         let store = RuntimeStore::new(store_root.path().join("runtimes"));
         store.import_plus_from_home(home.path(), false).unwrap();
-        let plan = preflight_runtime_switch(&store, PLUS_RUNTIME_ID, home.path()).unwrap();
+        let shared = tempdir().unwrap();
+        let plan =
+            preflight_runtime_switch(&store, PLUS_RUNTIME_ID, home.path(), shared.path()).unwrap();
         assert!(!plan.requires_change());
         fs::write(
             home.path().join("auth.json"),
@@ -1062,7 +1652,6 @@ mod tests {
         )
         .unwrap();
         let backup_root = tempdir().unwrap();
-        let shared = tempdir().unwrap();
 
         let error = switch_runtime_files_preflighted_with_progress(
             &store,
@@ -1111,14 +1700,15 @@ mod tests {
                 home.path(),
             )
             .unwrap();
-        let plan = preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let shared = tempdir().unwrap();
+        let plan =
+            preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path(), shared.path()).unwrap();
         fs::write(
             home.path().join("config.toml"),
             "model = \"gpt-5.5\"\n[features]\nnew_global = true\n",
         )
         .unwrap();
         let backup_root = tempdir().unwrap();
-        let shared = tempdir().unwrap();
 
         switch_runtime_files_preflighted_with_progress(
             &store,
@@ -1166,7 +1756,8 @@ mod tests {
                 home.path(),
             )
             .unwrap();
-        let plan = preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let plan =
+            preflight_runtime_switch(&store, RELAY_RUNTIME_ID, home.path(), shared.path()).unwrap();
         let sqlite_home = shared.path().to_string_lossy().replace('\\', "\\\\");
         fs::write(
             home.path().join("config.toml"),
@@ -1187,7 +1778,7 @@ mod tests {
 
         assert_eq!(
             error.message,
-            "SQLite root changed during switch preflight; retry"
+            "Codex paths changed during runtime switch preflight; retry"
         );
         assert!(error.backups.is_empty());
         assert!(fs::read_dir(backup_root.path()).unwrap().next().is_none());

@@ -127,18 +127,24 @@ preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
                                       \-> rollback -> verify rollback -> terminal status
 ```
 
-- 切换、删除、恢复可见和完整恢复必须在后端写入前再次确认 ChatGPT 受管进程已关闭；只有独立会话同步允许热写入。
-- 运行态切换必须在关闭 ChatGPT 前完成 plan、受管 root 冲突检查、备份容量预检和 relay 连通性验证；这些 fail-closed 错误不得先打断正在运行的 ChatGPT。
-- Windows 关闭态操作必须基于 ToolHelp PID/PPID 关系证明受管进程树，只把 `ChatGPT.exe` / `OpenAI.Codex.exe` 作为受管根，不得按模糊进程名误杀独立 `codex.exe` CLI。先温和关闭并等待，超时后只能强制结束重新枚举后仍可证明身份的受管进程。
-- 关闭态 mutation 可能影响 current/shared 两根时，必须在写入前分别创建覆盖本次实际写集、可验证且可补偿的 scoped 快照；任一根部分成功后另一根失败，必须补偿恢复两根。hard delete 会写四个受管数据库，必须使用 full scope。
-- 热同步允许 ChatGPT 运行，是上述规则的显式例外：失败时恢复工具内部 shared 根，但不得用操作前快照覆盖可能已产生并发变化的 live current Home；必须保留并回报 current 安全备份供人工恢复。
-- 文件写入、复制和 JSONL 重写统一走 `file_ops` 原子操作；不得直接 `fs::write` 覆盖 live 文件。
+- 切换、删除、恢复可见、手工 full backup 和完整恢复必须在后端第一份快照前与最后写入前确认 ChatGPT 受管进程已关闭，并对独立 `codex.exe` CLI fail closed；只有独立会话同步允许热写入。
+- 所有会创建安全快照的 mutation 必须在第一份新快照前完成受管 root 冲突检查与备份容量预检；关闭态操作还必须先完成 plan/校验，再关闭 ChatGPT。这些 fail-closed 错误不得先打断正在运行的 ChatGPT。
+- Windows 关闭态操作必须基于 ToolHelp PID/PPID 关系证明受管进程树，只把 `ChatGPT.exe` / `OpenAI.Codex.exe` 作为受管根，不得按模糊进程名误杀独立 `codex.exe` CLI。先温和关闭并等待，超时后只能强制结束重新枚举后仍可证明身份的受管进程；standalone CLI 只能检测和阻断，绝不结束。
+- changed switch 必须固定创建 current `RuntimeState` + shared `StateOnly`，普通 sync 固定创建双 `StateOnly`；不得为这些高频操作复制 GiB 级 `sessions/` 作为临时点。hard delete、手工 Full 和 restore safety 才使用覆盖四库与完整会话文件集的 Full；恢复可见使用单根 `StateOnly`。
+- 热同步允许 ChatGPT 运行，是关闭态规则的显式例外。Apply 失败只补偿工具内部 shared SQLite，不得用旧状态覆盖可能仍在变化的 live current。会话 JSONL 生产路径必须零 in-place，不得出现半截文件尾；hot shared→current 的 existing + `PreserveExisting` 必须在任何 target candidate 文件处理前直接跳过，不得读取、写入或发布候选，也不得为该既有 thread 制造 orphan。只有实际进入 Create/Import 的路径才可能在失败后保留完整文件，且不得为追求“整洁”而逆向删除。status 仍为 Failed，不得宣称 bit-exact 回到操作前。
+- 需要整文件替换的配置、备份和可写 index 统一走 `file_ops` 同目录完整临时文件 + sync + 原子替换，不得直接覆盖 live 文件。会话 source 在执行期必须校验完整尾行、session ID、长度和 SHA-256 前后稳定，只能做有界重试；Create 使用 provider 预归一的 hard-link no-clobber 发布；允许替换时，严格扩展和 Divergent 都必须按稳定 source hash 生成并发布完整 imported JSONL，旧目标 bytes/hash/mtime 不变。`SessionSyncPolicy.existing_rollout_path = ExistingRolloutPathPolicy::PreserveExisting` 仅允许用于 hot shared→current：检测到既有 current thread 后必须在 `existing_thread_rollout_path` / `copy_rollout_file` 前直接 duplicate+continue，保持零 target candidate I/O、零 orphan、`copied_session_files = 0`，不得改变既有 `rollout_path`、provider、title 或旧 writer 可见性；新 thread 仍在 SQLite 事务中插入，以已发布文件为路径、复用 source row 可用字段并归一 current provider。current→shared 与关闭态必须使用 `ExistingRolloutPathPolicy::SelectMostComplete`，且只能在完整文件发布后推进既有引用。hot current index 必须 `Skip`；closed/app-owned shared index 生成完整 merged bytes 后同目录 `atomic_write`；`Deny` 只校验且零写入。
 - 所有会修改运行态、凭据、current/shared 或备份目标的 command 必须共用 mutation guard：进程内 try-lock + Windows 独占 `mutation.lock` 文件句柄；新增入口不得绕过同进程/跨进程串行化。
 - 一键更新安装也必须取得同一 mutation guard；helper readiness 成功后父进程进入 shutdown-pending，退出前不得释放跨进程锁或接受新 mutation。前端禁用只能改善体验，不能替代后端互斥。
-- 当前没有备份 retention/prune；任何清理策略必须先定义保留周期、容量上限、在用/安全快照保护与用户确认，不能在列表扫描或其他无关流程中静默删除。
-- manifest v3 必须显式记录 `scope` 与 `trackedDatabases`。runtime / sessions / state-only 只覆盖实际写集；只有 hard delete、手工 full backup 和 restore safety 覆盖 `state_5.sqlite`、`goals_1.sqlite`、`memories_1.sqlite`、`logs_2.sqlite` 四库。局部快照只能用于对应操作补偿，不得进入 UI 可恢复列表；恢复 v2 时不得假装其含 v3 新增字段。
-- 纳入 scope 的 SQLite 必须使用 Online Backup API，不得直接复制 WAL/SHM。所有 payload 必须 DPAPI 加密并记录大小/SHA-256；容量估算必须按本次 scope 的实际 payload 加上 SQLite workspace、加密/manifest 开销和明确安全余量，恢复后按 `trackedDatabases` 执行适用的 `quick_check`。
-- 成功回执必须包含可关联的 operation ID、备份引用、计数、回滚终态和警告。高风险长流程还必须通过后端事件 `Channel` 上报真实阶段和 typed 终态；禁止用前端计时器或伪造百分比代替事实。命令完成后必须释放 UI busy，刷新失败必须与 mutation 失败分开表达。
+- 临时点只有成功、切换完整回滚、typed `Failed + Backup` 写入前失败和恢复可见成功，在 terminal operation record 成功持久化后才允许释放。v3 写入前失败可严格证明一根或两根，恢复可见只允许单根 `StateOnly`；Apply/回滚/日志失败必须保留。显式 cleanup 在 plan 与 execute 两阶段都必须重新验证 backup root 直接子目录、完整 manifest、受管路径、精确文件集合/大小和完整 payload SHA-256；计划后漂移必须保留。Summary、Receipt 和日志必须显式携带 `attemptedCount` / `failedCount`；只有已进入计划的目录在执行期 revalidate/remove 失败才增加 `failedCount` 并令 cleanup record 为 Failed。Full、孤儿、unclassified 等未尝试保留项只能进入 retained/warning，warning 本身不得作为 partial/Failed 判据。
+- 显式旧检查点清理必须严格解析完整 `operations.jsonl`。当前 v3 接受成功/完整回滚双根、typed `Failed + Backup` 写入前失败的一根/两根和恢复可见成功单根；operation ID 必须全文件唯一、时间窗有效，checkpoint `createdAtMs` 必须落在窗口内，reason、canonical source root、路径引用与 scope 必须精确。legacy v2 只兼容旧成功/完整回滚双根；日志损坏、重复引用、路径逃逸、Apply/回滚/日志失败、孤儿或无法分类目录都保留。
+- 手工 Full、hard delete 和 restore safety 不参与自动清理。Full 列表必须由用户按需加载，最多返回 256 个通过 managed-full 强校验的恢复点；列表和显式删除必须共用同一验证器，覆盖 backup root 直接子目录、Full scope、manifest、精确文件集合/大小与完整 payload SHA-256。extra file、hash drift、路径或 manifest 异常的目录不得显示为 verified，也不得自动删除。删除还必须再次复检，回报 reclaimed bytes 并写独立 `deleteBackup` 审计；禁止按年龄、目录数量、mtime 或容量阈值猜测删除，也禁止普通列表扫描静默 prune。
+- manifest v3 必须显式记录 `scope` 与 `trackedDatabases`。Full/Sessions 覆盖 `sessions/` 与 `archived_sessions/`，runtime/state scope 不扩大；changed switch 使用 `RuntimeState + StateOnly`，普通 sync 使用双 `StateOnly`。hard delete、手工 Full 和 restore safety 覆盖四个受管 SQLite。局部点不进入 UI 恢复列表；恢复 v2 时不得假装其含 v3 新字段。
+- 纳入 scope 的 SQLite 必须使用 Online Backup API，不得直接复制 WAL/SHM。所有 payload 必须 DPAPI 加密并记录大小/SHA-256；容量估算必须显式接收一个或多个 `home + CodexPaths + BackupScope` source，累加实际 payload、逐文件 DPAPI 与动态 manifest 开销，使用最大的 SQLite workspace，并加入至少 2 GiB 或 15% 安全余量。overflow、路径冲突、容量查询失败必须 fail closed，`available == required` 必须允许继续；恢复后按 `trackedDatabases` 执行适用的 `quick_check`。
+- 运行态切换双向证明 JSONL 与 `session_index.jsonl` 都无需写入时必须冻结 `SessionFileWritePolicy::Deny`；需要合并时使用 `Allow`，但检查点仍保持 `RuntimeState + StateOnly`，不得扩大为 Runtime/Sessions。`Deny` 的 late drift 必须 fail closed，不能静默切回 `Allow`。
+- 会话 plan 不能作为执行授权：source 必须按完整尾行/session ID/len/hash 重新冻结，Create/Import 抢先出现时重新比较或 fail closed。允许替换时，严格 extension 与 Divergent 都发布按稳定 source hash 命名的完整 imported JSONL；旧文件不能修改。活动路径选择必须与文件发布解耦：hot shared→current 的 existing + `PreserveExisting` 不是文件 plan，必须在 target rollout path 查询和 `copy_rollout_file` 前直接跳过；current→shared/关闭态的 `SelectMostComplete` 才能在发布后选择更完整文件；`Unchanged` 在终态返回前必须复检 source version 与 live relation。index 必须显式选择 hot `Skip`、closed/app-owned `MergeAtomic` 或零写 `Deny`。provider 归一发生在完整新文件发布前，不能发布后再改写 live JSONL。
+- 备份创建失败必须尝试移除 partial 目录；如果清理同样失败，错误必须同时报告残留路径/原因并写入审计上下文，不得吞错或留下看似完整的无记录目录。
+- 完整备份列表固定按需最多返回 256 个强校验通过的 full snapshot，不是只检查 256 个新候选。损坏、extra/hash drift 候选必须跳过且不得标 verified；局部 scope 始终排除，前端不得再次裁成 5 项。删除必须重新执行同一 managed-full 强校验；恢复也必须在 mutation 时重新校验所选 manifest/payload，不能复用列表时结果。
+- 成功回执必须包含可关联的 operation ID、备份引用、计数、回滚终态和警告；cleanup 还必须分别显示计划数与失败数。高风险长流程必须通过后端事件 `Channel` 上报真实阶段和 typed 终态；运行态切换必须在大会话扫描前上报 `planningSessions`，自动检查点释放必须有独立 `cleaningCheckpoints` 阶段，不能把昂贵规划或清理藏在无反馈等待中。没有后端 typed phase 的手工 cleanup 只能展示单一 indeterminate 运行态和由 `failedCount` 决定的真实成功/部分完成终态；安全保留 warning 可以显示“完成（有保留说明）”，不得虚构失败、分步进度或百分比。命令完成后必须释放 UI busy，刷新失败必须与 mutation 失败分开表达。
 
 ## 2. 新增功能接入规范
 
@@ -156,7 +162,7 @@ preflight -> plan/dry-run -> backup -> apply -> verify -> typed receipt
 
 本项目当前运行态是固定的 `plus`（ChatGPT 账号内部兼容 ID）和 `relay` 两槽位。扩展为任意账号池属于产品范围变化，必须先更新 PRD，不能仅通过循环 UI 或复用 legacy profile command 偷渡。
 
-Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文，scheme/host/port 改变必须输入新 Key。Key 不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key，成功响应也必须设置严格字节上限。
+Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文，scheme/host/port 改变必须输入新 Key。Key 不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key，成功响应也必须设置严格字节上限，并要求 `/models.data` 非空且包含配置的精确 model ID；同一次 Relay 验证失败只能进入一个页面错误面，不得由局部和全局路径重复显示。运行态 `exact` 判定必须比较所有影响请求路由的 provider 字段，包括 Relay Base URL。
 
 内置 Skill 接入必须使用编译期固定 ID、固定文件 allowlist、来源/版本/hash manifest 和后端推导目标；不得让前端传任意下载 URL、源路径、目标路径或文件名。Skill 状态必须区分 missing/current/update available/local drift/unmanaged/invalid，未知目录和本地修改不得静默覆盖。安装/更新属于关闭态 mutation，必须共用 mutation guard、同卷 stage、完整旧目录备份、原子激活、后置 hash 验证、崩溃 journal 恢复和 typed receipt。
 
@@ -166,10 +172,15 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 
 - Dashboard 数据必须按领域建模为 `loading | ready | error`；某个 Tauri command 失败时保留该域错误，禁止替换成空数组、零计数或绿色安全状态。
 - 应用首屏只加载 runtime 必需域；会话扫描、managed inventory 和备份 payload 哈希等昂贵域必须按需加载。切换完成后只刷新 runtime 域，并把 session/backup 标记 stale，禁止为了“看起来同步”立即重复全量扫描。
+- 备份域按需加载时应把可恢复 full backup 与检查点空间状态作为独立 `DomainState` 返回；先完成会执行 legacy 迁移的备份列表读取，再调用持 mutation guard 的检查点 inspect，禁止两个 guard 入口并发。空间状态必须区分总占用、严格证据可回收项、安全保留项、警告和最近清理结果。手工清理没有后端 typed 子阶段时，只能通过当前页面展示单一 indeterminate 运行态，并按 `attemptedCount` / `failedCount` 区分成功、成功但有保留说明和真实 partial；不使用确认弹窗、伪造分步进度、伪造百分比或模糊“已优化”文案。
+- 备份域刷新若已有 Promise 执行中，新的 mutation 后刷新请求必须标记 queued，并在旧请求 settle 后至少补跑一次最新扫描；不得永久复用 mutation 前快照或在成功回执旁继续显示旧可回收数值。
 - 写操作门禁必须依赖真实文件/SQLite/运行态域，而不是“页面加载完成”或“文件路径存在”。
+- 窗口关闭监听必须在应用挂载时预注册；注册未 ready 或失败时切换必须 fail closed。切换 invoke 前同步激活 guard，结束后解除；切换完成后的 runtime refresh pending 必须继续禁用两个切换入口，直到最新请求 settle。
+- mutation 失败、后台刷新失败与 unknown/缺失终态不得在多个全局/局部 banner 重复显示。unknown 终态必须保守提示用户先不要重新打开 ChatGPT，不能在没有 typed 证据时承诺“数据未变化”。
 - 运行态的“已保存”“当前激活”“最近验证”是三个独立概念；只有 `confidence = exact` 可标记当前并跳过切换，`mode` 只能提示重新应用。
 - 跨层 mutation 返回 typed receipt；新增/修改字段时必须同步 Rust serde、`src/types.ts`、`src/api.ts`、UI 展示和契约测试。
 - `switch_runtime` 等包含网络、scoped 备份和大量 SQLite/文件 I/O 的命令必须放入 Tauri blocking worker；进度通过 `Channel<RuntimeSwitchProgress>` 从真实后端阶段产生，并明确区分写入前失败、已回滚和回滚失败。
+- `sync_all_sessions`、检查点 inspect/cleanup 等包含容量扫描、目录遍历、SQLite/JSONL 或严格日志解析的命令也必须使用 async wrapper + blocking worker；inspect/cleanup 等会扫描或删除检查点目录的入口必须持 mutation guard。
 
 ### 2.5 前端交互与视觉合同
 
@@ -181,11 +192,13 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 ### 2.6 平台边界与外部只读集成
 
 - 当前唯一发布目标是 Windows x64 便携 EXE；没有对应目标编译和运行证据前，不得宣称支持 macOS/Linux。
+- Cargo release profile 必须保持 `opt-level = "z"`、`lto = true`、`codegen-units = 1`、`panic = "abort"`、`strip = "symbols"`。最终资产只能通过 `scripts/pack-windows-release.ps1` 对 raw 副本打包：固定官方 UPX 5.2.0 与 EXE SHA-256 `F4C0CC7ACA0F1FF0D0B750E966B44139F2FA1A2DB7281F48FC52194400712E1D`，禁止从未验证 PATH 取工具或原地压缩 raw。
+- CI 下载 UPX 的官方 ZIP 必须固定 SHA-256 `B471EBF1B7F20F4A89150264ED9A008A2A5BFD247F3C6D1184A75BB59CA08F5D`，解包后仍复核 EXE hash。raw 与 packed 都必须通过 release contract；packed 还必须通过 `upx -t`、PE32+ x64、双版本与 3,000,000 bytes 硬门禁，artifact 只能包含 packed 的裸 `codex-switch.exe`。
 - 与平台无关的新模块默认不得直接读取 `APPDATA`、调用 Windows shell 或拼接反斜杠路径；平台能力必须收敛到独立模块、target dependency 或 `cfg` 边界。
 - 凭据保护、进程控制、跨进程锁和 Skill runtime 属于平台能力。缺少安全实现时必须明确拒绝，禁止用可逆占位伪装可用。
 - 固定仓库更新检查属于外部只读集成：后端固定 endpoint，设置超时/响应上限、禁止元数据重定向、验证稳定 SemVer，错误不得回显响应正文；前端不得传任意仓库或下载 URL。
 - 启动更新检查必须与 runtime/session/backup 数据域解耦并保持非阻塞；应用不是常驻工具，不新增后台服务或运行中轮询。
-- Windows 单文件自更新必须只接受唯一固定名称的 Release EXE，要求 GitHub SHA-256 digest，按元数据大小和全量流式 hash 双重验证；下载 URL 从固定仓库和已验证 tag 推导，只允许 HTTPS GitHub Release 资产重定向。当前 EXE 复制为同版本 helper，父进程只能在 helper 完成计划/路径/hash/进程句柄预检并写入 readiness 后退出。
+- Windows 单文件自更新必须只接受唯一固定名称的 Release EXE，要求 GitHub SHA-256 digest，按元数据大小和全量流式 hash 双重验证；下载 URL 从固定仓库和已验证 tag 推导，只允许 HTTPS GitHub Release 资产重定向。v0.2.1 下载连接超时为 30 秒、总下载超时为 10 分钟；helper readiness 超时必须 kill + wait，staging 清理必须有界重试。当前 EXE 复制为同版本 helper，父进程只能在 helper 完成计划/路径/hash/进程句柄预检并写入 readiness 后退出。
 - 公开 UI 和窗口标题使用 ChatGPT Switch，但 GitHub Release 资产必须继续唯一命名为 `codex-switch.exe`；v0.1.9 updater 固定校验该名称，未经兼容迁移不得改为 `chatgpt-switch.exe`。
 - EXE 替换必须在目标目录同卷完成：先写 replacement 并复核 hash，再备份旧 EXE、激活 replacement。新进程必须在 Tauri `RunEvent::Ready` 后写入绑定受控 plan、状态与目标 hash 的 ACK；helper 在 ACK 前保留 backup，早退/超时必须终止新进程并恢复旧 EXE。staging 名必须来自 Windows CSPRNG，目录按当前 token 是否 elevated 施加只允许 SYSTEM/Administrators 或 SYSTEM/owner 的受限 DACL，并在准备和 helper 执行期间持有目录句柄。replacement 的每个不可逆阶段必须先后持久化并校验 journal，重入时按 journal 和旧/新 hash 决定继续或回滚。debug 和非 Windows 构建必须明确拒绝真实安装。
 
@@ -217,15 +230,20 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D w
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build
 npm run check:release
+.\scripts\pack-windows-release.ps1 -UpxPath "<verified-upx.exe>"
 ```
 
-- `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建、Rust fmt/clippy/test、完整 Tauri release 编译、版本/PE/路径/敏感 marker 合同及 verified artifact 留存；CI 文件存在不等于本轮已通过。
+- `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建、Rust fmt/clippy/test、raw Tauri release 编译/合同、固定官方 UPX ZIP/EXE 双 hash、copy-only packing、`upx -t`、packed 合同/3,000,000 bytes 上限，以及只留存 packed artifact；CI 文件存在不等于本轮已通过。
 - 备份、切换、双根同步/删除/恢复等高风险变化必须有临时目录或临时 `CODEX_HOME` 测试，至少覆盖幂等、故障注入和回滚终态。
-- 备份测试必须覆盖 v3 `scope` / `trackedDatabases`、runtime/sessions/state-only 实际写集、hard delete/full/restore safety 四库范围，以及局部快照不会进入 UI 可恢复列表。
-- 切换测试必须覆盖真实 phase 顺序、页面内阶段呈现、写入前失败/已回滚/回滚失败，以及完成后只刷新 runtime、session/backup 按需加载；不得只断言最终按钮文案。
-- Windows 进程控制测试必须覆盖 PID reuse 复检、受管根/后代、独立 `codex.exe` CLI 不受影响、温和关闭与强制兜底。updater 测试必须覆盖 elevated/non-elevated DACL、staging 目录句柄、journal 中断恢复、hash 篡改和 Ready ACK。
+- 备份测试必须覆盖 v3 scope、changed switch `RuntimeState + StateOnly`、sync 双 `StateOnly`、Full/Sessions active+archived 范围、hard delete/manual Full/restore safety 四库、损坏候选回填和局部点排除。临时清理要覆盖成功/完整回滚、typed prewrite 一根/两根、恢复可见单根、强 hash 漂移保留与 legacy v2 仅旧成功双根；Apply/回滚/日志失败、孤儿、重复 ID/路径、无效时间窗和 alias 都要 fail closed。必须断言 Summary/Receipt/log 的 `attemptedCount` / `failedCount`，纯保留 warnings 不增加失败数，执行期 revalidate/remove 失败即使无 warning 文本也必须失败。Full 治理必须覆盖列表/删除同一强校验、extra file/hash drift 不显示 verified、超过旧 5 项仍可见、256 上限、确认/审计/删除失败和绝不自动删 Full；partial 创建清理失败必须可见。
+- 切换测试必须覆盖真实 phase、写入前失败/已回滚/回滚失败/unknown、changed switch 始终 `RuntimeState + StateOnly`、`Deny/Allow` 边界、关闭门禁预注册、runtime refresh pending、单一错误面和按需域刷新；手工 cleanup 断言单一运行态，并锁定 `failedCount = 0 + warnings` 为成功有说明、`failedCount > 0` 为 partial。
+- 会话同步测试必须覆盖 source 尾行/session ID/len/hash 漂移与 bounded retry、抢先 Create、严格扩展与 Divergent 的稳定 hash-named 完整 import、旧短文件 bytes/hash/mtime 不变。必须分别锁定：hot shared→current 的既有 thread 在 target path 查询/复制前直接跳过、`copied_session_files = 0`、候选文件不存在、活动 `rollout_path`/provider/title 保留且旧 writer 同步后尾部继续可见；hot 新 thread 正常插入；current→shared 与关闭态 `SelectMostComplete` 可推进更完整引用。还必须验证重复 hot existing 同步不新增 target 文件或 C 盘占用。index 必须覆盖 hot current `Skip`、closed/app-owned shared 的完整 merged bytes 原子替换、`Deny` 零写和 `Unchanged` 终前复检；不得再把原地修改已有 JSONL/index 作为生产安全合同或测试要求。
+- 备份前端测试必须覆盖旧扫描 pending 时 queued rerun 的最终状态、按需列表不再裁成 5 项、Full 删除二次确认/回执，以及恢复点删除后刷新显示更旧候选；不得只验证 invoke 次数。
+- Windows 进程控制测试必须覆盖 PID reuse、受管根/后代、独立 CLI 阻断、最后写前复检、温和关闭与强制兜底。updater 测试必须覆盖 30 秒/10 分钟超时合同、helper kill + wait、cleanup retry、DACL、目录句柄、journal 中断、hash 篡改和 Ready ACK；由于已发布 v0.2.0 首跳仍为 120 秒，发布 v0.2.1 前还必须做真实 `v0.2.0 -> v0.2.1` 一键更新 smoke。
+- 会话性能回归必须使用临时 Home 证明多文件内容等价场景保持 JSONL 文件数、bytes、hash 与 mtime 不变、零 imported 副本，并验证 SQLite provider 的必要更新；不得把合成代理误述为真实 ChatGPT 重索引 wall-clock。
 - Skill 安装测试必须使用临时 `CODEX_HOME` / `APPDATA`，覆盖 clean install、幂等 current、未知目录/漂移确认、旧目录备份、URL 拒绝、Key 密文与空 Key 保留；vendored PowerShell/Python 至少做语法解析，并验证 Rust DPAPI 密文可被 Windows PowerShell 读取。
 - 发布回执必须区分已运行、未运行和被环境阻断的检查；不得把局部测试写成“全量通过”。
+- 本地临时候选大小/hash 不能写成最终 Release。只有 tag-CI packed artifact 的大小/hash、Release 重下载合同和真实 `v0.2.0 -> v0.2.1` 一键更新全部完成后，才能宣称首跳交付闭环。
 - 敏感扫描和中文乱码检查是发布门禁，不得被普通单元测试替代。
 
 ## 4. 文档更新规范

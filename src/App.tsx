@@ -6,15 +6,19 @@ import {
   CloudCog,
   Database,
   Download,
+  HardDriveDownload,
   History,
   KeyRound,
   LoaderCircle,
+  LogIn,
   MessagesSquare,
+  Power,
   RefreshCw,
   RotateCcw,
   Save,
   Settings2,
   ShieldCheck,
+  Trash2,
   UserRound,
   Wrench,
   X,
@@ -22,7 +26,10 @@ import {
 } from 'lucide-react';
 import {
   checkForUpdates as defaultCheckForUpdates,
+  cleanupAutomaticCheckpoints,
   closeCodexProcesses,
+  createFullBackup,
+  deleteBackup,
   deleteManagedSessions,
   dryRunAllSessions,
   importPlusRuntime,
@@ -53,6 +60,8 @@ import type {
   BackupSummary,
   AllSessionsDryRun,
   BackupDashboardData,
+  CheckpointCleanupReceipt,
+  CheckpointStorageStatus,
   DashboardData,
   DomainState,
   RelayRuntimeInput,
@@ -61,6 +70,7 @@ import type {
   RuntimeStatus,
   RuntimeDashboardData,
   RuntimeSwitchProgress,
+  RuntimeSwitchResult,
   SessionDashboardData,
   OperationRecord,
   SessionMutationResult,
@@ -73,21 +83,46 @@ type AppProps = {
   loadRuntimeDashboard?: () => Promise<RuntimeDashboardData>;
   loadSessionDashboard?: () => Promise<SessionDashboardData>;
   loadBackupDashboard?: () => Promise<BackupDashboardData>;
+  registerCloseGuard?: RegisterCloseGuard;
 };
+
+type CloseGuardEvent = { preventDefault: () => void };
+type RegisterCloseGuard = (
+  onCloseRequested: (event: CloseGuardEvent) => void,
+) => Promise<() => void>;
 
 type PendingConfirmation =
   | { kind: 'importAccount' }
   | { kind: 'syncSessions'; dryRun: AllSessionsDryRun }
-  | { kind: 'restoreBackup'; backup: BackupSummary };
+  | { kind: 'restoreBackup'; backup: BackupSummary }
+  | { kind: 'deleteBackup'; backup: BackupSummary };
 
-type RefreshScope = 'dashboard' | 'runtime' | 'none';
+type RefreshScope = 'dashboard' | 'runtime' | 'backup' | 'none';
+type CheckpointCleanupFlow = {
+  status: 'running' | 'succeeded' | 'partial' | 'failed';
+  startedAtMs: number;
+  completedAtMs?: number;
+  receipt?: CheckpointCleanupReceipt;
+  error?: string;
+};
 const numberFormat = new Intl.NumberFormat('zh-CN');
+
+async function defaultRegisterCloseGuard(
+  onCloseRequested: (event: CloseGuardEvent) => void,
+) {
+  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+    return () => undefined;
+  }
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  return getCurrentWindow().onCloseRequested(onCloseRequested);
+}
 
 function App({
   loadDashboard,
   loadRuntimeDashboard = defaultLoadRuntimeDashboard,
   loadSessionDashboard = defaultLoadSessionDashboard,
   loadBackupDashboard = defaultLoadBackupDashboard,
+  registerCloseGuard = defaultRegisterCloseGuard,
 }: AppProps) {
   const [data, setData] = useState<DashboardData>(() => loadingDashboard());
   const [error, setError] = useState<string | null>(null);
@@ -100,6 +135,10 @@ function App({
   const [clockNow, setClockNow] = useState(Date.now);
   const [sessionsStale, setSessionsStale] = useState(() => loadDashboard === undefined);
   const [backupsStale, setBackupsStale] = useState(() => loadDashboard === undefined);
+  const [backupLoading, setBackupLoading] = useState(false);
+  const [runtimeRefreshPending, setRuntimeRefreshPending] = useState(false);
+  const [checkpointCleanupFlow, setCheckpointCleanupFlow] =
+    useState<CheckpointCleanupFlow | null>(null);
   const [sessionRevision, setSessionRevision] = useState(0);
   const [activePage, setActivePage] = useState<'runtime' | 'sessions' | 'skills'>('runtime');
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -109,17 +148,23 @@ function App({
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateNotice, setUpdateNotice] = useState<string | null>(null);
   const [startupUpdateError, setStartupUpdateError] = useState<string | null>(null);
+  const [closeGuardStatus, setCloseGuardStatus] =
+    useState<'loading' | 'ready' | 'failed'>('loading');
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const loadRequestId = useRef(0);
   const runtimeRequestId = useRef(0);
   const sessionRequestId = useRef(0);
   const backupRequestId = useRef(0);
+  const backupLoadInFlight = useRef<Promise<void> | null>(null);
+  const backupRefreshQueued = useRef(false);
+  const checkpointCleanupInFlight = useRef(false);
   const requestedSessionRevision = useRef(-1);
   const switchAttemptId = useRef(0);
   const confirmationTrigger = useRef<HTMLElement | null>(null);
   const startupCheckStarted = useRef(false);
   const updateCheckInFlight = useRef(false);
   const exclusiveActionInFlight = useRef(false);
+  const switchCloseGuardActive = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -164,23 +209,27 @@ function App({
   }, [switchFlow?.status]);
 
   useEffect(() => {
-    if (switchFlow?.status !== 'running') return undefined;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => getCurrentWindow().onCloseRequested((event) => {
-        event.preventDefault();
-      }))
+    void registerCloseGuard((event) => {
+      if (switchCloseGuardActive.current) event.preventDefault();
+    })
       .then((stopListening) => {
-        if (disposed) stopListening();
-        else unlisten = stopListening;
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisten = stopListening;
+          setCloseGuardStatus('ready');
+        }
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!disposed) setCloseGuardStatus('failed');
+      });
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, [switchFlow?.status]);
+  }, [registerCloseGuard]);
 
   useEffect(() => {
     if (
@@ -208,7 +257,9 @@ function App({
   const canConfigureRelay = data.runtimes.status === 'ready'
     && (data.codexHome.status !== 'ready' || data.codexHome.data.configToml.exists);
   const canVerifyRelay = data.runtimes.status === 'ready' && Boolean(relayRuntime);
-  const canSwitchRuntime = data.runtimes.status === 'ready';
+  const canSwitchRuntime = data.runtimes.status === 'ready'
+    && closeGuardStatus === 'ready'
+    && !runtimeRefreshPending;
   const canSync = !sessionsStale
     && data.sessions.status === 'ready'
     && data.managedSessions.status === 'ready';
@@ -245,9 +296,16 @@ function App({
 
   async function refreshRuntimeDomains() {
     const requestId = ++runtimeRequestId.current;
-    const next = await loadRuntimeDashboard();
-    if (requestId === runtimeRequestId.current) {
-      setData((current) => ({ ...current, ...next }));
+    setRuntimeRefreshPending(true);
+    try {
+      const next = await loadRuntimeDashboard();
+      if (requestId === runtimeRequestId.current) {
+        setData((current) => ({ ...current, ...next }));
+      }
+    } finally {
+      if (requestId === runtimeRequestId.current) {
+        setRuntimeRefreshPending(false);
+      }
     }
   }
 
@@ -260,13 +318,34 @@ function App({
     }
   }
 
-  async function refreshBackupDomains() {
-    const requestId = ++backupRequestId.current;
-    const next = await loadBackupDashboard();
-    if (requestId === backupRequestId.current) {
-      setData((current) => ({ ...current, ...next }));
-      setBackupsStale(false);
+  function refreshBackupDomains() {
+    if (backupLoadInFlight.current) {
+      backupRefreshQueued.current = true;
+      return backupLoadInFlight.current;
     }
+    const requestId = ++backupRequestId.current;
+    setBackupLoading(true);
+    const task = loadBackupDashboard()
+      .then((next) => {
+        if (requestId === backupRequestId.current) {
+          setData((current) => ({ ...current, ...next }));
+          setBackupsStale(false);
+        }
+      })
+      .finally(() => {
+        if (backupLoadInFlight.current === task) {
+          backupLoadInFlight.current = null;
+        }
+        setBackupLoading(false);
+        if (backupRefreshQueued.current) {
+          backupRefreshQueued.current = false;
+          void refreshBackupDomains().catch((reason: unknown) => setError(
+            `备份状态刷新失败：${errorMessage(reason)}`,
+          ));
+        }
+      });
+    backupLoadInFlight.current = task;
+    return task;
   }
 
   function refreshInBackground(
@@ -274,7 +353,11 @@ function App({
     onFailure?: (reason: unknown) => void,
   ) {
     if (scope === 'none') return;
-    const task = scope === 'runtime' ? refreshRuntimeDomains() : refresh();
+    const task = scope === 'runtime'
+      ? refreshRuntimeDomains()
+      : scope === 'backup'
+        ? refreshBackupDomains()
+        : refresh();
     void task.catch((reason: unknown) => onFailure?.(reason));
   }
 
@@ -302,8 +385,12 @@ function App({
   }
 
   function handleLoadBackups() {
-    if (exclusiveBusy || exclusiveActionInFlight.current) return;
-    setData((current) => ({ ...current, backups: { status: 'loading' } }));
+    if (exclusiveBusy || exclusiveActionInFlight.current || backupLoadInFlight.current) return;
+    setData((current) => ({
+      ...current,
+      backups: { status: 'loading' },
+      backupStorage: { status: 'loading' },
+    }));
     void refreshBackupDomains().catch((reason: unknown) => setError(errorMessage(reason)));
   }
 
@@ -360,6 +447,7 @@ function App({
     onFailure?: (message: string) => void,
     refreshScope: RefreshScope = 'dashboard',
     onStart?: () => void,
+    reportFailureGlobally = true,
   ) {
     if (busy !== null || updateInstalling || exclusiveActionInFlight.current) return null;
     exclusiveActionInFlight.current = true;
@@ -373,7 +461,7 @@ function App({
         result = await action();
       } catch (reason) {
         const message = errorMessage(reason);
-        setError(message);
+        if (reportFailureGlobally) setError(message);
         onFailure?.(message);
         refreshInBackground(refreshScope);
         return null;
@@ -415,7 +503,7 @@ function App({
     setRelaySubmitError(null);
     const saved = await runAction('配置中转站', () => upsertRelayRuntime(input), (runtime) => ({
       label: 'API 中转站已保存', metrics: [`模型：${runtime.model ?? '未设置'}`],
-    }), setRelaySubmitError, 'runtime');
+    }), setRelaySubmitError, 'runtime', undefined, false);
     if (saved) setRelayEditorOpen(false);
   }
 
@@ -431,67 +519,84 @@ function App({
     let mutationObserved = false;
     let backupObserved = false;
 
-    const result = await runAction(label, () => switchRuntime(runtimeId, (event) => {
-      if (attemptId !== switchAttemptId.current) return;
-      if (!backupObserved && event.phase === 'backingUpShared') {
-        backupObserved = true;
-        markBackupsStale();
-      }
-      if (!mutationObserved && mutatesSessionData(event)) {
-        mutationObserved = true;
-        markSessionsStale();
-      }
-      setSwitchFlow((current) => {
-        if (!current || current.target !== runtimeId) return current;
-        const failedPhase = event.phase === 'rollingBack'
-          ? current.failedPhase ?? lastRuntimeWorkPhase(current.events)
-          : event.phase === 'failed'
+    let result: RuntimeSwitchResult | null = null;
+    try {
+      result = await runAction(label, () => switchRuntime(runtimeId, (event) => {
+        if (attemptId !== switchAttemptId.current) return;
+        if (!backupObserved && event.phase === 'backingUpShared') {
+          backupObserved = true;
+          markBackupsStale();
+        }
+        if (!mutationObserved && mutatesSessionData(event)) {
+          mutationObserved = true;
+          markSessionsStale();
+        }
+        setSwitchFlow((current) => {
+          if (!current || current.target !== runtimeId) return current;
+          const failedPhase = event.phase === 'rollingBack'
             ? current.failedPhase ?? lastRuntimeWorkPhase(current.events)
-            : current.failedPhase;
-        const events = [
-          ...current.events.filter((item) => item.phase !== event.phase),
-          event,
-        ];
+            : event.phase === 'failed'
+              ? current.failedPhase ?? lastRuntimeWorkPhase(current.events)
+              : current.failedPhase;
+          const events = [
+            ...current.events.filter((item) => item.phase !== event.phase),
+            event,
+          ];
+          return {
+            ...current,
+            status: event.phase === 'failed' ? 'failed'
+              : event.phase === 'complete' ? 'succeeded'
+              : current.status,
+            events,
+            failedPhase,
+            completedAtMs: ['complete', 'failed'].includes(event.phase)
+              ? event.timestampMs
+              : current.completedAtMs,
+          };
+        });
+      }), (switchResult) => {
+        const cleanupComplete = switchResult.checkpointCleanup
+          && switchResult.checkpointCleanup.failedCount === 0
+          && switchResult.checkpointCleanup.reclaimedCount === switchResult.backups.length;
         return {
-          ...current,
-          status: event.phase === 'failed' ? 'failed'
-            : event.phase === 'complete' ? 'succeeded'
-            : current.status,
-          events,
-          failedPhase,
-          completedAtMs: ['complete', 'failed'].includes(event.phase)
-            ? event.timestampMs
-            : current.completedAtMs,
+          label: switchResult.changed ? `${label}完成` : '运行态无需切换',
+          operationId: switchResult.operationId,
+          backupCount: cleanupComplete ? 0 : switchResult.backups.length,
+          backupPaths: cleanupComplete
+            ? []
+            : switchResult.backups.map((backup) => backup.backupDir),
+          rolledBack: switchResult.rolledBack,
+          warnings: switchResult.warnings,
+          metrics: [
+            `写入共享池：${switchResult.toShared.insertedThreads}`,
+            `写回本机：${switchResult.fromShared.insertedThreads}`,
+            ...(switchResult.checkpointCleanup
+              ? [`临时检查点已释放：${formatBytes(switchResult.checkpointCleanup.reclaimedBytes)}`]
+              : []),
+          ],
         };
-      });
-    }), (switchResult) => ({
-      label: switchResult.changed ? `${label}完成` : '运行态无需切换',
-      operationId: switchResult.operationId,
-      backupCount: switchResult.backups.length,
-      backupPaths: switchResult.backups.map((backup) => backup.backupDir),
-      rolledBack: switchResult.rolledBack,
-      metrics: [
-        `写入共享池：${switchResult.toShared.insertedThreads}`,
-        `写回本机：${switchResult.fromShared.insertedThreads}`,
-      ],
-    }), (message) => {
-      setSwitchFlow((current) => current ? {
-        ...current,
-        status: 'failed',
-        error: message,
-        failedPhase: current.failedPhase ?? lastRuntimeWorkPhase(current.events),
-        completedAtMs: Date.now(),
-      } : current);
-    }, 'runtime', () => {
-      attemptId = ++switchAttemptId.current;
-      setClockNow(Date.now());
-      setSwitchFlow({
-        status: 'running',
-        target: runtimeId,
-        events: [],
-        startedAtMs: Date.now(),
-      });
-    });
+      }, (message) => {
+        setSwitchFlow((current) => current ? {
+          ...current,
+          status: 'failed',
+          error: message,
+          failedPhase: current.failedPhase ?? lastRuntimeWorkPhase(current.events),
+          completedAtMs: Date.now(),
+        } : current);
+      }, 'runtime', () => {
+        switchCloseGuardActive.current = true;
+        attemptId = ++switchAttemptId.current;
+        setClockNow(Date.now());
+        setSwitchFlow({
+          status: 'running',
+          target: runtimeId,
+          events: [],
+          startedAtMs: Date.now(),
+        });
+      }, false);
+    } finally {
+      switchCloseGuardActive.current = false;
+    }
 
     if (attemptId === null || attemptId !== switchAttemptId.current) return;
     if (result) {
@@ -562,6 +667,96 @@ function App({
     }));
   }
 
+  function handleDeleteBackup(backup: BackupSummary) {
+    if (!backup.verified || !canRestoreBackup || backupLoadInFlight.current) return;
+    requestConfirmation({ kind: 'deleteBackup', backup });
+  }
+
+  async function performDeleteBackup(backup: BackupSummary) {
+    await runAction('删除恢复点', () => deleteBackup(backup.backupDir, true), (result) => ({
+      label: '恢复点已删除',
+      operationId: result.operationId,
+      warnings: result.warnings,
+      metrics: [`已回收：${formatBytes(result.reclaimedBytes)}`],
+    }), undefined, 'backup');
+  }
+
+  async function handleCreateFullBackup() {
+    if (backupLoadInFlight.current) return;
+    await runAction('创建完整备份', createFullBackup, (result) => ({
+      label: '完整备份已创建',
+      operationId: result.operationId,
+      backupCount: result.backups.length,
+      backupPaths: result.backups.map((backup) => backup.backupDir),
+      warnings: result.warnings,
+      metrics: [
+        '范围：当前 Home + 共享池',
+        ...result.backups.map((backup, index) => (
+          `来源 ${index + 1}：${backup.sourceRoot} · 受管数据库：${backup.trackedDatabaseCount}`
+        )),
+      ],
+    }), undefined, 'backup');
+  }
+
+  async function handleCleanupAutomaticCheckpoints() {
+    if (
+      checkpointCleanupInFlight.current
+      || backupLoadInFlight.current
+      || exclusiveBusy
+      || exclusiveActionInFlight.current
+    ) return;
+    checkpointCleanupInFlight.current = true;
+    const startedAtMs = Date.now();
+    setCheckpointCleanupFlow({ status: 'running', startedAtMs });
+    setData((current) => ({
+      ...current,
+      backupStorage: { status: 'loading' },
+    }));
+    try {
+      const result = await runAction(
+        '清理自动检查点',
+        cleanupAutomaticCheckpoints,
+        (cleanup) => ({
+          label: cleanup.failedCount > 0
+            ? '自动检查点部分完成'
+            : cleanup.warnings.length > 0
+              ? '自动检查点清理完成（有保留说明）'
+              : '自动检查点清理完成',
+          operationId: cleanup.operationId,
+          warnings: cleanup.warnings,
+          metrics: [
+            `计划：${cleanup.attemptedCount}`,
+            `失败：${cleanup.failedCount}`,
+            `释放：${formatBytes(cleanup.reclaimedBytes)}`,
+            `回收检查点：${cleanup.reclaimedCount}`,
+            `安全保留：${cleanup.retainedCount}`,
+          ],
+        }),
+        (message) => {
+          setCheckpointCleanupFlow({
+            status: 'failed',
+            startedAtMs,
+            completedAtMs: Date.now(),
+            error: message,
+          });
+        },
+        'backup',
+        undefined,
+        false,
+      );
+      if (result) {
+        setCheckpointCleanupFlow({
+          status: result.failedCount > 0 ? 'partial' : 'succeeded',
+          startedAtMs,
+          completedAtMs: Date.now(),
+          receipt: result,
+        });
+      }
+    } finally {
+      checkpointCleanupInFlight.current = false;
+    }
+  }
+
   async function confirmPendingAction() {
     const pending = pendingConfirmation;
     if (!pending) return;
@@ -570,8 +765,10 @@ function App({
       await importAccountRuntime(true);
     } else if (pending.kind === 'syncSessions') {
       await performSyncSessions();
-    } else {
+    } else if (pending.kind === 'restoreBackup') {
       await performRestoreBackup(pending.backup);
+    } else {
+      await performDeleteBackup(pending.backup);
     }
     window.requestAnimationFrame(() => confirmationTrigger.current?.focus());
   }
@@ -639,16 +836,29 @@ function App({
       {updateNotice ? <p className="busy-banner" role="status" aria-live="polite">{updateNotice}</p> : null}
       {startupUpdateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{startupUpdateError}</span></p> : null}
       {updateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{updateError}</span></p> : null}
+      {closeGuardStatus === 'failed' ? (
+        <p className="error-banner" role="alert">
+          窗口保护初始化失败，运行态切换已禁用。请重新启动 ChatGPT Switch 后重试。
+        </p>
+      ) : null}
       {activePage !== 'skills' ? domainErrors.map(({ domain, message }) => (
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}
       {activePage !== 'skills' && error ? <p className="error-banner" role="alert">{error}</p> : null}
       {busy ? <p className="busy-banner" role="status" aria-live="polite"><LoaderCircle className="spin" aria-hidden="true" />{busy}处理中</p> : null}
+      {!busy && runtimeRefreshPending ? (
+        <p className="busy-banner" role="status" aria-live="polite">
+          <LoaderCircle className="spin" aria-hidden="true" />正在确认当前运行态
+        </p>
+      ) : null}
       {activePage !== 'skills' && receipt ? <OperationResultPanel result={receipt} /> : null}
       {pendingConfirmation ? (
         <InlineConfirmation
           pending={pendingConfirmation}
-          busy={exclusiveBusy}
+          busy={
+            exclusiveBusy
+            || (backupLoading && ['restoreBackup', 'deleteBackup'].includes(pendingConfirmation.kind))
+          }
           onCancel={cancelPendingConfirmation}
           onConfirm={() => void confirmPendingAction()}
         />
@@ -669,6 +879,21 @@ function App({
               <div><dt>JSONL</dt><dd>{jsonlCount}</dd></div>
             </dl>
           </header>
+
+          {codexHome && (!codexHome.authJson.exists || !codexHome.configToml.exists) ? (
+            <section className="home-setup-notice" aria-label="需要完成 ChatGPT 登录">
+              <LogIn aria-hidden="true" />
+              <div>
+                <p className="eyebrow">LOGIN REQUIRED</p>
+                <h2>先打开 ChatGPT 完成登录，再回到这里刷新</h2>
+                <p>检测到账号运行态所需的 auth.json 或 config.toml 尚未就绪。</p>
+              </div>
+              <button className="ghost-button" onClick={handleManualRefresh} disabled={exclusiveBusy}>
+                <RefreshCw className="button-icon" aria-hidden="true" />
+                刷新
+              </button>
+            </section>
+          ) : null}
 
           <section className="runtime-grid" aria-label="运行态">
             <RuntimeCard
@@ -712,11 +937,19 @@ function App({
             <SafetyPanel data={data} sessionsStale={sessionsStale} backupsStale={backupsStale} />
             <BackupRecoveryPanel
               state={data.backups}
+              storage={data.backupStorage}
               stale={backupsStale}
-              disabled={exclusiveBusy || !canRestoreBackup}
-              loadDisabled={exclusiveBusy}
+              disabled={exclusiveBusy || backupLoading || !canRestoreBackup}
+              loadDisabled={exclusiveBusy || backupLoading}
+              createDisabled={exclusiveBusy || backupLoading}
+              cleanupDisabled={exclusiveBusy || backupLoading}
+              creating={busy === '创建完整备份'}
+              cleanupFlow={checkpointCleanupFlow}
               onLoad={handleLoadBackups}
+              onCreate={() => void handleCreateFullBackup()}
+              onCleanup={() => void handleCleanupAutomaticCheckpoints()}
               onRestore={handleRestoreBackup}
+              onDelete={handleDeleteBackup}
             />
             <OperationHistoryPanel state={data.operations} />
           </section>
@@ -769,6 +1002,7 @@ function InlineConfirmation({
   let detail = '';
   let metrics: string[] = [];
   let confirmLabel = '继续';
+  const destructive = pending.kind === 'deleteBackup';
 
   if (pending.kind === 'importAccount') {
     title = '覆盖已保存的 ChatGPT 账号态';
@@ -782,15 +1016,23 @@ function InlineConfirmation({
     detail = '确认后开始创建备份并执行双向同步。';
     metrics = [`新增 ${newThreads} 个线程`, `识别 ${duplicates} 个重复线程`];
     confirmLabel = '开始同步';
-  } else {
+  } else if (pending.kind === 'restoreBackup') {
     title = '恢复已验证备份';
     detail = `来源：${pending.backup.sourceRoot}`;
     metrics = [`快照：${pending.backup.backupDir}`];
     confirmLabel = '开始恢复';
+  } else {
+    title = '删除此恢复点';
+    detail = '这会永久删除备份本身；删除后无法从 ChatGPT Switch 恢复。当前 ChatGPT 数据不会被删除。';
+    metrics = [`路径：${pending.backup.backupDir}`];
+    confirmLabel = '确认删除恢复点';
   }
 
   return (
-    <section className="inline-confirmation warning-confirmation" aria-label={title}>
+    <section
+      className={`inline-confirmation ${destructive ? 'danger-confirmation' : 'warning-confirmation'}`}
+      aria-label={title}
+    >
       <CircleAlert className="section-icon" aria-hidden="true" />
       <div className="confirmation-copy">
         <p className="eyebrow">REVIEW ACTION</p>
@@ -800,7 +1042,12 @@ function InlineConfirmation({
       </div>
       <div className="confirmation-actions">
         <button className="ghost-button" onClick={onCancel} disabled={busy}><X className="button-icon" aria-hidden="true" />取消</button>
-        <button className="warm-button" onClick={onConfirm} disabled={busy}><Check className="button-icon" aria-hidden="true" />{confirmLabel}</button>
+        <button className={destructive ? 'ghost-button danger' : 'warm-button'} onClick={onConfirm} disabled={busy}>
+          {destructive
+            ? <Trash2 className="button-icon" aria-hidden="true" />
+            : <Check className="button-icon" aria-hidden="true" />}
+          {confirmLabel}
+        </button>
       </div>
     </section>
   );
@@ -850,6 +1097,7 @@ function RuntimeCard({
         {onVerify ? <button className="ghost-button inline" onClick={onVerify} disabled={verifyDisabled || !runtime}><ShieldCheck className="button-icon" aria-hidden="true" />验证连接</button> : null}
         <button className="switch-button" onClick={onSwitch} disabled={switchDisabled}><ArrowLeftRight className="button-icon" aria-hidden="true" />{switchAction}</button>
       </div>
+      <p className="runtime-switch-note"><Power aria-hidden="true" />切换前会先关闭 ChatGPT</p>
     </article>
   );
 }
@@ -899,24 +1147,114 @@ function SafetyPanel({
 
 function BackupRecoveryPanel({
   state,
+  storage,
   stale,
   disabled,
   loadDisabled,
+  createDisabled,
+  cleanupDisabled,
+  creating,
+  cleanupFlow,
   onLoad,
+  onCreate,
+  onCleanup,
   onRestore,
+  onDelete,
 }: {
   state: DomainState<BackupSummary[]>;
+  storage: DomainState<CheckpointStorageStatus>;
   stale: boolean;
   disabled: boolean;
   loadDisabled: boolean;
+  createDisabled: boolean;
+  cleanupDisabled: boolean;
+  creating: boolean;
+  cleanupFlow: CheckpointCleanupFlow | null;
   onLoad: () => void;
+  onCreate: () => void;
+  onCleanup: () => void;
   onRestore: (backup: BackupSummary) => void;
+  onDelete: (backup: BackupSummary) => void;
 }) {
-  const verifiedBackups = state.status === 'ready' ? state.data.filter((item) => item.verified).slice(0, 5) : [];
+  const verifiedBackups = state.status === 'ready' ? state.data.filter((item) => item.verified) : [];
+  const storageStatus = storage.status === 'ready' ? storage.data : null;
+  const cleanupRunning = cleanupFlow?.status === 'running';
   return (
-    <aside className="detail-panel backup-panel" aria-label="备份恢复">
-      <div className="card-title-row"><RotateCcw className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SNAPSHOTS</p><h2>备份恢复</h2></div></div>
-      <p className="runtime-description">最近 5 份已验证快照</p>
+    <aside className="detail-panel backup-panel" aria-label="备份与恢复">
+      <div className="card-title-row"><RotateCcw className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SNAPSHOTS</p><h2>备份与恢复</h2></div></div>
+      <p className="runtime-description">已验证完整备份会持续保留，可逐份恢复或删除</p>
+      <button className="primary-button full backup-create-button" onClick={onCreate} disabled={createDisabled}>
+        {creating
+          ? <LoaderCircle className="button-icon spin" aria-hidden="true" />
+          : <HardDriveDownload className="button-icon" aria-hidden="true" />}
+        {creating ? '正在创建完整备份' : '创建完整备份'}
+      </button>
+      <p className="runtime-switch-note"><Power aria-hidden="true" />创建时会先关闭 ChatGPT，并保留当前 Home 与共享池两份快照</p>
+      {!stale ? (
+        <section className="checkpoint-storage" aria-label="自动检查点空间">
+          <div className="checkpoint-storage-heading">
+            <div>
+              <p className="eyebrow">TRANSIENT CHECKPOINTS</p>
+              <h3>自动检查点空间</h3>
+            </div>
+            {storageStatus ? <strong>{formatBytes(storageStatus.reclaimableBytes)} 可释放</strong> : null}
+          </div>
+          {storage.status === 'loading' ? (
+            <p className="checkpoint-storage-status" role="status">
+              <LoaderCircle className="spin" aria-hidden="true" />正在核对操作终态
+            </p>
+          ) : storage.status === 'error' ? (
+            <p className="checkpoint-storage-status" role="alert">{storage.error}</p>
+          ) : (
+            <>
+              <dl className="checkpoint-storage-metrics">
+                <div><dt>目录占用</dt><dd>{formatBytes(storage.data.totalBytes)}</dd></div>
+                <div><dt>可证明回收</dt><dd>{storage.data.reclaimableCount}</dd></div>
+                <div><dt>安全保留</dt><dd>{storage.data.retainedCount}</dd></div>
+              </dl>
+              <p className="checkpoint-storage-copy">
+                普通同步与切换只创建覆盖实际写集的轻量临时检查点。同步或切换成功、切换完整回滚、
+                Backup 阶段写入前失败、恢复可见成功等可证明终态会自动释放；写入后失败、回滚失败、
+                孤儿和证据不足项继续保留。完整备份由你通过“删除恢复点”显式管理。
+              </p>
+              <button
+                className="ghost-button inline checkpoint-cleanup-button"
+                onClick={onCleanup}
+                disabled={
+                  cleanupDisabled
+                  || cleanupRunning
+                  || storage.data.reclaimableCount === 0
+                }
+              >
+                {cleanupRunning
+                  ? <LoaderCircle className="button-icon spin" aria-hidden="true" />
+                  : <Trash2 className="button-icon" aria-hidden="true" />}
+                {cleanupRunning
+                  ? '正在安全释放'
+                  : storage.data.reclaimableCount > 0
+                    ? `安全释放 ${formatBytes(storage.data.reclaimableBytes)}`
+                    : '没有可安全释放的检查点'}
+              </button>
+              {storage.data.warnings.length > 0 ? (
+                <div className="checkpoint-warnings" aria-label="保留说明">
+                  {storage.data.warnings.map((warning) => (
+                    <p className="checkpoint-warning" key={warning}>{warning}</p>
+                  ))}
+                </div>
+              ) : null}
+              {storage.data.lastCleanup ? (
+                <p className="checkpoint-last-cleanup">
+                  最近清理：计划 {storage.data.lastCleanup.attemptedCount} 项，
+                  失败 {storage.data.lastCleanup.failedCount} 项，
+                  释放 {formatBytes(storage.data.lastCleanup.reclaimedBytes)}，
+                  保留 {storage.data.lastCleanup.retainedCount} 项
+                </p>
+              ) : null}
+            </>
+          )}
+          {cleanupFlow ? <CheckpointCleanupProgress flow={cleanupFlow} /> : null}
+        </section>
+      ) : null}
       {stale ? (
         <div className="backup-load-state">
           <p>备份校验按需执行，避免与 ChatGPT 抢占磁盘。</p>
@@ -926,7 +1264,13 @@ function BackupRecoveryPanel({
         </div>
       ) : state.status === 'error' ? <div className="backup-load-state" role="alert"><p>{state.error}</p><button className="ghost-button inline" onClick={onLoad} disabled={loadDisabled}><RefreshCw className="button-icon" aria-hidden="true" />重试</button></div>
         : state.status === 'loading' ? <p className="empty-state">备份列表扫描中...</p>
-        : verifiedBackups.length > 0 ? <div className="backup-list">
+        : verifiedBackups.length > 0 ? (
+          <div
+            className="backup-list"
+            role="region"
+            aria-label={`已验证完整备份，共 ${verifiedBackups.length} 份`}
+            tabIndex={0}
+          >
         {verifiedBackups.map((backup) => <article className="backup-entry" key={backup.backupDir}>
           <dl className="compact-meta">
             <div><dt>原因</dt><dd>{backup.reason}</dd></div>
@@ -935,15 +1279,71 @@ function BackupRecoveryPanel({
           </dl>
           <p className="backup-path" title={backup.sourceRoot}>来源：{backup.sourceRoot}</p>
           <p className="backup-path" title={backup.backupDir}>{backup.backupDir}</p>
-          <button
-            className="warm-button full"
-            aria-label={`恢复此备份，${formatTime(backup.createdAtMs)}，来源 ${backup.sourceRoot}`}
-            onClick={() => onRestore(backup)}
-            disabled={disabled}
-          ><RotateCcw className="button-icon" aria-hidden="true" />恢复此备份</button>
+          <div className="backup-entry-actions">
+            <button
+              className="warm-button"
+              aria-label={`恢复此备份，${formatTime(backup.createdAtMs)}，来源 ${backup.sourceRoot}`}
+              onClick={() => onRestore(backup)}
+              disabled={disabled}
+            ><RotateCcw className="button-icon" aria-hidden="true" />恢复此备份</button>
+            <button
+              className="ghost-button danger"
+              aria-label={`删除恢复点，${formatTime(backup.createdAtMs)}，路径 ${backup.backupDir}`}
+              onClick={() => onDelete(backup)}
+              disabled={disabled}
+            ><Trash2 className="button-icon" aria-hidden="true" />删除恢复点</button>
+          </div>
         </article>)}
-      </div> : <p className="empty-state">没有可恢复的已验证备份。</p>}
+          </div>
+        ) : <p className="empty-state">没有可恢复的已验证备份。</p>}
     </aside>
+  );
+}
+
+function CheckpointCleanupProgress({ flow }: { flow: CheckpointCleanupFlow }) {
+  const complete = flow.status === 'succeeded';
+  const partial = flow.status === 'partial';
+  const completeWithNotes = complete && Boolean(flow.receipt?.warnings.length);
+  return (
+    <section
+      className={`checkpoint-cleanup-flow ${flow.status}`}
+      role="region"
+      aria-label="自动检查点清理进度"
+      aria-live="polite"
+      aria-busy={flow.status === 'running'}
+    >
+      <div className="checkpoint-cleanup-flow-title">
+        {flow.status === 'running'
+          ? <LoaderCircle className="spin" aria-hidden="true" />
+          : complete
+            ? <Check aria-hidden="true" />
+            : <CircleAlert aria-hidden="true" />}
+        <strong>
+          {flow.status === 'running'
+            ? '正在执行安全清理任务'
+            : complete
+              ? completeWithNotes
+                ? '安全清理任务已完成（有保留说明）'
+                : '安全清理任务已完成'
+              : partial
+                ? '安全清理任务部分完成'
+                : '安全清理任务未完成'}
+        </strong>
+      </div>
+      {flow.status === 'running' ? (
+        <p role="status">
+          正在核对持久化终态与完整检查点证据；只会删除符合安全合同的目录。
+        </p>
+      ) : null}
+      {flow.receipt ? (
+        <p>
+          计划 {flow.receipt.attemptedCount} 项，失败 {flow.receipt.failedCount} 项，
+          已释放 {formatBytes(flow.receipt.reclaimedBytes)}，
+          {flow.receipt.retainedCount} 项因恢复职责或证据不足继续保留。
+        </p>
+      ) : null}
+      {flow.error ? <p role="alert">{flow.error}</p> : null}
+    </section>
   );
 }
 
@@ -1033,7 +1433,8 @@ function operationActionLabel(action: OperationRecord['action']) {
   const labels: Record<OperationRecord['action'], string> = {
     importAccount: '保存账号态', saveRelay: '保存中转站', verifyRelay: '验证中转站',
     switchRuntime: '切换运行态', syncSessions: '同步会话', deleteSessions: '删除会话',
-    restoreVisibility: '恢复会话可见', restoreBackup: '恢复备份',
+    restoreVisibility: '恢复会话可见', restoreBackup: '恢复备份', createBackup: '创建完整备份',
+    deleteBackup: '删除恢复点', cleanupCheckpoints: '清理自动检查点',
     installSkill: '安装技能', configureSkill: '配置技能',
   };
   return labels[action];
@@ -1056,26 +1457,62 @@ function dashboardErrors(data: DashboardData) {
 }
 
 function syncReceipt(result: SessionSyncResult): OperationView {
+  const backups = result.backups ?? [];
+  const cleanupComplete = result.checkpointCleanup
+    && result.checkpointCleanup.failedCount === 0
+    && result.checkpointCleanup.reclaimedCount === backups.length;
   return {
-    label: '会话同步完成', operationId: result.operationId, backupCount: result.backups?.length ?? 0,
-    backupPaths: result.backups?.map((backup) => backup.backupDir),
+    label: '会话同步完成',
+    operationId: result.operationId,
+    backupCount: cleanupComplete ? 0 : backups.length,
+    backupPaths: cleanupComplete ? [] : backups.map((backup) => backup.backupDir),
     rolledBack: result.rolledBack,
     warnings: result.warnings,
-    metrics: [`新增线程：${result.insertedThreads}`, `复制 JSONL：${result.copiedSessionFiles}`, `跳过缺失正文：${result.skippedMissingSessionFiles}`],
+    metrics: [
+      `新增线程：${result.insertedThreads}`,
+      `复制 JSONL：${result.copiedSessionFiles}`,
+      `跳过缺失正文：${result.skippedMissingSessionFiles}`,
+      ...(result.checkpointCleanup
+        ? [`临时检查点已释放：${formatBytes(result.checkpointCleanup.reclaimedBytes)}`]
+        : []),
+    ],
   };
 }
 
 function mutationReceipt(label: string) {
-  return (result: SessionMutationResult): OperationView => ({
-    label, operationId: result.operationId, backupCount: result.backups.length, rolledBack: result.rolledBack,
-    backupPaths: result.backups.map((backup) => backup.backupDir),
-    warnings: result.warnings,
-    metrics: [`删除线程：${result.deletedThreads}`, `删除 JSONL：${result.deletedSessionFiles}`, `恢复线程：${result.restoredThreads}`],
-  });
+  return (result: SessionMutationResult): OperationView => {
+    const cleanupComplete = result.checkpointCleanup
+      && result.checkpointCleanup.failedCount === 0
+      && result.checkpointCleanup.reclaimedCount === result.backups.length;
+    return {
+      label,
+      operationId: result.operationId,
+      backupCount: cleanupComplete ? undefined : result.backups.length,
+      rolledBack: result.rolledBack,
+      backupPaths: cleanupComplete ? [] : result.backups.map((backup) => backup.backupDir),
+      warnings: result.warnings,
+      metrics: [
+        `删除线程：${result.deletedThreads}`,
+        `删除 JSONL：${result.deletedSessionFiles}`,
+        `恢复线程：${result.restoredThreads}`,
+        ...(result.checkpointCleanup
+          ? [`临时检查点已释放：${formatBytes(result.checkpointCleanup.reclaimedBytes)}`]
+          : []),
+      ],
+    };
+  };
 }
 
 function formatTime(value: number | null) {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '未验证';
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const order = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const scaled = value / (1024 ** order);
+  return `${scaled >= 100 || order === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[order]}`;
 }
 
 function errorMessage(reason: unknown) {

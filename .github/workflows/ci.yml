@@ -55,22 +55,46 @@ jobs:
       - name: Build portable release executable
         run: npm run tauri -- build
 
-      - name: Verify release contract
+      - name: Verify uncompressed release contract
         run: npm run check:release
 
-      - name: Verify PE product version
+      - name: Fetch verified UPX 5.2.0
         shell: pwsh
         run: |
-          $expected = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $actual = (Get-Item src-tauri/target/release/codex-switch.exe).VersionInfo.ProductVersion
-          if ($actual -ne $expected) {
-            throw "PE ProductVersion $actual does not match package version $expected"
+          $archive = Join-Path $env:RUNNER_TEMP 'upx-5.2.0-win64.zip'
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'upx-5.2.0-win64'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/upx/upx/releases/download/v5.2.0/upx-5.2.0-win64.zip' `
+            -OutFile $archive
+
+          $expectedArchiveSha256 = 'B471EBF1B7F20F4A89150264ED9A008A2A5BFD247F3C6D1184A75BB59CA08F5D'
+          $actualArchiveSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actualArchiveSha256 -ne $expectedArchiveSha256) {
+            throw "UPX archive SHA-256 $actualArchiveSha256 does not match pinned $expectedArchiveSha256"
           }
 
-      - name: Upload verified executable
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+          $upxPath = Join-Path $extractRoot 'upx-5.2.0-win64/upx.exe'
+          $expectedUpxSha256 = 'F4C0CC7ACA0F1FF0D0B750E966B44139F2FA1A2DB7281F48FC52194400712E1D'
+          $actualUpxSha256 = (Get-FileHash -LiteralPath $upxPath -Algorithm SHA256).Hash
+          if ($actualUpxSha256 -ne $expectedUpxSha256) {
+            throw "UPX executable SHA-256 $actualUpxSha256 does not match pinned $expectedUpxSha256"
+          }
+          "UPX_PATH=$upxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Pack and verify release executable
+        shell: pwsh
+        run: |
+          ./scripts/pack-windows-release.ps1 `
+            -UpxPath $env:UPX_PATH `
+            -SourceExe 'src-tauri/target/release/codex-switch.exe' `
+            -OutputExe 'release/codex-switch.exe'
+
+      - name: Upload verified packed executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codex-switch-${{ github.sha }}
-          path: src-tauri/target/release/codex-switch.exe
+          path: release/codex-switch.exe
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0

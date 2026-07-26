@@ -17,6 +17,7 @@ pub struct CodexPaths {
     pub goals_db: PathBuf,
     pub memories_db: PathBuf,
     pub sessions_dir: PathBuf,
+    pub archived_sessions_dir: PathBuf,
     pub session_index: PathBuf,
 }
 
@@ -43,6 +44,7 @@ fn build_paths(codex_home: &Path, sqlite_home: &Path) -> CodexPaths {
         goals_db: sqlite_home.join("goals_1.sqlite"),
         memories_db: sqlite_home.join("memories_1.sqlite"),
         sessions_dir: codex_home.join("sessions"),
+        archived_sessions_dir: codex_home.join("archived_sessions"),
         session_index: codex_home.join("session_index.jsonl"),
     }
 }
@@ -128,6 +130,10 @@ mod tests {
 
         assert_eq!(paths.sqlite_home, sqlite_home.path());
         assert_eq!(paths.state_db, sqlite_home.path().join("state_5.sqlite"));
+        assert_eq!(
+            paths.archived_sessions_dir,
+            home.path().join("archived_sessions")
+        );
     }
 
     #[test]
@@ -149,6 +155,10 @@ mod tests {
         assert_eq!(paths.sqlite_home, home.path());
         assert_eq!(paths.state_db, home.path().join("state_5.sqlite"));
         assert_eq!(paths.memories_db, home.path().join("memories_1.sqlite"));
+        assert_eq!(
+            paths.archived_sessions_dir,
+            home.path().join("archived_sessions")
+        );
     }
 
     #[test]

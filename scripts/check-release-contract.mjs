@@ -50,19 +50,41 @@ const executableSize = statSync(executablePath).size;
 if (executableSize === 0 || executableSize > 64 * 1024 * 1024) {
   fail(`unexpected executable size ${executableSize}`);
 }
-if (executable[0] !== 0x4d || executable[1] !== 0x5a) {
+if (
+  executable.length < 0x40 ||
+  executable[0] !== 0x4d ||
+  executable[1] !== 0x5a
+) {
   fail('release artifact is not a Windows PE executable');
+}
+const peOffset = executable.readUInt32LE(0x3c);
+if (
+  peOffset > executable.length - 26 ||
+  executable.subarray(peOffset, peOffset + 4).compare(Buffer.from('PE\0\0')) !==
+    0
+) {
+  fail('release artifact has an invalid PE header');
+}
+const machine = executable.readUInt16LE(peOffset + 4);
+if (machine !== 0x8664) {
+  fail(`release artifact machine 0x${machine.toString(16)} is not x64`);
+}
+const optionalHeaderMagic = executable.readUInt16LE(peOffset + 24);
+if (optionalHeaderMagic !== 0x20b) {
+  fail(
+    `release artifact optional header 0x${optionalHeaderMagic.toString(16)} is not PE32+`,
+  );
 }
 
 if (process.platform === 'win32') {
-  const productVersion = execFileSync(
+  const versionJson = execFileSync(
     'powershell.exe',
     [
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      '(Get-Item -LiteralPath $env:CODEX_SWITCH_RELEASE_EXE).VersionInfo.ProductVersion',
+      '$version = (Get-Item -LiteralPath $env:CODEX_SWITCH_RELEASE_EXE).VersionInfo; [pscustomobject]@{ ProductVersion = $version.ProductVersion; FileVersion = $version.FileVersion } | ConvertTo-Json -Compress',
     ],
     {
       encoding: 'utf8',
@@ -72,8 +94,13 @@ if (process.platform === 'win32') {
       },
     },
   ).trim();
-  if (productVersion !== expectedVersion) {
-    fail(`PE ProductVersion ${productVersion} does not match ${expectedVersion}`);
+  const versionInfo = JSON.parse(versionJson);
+  for (const field of ['ProductVersion', 'FileVersion']) {
+    if (versionInfo[field] !== expectedVersion) {
+      fail(
+        `PE ${field} ${String(versionInfo[field])} does not match ${expectedVersion}`,
+      );
+    }
   }
 }
 
@@ -98,5 +125,5 @@ for (const [label, marker] of forbidden) {
 }
 
 console.log(
-  `Release contract passed: v${expectedVersion}, ${executableSize} bytes, ${executablePath}`,
+  `Release contract passed: v${expectedVersion}, PE32+ x64, ${executableSize} bytes, ${executablePath}`,
 );
