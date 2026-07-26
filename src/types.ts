@@ -60,6 +60,7 @@ export type DashboardData = {
   runtimes: DomainState<RuntimeMetadata[]>;
   runtimeStatus: DomainState<RuntimeStatus>;
   backups: DomainState<BackupSummary[]>;
+  backupStorage: DomainState<CheckpointStorageStatus>;
   operations: DomainState<OperationRecord[]>;
 };
 
@@ -73,7 +74,7 @@ export type SessionDashboardData = Pick<
   'sessions' | 'managedSessions'
 >;
 
-export type BackupDashboardData = Pick<DashboardData, 'backups'>;
+export type BackupDashboardData = Pick<DashboardData, 'backups' | 'backupStorage' | 'operations'>;
 
 export type AppStatus = {
   appName: string;
@@ -139,13 +140,14 @@ export type ManagedSessionInventory = {
 export type SessionMutationResult = {
   operationId?: string;
   selectedCount: number;
-  backups: BackupManifest[];
+  backups: BackupReceiptSummary[];
   deletedThreads: number;
   deletedSessionFiles: number;
   removedSessionIndexEntries: number;
   restoredThreads: number;
   rolledBack?: boolean;
   warnings?: string[];
+  checkpointCleanup?: CheckpointCleanupSummary;
 };
 
 export type RuntimeKind = 'plus' | 'relay';
@@ -228,15 +230,52 @@ export type SkillMutationReceipt = {
   warnings: string[];
 };
 
-export type BackupScope = 'full' | 'runtime' | 'sessions' | 'stateOnly';
+export type BackupScope = 'full' | 'runtime' | 'runtimeState' | 'sessions' | 'stateOnly';
 
-export type BackupManifest = {
+export type BackupReceiptSummary = {
   backupDir: string;
+  sourceRoot: string;
   reason: string;
   createdAtMs: number;
   scope: BackupScope;
-  trackedDatabases: string[];
+  trackedDatabaseCount: number;
   completeSessions: boolean;
+};
+
+export type CreateFullBackupReceipt = {
+  operationId: string;
+  backups: BackupReceiptSummary[];
+  warnings: string[];
+};
+
+export type BackupDeleteReceipt = {
+  operationId: string;
+  backupDir: string;
+  reclaimedBytes: number;
+  warnings: string[];
+};
+
+export type CheckpointCleanupSummary = {
+  attemptedCount: number;
+  failedCount: number;
+  reclaimedCount: number;
+  reclaimedBytes: number;
+  retainedCount: number;
+  warnings: string[];
+};
+
+export type CheckpointCleanupReceipt = CheckpointCleanupSummary & {
+  operationId: string;
+};
+
+export type CheckpointStorageStatus = {
+  totalCount: number;
+  totalBytes: number;
+  reclaimableCount: number;
+  reclaimableBytes: number;
+  retainedCount: number;
+  warnings: string[];
+  lastCleanup: CheckpointCleanupReceipt | null;
 };
 
 export type BackupSummary = {
@@ -258,7 +297,7 @@ export type RestoreResult = {
   verified: boolean;
   rolledBack?: boolean;
   warnings?: string[];
-  safetyBackup?: BackupManifest;
+  safetyBackup?: BackupReceiptSummary;
 };
 
 export type OperationAction =
@@ -270,6 +309,9 @@ export type OperationAction =
   | 'deleteSessions'
   | 'restoreVisibility'
   | 'restoreBackup'
+  | 'createBackup'
+  | 'deleteBackup'
+  | 'cleanupCheckpoints'
   | 'installSkill'
   | 'configureSkill';
 
@@ -289,7 +331,7 @@ export type OperationRecord = {
 
 export type SessionSyncResult = {
   operationId?: string;
-  backups?: BackupManifest[];
+  backups?: BackupReceiptSummary[];
   insertedThreads: number;
   copiedSessionFiles: number;
   duplicateThreads: number;
@@ -298,19 +340,23 @@ export type SessionSyncResult = {
   mergedSessionIndexEntries: number;
   rolledBack?: boolean;
   warnings?: string[];
+  checkpointCleanup?: CheckpointCleanupSummary;
 };
 
 export type RuntimeSwitchResult = {
   operationId: string;
   changed: boolean;
   runtime: RuntimeMetadata;
-  backups: BackupManifest[];
+  backups: BackupReceiptSummary[];
   toShared: SessionSyncResult;
   fromShared: SessionSyncResult;
   rolledBack: boolean;
+  warnings?: string[];
+  checkpointCleanup?: CheckpointCleanupSummary;
 };
 
 export type RuntimeSwitchPhase =
+  | 'planningSessions'
   | 'detectingApp'
   | 'closingApp'
   | 'verifyingRelay'
@@ -321,6 +367,7 @@ export type RuntimeSwitchPhase =
   | 'syncingToCurrent'
   | 'verifying'
   | 'rollingBack'
+  | 'cleaningCheckpoints'
   | 'complete'
   | 'failed';
 

@@ -74,9 +74,11 @@ describe('RuntimeSwitchProgressPanel', () => {
       failedPhase: 'applyingRuntime',
       error: 'runtime apply failed',
       events: [
+        event('planningSessions', 105),
         event('verifyingRelay', 110),
         event('applyingRuntime', 120),
         event('rollingBack', 130),
+        event('cleaningCheckpoints', 140),
         event('failed', 150, 'rolledBack'),
       ],
     };
@@ -89,6 +91,9 @@ describe('RuntimeSwitchProgressPanel', () => {
     const interrupted = screen.getByText('应用运行态').closest('li');
     expect(interrupted?.className).toBe('failed');
     expect(within(interrupted as HTMLElement).getByText('中断')).toBeTruthy();
+    const cleanup = screen.getByText('释放临时检查点').closest('li');
+    expect(cleanup?.className).toBe('done');
+    expect(within(cleanup as HTMLElement).getByText('已完成')).toBeTruthy();
   });
 
   it('renders rollback failure as a distinct terminal state', () => {
@@ -134,5 +139,22 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(interrupted?.className).toBe('failed');
     expect(within(interrupted as HTMLElement).getByText('中断')).toBeTruthy();
     expect(screen.getByRole('alert').textContent).toContain('ChatGPT 数据未变更');
+  });
+
+  it('does not promise unchanged data when the backend terminal outcome is missing', () => {
+    const flow: RuntimeSwitchFlow = {
+      status: 'failed',
+      target: 'relay',
+      startedAtMs: 100,
+      completedAtMs: 120,
+      error: 'IPC channel closed',
+      events: [event('planningSessions', 110)],
+    };
+
+    render(<RuntimeSwitchProgressPanel flow={flow} now={200} />);
+
+    expect(screen.getByRole('alert').textContent).toContain('未收到可验证的终态');
+    expect(screen.getByRole('alert').textContent).toContain('请先不要重新打开 ChatGPT');
+    expect(screen.getByRole('alert').textContent).not.toContain('数据未变更');
   });
 });

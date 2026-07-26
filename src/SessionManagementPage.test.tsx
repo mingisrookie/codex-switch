@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { SessionManagementPage } from './SessionManagementPage';
 import type { ManagedSessionInventory, ManagedSessionRecord } from './types';
@@ -76,6 +76,14 @@ describe('SessionManagementPage', () => {
     expect(screen.getAllByLabelText(/^选择 thread-/)[0].getAttribute('aria-label')).toBe('选择 thread-55：会话 55');
   });
 
+  it('exposes the horizontally scrollable session table as a keyboard focusable region', () => {
+    renderPage([session(1)]);
+
+    const region = screen.getByRole('region', { name: '会话表格，可横向滚动' });
+    expect(region.getAttribute('tabindex')).toBe('0');
+    expect(within(region).getByRole('table', { name: '会话列表' })).toBeTruthy();
+  });
+
   it('keeps selections across pages and exposes the partial-page indeterminate state', () => {
     const sessions = Array.from({ length: 55 }, (_, index) => session(index + 1));
     renderPage(sessions);
@@ -151,9 +159,15 @@ describe('SessionManagementPage', () => {
 
     await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
     expect(screen.queryByRole('heading', { name: '确认硬删除 1 个会话' })).toBeNull();
-    await waitFor(() => expect(document.activeElement).toBe(trigger));
-    expect(trigger.getAttribute('aria-disabled')).toBe('true');
-    expect((trigger as HTMLButtonElement).disabled).toBe(false);
+    expect((trigger as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: '0 个' })));
+  });
+
+  it('uses the native disabled state when no sessions are selected', () => {
+    renderPage([session(1)]);
+
+    const trigger = screen.getByRole('button', { name: '删除所选' }) as HTMLButtonElement;
+    expect(trigger.disabled).toBe(true);
   });
 
   it('keeps the inline delete state and selection when deletion fails', async () => {

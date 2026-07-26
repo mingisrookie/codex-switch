@@ -16,6 +16,9 @@ vi.mock('@tauri-apps/api/core', () => ({ Channel, invoke }));
 
 import {
   checkForUpdates,
+  cleanupAutomaticCheckpoints,
+  createFullBackup,
+  deleteBackup,
   deleteManagedSessions,
   getAppStatus,
   getUpdateStartupNotice,
@@ -30,6 +33,7 @@ import {
   saveSkillConfig,
   switchRuntime,
 } from './api';
+import type { BackupSummary } from './types';
 
 describe('dashboard API', () => {
   beforeEach(() => invoke.mockReset());
@@ -51,6 +55,15 @@ describe('dashboard API', () => {
           detectedAtMs: 1,
         },
         list_backups: [],
+        inspect_checkpoint_storage: {
+          totalCount: 0,
+          totalBytes: 0,
+          reclaimableCount: 0,
+          reclaimableBytes: 0,
+          retainedCount: 0,
+          warnings: [],
+          lastCleanup: null,
+        },
         list_operation_records: [],
       };
       return Promise.resolve(values[command]);
@@ -67,8 +80,9 @@ describe('dashboard API', () => {
     expect(dashboard.runtimes).toMatchObject({ status: 'ready', data: [] });
     expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
     expect(dashboard.backups).toMatchObject({ status: 'ready', data: [] });
+    expect(dashboard.backupStorage).toMatchObject({ status: 'ready' });
     expect(dashboard.operations).toMatchObject({ status: 'ready', data: [] });
-    expect(invoke).toHaveBeenCalledTimes(7);
+    expect(invoke).toHaveBeenCalledTimes(8);
     expect(invoke).toHaveBeenCalledWith('list_operation_records', { limit: 20 });
   });
 
@@ -109,13 +123,62 @@ describe('dashboard API', () => {
   });
 
   it('loads expensive backup verification only through its explicit loader', async () => {
-    invoke.mockResolvedValue([]);
+    invoke.mockImplementation((command: string) => Promise.resolve(command === 'inspect_checkpoint_storage'
+      ? {
+          totalCount: 2,
+          totalBytes: 4096,
+          reclaimableCount: 1,
+          reclaimableBytes: 2048,
+          retainedCount: 1,
+          warnings: [],
+          lastCleanup: null,
+        }
+      : []));
 
     const dashboard = await loadBackupDashboard();
 
     expect(dashboard.backups).toMatchObject({ status: 'ready', data: [] });
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(dashboard.backupStorage).toMatchObject({
+      status: 'ready',
+      data: { reclaimableCount: 1 },
+    });
+    expect(dashboard.operations).toMatchObject({ status: 'ready', data: [] });
+    expect(invoke).toHaveBeenCalledTimes(3);
     expect(invoke).toHaveBeenCalledWith('list_backups');
+    expect(invoke).toHaveBeenCalledWith('inspect_checkpoint_storage');
+    expect(invoke).toHaveBeenCalledWith('list_operation_records', { limit: 20 });
+  });
+
+  it('waits for backup migration/listing before acquiring the checkpoint scan guard', async () => {
+    let resolveBackups!: (value: BackupSummary[]) => void;
+    const backups = new Promise<BackupSummary[]>((resolve) => {
+      resolveBackups = resolve;
+    });
+    invoke.mockImplementation((command: string) => {
+      if (command === 'list_backups') return backups;
+      if (command === 'list_operation_records') return Promise.resolve([]);
+      if (command === 'inspect_checkpoint_storage') {
+        return Promise.resolve({
+          totalCount: 0,
+          totalBytes: 0,
+          reclaimableCount: 0,
+          reclaimableBytes: 0,
+          retainedCount: 0,
+          warnings: [],
+          lastCleanup: null,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const pending = loadBackupDashboard();
+    await Promise.resolve();
+    expect(invoke).not.toHaveBeenCalledWith('inspect_checkpoint_storage');
+
+    resolveBackups([]);
+    await pending;
+
+    expect(invoke).toHaveBeenCalledWith('inspect_checkpoint_storage');
   });
 
   it('passes overwrite confirmation explicitly when importing the account runtime', async () => {
@@ -148,6 +211,83 @@ describe('dashboard API', () => {
     expect(invoke).toHaveBeenCalledWith('delete_managed_sessions', {
       ids: ['thread-a'],
       confirmed: true,
+    });
+  });
+
+  it('uses the fixed command for a typed full backup receipt', async () => {
+    invoke.mockResolvedValue({
+      operationId: 'backup-1',
+      backups: [
+        {
+          backupDir: 'C:\\backups\\manual-current',
+          sourceRoot: 'C:\\Users\\alice\\.codex',
+          reason: 'manual-full-backup',
+          createdAtMs: 10,
+          scope: 'full',
+          trackedDatabaseCount: 1,
+          completeSessions: true,
+        },
+        {
+          backupDir: 'C:\\backups\\manual-shared',
+          sourceRoot: 'C:\\Users\\alice\\AppData\\Roaming\\codex-switch\\shared-sessions',
+          reason: 'manual-full-backup',
+          createdAtMs: 11,
+          scope: 'full',
+          trackedDatabaseCount: 1,
+          completeSessions: true,
+        },
+      ],
+      warnings: [],
+    });
+
+    const receipt = await createFullBackup();
+
+    expect(invoke).toHaveBeenCalledWith('create_full_backup');
+    expect(receipt).toMatchObject({
+      operationId: 'backup-1',
+      backups: [{ scope: 'full' }, { scope: 'full' }],
+    });
+  });
+
+  it('passes the verified backup path and explicit confirmation when deleting a backup', async () => {
+    invoke.mockResolvedValue({
+      operationId: 'delete-backup-1',
+      backupDir: 'C:\\backups\\manual-current',
+      reclaimedBytes: 4096,
+      warnings: [],
+    });
+
+    const receipt = await deleteBackup('C:\\backups\\manual-current', true);
+
+    expect(invoke).toHaveBeenCalledWith('delete_backup', {
+      backupDir: 'C:\\backups\\manual-current',
+      confirmed: true,
+    });
+    expect(receipt).toMatchObject({
+      operationId: 'delete-backup-1',
+      reclaimedBytes: 4096,
+    });
+  });
+
+  it('uses the fixed command for automatic checkpoint cleanup', async () => {
+    invoke.mockResolvedValue({
+      operationId: 'cleanup-1',
+      attemptedCount: 2,
+      failedCount: 0,
+      reclaimedCount: 2,
+      reclaimedBytes: 4096,
+      retainedCount: 3,
+      warnings: [],
+    });
+
+    const receipt = await cleanupAutomaticCheckpoints();
+
+    expect(invoke).toHaveBeenCalledWith('cleanup_automatic_checkpoints');
+    expect(receipt).toMatchObject({
+      operationId: 'cleanup-1',
+      attemptedCount: 2,
+      failedCount: 0,
+      reclaimedCount: 2,
     });
   });
 

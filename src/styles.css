@@ -66,6 +66,11 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
+.session-table-card:focus-visible {
+  outline: 3px solid rgba(39, 99, 197, 0.34);
+  outline-offset: 2px;
+}
+
 button:disabled,
 button[aria-disabled="true"] {
   cursor: not-allowed;
@@ -763,6 +768,36 @@ span.section-icon svg {
   padding-top: 18px;
 }
 
+.home-setup-notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 1px solid #e1c27e;
+  border-left: 4px solid var(--amber);
+  border-radius: 6px;
+  background: var(--amber-soft);
+}
+
+.home-setup-notice > svg {
+  width: 24px;
+  height: 24px;
+  color: var(--amber);
+}
+
+.home-setup-notice h2 {
+  margin-top: 2px;
+  font-size: 16px;
+}
+
+.home-setup-notice p:last-child {
+  margin-top: 4px;
+  color: #755319;
+  font-size: 11px;
+}
+
 .runtime-card,
 .skill-card {
   min-width: 0;
@@ -905,6 +940,20 @@ span.section-icon svg {
   margin-left: auto;
 }
 
+.runtime-switch-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.runtime-switch-note svg {
+  width: 13px;
+  height: 13px;
+}
+
 .runtime-operations {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1002,9 +1051,163 @@ span.section-icon svg {
   line-height: 1.5;
 }
 
+.backup-create-button {
+  margin-top: 14px;
+}
+
+.checkpoint-storage {
+  position: relative;
+  overflow: hidden;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgba(39, 99, 91, 0.22);
+  background:
+    linear-gradient(135deg, rgba(223, 243, 238, 0.82), rgba(248, 246, 238, 0.88)),
+    repeating-linear-gradient(90deg, transparent 0 28px, rgba(39, 99, 91, 0.04) 28px 29px);
+}
+
+.checkpoint-storage::after {
+  position: absolute;
+  top: -42px;
+  right: -34px;
+  width: 108px;
+  height: 108px;
+  border: 1px solid rgba(39, 99, 91, 0.16);
+  border-radius: 50%;
+  content: '';
+  pointer-events: none;
+}
+
+.checkpoint-storage-heading {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.checkpoint-storage-heading h3 {
+  margin: 2px 0 0;
+  font-size: 16px;
+}
+
+.checkpoint-storage-heading > strong {
+  color: var(--teal);
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: -0.02em;
+}
+
+.checkpoint-storage-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 12px 0 0;
+  border-top: 1px solid rgba(39, 99, 91, 0.18);
+  border-bottom: 1px solid rgba(39, 99, 91, 0.18);
+}
+
+.checkpoint-storage-metrics > div {
+  min-width: 0;
+  padding: 9px 5px;
+}
+
+.checkpoint-storage-metrics dt {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.checkpoint-storage-metrics dd {
+  overflow: hidden;
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkpoint-storage-copy,
+.checkpoint-last-cleanup,
+.checkpoint-warning,
+.checkpoint-storage-status {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-storage-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.checkpoint-warning {
+  color: var(--amber);
+}
+
+.checkpoint-cleanup-button {
+  position: relative;
+  z-index: 1;
+  margin-top: 12px;
+}
+
+.checkpoint-cleanup-flow {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(39, 99, 91, 0.18);
+}
+
+.checkpoint-cleanup-flow-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--teal);
+  font-size: 11px;
+}
+
+.checkpoint-cleanup-flow-title svg {
+  width: 14px;
+  height: 14px;
+}
+
+.checkpoint-cleanup-flow.failed .checkpoint-cleanup-flow-title {
+  color: var(--red);
+}
+
+.checkpoint-cleanup-flow.partial .checkpoint-cleanup-flow-title {
+  color: var(--amber);
+}
+
+.checkpoint-cleanup-flow > p {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .backup-entry {
   padding: 12px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.backup-list {
+  max-height: min(70vh, 760px);
+  margin-top: 10px;
+  padding-right: 6px;
+  overflow-y: auto;
+  overscroll-behavior-block: contain;
+  scrollbar-gutter: stable;
+}
+
+.backup-list:focus-visible {
+  outline: 3px solid rgba(39, 99, 197, 0.34);
+  outline-offset: 2px;
 }
 
 .backup-entry:last-child {
@@ -1025,6 +1228,17 @@ span.section-icon svg {
 .backup-entry .compact-meta dd {
   margin-top: 2px;
   text-align: left;
+}
+
+.backup-entry-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.backup-entry-actions button {
+  width: 100%;
 }
 
 .backup-path {
@@ -1153,11 +1367,17 @@ span.section-icon svg {
 }
 
 .confirmation-metrics span {
+  min-width: 0;
   padding: 4px 7px;
   border: 1px solid rgba(184, 117, 8, 0.25);
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.55);
   font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.danger-confirmation .confirmation-metrics span {
+  border-color: rgba(139, 40, 40, 0.24);
 }
 
 .form-field,
@@ -1279,8 +1499,11 @@ span.section-icon svg {
 
 .session-table-card {
   min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
@@ -1626,6 +1849,15 @@ span.section-icon svg {
     grid-template-columns: 1fr;
   }
 
+  .home-setup-notice {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .home-setup-notice .ghost-button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
   .switch-timeline {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1719,13 +1951,46 @@ span.section-icon svg {
     padding: 15px;
   }
 
+  .home-setup-notice {
+    display: block;
+    padding: 14px;
+  }
+
+  .home-setup-notice > svg {
+    margin-bottom: 8px;
+  }
+
   .runtime-state-grid {
     grid-template-columns: 1fr;
+  }
+
+  .checkpoint-storage-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .backup-list {
+    max-height: 62vh;
+    padding-right: 3px;
+  }
+
+  .checkpoint-storage-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .checkpoint-storage-metrics > div + div {
+    border-top: 1px solid rgba(39, 99, 91, 0.12);
+  }
+
+  .checkpoint-storage-metrics dt,
+  .checkpoint-storage-metrics dd {
+    font-size: 11px;
   }
 
   .runtime-actions,
   .skill-actions,
   .form-actions,
+  .backup-entry-actions,
   .confirmation-actions {
     display: grid;
     grid-template-columns: 1fr;

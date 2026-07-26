@@ -17,13 +17,18 @@ pub struct RelayVerificationResult {
     pub message: String,
 }
 
-pub fn verify_relay(base_url: &str, api_key: &str) -> Result<RelayVerificationResult, String> {
-    verify_relay_with_timeout(base_url, api_key, RELAY_VERIFY_TIMEOUT)
+pub fn verify_relay(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<RelayVerificationResult, String> {
+    verify_relay_with_timeout(base_url, api_key, model, RELAY_VERIFY_TIMEOUT)
 }
 
 fn verify_relay_with_timeout(
     base_url: &str,
     api_key: &str,
+    model: &str,
     timeout: Duration,
 ) -> Result<RelayVerificationResult, String> {
     let url = models_url(base_url)?;
@@ -71,6 +76,16 @@ fn verify_relay_with_timeout(
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| "relay /models response did not contain a model list".to_string())?;
+    if models.is_empty() {
+        return Err("relay /models response contained an empty model list".to_string());
+    }
+    if !models.iter().any(|item| {
+        item.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == model)
+    }) {
+        return Err("configured relay model was not found in /models".to_string());
+    }
 
     Ok(RelayVerificationResult {
         verified: true,
@@ -146,7 +161,7 @@ mod tests {
         let (base_url, request) = spawn_server(response, Duration::ZERO);
         let api_key = "sk-test-relay-secret";
 
-        let result = verify_relay(&base_url, api_key).unwrap();
+        let result = verify_relay(&base_url, api_key, "one").unwrap();
 
         let request = request.recv_timeout(Duration::from_secs(1)).unwrap();
         let request_lower = request.to_ascii_lowercase();
@@ -164,7 +179,7 @@ mod tests {
         let (base_url, _) = spawn_server(response, Duration::ZERO);
         let api_key = "sk-test-relay-secret";
 
-        let error = verify_relay(&base_url, api_key).unwrap_err();
+        let error = verify_relay(&base_url, api_key, "one").unwrap_err();
 
         assert!(error.contains("HTTP 401"), "{error}");
         assert!(!error.contains(api_key));
@@ -172,11 +187,38 @@ mod tests {
     }
 
     #[test]
+    fn does_not_follow_redirects_or_expose_redirect_body_or_key() {
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirect_listener.set_nonblocking(true).unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let api_key = "sk-test-relay-secret";
+        let marker = "redirect-body-marker";
+        let body = format!("{{\"error\":\"{marker} {api_key}\"}}");
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{redirect_address}/v1/models\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, _) = spawn_server(response.as_bytes(), Duration::ZERO);
+
+        let error = verify_relay_with_timeout(&base_url, api_key, "one", Duration::from_secs(1))
+            .expect_err("relay verification must not follow redirects");
+
+        assert!(error.contains("HTTP 302"), "{error}");
+        assert!(!error.contains(api_key));
+        assert!(!error.contains(marker));
+        match redirect_listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("relay verification followed the redirect"),
+            Err(error) => panic!("failed to inspect redirect listener: {error}"),
+        }
+    }
+
+    #[test]
     fn rejects_invalid_url_without_echoing_input_or_key() {
         let api_key = "sk-test-relay-secret";
         let base_url = "not a url/sk-test-relay-secret";
 
-        let error = verify_relay(base_url, api_key).unwrap_err();
+        let error = verify_relay(base_url, api_key, "one").unwrap_err();
 
         assert!(error.contains("invalid relay base URL"));
         assert!(!error.contains(base_url));
@@ -188,7 +230,7 @@ mod tests {
         let api_key = "sk-test-relay-secret";
         let base_url = "http://relay.example.com/v1";
 
-        let error = verify_relay(base_url, api_key).unwrap_err();
+        let error = verify_relay(base_url, api_key, "one").unwrap_err();
 
         assert!(error.contains("invalid relay base URL"), "{error}");
         assert!(!error.contains(base_url));
@@ -202,8 +244,8 @@ mod tests {
         let api_key = "sk-test-relay-secret";
         let started = Instant::now();
 
-        let error =
-            verify_relay_with_timeout(&base_url, api_key, Duration::from_millis(40)).unwrap_err();
+        let error = verify_relay_with_timeout(&base_url, api_key, "one", Duration::from_millis(40))
+            .unwrap_err();
 
         assert!(error.contains("timed out"), "{error}");
         assert!(!error.contains(api_key));
@@ -220,7 +262,7 @@ mod tests {
         );
         let (base_url, _) = spawn_server(response.as_bytes(), Duration::ZERO);
 
-        let error = verify_relay(&base_url, api_key).unwrap_err();
+        let error = verify_relay(&base_url, api_key, "one").unwrap_err();
 
         assert!(error.contains("size limit"), "{error}");
         assert!(!error.contains(api_key));
@@ -239,10 +281,46 @@ mod tests {
         response.extend_from_slice(format!("{marker} {api_key}\"}}").as_bytes());
         let (base_url, _) = spawn_server(&response, Duration::ZERO);
 
-        let error = verify_relay(&base_url, api_key).unwrap_err();
+        let error = verify_relay(&base_url, api_key, "one").unwrap_err();
 
         assert!(error.contains("size limit"), "{error}");
         assert!(!error.contains(api_key));
         assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn rejects_empty_model_lists() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}";
+        let (base_url, _) = spawn_server(response, Duration::ZERO);
+
+        let error = verify_relay(&base_url, "sk-test-relay-secret", "configured-model")
+            .expect_err("an empty list must not verify a relay");
+
+        assert!(error.contains("empty model list"), "{error}");
+        assert!(!error.contains("sk-test-relay-secret"));
+    }
+
+    #[test]
+    fn requires_an_exact_configured_model_id() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"model-one\"},{\"id\":\"Model-Two\"}]}";
+        let (base_url, _) = spawn_server(response, Duration::ZERO);
+
+        let error = verify_relay(&base_url, "sk-test-relay-secret", "model-two")
+            .expect_err("model IDs are case-sensitive exact identifiers");
+
+        assert!(error.contains("configured relay model"), "{error}");
+        assert!(!error.contains("model-two"));
+        assert!(!error.contains("sk-test-relay-secret"));
+    }
+
+    #[test]
+    fn ignores_items_without_ids_and_accepts_duplicate_exact_ids() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 66\r\nConnection: close\r\n\r\n{\"data\":[{}, {\"id\":\"configured-model\"},{\"id\":\"configured-model\"}]}";
+        let (base_url, _) = spawn_server(response, Duration::ZERO);
+
+        let result = verify_relay(&base_url, "sk-test-relay-secret", "configured-model").unwrap();
+
+        assert!(result.verified);
+        assert_eq!(result.model_count, 3);
     }
 }

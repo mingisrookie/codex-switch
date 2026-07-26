@@ -52,6 +52,7 @@ export function SessionManagementPage({
   const selectAllRef = useRef<HTMLInputElement>(null);
   const deleteTriggerRef = useRef<HTMLButtonElement>(null);
   const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
+  const selectionHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     const availableIds = new Set(inventory.sessions.map((session) => session.id));
@@ -152,7 +153,11 @@ export function SessionManagementPage({
   function cancelDelete() {
     setDeleteRequest(null);
     setDeletePhrase('');
-    window.requestAnimationFrame(() => deleteTriggerRef.current?.focus());
+    window.requestAnimationFrame(() => {
+      const trigger = deleteTriggerRef.current;
+      if (trigger && !trigger.disabled) trigger.focus();
+      else selectionHeadingRef.current?.focus();
+    });
   }
 
   async function confirmDelete() {
@@ -238,7 +243,12 @@ export function SessionManagementPage({
           <p className="safe-note">每页 50 个会话，选择状态跨页保留。</p>
         </aside>
 
-        <section className="session-table-card">
+        <section
+          className="session-table-card"
+          role="region"
+          aria-label="会话表格，可横向滚动"
+          tabIndex={0}
+        >
           <div className="session-selection-toolbar" aria-label="批量选择">
             <div className="selection-left">
               <label className="select-all-box">
@@ -313,7 +323,7 @@ export function SessionManagementPage({
         <aside className="detail-panel selected-session-panel">
           <div className="card-title-row">
             <span className="section-icon"><FolderArchive aria-hidden="true" /></span>
-            <div><p className="eyebrow">所选会话</p><h2>{numberFormat.format(selectedIds.size)} 个</h2></div>
+            <div><p className="eyebrow">所选会话</p><h2 ref={selectionHeadingRef} tabIndex={-1}>{numberFormat.format(selectedIds.size)} 个</h2></div>
           </div>
           <dl className="compact-meta">
             <div><dt>未归档</dt><dd>{numberFormat.format(selectedUnarchived)}</dd></div>
@@ -329,8 +339,7 @@ export function SessionManagementPage({
               ref={deleteTriggerRef}
               className="danger"
               onClick={requestDeleteSelected}
-              disabled={busy || mutationDisabled || Boolean(deleteRequest)}
-              aria-disabled={selectedIds.size === 0}
+              disabled={busy || mutationDisabled || Boolean(deleteRequest) || selectedIds.size === 0}
             >
               <Trash2 className="button-icon" aria-hidden="true" />
               删除所选

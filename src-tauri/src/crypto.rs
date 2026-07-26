@@ -7,7 +7,7 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     };
 
     let input = CRYPT_INTEGER_BLOB {
-        cbData: plaintext.len() as u32,
+        cbData: dpapi_blob_len(plaintext.len())?,
         pbData: plaintext.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB {
@@ -49,7 +49,7 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     };
 
     let input = CRYPT_INTEGER_BLOB {
-        cbData: ciphertext.len() as u32,
+        cbData: dpapi_blob_len(ciphertext.len())?,
         pbData: ciphertext.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB {
@@ -80,6 +80,12 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(windows)]
+fn dpapi_blob_len(len: usize) -> Result<u32, String> {
+    u32::try_from(len)
+        .map_err(|_| "credential data exceeds the Windows DPAPI size limit".to_string())
+}
+
 #[cfg(not(windows))]
 pub fn protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Err("credential encryption is not supported on this platform".to_string())
@@ -92,6 +98,8 @@ pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::dpapi_blob_len;
     use super::{protect, unprotect};
 
     #[test]
@@ -104,6 +112,17 @@ mod tests {
 
         let decrypted = unprotect(&encrypted).unwrap();
         assert_eq!(decrypted, secret);
+    }
+
+    #[test]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    fn rejects_dpapi_lengths_that_do_not_fit_the_windows_blob_contract() {
+        let oversized = u32::MAX as usize + 1;
+
+        let error = dpapi_blob_len(oversized).unwrap_err();
+
+        assert!(error.contains("DPAPI size limit"), "{error}");
+        assert_eq!(dpapi_blob_len(u32::MAX as usize).unwrap(), u32::MAX);
     }
 
     #[test]

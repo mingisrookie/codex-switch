@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -13,9 +13,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static OPERATION_LOG_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationAction {
     ImportAccount,
@@ -25,12 +25,15 @@ pub enum OperationAction {
     SyncSessions,
     DeleteSessions,
     RestoreVisibility,
+    CreateBackup,
+    DeleteBackup,
     RestoreBackup,
+    CleanupCheckpoints,
     InstallSkill,
     ConfigureSkill,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationStatus {
     Succeeded,
@@ -39,7 +42,7 @@ pub enum OperationStatus {
     RollbackFailed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationPhase {
     Preflight,
@@ -78,9 +81,17 @@ impl OperationLog {
     }
 
     pub fn append(&self, record: &OperationRecord) -> Result<(), String> {
-        let _guard = LOG_WRITE_LOCK
+        self.append_with_lock(record, || {})
+    }
+
+    fn append_with_lock<F>(&self, record: &OperationRecord, on_locked: F) -> Result<(), String>
+    where
+        F: FnOnce(),
+    {
+        let _guard = OPERATION_LOG_LOCK
             .lock()
             .map_err(|_| "operation log lock is poisoned".to_string())?;
+        on_locked();
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create operation log directory: {error}"))?;
@@ -100,21 +111,61 @@ impl OperationLog {
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<OperationRecord>, String> {
-        if !self.path.exists() || limit == 0 {
+        self.list_with_lock(limit, || {})
+    }
+
+    pub fn list_all_strict(&self) -> Result<Vec<OperationRecord>, String> {
+        let _guard = OPERATION_LOG_LOCK
+            .lock()
+            .map_err(|_| "operation log lock is poisoned".to_string())?;
+        if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let file = fs::File::open(&self.path)
-            .map_err(|error| format!("failed to open operation log: {error}"))?;
+        let payload = fs::read(&self.path)
+            .map_err(|error| format!("failed to read operation log: {error}"))?;
         let mut records = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|error| format!("failed to read operation log: {error}"))?;
-            if line.trim().is_empty() {
-                continue;
-            }
+        for line in payload
+            .split(|byte| *byte == b'\n')
+            .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+        {
             records.push(
-                serde_json::from_str(&line)
+                serde_json::from_slice(line)
                     .map_err(|error| format!("failed to parse operation record: {error}"))?,
             );
+        }
+        records.reverse();
+        Ok(records)
+    }
+
+    fn list_with_lock<F>(&self, limit: usize, on_locked: F) -> Result<Vec<OperationRecord>, String>
+    where
+        F: FnOnce(),
+    {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = OPERATION_LOG_LOCK
+            .lock()
+            .map_err(|_| "operation log lock is poisoned".to_string())?;
+        on_locked();
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let payload = fs::read(&self.path)
+            .map_err(|error| format!("failed to read operation log: {error}"))?;
+        let lines = payload
+            .split(|byte| *byte == b'\n')
+            .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            match serde_json::from_slice(line) {
+                Ok(record) => records.push(record),
+                Err(_) if index + 1 == lines.len() => break,
+                Err(error) => {
+                    return Err(format!("failed to parse operation record: {error}"));
+                }
+            }
         }
         records.reverse();
         records.truncate(limit);
@@ -140,7 +191,14 @@ pub fn timestamp_millis() -> Result<u128, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        fs::{self, OpenOptions},
+        io::Write,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
@@ -149,22 +207,25 @@ mod tests {
         OperationStatus,
     };
 
+    fn record(id: &str, completed_at_ms: u128) -> OperationRecord {
+        OperationRecord {
+            operation_id: id.to_string(),
+            action: OperationAction::SyncSessions,
+            status: OperationStatus::Succeeded,
+            phase: OperationPhase::Complete,
+            started_at_ms: 0,
+            completed_at_ms,
+            backup_dirs: Vec::new(),
+            counts: BTreeMap::from([("insertedThreads".to_string(), completed_at_ms as usize)]),
+        }
+    }
+
     #[test]
     fn appends_terminal_records_and_lists_newest_first() {
         let root = tempdir().unwrap();
         let log = OperationLog::new(root.path().join("operations.jsonl"));
         for (id, completed) in [("first", 1), ("second", 2)] {
-            log.append(&OperationRecord {
-                operation_id: id.to_string(),
-                action: OperationAction::SyncSessions,
-                status: OperationStatus::Succeeded,
-                phase: OperationPhase::Complete,
-                started_at_ms: 0,
-                completed_at_ms: completed,
-                backup_dirs: Vec::new(),
-                counts: BTreeMap::from([("insertedThreads".to_string(), completed as usize)]),
-            })
-            .unwrap();
+            log.append(&record(id, completed)).unwrap();
         }
 
         let records = log.list(1).unwrap();
@@ -174,11 +235,153 @@ mod tests {
     }
 
     #[test]
+    fn ignores_one_damaged_tail_record_but_rejects_internal_corruption() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("operations.jsonl");
+        let log = OperationLog::new(path.clone());
+        log.append(&record("first", 1)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"operationId":"truncated""#)
+            .unwrap();
+
+        let records = log.list(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation_id, "first");
+
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot-json\n",
+                serde_json::to_string(&record("first", 1)).unwrap(),
+            ),
+        )
+        .unwrap();
+        let records = log.list(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation_id, "first");
+
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot-json\n{}\n",
+                serde_json::to_string(&record("first", 1)).unwrap(),
+                serde_json::to_string(&record("second", 2)).unwrap(),
+            ),
+        )
+        .unwrap();
+        let error = log.list(10).unwrap_err();
+        assert!(
+            error.contains("failed to parse operation record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn list_waits_for_an_in_progress_append() {
+        let root = tempdir().unwrap();
+        let log = OperationLog::new(root.path().join("operations.jsonl"));
+        log.append(&record("first", 1)).unwrap();
+        let writer_log = log.clone();
+        let reader_log = log.clone();
+        let (locked_sender, locked_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (reader_started_sender, reader_started_receiver) = mpsc::channel();
+        let (reader_locked_sender, reader_locked_receiver) = mpsc::channel();
+        let (reader_done_sender, reader_done_receiver) = mpsc::channel();
+
+        let writer = thread::spawn(move || {
+            writer_log.append_with_lock(&record("second", 2), || {
+                let _ = locked_sender.send(());
+                let _ = release_receiver.recv();
+            })
+        });
+        locked_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let reader = thread::spawn(move || {
+            reader_started_sender.send(()).unwrap();
+            let result = reader_log.list_with_lock(10, || {
+                let _ = reader_locked_sender.send(());
+            });
+            reader_done_sender.send(result).unwrap();
+        });
+        reader_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let reader_entered_while_append_was_locked = reader_locked_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_sender.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        if !reader_entered_while_append_was_locked {
+            reader_locked_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+        }
+        let records = reader_done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+
+        assert!(!reader_entered_while_append_was_locked);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+    }
+
+    #[test]
     fn operation_ids_are_unique_without_containing_credentials() {
         let first = operation_id("switch-runtime").unwrap();
         let second = operation_id("switch-runtime").unwrap();
         assert_ne!(first, second);
         assert!(!first.contains("token"));
         assert!(!first.contains("key"));
+    }
+
+    #[test]
+    fn create_backup_action_uses_the_public_camel_case_contract() {
+        assert_eq!(
+            serde_json::to_string(&OperationAction::CreateBackup).unwrap(),
+            "\"createBackup\""
+        );
+    }
+
+    #[test]
+    fn delete_backup_action_uses_the_public_camel_case_contract() {
+        assert_eq!(
+            serde_json::to_string(&OperationAction::DeleteBackup).unwrap(),
+            "\"deleteBackup\""
+        );
+    }
+
+    #[test]
+    fn strict_cleanup_reader_rejects_a_truncated_final_record() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("operations.jsonl");
+        let log = OperationLog::new(path.clone());
+        log.append(&record("complete", 1)).unwrap();
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(br#"{"operationId":"truncated""#).unwrap();
+        file.sync_data().unwrap();
+
+        assert!(log.list(10).is_ok());
+        assert!(log.list_all_strict().is_err());
+    }
+
+    #[test]
+    fn checkpoint_cleanup_action_uses_the_public_camel_case_contract() {
+        assert_eq!(
+            serde_json::to_string(&OperationAction::CleanupCheckpoints).unwrap(),
+            "\"cleanupCheckpoints\""
+        );
     }
 }

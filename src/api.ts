@@ -1,7 +1,11 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   AppStatus,
+  BackupDeleteReceipt,
   BackupDashboardData,
+  CheckpointCleanupReceipt,
+  CheckpointStorageStatus,
+  CreateFullBackupReceipt,
   CodexHomeStatus,
   CodexProcess,
   DashboardData,
@@ -47,7 +51,15 @@ export function getUpdateStartupNotice() {
 }
 
 export async function loadDashboard(): Promise<DashboardData> {
-  const [codexHome, sessions, managedSessions, runtimes, runtimeStatus, backups, operations] =
+  const [
+    codexHome,
+    sessions,
+    managedSessions,
+    runtimes,
+    runtimeStatus,
+    backups,
+    operations,
+  ] =
     await Promise.allSettled([
       invoke<CodexHomeStatus>('scan_codex_home'),
       invoke<SessionInventory>('scan_sessions'),
@@ -57,6 +69,9 @@ export async function loadDashboard(): Promise<DashboardData> {
       invoke<BackupSummary[]>('list_backups'),
       invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
     ]);
+  const [backupStorage] = await Promise.allSettled([
+    invoke<CheckpointStorageStatus>('inspect_checkpoint_storage'),
+  ]);
 
   return {
     codexHome: settledDomain(codexHome),
@@ -65,6 +80,7 @@ export async function loadDashboard(): Promise<DashboardData> {
     runtimes: settledDomain(runtimes),
     runtimeStatus: settledDomain(runtimeStatus),
     backups: settledDomain(backups),
+    backupStorage: settledDomain(backupStorage),
     operations: settledDomain(operations),
   };
 }
@@ -98,10 +114,18 @@ export async function loadSessionDashboard(): Promise<SessionDashboardData> {
 }
 
 export async function loadBackupDashboard(): Promise<BackupDashboardData> {
-  const [backups] = await Promise.allSettled([
+  const [backups, operations] = await Promise.allSettled([
     invoke<BackupSummary[]>('list_backups'),
+    invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
   ]);
-  return { backups: settledDomain(backups) };
+  const [backupStorage] = await Promise.allSettled([
+    invoke<CheckpointStorageStatus>('inspect_checkpoint_storage'),
+  ]);
+  return {
+    backups: settledDomain(backups),
+    backupStorage: settledDomain(backupStorage),
+    operations: settledDomain(operations),
+  };
 }
 
 export function loadingDashboard(): DashboardData {
@@ -112,6 +136,7 @@ export function loadingDashboard(): DashboardData {
     runtimes: { status: 'loading' },
     runtimeStatus: { status: 'loading' },
     backups: { status: 'loading' },
+    backupStorage: { status: 'loading' },
     operations: { status: 'loading' },
   };
 }
@@ -162,6 +187,18 @@ export function restoreSessionsVisible(ids: string[]) {
 
 export function restoreBackup(backupDir: string) {
   return invoke<RestoreResult>('restore_backup', { backupDir });
+}
+
+export function createFullBackup() {
+  return invoke<CreateFullBackupReceipt>('create_full_backup');
+}
+
+export function deleteBackup(backupDir: string, confirmed: true) {
+  return invoke<BackupDeleteReceipt>('delete_backup', { backupDir, confirmed });
+}
+
+export function cleanupAutomaticCheckpoints() {
+  return invoke<CheckpointCleanupReceipt>('cleanup_automatic_checkpoints');
 }
 
 export function listSkills() {

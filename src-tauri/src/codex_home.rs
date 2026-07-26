@@ -39,12 +39,23 @@ pub struct CodexHomeStatus {
 }
 
 pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
+    scan_codex_home_with_file_status(home, file_status)
+}
+
+fn scan_codex_home_with_file_status<F>(
+    home: &Path,
+    mut status_for: F,
+) -> Result<CodexHomeStatus, String>
+where
+    F: FnMut(&Path) -> FileStatus,
+{
     let paths = resolve_user_codex_paths(home)?;
     let auth_path = home.join("auth.json");
     let config_path = home.join("config.toml");
     let sessions_path = &paths.sessions_dir;
+    let auth_json = status_for(&auth_path);
 
-    let auth_summary = if auth_path.exists() {
+    let auth_summary = if auth_json.exists {
         Some(summarize_auth(&auth_path)?)
     } else {
         None
@@ -53,12 +64,12 @@ pub fn scan_codex_home(home: &Path) -> Result<CodexHomeStatus, String> {
     Ok(CodexHomeStatus {
         root: home.to_path_buf(),
         sqlite_home: paths.sqlite_home,
-        auth_json: file_status(&auth_path),
-        config_toml: file_status(&config_path),
-        state_db: file_status(&paths.state_db),
-        logs_db: file_status(&paths.logs_db),
-        codex_dev_db: file_status(&home.join("sqlite").join("codex-dev.db")),
-        sessions_dir: file_status(sessions_path),
+        auth_json,
+        config_toml: status_for(&config_path),
+        state_db: status_for(&paths.state_db),
+        logs_db: status_for(&paths.logs_db),
+        codex_dev_db: status_for(&home.join("sqlite").join("codex-dev.db")),
+        sessions_dir: status_for(sessions_path),
         auth_summary,
     })
 }
@@ -97,11 +108,11 @@ fn file_status(path: &Path) -> FileStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{cell::RefCell, fs};
 
     use tempfile::tempdir;
 
-    use super::{scan_codex_home, summarize_auth};
+    use super::{file_status, scan_codex_home, scan_codex_home_with_file_status, summarize_auth};
 
     #[test]
     fn scans_expected_codex_home_files_without_reading_secret_values() {
@@ -132,6 +143,49 @@ model_instructions_file = "C:\\Users\\alice\\.codex\\instruction.md"
         assert_eq!(
             status.auth_summary.unwrap().auth_mode.as_deref(),
             Some("chatgpt")
+        );
+    }
+
+    #[test]
+    fn scans_only_sessions_root_metadata_for_a_deep_tree() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let sessions = home.join("sessions");
+        fs::create_dir(&sessions).unwrap();
+
+        let mut level = sessions.clone();
+        for depth in 0..24 {
+            level.push(format!("d{depth:02}"));
+            fs::create_dir(&level).unwrap();
+            for index in 0..4 {
+                // Any recursive text reader would fail on these rollout fixtures.
+                fs::write(
+                    level.join(format!("rollout-{index}.jsonl")),
+                    [0xff, 0xfe, 0xfd],
+                )
+                .unwrap();
+            }
+        }
+
+        let status = scan_codex_home(home).unwrap();
+        let probed_paths = RefCell::new(Vec::new());
+        let probed_status = scan_codex_home_with_file_status(home, |path| {
+            probed_paths.borrow_mut().push(path.to_path_buf());
+            file_status(path)
+        })
+        .unwrap();
+
+        assert_eq!(probed_status, status);
+        assert!(level.join("rollout-3.jsonl").is_file());
+        assert_eq!(status.sessions_dir.path, sessions);
+        assert!(status.sessions_dir.exists);
+        assert_eq!(
+            probed_paths
+                .into_inner()
+                .into_iter()
+                .filter(|path| path.starts_with(&status.sessions_dir.path))
+                .collect::<Vec<_>>(),
+            vec![status.sessions_dir.path]
         );
     }
 

@@ -153,33 +153,71 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
 3. 发布前必须重新验证：
 
-   ```bash
+   ```powershell
    npm test -- --run
    npm run typecheck
    npm run build
    cargo test --manifest-path src-tauri/Cargo.toml
    npm run tauri -- build
+   npm run check:release
    ```
 
 4. tag 和 release 必须指向已提交、已推送的 commit。不得用脏工作区产物发布。
 
-5. 上传 release asset 前确认真实文件存在，例如：
+5. Windows Release 必须从 raw EXE 生成独立 packed 副本，禁止原地压缩 raw EXE，也禁止从未验证的 `PATH` 任取 UPX：
 
-   ```bash
+   - 官方 `UPX 5.2.0` 版本固定不变。
+   - `upx-5.2.0-win64.zip` 的 SHA-256 固定为 `B471EBF1B7F20F4A89150264ED9A008A2A5BFD247F3C6D1184A75BB59CA08F5D`。
+   - 解包后的 `upx.exe` SHA-256 固定为 `F4C0CC7ACA0F1FF0D0B750E966B44139F2FA1A2DB7281F48FC52194400712E1D`。
+   - 统一调用 copy-only 脚本；raw 输入保持在 `src-tauri/target/release/codex-switch.exe`，唯一待发布输出为 `release/codex-switch.exe`。
+
+   ```powershell
    Test-Path src-tauri\target\release\codex-switch.exe
+   Get-FileHash -Algorithm SHA256 "<verified-upx.exe>"
+   .\scripts\pack-windows-release.ps1 `
+     -UpxPath "<verified-upx.exe>" `
+     -SourceExe "src-tauri/target/release/codex-switch.exe" `
+     -OutputExe "release/codex-switch.exe"
    ```
 
-   公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；v0.1.9 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
+   该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --best --lzma`，并对 packed 文件执行 `upx -t`。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，确认主窗口、版本和基本切换入口可用；只验证 raw EXE 不算发布验证完成。
 
-6. 创建或更新 GitHub Release 后必须验证：
+   公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；既有 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
 
-   ```bash
+6. 创建 tag 后必须等待该 tag commit 对应的 Windows CI 全部通过，并从该 run 下载唯一 packed artifact。不得上传 raw EXE，也不得用本地脏工作区产物替代 tag-CI 产物：
+
+   ```powershell
+   $tagCommit = git rev-list -n 1 <tag>
+   gh run list --workflow ci.yml --commit $tagCommit
+   gh run download <run-id> `
+     --name "codex-switch-$tagCommit" `
+     --dir "artifacts\<tag>"
+   node scripts/check-release-contract.mjs "artifacts\<tag>\codex-switch.exe"
+   & "<verified-upx.exe>" -t "artifacts\<tag>\codex-switch.exe"
+   ```
+
+   下载后的 tag-CI artifact 必须再次满足 packed contract、`upx -t`、PE32+ x64、双版本、体积门禁，并实际启动成功。CI artifact 只能包含 packed 的裸 `codex-switch.exe`。
+
+7. 创建或更新 GitHub Release 后，必须把公开资产重新下载到独立目录验证，不能只检查网页元数据：
+
+   ```powershell
    gh release view <tag> --json tagName,name,url,assets
    gh api repos/mingisrookie/codex-switch/releases/latest --jq .tag_name
    git ls-remote --tags origin <tag>
+   gh release download <tag> `
+     --pattern "codex-switch.exe" `
+     --dir "release-verification\<tag>" `
+     --clobber
+   node scripts/check-release-contract.mjs "release-verification\<tag>\codex-switch.exe"
+   & "<verified-upx.exe>" -t "release-verification\<tag>\codex-switch.exe"
+   Get-FileHash -Algorithm SHA256 "release-verification\<tag>\codex-switch.exe"
    ```
 
+   回下载文件的 SHA-256 和字节数必须与 tag-CI artifact 完全一致，并重新通过 packed contract、`upx -t`、体积门禁和实际启动验证；网页显示存在同名资产不能代替二进制回下载校验。
+
    `gh release view --json` 不支持 `isLatest` 字段；必须把 `gh api .../releases/latest` 返回的 tag 与目标 `<tag>` 对比，不能仅凭 release 列表顺序推断 latest。
+
+8. 自动更新必须使用已发布 Release 做真实首跳烟测。以 `v0.2.1` 为例，必须从干净隔离环境中的正式 `v0.2.0` 启动，触发一键更新并证明 updater 下载的正是 Release 中的 `codex-switch.exe`，随后完成退出、替换、重启并显示 `v0.2.1`；同时复核中转站配置、会话数据和其他用户状态未被破坏。tag-CI、Release 回下载或真实 `v0.2.0 -> v0.2.1` 首跳任一未完成，都不得宣称发布闭环完成。
 
 Release 文案必须说明用户可见变化、风险/兼容性和本次验证命令，不得用空泛“更新 release”替代。
 
