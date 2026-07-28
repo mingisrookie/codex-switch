@@ -207,7 +207,7 @@ export function SessionManagementPage({
         <div className="hero-actions">
           <button className="primary-button" onClick={onSync} disabled={busy || syncDisabled}>
             <RefreshCw className="button-icon" aria-hidden="true" />
-            立即同步
+            完全同步
           </button>
         </div>
       </section>

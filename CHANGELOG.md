@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.3 - 2026-07-28
+
+### 关闭、切换耗时与任务体验
+
+- 修复窗口关闭无反应：所有 close event 先由前端接管，再调用零参数 `request_app_exit`。后端复用全局 mutation lock；空闲时把锁保留并调度 `app.exit(0)`，若 2 秒后进程仍存活则释放 shutdown reservation，前端在 2.5 秒后重新请求，避免一次失效 exit 把后续 mutation 永久锁成 busy。写操作繁忙时返回 pending，任务到达可靠终态后自动退出。删除没有调用方的 `core:window:allow-destroy` 权限，不靠前端直接 destroy 强拆窗口。
+- 按用户确认的 `1A / 2A / 3A` 重构为“官方登录态不变、只切请求端”：live `auth.json` 必须是 `auth_mode = chatgpt`，缺失/损坏/非官方模式在 mutation 前 fail closed；Account ↔ Relay 切换从不写入或恢复认证文件，写后还会做 byte-exact 复核。
+- Relay Key 在槽位中继续使用 Windows DPAPI 加密；激活 Relay 时只投影到 live `config.toml` 的受管 `model_providers.openai_custom.experimental_bearer_token`，并拒绝受管合同之外的 Relay provider 名。切回 Account 时从同一受管 provider 常量删除整个表与明文 token，避免不可见密钥残留。TOML 解析错误、日志、回执和 UI 都不回显该值。
+- Account overlay 对 `model` / `service_tier` 采用权威语义：保存值存在时恢复；保存值缺失时删除 live 中遗留的 Relay-only 字段，避免切回官方账号后继续沿用中转站模型或 tier。这是有意的路由清理行为，不是配置丢失。
+- 请求路由 mutation 彻底移除会话全量扫描、双向同步、容量规划、checkpoint 和 provider slot GC；基线成功样本 `704.3s` 中三次扫描 `466.4s`、两次同步 `223.1s`，合计占 `97.9%`，现已从路由主事务删除。
+- 请求路由持久终态之后新增独立有界增量收口：只有有效 `session-sync-state-v1.json` 才做 current/shared 轻量 metadata inventory，最多 32 个变化线程、32 MiB 预计写入，inventory 上限 750 ms、整体目标预算 2 秒；只同步变化 ID并使用双 `StateOnly`。索引缺失/损坏、删除/归档、双边同 ID 变化、分叉、超时或超限都标记“需要完全同步”，绝不自动回退全量，也不回滚已成功请求端；若增量终态无法持久化或 SQLite 补偿恢复失败，返回 typed `blocked` 启动态、保留检查点并禁止 UI 直接重试打开 ChatGPT。
+- 原“立即同步”改为手动“完全同步”：由后端先关闭并复核 ChatGPT，移除前端 dry-run 的重复全扫描，只完整对账 current ↔ shared 活跃会话；归档行与 `archived_sessions/` 保持不动。成功后写入增量基线、记录真实阶段并受控重启 ChatGPT；失败可恢复两边 SQLite 状态，immutable JSONL 新增只可能完整保留供重试。
+- 正式 Tauri release 实测 Account reapply 后端耗时 `10.770s`、UI `10.9s`，相较 `704.3s` 成功基线约快 `65x`；其中安全关闭 ChatGPT 为 `10.7s`，其余请求配置、认证复核和终态阶段均为 `0.0s`。标准 `WM_CLOSE` 实测应用在 `87ms` 内退出。
+- 后端真实 phase/timestamp 继续完整保留，前端聚合成最多 7 个用户步骤：准备、可选 Relay 验证、关闭 ChatGPT、应用请求端、验证并记录、增量会话、启动 ChatGPT；逐步显示真实耗时和终态最慢步骤，不再展示 11 步长列表或“0 会话已同步”。
+- 删除 `RuntimeSwitchResult` 中恒空的 `backups / toShared / fromShared / checkpointCleanup` 字段与无用 dry-run wire contract；生产前置关闭 helper 也移除恒为 false 的参数和旧“switching runtimes”文案。关闭前 preflight、关闭后权威 replan 与关键进程复检仍保留为 TOCTOU 安全边界，不为减少调用次数而合并。
+- Relay `/models` 验证位于进程检测与关闭之前；无效地址、Key 或模型只消耗一次有界网络探测，不扫描会话池或触碰 ChatGPT。
+- 整理仓库分支：把本地未合并的 session schema drift 修复合入 `main`，移除被后续实现取代的本地工作树/分支，并删除已合并或已废弃的对应远端分支；保留 `main` 作为唯一分支。
+
 ## v0.2.2 - 2026-07-26
 
 ### 切换体验与 ChatGPT 启动

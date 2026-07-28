@@ -12,13 +12,13 @@ use sha2::{Digest, Sha256};
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::{
+    config_patch::MANAGED_RELAY_PROVIDER_ID,
     crypto::{protect, unprotect},
     file_ops::{atomic_copy, atomic_write},
 };
 
 pub const PLUS_RUNTIME_ID: &str = "plus";
 pub const RELAY_RUNTIME_ID: &str = "relay";
-const RELAY_PROVIDER_ID: &str = "openai_custom";
 const RUNTIME_BUNDLE_MANIFEST: &str = "bundle.json";
 const RUNTIME_BUNDLE_MARKER: &str = ".bundle-v1";
 const RUNTIME_BUNDLE_MARKER_BYTES: &[u8] = b"codex-switch-runtime-bundle-v1\n";
@@ -134,6 +134,11 @@ impl RuntimeStore {
         }
         let config = fs::read_to_string(codex_home.join("config.toml"))
             .map_err(|error| format!("failed to read plus config.toml: {error}"))?;
+        if config_string(&config, "model_provider")?.as_deref() == Some(MANAGED_RELAY_PROVIDER_ID) {
+            return Err(
+                "当前请求端是 API Relay；请先切回 OpenAI 官方请求端，再更新账号配置".to_string(),
+            );
+        }
         let config_overlay = account_config_overlay(&config)?;
         let existing = self.load_existing_metadata(PLUS_RUNTIME_ID)?;
         if existing.is_some() && !confirm_overwrite {
@@ -246,26 +251,33 @@ impl RuntimeStore {
         let auth_mode = auth_mode_from_bytes(&live_auth)?;
         let model_provider = config_string(&live_config, "model_provider")?;
 
-        for runtime in self.list_runtimes()? {
-            let files = self.load_runtime_files(&runtime.id)?;
-            if json_equivalent(&live_auth, &files.auth_json)?
-                && runtime_binding_matches(&runtime, &files.config_toml, &live_config)?
-            {
-                return Ok(RuntimeStatus {
-                    active_runtime_id: Some(runtime.id),
-                    confidence: RuntimeConfidence::Exact,
-                    auth_mode,
-                    model_provider,
-                    detected_at_ms: timestamp_millis()?,
-                });
+        if auth_mode.as_deref() == Some("chatgpt") {
+            for runtime in self.list_runtimes()? {
+                let files = self.load_runtime_files(&runtime.id)?;
+                if runtime_binding_matches(
+                    &runtime,
+                    &files.auth_json,
+                    &files.config_toml,
+                    &live_config,
+                )? {
+                    return Ok(RuntimeStatus {
+                        active_runtime_id: Some(runtime.id),
+                        confidence: RuntimeConfidence::Exact,
+                        auth_mode,
+                        model_provider,
+                        detected_at_ms: timestamp_millis()?,
+                    });
+                }
             }
         }
 
         let active_runtime_id = match (auth_mode.as_deref(), model_provider.as_deref()) {
-            (Some("chatgpt"), provider) if provider != Some(RELAY_PROVIDER_ID) => {
+            (Some("chatgpt"), provider) if provider != Some(MANAGED_RELAY_PROVIDER_ID) => {
                 Some(PLUS_RUNTIME_ID.to_string())
             }
-            (Some("apikey"), Some(RELAY_PROVIDER_ID)) => Some(RELAY_RUNTIME_ID.to_string()),
+            (Some("chatgpt"), Some(MANAGED_RELAY_PROVIDER_ID)) => {
+                Some(RELAY_RUNTIME_ID.to_string())
+            }
             _ => None,
         };
         let confidence = if active_runtime_id.is_some() {
@@ -300,8 +312,9 @@ impl RuntimeStore {
 
     pub fn load_relay_connection(&self) -> Result<RelayConnection, String> {
         let (_, files) = self.load_runtime_bundle(RELAY_RUNTIME_ID)?;
-        let base_url = provider_config_string(&files.config_toml, RELAY_PROVIDER_ID, "base_url")?
-            .ok_or_else(|| "relay base URL is missing".to_string())?;
+        let base_url =
+            provider_config_string(&files.config_toml, MANAGED_RELAY_PROVIDER_ID, "base_url")?
+                .ok_or_else(|| "relay base URL is missing".to_string())?;
         let model = config_string(&files.config_toml, "model")?
             .filter(|model| !model.trim().is_empty())
             .ok_or_else(|| "relay model is missing".to_string())?;
@@ -665,10 +678,11 @@ fn validate_runtime_bundle_semantics(
             }
         }
         RuntimeKind::Relay => {
-            let base_url = provider_config_string(config_toml, RELAY_PROVIDER_ID, "base_url")?;
+            let base_url =
+                provider_config_string(config_toml, MANAGED_RELAY_PROVIDER_ID, "base_url")?;
             if !valid_relay_auth(auth_json)
                 || config_string(config_toml, "model_provider")?.as_deref()
-                    != Some(RELAY_PROVIDER_ID)
+                    != Some(MANAGED_RELAY_PROVIDER_ID)
                 || metadata.base_url.as_deref() != base_url.as_deref()
             {
                 return Err(runtime_bundle_integrity_error());
@@ -856,29 +870,36 @@ fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
 }
 
 fn valid_relay_auth(auth: &[u8]) -> bool {
-    serde_json::from_slice::<JsonValue>(auth)
-        .ok()
-        .is_some_and(|value| {
-            value.get("auth_mode").and_then(JsonValue::as_str) == Some("apikey")
-                && value
-                    .get("OPENAI_API_KEY")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|key| !key.trim().is_empty())
-        })
+    relay_api_key_from_auth(auth).is_ok()
+}
+
+pub(crate) fn relay_api_key_from_auth(auth: &[u8]) -> Result<String, String> {
+    let value = serde_json::from_slice::<JsonValue>(auth)
+        .map_err(|_| "stored relay credentials are invalid".to_string())?;
+    if value.get("auth_mode").and_then(JsonValue::as_str) != Some("apikey") {
+        return Err("stored relay credentials are invalid".to_string());
+    }
+    value
+        .get("OPENAI_API_KEY")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "stored relay credentials are invalid".to_string())
 }
 
 fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Result<String, String> {
     if !base_config.trim().is_empty() {
         DocumentMut::from_str(base_config)
-            .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+            .map_err(|_| "failed to parse config.toml".to_string())?;
     }
     let mut doc = DocumentMut::new();
 
     doc["model"] = value(model);
-    doc["model_provider"] = value(RELAY_PROVIDER_ID);
+    doc["model_provider"] = value(MANAGED_RELAY_PROVIDER_ID);
 
-    let provider = provider_table_mut(&mut doc, RELAY_PROVIDER_ID)?;
-    provider["name"] = value(RELAY_PROVIDER_ID);
+    let provider = provider_table_mut(&mut doc, MANAGED_RELAY_PROVIDER_ID)?;
+    provider["name"] = value(MANAGED_RELAY_PROVIDER_ID);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["supports_websockets"] = value(false);
@@ -894,7 +915,7 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
 
 fn account_config_overlay(config: &str) -> Result<String, String> {
     let source = DocumentMut::from_str(config)
-        .map_err(|error| format!("failed to parse plus config.toml: {error}"))?;
+        .map_err(|_| "failed to parse plus config.toml".to_string())?;
     let mut overlay = DocumentMut::new();
     for key in ["model", "service_tier"] {
         if let Some(value) = source.get(key).and_then(Item::as_str) {
@@ -993,29 +1014,22 @@ fn auth_mode_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
         .map(str::to_string))
 }
 
-fn json_equivalent(left: &[u8], right: &[u8]) -> Result<bool, String> {
-    let left: JsonValue = serde_json::from_slice(left)
-        .map_err(|error| format!("failed to parse live auth.json: {error}"))?;
-    let right: JsonValue = serde_json::from_slice(right)
-        .map_err(|error| format!("failed to parse stored auth.json: {error}"))?;
-    Ok(left == right)
-}
-
 fn config_string(config: &str, key: &str) -> Result<Option<String>, String> {
-    let doc = DocumentMut::from_str(config)
-        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    let doc =
+        DocumentMut::from_str(config).map_err(|_| "failed to parse config.toml".to_string())?;
     Ok(doc.get(key).and_then(Item::as_str).map(str::to_string))
 }
 
 fn runtime_binding_matches(
     runtime: &RuntimeMetadata,
+    stored_auth: &[u8],
     stored_config: &str,
     live_config: &str,
 ) -> Result<bool, String> {
     let stored = DocumentMut::from_str(stored_config)
-        .map_err(|error| format!("failed to parse stored runtime config.toml: {error}"))?;
+        .map_err(|_| "failed to parse stored runtime config.toml".to_string())?;
     let live = DocumentMut::from_str(live_config)
-        .map_err(|error| format!("failed to parse live config.toml: {error}"))?;
+        .map_err(|_| "failed to parse live config.toml".to_string())?;
     let stored_model = document_string(&stored, "model");
     let live_model = document_string(&live, "model");
     if runtime.model.as_deref() != stored_model {
@@ -1025,17 +1039,23 @@ fn runtime_binding_matches(
         RuntimeKind::Plus => {
             let stored_service_tier = document_string(&stored, "service_tier");
             Ok(document_string(&live, "model_provider").is_none()
-                && stored_model.is_none_or(|model| live_model == Some(model))
-                && stored_service_tier
-                    .is_none_or(|tier| document_string(&live, "service_tier") == Some(tier)))
+                && provider_config_table(&live, MANAGED_RELAY_PROVIDER_ID).is_none()
+                && live_model == stored_model
+                && document_string(&live, "service_tier") == stored_service_tier)
         }
         RuntimeKind::Relay => {
+            let relay_api_key = relay_api_key_from_auth(stored_auth)?;
+            let expected_provider = provider_config_fingerprint_with_bearer(
+                &stored,
+                MANAGED_RELAY_PROVIDER_ID,
+                &relay_api_key,
+            );
             let stored_provider = document_string(&stored, "model_provider");
-            Ok(stored_provider == Some(RELAY_PROVIDER_ID)
+            Ok(stored_provider == Some(MANAGED_RELAY_PROVIDER_ID)
                 && document_string(&live, "model_provider") == stored_provider
                 && live_model == stored_model
-                && provider_config_fingerprint(&live, RELAY_PROVIDER_ID)
-                    == provider_config_fingerprint(&stored, RELAY_PROVIDER_ID))
+                && provider_config_fingerprint(&live, MANAGED_RELAY_PROVIDER_ID)
+                    == expected_provider)
         }
     }
 }
@@ -1059,6 +1079,26 @@ fn provider_config_fingerprint(
         .iter()
         .map(|(key, item)| (key.to_string(), semantic_toml_item(item)))
         .collect::<Vec<_>>();
+    entries.sort_unstable();
+    Some(entries)
+}
+
+fn provider_config_fingerprint_with_bearer(
+    doc: &DocumentMut,
+    provider: &str,
+    bearer_token: &str,
+) -> Option<Vec<(String, SemanticToml)>> {
+    let mut entries = provider_config_fingerprint(doc, provider)?;
+    entries.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "api_key" | "env_key" | "goal" | "experimental_bearer_token"
+        )
+    });
+    entries.push((
+        "experimental_bearer_token".to_string(),
+        SemanticToml::String(bearer_token.to_string()),
+    ));
     entries.sort_unstable();
     Some(entries)
 }
@@ -1122,8 +1162,8 @@ fn provider_config_string(
     provider: &str,
     key: &str,
 ) -> Result<Option<String>, String> {
-    let doc = DocumentMut::from_str(config)
-        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    let doc =
+        DocumentMut::from_str(config).map_err(|_| "failed to parse config.toml".to_string())?;
     Ok(doc
         .get("model_providers")
         .and_then(Item::as_table)
@@ -1141,6 +1181,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{RuntimeConfidence, RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID};
+    use crate::config_patch::{plan_runtime_config_patch, RuntimeConfigKind};
+
+    fn activate_relay_route(store: &RuntimeStore, home: &std::path::Path) {
+        let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
+        let key = super::relay_api_key_from_auth(&files.auth_json).unwrap();
+        let live = fs::read_to_string(home.join("config.toml")).unwrap();
+        let plan = plan_runtime_config_patch(
+            &live,
+            &files.config_toml,
+            RuntimeConfigKind::Relay,
+            Some(&key),
+        )
+        .unwrap();
+        fs::write(home.join("config.toml"), plan.patched_toml).unwrap();
+    }
 
     #[test]
     fn imports_plus_runtime_as_encrypted_auth_and_full_config() {
@@ -1597,7 +1652,29 @@ mod tests {
     }
 
     #[test]
-    fn detects_exact_and_mode_only_active_runtime_without_exposing_credentials() {
+    fn account_import_rejects_a_live_managed_relay_route_without_touching_the_slot() {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "model = \"relay-model\"\nmodel_provider = \"openai_custom\"\n",
+        )
+        .unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+
+        let error = store.import_plus_from_home(home.path(), false).unwrap_err();
+
+        assert!(error.contains("先切回 OpenAI 官方请求端"), "{error}");
+        assert!(!store.runtime_dir(PLUS_RUNTIME_ID).exists());
+    }
+
+    #[test]
+    fn refreshed_official_auth_remains_an_exact_route_match_without_exposing_credentials() {
         let home = tempdir().unwrap();
         fs::write(
             home.path().join("auth.json"),
@@ -1623,12 +1700,17 @@ mod tests {
             refreshed.active_runtime_id.as_deref(),
             Some(PLUS_RUNTIME_ID)
         );
-        assert_eq!(refreshed.confidence, RuntimeConfidence::Mode);
+        assert_eq!(refreshed.confidence, RuntimeConfidence::Exact);
     }
 
     #[test]
     fn changed_saved_relay_base_url_is_not_exact_until_live_config_is_applied() {
         let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
         let root = tempdir().unwrap();
         let store = RuntimeStore::new(root.path().join("runtimes"));
@@ -1642,9 +1724,7 @@ mod tests {
                 home.path(),
             )
             .unwrap();
-        let old_files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
-        fs::write(home.path().join("auth.json"), &old_files.auth_json).unwrap();
-        fs::write(home.path().join("config.toml"), &old_files.config_toml).unwrap();
+        activate_relay_route(&store, home.path());
         let exact = store.detect_active_runtime(home.path()).unwrap();
         assert_eq!(exact.active_runtime_id.as_deref(), Some(RELAY_RUNTIME_ID));
         assert_eq!(exact.confidence, RuntimeConfidence::Exact);
@@ -1671,6 +1751,11 @@ mod tests {
     #[test]
     fn relay_provider_route_drift_is_not_reported_as_exact() {
         let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
         let root = tempdir().unwrap();
         let store = RuntimeStore::new(root.path().join("runtimes"));
@@ -1684,9 +1769,8 @@ mod tests {
                 home.path(),
             )
             .unwrap();
-        let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
-        fs::write(home.path().join("auth.json"), &files.auth_json).unwrap();
-        fs::write(home.path().join("config.toml"), &files.config_toml).unwrap();
+        activate_relay_route(&store, home.path());
+        let active_config = fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert_eq!(
             store.detect_active_runtime(home.path()).unwrap().confidence,
             RuntimeConfidence::Exact
@@ -1702,8 +1786,8 @@ mod tests {
                 "stream_idle_timeout_ms = 1000",
             ),
         ] {
-            let drifted = files.config_toml.replace(from, to);
-            assert_ne!(drifted, files.config_toml, "{from}");
+            let drifted = active_config.replace(from, to);
+            assert_ne!(drifted, active_config, "{from}");
             fs::write(home.path().join("config.toml"), drifted).unwrap();
 
             assert_eq!(
@@ -1717,6 +1801,11 @@ mod tests {
     #[test]
     fn relay_provider_formatting_drift_remains_exact() {
         let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
         let root = tempdir().unwrap();
         let store = RuntimeStore::new(root.path().join("runtimes"));
@@ -1730,10 +1819,9 @@ mod tests {
                 home.path(),
             )
             .unwrap();
-        let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
-        fs::write(home.path().join("auth.json"), &files.auth_json).unwrap();
-        let formatted = files
-            .config_toml
+        activate_relay_route(&store, home.path());
+        let active_config = fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let formatted = active_config
             .replace(
                 "request_max_retries = 6",
                 "request_max_retries = 0x6 # equivalent TOML integer",
@@ -1742,7 +1830,7 @@ mod tests {
                 "wire_api = \"responses\"",
                 "wire_api = 'responses' # equivalent TOML string",
             );
-        assert_ne!(formatted, files.config_toml);
+        assert_ne!(formatted, active_config);
         fs::write(home.path().join("config.toml"), formatted).unwrap();
 
         assert_eq!(

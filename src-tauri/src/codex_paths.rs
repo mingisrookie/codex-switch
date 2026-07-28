@@ -55,8 +55,7 @@ fn read_config_sqlite_home(codex_home: &Path) -> Result<Option<PathBuf>, String>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("failed to read config.toml: {error}")),
     };
-    let doc = DocumentMut::from_str(&raw)
-        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    let doc = DocumentMut::from_str(&raw).map_err(|_| "failed to parse config.toml".to_string())?;
     let Some(item) = doc.get("sqlite_home") else {
         return Ok(None);
     };

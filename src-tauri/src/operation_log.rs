@@ -23,6 +23,7 @@ pub enum OperationAction {
     SaveRelay,
     VerifyRelay,
     SwitchRuntime,
+    IncrementalSync,
     SyncSessions,
     DeleteSessions,
     RestoreVisibility,

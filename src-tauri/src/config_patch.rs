@@ -3,6 +3,8 @@ use std::str::FromStr;
 use serde::Serialize;
 use toml_edit::{value, DocumentMut, Item, Table};
 
+pub const MANAGED_RELAY_PROVIDER_ID: &str = "openai_custom";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeConfigKind {
     Account,
@@ -37,8 +39,8 @@ pub fn plan_config_patch(
         });
     }
 
-    let mut doc = DocumentMut::from_str(base_toml)
-        .map_err(|error| format!("failed to parse config.toml: {error}"))?;
+    let mut doc =
+        DocumentMut::from_str(base_toml).map_err(|_| "failed to parse config.toml".to_string())?;
     let mut changed_keys = Vec::new();
 
     set_top_level_string(
@@ -144,30 +146,54 @@ pub fn plan_runtime_config_patch(
     live_toml: &str,
     runtime_toml: &str,
     kind: RuntimeConfigKind,
+    relay_bearer_token: Option<&str>,
 ) -> Result<ConfigPatchPlan, String> {
     let mut live = DocumentMut::from_str(live_toml)
-        .map_err(|error| format!("failed to parse live config.toml: {error}"))?;
+        .map_err(|_| "failed to parse live config.toml".to_string())?;
     let runtime = DocumentMut::from_str(runtime_toml)
-        .map_err(|error| format!("failed to parse runtime config.toml: {error}"))?;
+        .map_err(|_| "failed to parse runtime config.toml".to_string())?;
     let mut changed_keys = Vec::new();
-
-    for key in ["model", "service_tier"] {
-        if let Some(next) = runtime.get(key).and_then(Item::as_str) {
-            set_top_level_string(&mut live, key, Some(next), &mut changed_keys);
-        }
-    }
 
     match kind {
         RuntimeConfigKind::Account => {
+            // The saved Account overlay is authoritative for route-scoped model fields.
+            // Removing an absent field prevents a Relay-only model from leaking into OpenAI.
+            for key in ["model", "service_tier"] {
+                if let Some(next) = runtime.get(key).and_then(Item::as_str) {
+                    set_top_level_string(&mut live, key, Some(next), &mut changed_keys);
+                } else if live.remove(key).is_some() {
+                    changed_keys.push(key.to_string());
+                }
+            }
             if live.remove("model_provider").is_some() {
                 changed_keys.push("model_provider".to_string());
             }
+            if let Some(providers) = live.get_mut("model_providers").and_then(Item::as_table_mut) {
+                if providers.remove(MANAGED_RELAY_PROVIDER_ID).is_some() {
+                    changed_keys.push(format!("model_providers.{MANAGED_RELAY_PROVIDER_ID}"));
+                }
+                if providers.is_empty() {
+                    live.remove("model_providers");
+                }
+            }
         }
         RuntimeConfigKind::Relay => {
+            for key in ["model", "service_tier"] {
+                if let Some(next) = runtime.get(key).and_then(Item::as_str) {
+                    set_top_level_string(&mut live, key, Some(next), &mut changed_keys);
+                }
+            }
+            let relay_bearer_token = relay_bearer_token
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| "relay bearer token is required".to_string())?;
             let provider = runtime
                 .get("model_provider")
                 .and_then(Item::as_str)
                 .ok_or_else(|| "relay runtime config is missing model_provider".to_string())?;
+            if provider != MANAGED_RELAY_PROVIDER_ID {
+                return Err("relay runtime config uses an unsupported provider".to_string());
+            }
             set_top_level_string(
                 &mut live,
                 "model_provider",
@@ -185,18 +211,22 @@ pub fn plan_runtime_config_patch(
             let target_table = provider_table_mut(&mut live, provider)?;
             target_table.clear();
             for (key, item) in source_table.iter() {
-                if matches!(key, "api_key" | "env_key" | "goal") {
+                if matches!(
+                    key,
+                    "api_key" | "env_key" | "goal" | "experimental_bearer_token"
+                ) {
                     continue;
                 }
                 target_table.insert(key, item.clone());
             }
+            target_table["experimental_bearer_token"] = value(relay_bearer_token);
             changed_keys.push(format!("model_providers.{provider}"));
         }
     }
 
     let patched_toml = live.to_string();
     DocumentMut::from_str(&patched_toml)
-        .map_err(|error| format!("patched config.toml is invalid: {error}"))?;
+        .map_err(|_| "patched config.toml is invalid".to_string())?;
     Ok(ConfigPatchPlan {
         patched_toml,
         changed_keys,
@@ -289,7 +319,8 @@ command = "old-command"
 "#;
 
         let plan =
-            plan_runtime_config_patch(live, stored_account, RuntimeConfigKind::Account).unwrap();
+            plan_runtime_config_patch(live, stored_account, RuntimeConfigKind::Account, None)
+                .unwrap();
 
         assert!(plan.patched_toml.contains("model = \"account-model\""));
         assert!(!plan
@@ -301,6 +332,7 @@ command = "old-command"
         assert!(plan.patched_toml.contains("fast_mode = true"));
         assert!(plan.patched_toml.contains("new-command"));
         assert!(!plan.patched_toml.contains("old-command"));
+        assert!(!plan.patched_toml.contains("openai_custom"));
     }
 
     #[test]
@@ -326,7 +358,13 @@ wire_api = "responses"
 supports_websockets = false
 "#;
 
-        let plan = plan_runtime_config_patch(live, stored_relay, RuntimeConfigKind::Relay).unwrap();
+        let plan = plan_runtime_config_patch(
+            live,
+            stored_relay,
+            RuntimeConfigKind::Relay,
+            Some("sk-relay-secret"),
+        )
+        .unwrap();
 
         assert!(plan.patched_toml.contains("model = \"relay-model\""));
         assert!(plan
@@ -338,5 +376,77 @@ supports_websockets = false
         assert!(plan
             .patched_toml
             .contains("model_instructions_file = \"global\""));
+        assert!(plan
+            .patched_toml
+            .contains("experimental_bearer_token = \"sk-relay-secret\""));
+    }
+
+    #[test]
+    fn relay_runtime_patch_requires_a_nonempty_bearer_token_without_echoing_it() {
+        let error = plan_runtime_config_patch(
+            "model = \"account\"\n",
+            "model = \"relay\"\nmodel_provider = \"openai_custom\"\n\
+             [model_providers.openai_custom]\nbase_url = \"https://relay.example.com/v1\"\n",
+            RuntimeConfigKind::Relay,
+            Some("   "),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "relay bearer token is required");
+    }
+
+    #[test]
+    fn account_patch_removes_only_the_managed_relay_provider_and_secret() {
+        let live = r#"
+model = "relay"
+model_provider = "openai_custom"
+
+[model_providers.openai_custom]
+base_url = "https://relay.example.com/v1"
+experimental_bearer_token = "sk-secret"
+
+[model_providers.customer_owned]
+base_url = "https://customer.example.com/v1"
+"#;
+        let plan = plan_runtime_config_patch(
+            live,
+            "model = \"account\"\n",
+            RuntimeConfigKind::Account,
+            None,
+        )
+        .unwrap();
+
+        assert!(!plan.patched_toml.contains("openai_custom"));
+        assert!(!plan.patched_toml.contains("sk-secret"));
+        assert!(plan.patched_toml.contains("customer_owned"));
+    }
+
+    #[test]
+    fn account_patch_removes_relay_only_model_fields_absent_from_the_saved_overlay() {
+        let plan = plan_runtime_config_patch(
+            "model = \"relay\"\nservice_tier = \"fast\"\nmodel_provider = \"openai_custom\"\n",
+            "",
+            RuntimeConfigKind::Account,
+            None,
+        )
+        .unwrap();
+
+        assert!(!plan.patched_toml.contains("model ="));
+        assert!(!plan.patched_toml.contains("service_tier"));
+        assert!(!plan.patched_toml.contains("model_provider"));
+    }
+
+    #[test]
+    fn relay_patch_rejects_a_provider_outside_the_managed_contract() {
+        let error = plan_runtime_config_patch(
+            "model = \"account\"\n",
+            "model = \"relay\"\nmodel_provider = \"other\"\n\
+             [model_providers.other]\nbase_url = \"https://relay.example.com/v1\"\n",
+            RuntimeConfigKind::Relay,
+            Some("sk-relay-secret"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "relay runtime config uses an unsupported provider");
     }
 }

@@ -8,11 +8,13 @@ AI 在本项目里进行开发、整理改动、发起 PR、更新 PR、补充�
 
 <!-- DXM-DOC-RULES:START -->
 
+<!-- DXM-CONTRACT:1 -->
+
 ## DXM 文档维护规则
 
 - 本块由 DXM 管理；`--refresh-blocks` 只刷新本块，保留下方项目专属 Git/PR 规则和人工补充。
 - GitHub、PR、提交、推送、合并相关结论必须基于真实命令输出和真实 diff。
-- 未获用户明确授权时，不得 stage、commit、push、创建 PR、合并 PR、关闭 PR、删分支或强推。
+- 未获用户明确授权时，不得 stage、commit、push、创建 PR、合并 PR、关闭 PR、删分支、强推、创建/推送 tag、创建/编辑 GitHub Release 或修改 Latest。
 - PR 文案必须基于真实改动和验证结果，不写机器人腔或空泛结论。
 
 <!-- DXM-DOC-RULES:END -->

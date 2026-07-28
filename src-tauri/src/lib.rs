@@ -9,8 +9,10 @@ pub mod file_ops;
 pub mod operation_log;
 pub mod process_control;
 pub mod relay_verify;
+mod request_route_switcher;
 pub mod runtime_store;
 pub mod runtime_switcher;
+pub mod session_incremental;
 pub mod session_manager;
 pub mod session_scan;
 pub mod session_sync;
@@ -22,13 +24,13 @@ pub fn run() {
     let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
+            commands::request_app_exit,
             commands::check_for_updates,
             commands::install_update,
             commands::get_update_startup_notice,
             commands::scan_codex_home,
             commands::scan_sessions,
             commands::scan_managed_sessions,
-            commands::dry_run_all_sessions,
             commands::list_runtimes,
             commands::scan_runtime_status,
             commands::import_plus_runtime,

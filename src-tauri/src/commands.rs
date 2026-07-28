@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
         Mutex, MutexGuard, TryLockError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::ipc::Channel;
 
@@ -23,10 +23,9 @@ use crate::{
         inspect_checkpoint_storage as inspect_checkpoint_storage_at,
         list_recent_backups as list_backup_snapshots, migrate_legacy_plaintext_auth,
         preflight_backup_capacity_for_sources, preflight_backup_capacity_with_paths,
-        preflight_combined_capacity_for_sources, restore_backup as restore_backup_snapshot,
-        verify_backup, AdditionalCapacityDemand, BackupCapacitySource, BackupManifest, BackupScope,
-        BackupSummary, CheckpointCleanupReceipt, CheckpointCleanupSummary, CheckpointRole,
-        CheckpointStorageStatus, RestoreResult,
+        restore_backup as restore_backup_snapshot, verify_backup, BackupCapacitySource,
+        BackupManifest, BackupScope, BackupSummary, CheckpointCleanupReceipt,
+        CheckpointCleanupSummary, CheckpointRole, CheckpointStorageStatus, RestoreResult,
     },
     codex_home::{scan_codex_home as scan_home, CodexHomeStatus},
     codex_paths::{
@@ -42,14 +41,22 @@ use crate::{
         list_codex_processes as list_processes, CodexProcess,
     },
     relay_verify::verify_relay,
+    request_route_switcher::{
+        preflight_request_route_switch, switch_request_route_preflighted_with_progress,
+    },
     runtime_store::{
-        RelayRuntimeInput, RuntimeMetadata, RuntimeStatus, RuntimeStore, RELAY_RUNTIME_ID,
+        RelayRuntimeInput, RuntimeMetadata, RuntimeStatus, RuntimeStore, PLUS_RUNTIME_ID,
+        RELAY_RUNTIME_ID,
     },
     runtime_switcher::{
-        preflight_hot_session_sync_with_paths, preflight_runtime_session_sync_with_paths,
-        preflight_runtime_switch, switch_runtime_files_preflighted_with_progress,
-        sync_home_with_shared_preflighted_with_paths, BackupReceiptSummary, ChatGptLaunchReceipt,
-        ChatGptLaunchStatus, RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
+        combine_session_sync_results, sync_home_with_shared_complete_with_paths,
+        BackupReceiptSummary, ChatGptLaunchReceipt, ChatGptLaunchStatus, RuntimeSwitchOutcome,
+        RuntimeSwitchPhase, RuntimeSwitchResult,
+    },
+    session_incremental::{
+        plan_incremental_session_sync, save_session_sync_index, save_session_sync_index_bounded,
+        IncrementalSessionPlan, IncrementalSessionSyncReceipt, IncrementalSessionSyncStatus,
+        MAX_INCREMENTAL_TOTAL_DURATION,
     },
     session_manager::{
         delete_managed_sessions_detailed_with_prepare as delete_sessions,
@@ -57,11 +64,12 @@ use crate::{
         scan_managed_sessions as scan_managed_session_inventory, ManagedSessionInventory,
         SessionMutationResult,
     },
-    session_scan::{
-        build_sync_dry_run, scan_sessions as scan_session_inventory,
-        scan_sessions_local as scan_local_session_inventory, SessionInventory, SyncDryRun,
+    session_scan::{scan_sessions as scan_session_inventory, SessionInventory},
+    session_sync::{
+        cleanup_obsolete_provider_slots, normalize_selected_user_home_provider_with_paths,
+        sync_selected_shared_to_user_home_hot_with_paths,
+        sync_selected_user_home_to_shared_with_paths, SessionSyncResult,
     },
-    session_sync::{cleanup_obsolete_provider_slots, SessionSyncResult},
     skill_manager::{
         install_skill_at, list_skills_at, save_skill_config_at, SkillConfigInput, SkillId,
         SkillMutationReceipt, SkillStatus,
@@ -117,6 +125,15 @@ impl MutationCoordinator {
         }
         matches!(self.process_lock.try_lock(), Err(TryLockError::WouldBlock))
     }
+
+    fn release_shutdown_reservation(&self) {
+        let mut shutdown_lock_file = self
+            .shutdown_lock_file
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        shutdown_lock_file.take();
+        self.shutdown_pending.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -161,13 +178,6 @@ pub struct AppStatus {
     pub codex_home: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AllSessionsDryRun {
-    pub to_shared: SyncDryRun,
-    pub to_current: SyncDryRun,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSyncReceipt {
@@ -178,6 +188,29 @@ pub struct SessionSyncReceipt {
     pub rolled_back: bool,
     pub warnings: Vec<String>,
     pub checkpoint_cleanup: CheckpointCleanupSummary,
+    pub chatgpt_launch: ChatGptLaunchReceipt,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionSyncPhase {
+    Preparing,
+    ClosingApp,
+    BackingUp,
+    Reconciling,
+    RecordingResult,
+    LaunchingApp,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSyncProgress {
+    pub phase: SessionSyncPhase,
+    pub timestamp_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,10 +291,10 @@ pub struct RuntimeSwitchProgress {
     pub outcome: Option<RuntimeSwitchOutcome>,
 }
 
-#[derive(Debug, Clone)]
-struct HotSyncCompensation {
-    shared_rolled_back: bool,
-    current_backup_dir: PathBuf,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppExitRequestResult {
+    pub scheduled: bool,
 }
 
 #[tauri::command]
@@ -301,6 +334,23 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceip
 }
 
 #[tauri::command]
+pub fn request_app_exit(app: tauri::AppHandle) -> Result<AppExitRequestResult, String> {
+    let lock_path = appdata_root()?.join("codex-switch").join("mutation.lock");
+    let scheduled = prepare_app_exit_at(&MUTATION_COORDINATOR, &lock_path)?;
+    if scheduled {
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            app.exit(0);
+            // A prevented or stalled exit must not leave every later mutation
+            // permanently blocked for the rest of the process lifetime.
+            thread::sleep(Duration::from_secs(2));
+            MUTATION_COORDINATOR.release_shutdown_reservation();
+        });
+    }
+    Ok(AppExitRequestResult { scheduled })
+}
+
+#[tauri::command]
 pub fn get_update_startup_notice() -> Option<UpdateStartupNotice> {
     startup_update_notice()
 }
@@ -319,16 +369,6 @@ pub fn scan_sessions() -> Result<SessionInventory, String> {
 pub fn scan_managed_sessions() -> Result<ManagedSessionInventory, String> {
     let shared_home = default_shared_sessions_root()?;
     scan_managed_session_inventory(&managed_codex_home()?, &shared_home)
-}
-
-#[tauri::command]
-pub fn dry_run_all_sessions() -> Result<AllSessionsDryRun, String> {
-    let current = scan_session_inventory(&managed_codex_home()?)?;
-    let shared = scan_local_session_inventory(&default_shared_sessions_root()?)?;
-    Ok(AllSessionsDryRun {
-        to_shared: build_sync_dry_run(std::slice::from_ref(&current), &shared),
-        to_current: build_sync_dry_run(std::slice::from_ref(&shared), &current),
-    })
 }
 
 #[tauri::command]
@@ -485,108 +525,72 @@ fn switch_runtime_blocking(
             return Err(error);
         }
     };
-    let mut failure_backups = Vec::new();
     let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
     let mut failure_operation_id = None;
-    let mut checkpoint_root = None;
-    emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::PlanningSessions, None);
+    let target_is_account = runtime_id == PLUS_RUNTIME_ID;
+    emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LoadingRuntime, None);
     let mut result = (|| {
         let store = RuntimeStore::from_default_root()?;
         let current_home = managed_codex_home()?;
-        let backup_root = default_backup_root()?;
-        checkpoint_root = Some(backup_root.clone());
-        let shared_home = default_shared_sessions_root()?;
-        let shared_paths = local_codex_paths(&shared_home);
         let mut launch_target_captured = false;
-        let plan = prepare_runtime_switch_before_close(
-            runtime_id == RELAY_RUNTIME_ID,
-            || {
-                let plan =
-                    preflight_runtime_switch(&store, &runtime_id, &current_home, &shared_home)?;
-                let requires_change = plan.requires_change();
-                Ok((plan, requires_change))
-            },
-            |plan| {
-                let session_demands = plan.session_storage_plan().demands();
-                let additional = session_demands
-                    .iter()
-                    .map(|demand| AdditionalCapacityDemand {
-                        destination: &demand.destination,
-                        bytes: demand.bytes,
-                    })
-                    .collect::<Vec<_>>();
-                preflight_combined_capacity_for_sources(
-                    &backup_root,
-                    &[
-                        BackupCapacitySource {
-                            home: &current_home,
-                            paths: plan.codex_paths(),
-                            scope: plan.current_backup_scope(),
-                        },
-                        BackupCapacitySource {
-                            home: &shared_home,
-                            paths: &shared_paths,
-                            scope: plan.shared_backup_scope(),
-                        },
-                    ],
-                    &additional,
-                )?;
-                preflight_runtime_session_sync_with_paths(plan.codex_paths(), &shared_paths)
-            },
-            || {
-                let connection = store.load_relay_connection()?;
-                verify_relay(&connection.base_url, &connection.api_key, &connection.model)?;
-                store.mark_verified(RELAY_RUNTIME_ID)?;
-                Ok(())
-            },
-            || {
-                let processes = list_managed_processes_for_closed_mutation("switching runtimes")?;
-                capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                    // The pre-close inventory is the only point at which the
-                    // running package identity may be captured. The post-close
-                    // inventory must not erase it.
-                    let _ = cache_chatgpt_launch_target();
-                });
-                Ok(processes)
-            },
-            || close_codex().map(|_| ()),
-            |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
-        )?;
-        if !plan.requires_change() {
-            // A no-op does not enter the process-close gate, so capture the
-            // currently running package identity here before the controlled
-            // launcher consumes it or falls back to registered-app discovery.
+        emit_runtime_switch_progress(
+            &on_progress,
+            RuntimeSwitchPhase::ValidatingOfficialAuth,
+            None,
+        );
+        let plan = preflight_request_route_switch(&store, &runtime_id, &current_home)?;
+        if runtime_id == RELAY_RUNTIME_ID {
+            emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::VerifyingRelay, None);
+            let connection = store.load_relay_connection()?;
+            verify_relay(&connection.base_url, &connection.api_key, &connection.model)?;
+            store.mark_verified(RELAY_RUNTIME_ID)?;
+        }
+        if plan.requires_change() {
+            close_runtime_processes_with_progress(
+                || {
+                    let processes =
+                        list_managed_processes_for_closed_mutation("switching request routes")?;
+                    capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+                        // The pre-close inventory is the only point at which the
+                        // running package identity may be captured.
+                        let _ = cache_chatgpt_launch_target();
+                    });
+                    Ok(processes)
+                },
+                || close_codex().map(|_| ()),
+                |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
+            )?;
+        } else {
+            // A no-op does not enter the process-close gate, so retain the
+            // running package identity for the controlled launcher.
             capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
                 let _ = cache_chatgpt_launch_target();
             });
         }
-        match switch_runtime_files_preflighted_with_progress(
+        match switch_request_route_preflighted_with_progress(
             &store,
             &current_home,
-            &backup_root,
-            &shared_home,
             plan,
+            &mut || ensure_codex_closed("switching request routes"),
             &mut |phase| emit_runtime_switch_progress(&on_progress, phase, None),
         ) {
             Ok(receipt) => Ok(receipt),
             Err(failure) => {
                 failure_operation_id = failure.operation_id;
-                failure_backups = failure.backups;
                 failure_outcome = failure.outcome;
                 Err(failure.message)
             }
         }
     })();
-    let (id, backups, counts) = match &result {
+    let (id, counts) = match &result {
         Ok(receipt) => (
             receipt.operation_id.as_str(),
-            receipt.backup_manifests.as_slice(),
             BTreeMap::from([
-                ("toShared".to_string(), receipt.to_shared.inserted_threads),
                 (
-                    "fromShared".to_string(),
-                    receipt.from_shared.inserted_threads,
+                    "requestRouteChanged".to_string(),
+                    usize::from(receipt.changed),
                 ),
+                ("officialAuthPreserved".to_string(), 1),
                 (
                     "chatProcessStateRepaired".to_string(),
                     usize::from(receipt.chat_process_state_repaired),
@@ -597,107 +601,48 @@ fn switch_runtime_blocking(
             failure_operation_id
                 .as_deref()
                 .unwrap_or(attempt_id.as_str()),
-            failure_backups.as_slice(),
             BTreeMap::new(),
         ),
     };
+    emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::RecordingResult, None);
     let terminal_record =
-        record_runtime_switch_result(id, started, &result, backups, counts, failure_outcome).ok();
+        record_runtime_switch_result(id, started, &result, &[], counts, failure_outcome).ok();
     let terminal_recorded = terminal_record.is_some();
-    match &mut result {
-        Ok(receipt) => {
-            if receipt.changed {
-                if terminal_recorded {
-                    emit_runtime_switch_progress(
-                        &on_progress,
-                        RuntimeSwitchPhase::CleaningCheckpoints,
-                        None,
-                    );
-                }
-                let cleanup = release_transient_checkpoints(
-                    checkpoint_root.as_deref(),
-                    terminal_record.as_ref(),
-                    receipt.backup_manifests.as_slice(),
-                );
-                receipt.warnings.extend(cleanup.warnings.clone());
-                receipt.checkpoint_cleanup = cleanup;
-                if terminal_recorded
-                    && (!receipt.to_shared.obsolete_provider_slots.is_empty()
-                        || !receipt.from_shared.obsolete_provider_slots.is_empty())
-                {
-                    match (managed_codex_home(), default_shared_sessions_root()) {
-                        (Ok(current_home), Ok(shared_home)) => {
-                            match resolve_user_codex_paths(&current_home) {
-                                Ok(current_paths) => {
-                                    let shared_paths = local_codex_paths(&shared_home);
-                                    let to_shared_gc = cleanup_obsolete_provider_slots(
-                                        &receipt.to_shared.obsolete_provider_slots,
-                                        &current_paths,
-                                        &shared_paths,
-                                    );
-                                    receipt.to_shared.persistent_session_bytes_reclaimed = receipt
-                                        .to_shared
-                                        .persistent_session_bytes_reclaimed
-                                        .saturating_add(to_shared_gc.reclaimed_bytes);
-                                    receipt.warnings.extend(to_shared_gc.warnings);
-                                    let from_shared_gc = cleanup_obsolete_provider_slots(
-                                        &receipt.from_shared.obsolete_provider_slots,
-                                        &current_paths,
-                                        &shared_paths,
-                                    );
-                                    receipt.from_shared.persistent_session_bytes_reclaimed =
-                                        receipt
-                                            .from_shared
-                                            .persistent_session_bytes_reclaimed
-                                            .saturating_add(from_shared_gc.reclaimed_bytes);
-                                    receipt.warnings.extend(from_shared_gc.warnings);
-                                }
-                                Err(_) => receipt
-                                    .warnings
-                                    .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
-                            }
-                        }
-                        _ => receipt
-                            .warnings
-                            .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
-                    }
-                }
-            }
-            if successful_switch_requests_chatgpt_launch(receipt.changed) {
-                if terminal_recorded {
-                    emit_runtime_switch_progress(
-                        &on_progress,
-                        RuntimeSwitchPhase::LaunchingApp,
-                        None,
-                    );
-                }
-                receipt.chatgpt_launch =
-                    launch_chatgpt_after_durable_terminal(terminal_recorded, || {
-                        ChatGptLaunchReceipt::from(launch_cached_chatgpt())
-                    });
-            }
-        }
-        Err(error)
-            if failed_runtime_switch_checkpoints_are_releasable(
-                failure_outcome,
-                &failure_backups,
-            ) =>
-        {
-            if terminal_recorded {
-                emit_runtime_switch_progress(
-                    &on_progress,
-                    RuntimeSwitchPhase::CleaningCheckpoints,
-                    None,
-                );
-            }
-            let cleanup = release_transient_checkpoints(
-                checkpoint_root.as_deref(),
-                terminal_record.as_ref(),
-                failure_backups.as_slice(),
+    let mut incremental_launch_allowed = true;
+    if let Ok(receipt) = &mut result {
+        if receipt.changed && terminal_recorded {
+            emit_runtime_switch_progress(
+                &on_progress,
+                RuntimeSwitchPhase::SyncingIncrementalSessions,
+                None,
             );
-            append_warnings_to_error(error, &cleanup.warnings);
+            let incremental = run_incremental_session_sync_after_route(target_is_account);
+            incremental_launch_allowed = incremental.chatgpt_launch_allowed;
+            receipt.incremental_session_sync = incremental.receipt;
+            if let Some(warning) = incremental.warning {
+                receipt.warnings.push(warning);
+            }
+        } else {
+            receipt.incremental_session_sync = IncrementalSessionSyncReceipt::skipped();
         }
-        _ => {}
+        if successful_switch_requests_chatgpt_launch(receipt.changed) {
+            if terminal_recorded && incremental_launch_allowed {
+                emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LaunchingApp, None);
+            }
+            receipt.chatgpt_launch = if incremental_launch_allowed {
+                launch_chatgpt_after_durable_terminal(terminal_recorded, || {
+                    ChatGptLaunchReceipt::from(launch_cached_chatgpt())
+                })
+            } else {
+                ChatGptLaunchReceipt {
+                    status: ChatGptLaunchStatus::Blocked,
+                    message: Some(
+                        "ChatGPT was kept closed because incremental session work did not reach a durable safe terminal; review the operation log and retained safety checkpoints before retrying."
+                            .to_string(),
+                    ),
+                }
+            };
+        }
     }
     emit_runtime_switch_terminal(&on_progress, &result, failure_outcome);
     result
@@ -739,68 +684,19 @@ where
     launch()
 }
 
-fn prepare_runtime_switch_before_close<Plan, Prepare, Capacity, Verify, List, Close, Progress>(
-    verify_relay_first: bool,
-    mut prepare_switch: Prepare,
-    mut verify_backup_capacity: Capacity,
-    mut verify_relay_connection: Verify,
-    list_managed_processes: List,
-    close_managed_processes: Close,
-    mut progress: Progress,
-) -> Result<Plan, String>
-where
-    Prepare: FnMut() -> Result<(Plan, bool), String>,
-    Capacity: FnMut(&Plan) -> Result<(), String>,
-    Verify: FnMut() -> Result<(), String>,
-    List: FnMut() -> Result<Vec<CodexProcess>, String>,
-    Close: FnMut() -> Result<(), String>,
-    Progress: FnMut(RuntimeSwitchPhase, Option<String>),
-{
-    let (plan, requires_change) = prepare_switch()?;
-    if requires_change {
-        verify_backup_capacity(&plan)?;
-        run_runtime_switch_preflight(
-            verify_relay_first,
-            verify_relay_connection,
-            list_managed_processes,
-            close_managed_processes,
-            &mut progress,
-        )?;
-        progress(
-            RuntimeSwitchPhase::PlanningSessions,
-            Some("Rechecking the closed-session write set and disk capacity".to_string()),
-        );
-        let (closed_plan, closed_requires_change) = prepare_switch()?;
-        if closed_requires_change {
-            verify_backup_capacity(&closed_plan)?;
-        }
-        return Ok(closed_plan);
-    } else if verify_relay_first {
-        progress(RuntimeSwitchPhase::VerifyingRelay, None);
-        verify_relay_connection()?;
-    }
-    Ok(plan)
-}
-
-fn run_runtime_switch_preflight<Verify, List, Close, Progress>(
-    verify_relay_first: bool,
-    mut verify_relay_connection: Verify,
+fn close_runtime_processes_with_progress<List, Close, Progress>(
     mut list_managed_processes: List,
     mut close_managed_processes: Close,
     mut progress: Progress,
-) -> Result<(), String>
+) -> Result<bool, String>
 where
-    Verify: FnMut() -> Result<(), String>,
     List: FnMut() -> Result<Vec<CodexProcess>, String>,
     Close: FnMut() -> Result<(), String>,
     Progress: FnMut(RuntimeSwitchPhase, Option<String>),
 {
-    if verify_relay_first {
-        progress(RuntimeSwitchPhase::VerifyingRelay, None);
-        verify_relay_connection()?;
-    }
     progress(RuntimeSwitchPhase::DetectingApp, None);
     let processes = list_managed_processes()?;
+    let closed_running_processes = !processes.is_empty();
     if !processes.is_empty() {
         progress(
             RuntimeSwitchPhase::ClosingApp,
@@ -809,9 +705,9 @@ where
         close_managed_processes()?;
     }
     if list_managed_processes()?.is_empty() {
-        Ok(())
+        Ok(closed_running_processes)
     } else {
-        Err("ChatGPT is still running; close it before switching runtimes".to_string())
+        Err("ChatGPT is still running; close it before switching request routes".to_string())
     }
 }
 
@@ -865,14 +761,567 @@ fn emit_runtime_switch_terminal<T>(
     }
 }
 
-#[tauri::command]
-pub async fn sync_all_sessions() -> Result<SessionSyncReceipt, String> {
-    tauri::async_runtime::spawn_blocking(sync_all_sessions_blocking)
-        .await
-        .map_err(|_| "session sync worker failed".to_string())?
+#[derive(Debug)]
+struct IncrementalSessionRun {
+    receipt: IncrementalSessionSyncReceipt,
+    warning: Option<String>,
+    chatgpt_launch_allowed: bool,
 }
 
-fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
+impl IncrementalSessionRun {
+    fn safe(receipt: IncrementalSessionSyncReceipt, warning: Option<String>) -> Self {
+        Self {
+            receipt,
+            warning,
+            chatgpt_launch_allowed: true,
+        }
+    }
+
+    fn after_terminal(
+        receipt: IncrementalSessionSyncReceipt,
+        warning: Option<String>,
+        terminal_recorded: bool,
+    ) -> Self {
+        if terminal_recorded {
+            return Self::safe(receipt, warning);
+        }
+        let terminal_warning = incremental_terminal_warning();
+        Self {
+            receipt,
+            warning: Some(match warning {
+                Some(warning) => format!("{warning}；{terminal_warning}"),
+                None => terminal_warning,
+            }),
+            chatgpt_launch_allowed: false,
+        }
+    }
+}
+
+fn run_incremental_session_sync_after_route(target_is_account: bool) -> IncrementalSessionRun {
+    let clock = Instant::now();
+    let deadline = clock + MAX_INCREMENTAL_TOTAL_DURATION;
+    let started_at_ms = timestamp_millis().unwrap_or_default();
+    let operation_id = operation_id("sync-incremental")
+        .unwrap_or_else(|_| format!("sync-incremental-{started_at_ms}"));
+    let current_home = match managed_codex_home() {
+        Ok(path) => path,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+    let shared_home = match default_shared_sessions_root() {
+        Ok(path) => path,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+    let current_paths = match resolve_user_codex_paths(&current_home) {
+        Ok(paths) => paths,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+    let shared_paths = local_codex_paths(&shared_home);
+    let index_path = match default_session_sync_index_path() {
+        Ok(path) => path,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+    let target_provider = target_is_account.then_some("openai");
+    let plan = match plan_incremental_session_sync(
+        &index_path,
+        &current_paths,
+        &shared_paths,
+        target_provider,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+
+    match plan {
+        IncrementalSessionPlan::Unchanged => {
+            let receipt = IncrementalSessionSyncReceipt {
+                status: IncrementalSessionSyncStatus::Unchanged,
+                detected_threads: 0,
+                synced_threads: 0,
+                projected_bytes: 0,
+                duration_ms: clock.elapsed().as_millis(),
+                requires_full_sync: false,
+            };
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Succeeded,
+                OperationPhase::Complete,
+                &[],
+            )
+            .is_some();
+            IncrementalSessionRun::after_terminal(receipt, None, terminal_recorded)
+        }
+        IncrementalSessionPlan::NeedsFullSync => {
+            let receipt =
+                IncrementalSessionSyncReceipt::needs_full_sync(clock.elapsed().as_millis());
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            )
+        }
+        IncrementalSessionPlan::Deferred {
+            detected_threads,
+            projected_bytes,
+        } => {
+            let receipt = IncrementalSessionSyncReceipt {
+                status: IncrementalSessionSyncStatus::Deferred,
+                detected_threads,
+                synced_threads: 0,
+                projected_bytes,
+                duration_ms: clock.elapsed().as_millis(),
+                requires_full_sync: true,
+            };
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_deferred_warning()),
+                terminal_recorded,
+            )
+        }
+        IncrementalSessionPlan::Ready {
+            current_ids,
+            shared_ids,
+            normalize_current_ids,
+            projected_bytes,
+        } => run_incremental_session_plan(
+            operation_id,
+            started_at_ms,
+            clock,
+            &current_home,
+            &shared_home,
+            &current_paths,
+            &shared_paths,
+            &index_path,
+            current_ids,
+            shared_ids,
+            normalize_current_ids,
+            projected_bytes,
+            deadline,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_incremental_session_plan(
+    operation_id: String,
+    started_at_ms: u128,
+    clock: Instant,
+    current_home: &Path,
+    shared_home: &Path,
+    current_paths: &CodexPaths,
+    shared_paths: &CodexPaths,
+    index_path: &Path,
+    current_ids: HashSet<String>,
+    shared_ids: HashSet<String>,
+    normalize_current_ids: HashSet<String>,
+    projected_bytes: u64,
+    deadline: Instant,
+) -> IncrementalSessionRun {
+    let detected_threads = current_ids
+        .union(&normalize_current_ids)
+        .count()
+        .saturating_add(shared_ids.len());
+    let backup_root = match default_backup_root() {
+        Ok(root) => root,
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt::failed(
+                detected_threads,
+                projected_bytes,
+                clock.elapsed().as_millis(),
+            );
+            let terminal_recorded = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Failed,
+                OperationPhase::Preflight,
+                &[],
+            )
+            .is_some();
+            return IncrementalSessionRun::after_terminal(
+                receipt,
+                Some(incremental_full_sync_warning()),
+                terminal_recorded,
+            );
+        }
+    };
+    let mut backups = Vec::new();
+    let mut combined_result = None;
+    let mut mutation_started = false;
+    let mut budget_deferred = false;
+    let result = (|| {
+        ensure_incremental_budget(deadline).inspect_err(|_| {
+            budget_deferred = true;
+        })?;
+        ensure_codex_closed("incrementally syncing sessions")?;
+        preflight_backup_capacity_for_sources(
+            &backup_root,
+            &[
+                BackupCapacitySource {
+                    home: current_home,
+                    paths: current_paths,
+                    scope: BackupScope::StateOnly,
+                },
+                BackupCapacitySource {
+                    home: shared_home,
+                    paths: shared_paths,
+                    scope: BackupScope::StateOnly,
+                },
+            ],
+        )
+        .map(|_| ())?;
+        ensure_incremental_budget(deadline).inspect_err(|_| {
+            budget_deferred = true;
+        })?;
+        ensure_codex_paths_unchanged(
+            "incrementally syncing sessions",
+            current_home,
+            current_paths,
+        )?;
+        let current_backup = create_hot_sync_backup_with_paths(
+            current_home,
+            &backup_root,
+            "incremental-current",
+            current_paths.clone(),
+            &operation_id,
+            CheckpointRole::Current,
+        )?;
+        backups.push(current_backup);
+        ensure_incremental_budget(deadline).inspect_err(|_| {
+            budget_deferred = true;
+        })?;
+        let shared_backup = create_hot_sync_backup_with_paths(
+            shared_home,
+            &backup_root,
+            "incremental-shared",
+            shared_paths.clone(),
+            &operation_id,
+            CheckpointRole::Shared,
+        )?;
+        backups.push(shared_backup);
+        ensure_incremental_budget(deadline).inspect_err(|_| {
+            budget_deferred = true;
+        })?;
+        ensure_codex_closed("incrementally syncing sessions")?;
+        ensure_codex_paths_unchanged(
+            "incrementally syncing sessions",
+            current_home,
+            current_paths,
+        )?;
+
+        mutation_started = true;
+        let to_shared = sync_selected_user_home_to_shared_with_paths(
+            current_paths,
+            shared_paths,
+            &current_ids,
+        )?;
+        let from_shared = sync_selected_shared_to_user_home_hot_with_paths(
+            shared_paths,
+            current_paths,
+            &shared_ids,
+            "openai",
+        )?;
+        let mut combined = combine_session_sync_results(to_shared, from_shared)?;
+        if !normalize_current_ids.is_empty() {
+            let normalized = normalize_selected_user_home_provider_with_paths(
+                current_paths,
+                &normalize_current_ids,
+                "openai",
+            )?;
+            combined = combine_session_sync_results(combined, normalized)?;
+        }
+        if !save_session_sync_index_bounded(index_path, current_paths, shared_paths, deadline)? {
+            budget_deferred = true;
+            return Err("incremental session sync exceeded its time budget".to_string());
+        }
+        combined_result = Some(combined);
+        Ok::<_, String>(())
+    })();
+
+    match result {
+        Ok(()) => {
+            let mut result = combined_result.expect("successful incremental sync has a result");
+            let receipt = IncrementalSessionSyncReceipt {
+                status: IncrementalSessionSyncStatus::Applied,
+                detected_threads,
+                synced_threads: detected_threads,
+                projected_bytes,
+                duration_ms: clock.elapsed().as_millis(),
+                requires_full_sync: false,
+            };
+            let terminal_record = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Succeeded,
+                OperationPhase::Complete,
+                &backups,
+            );
+            let cleanup = release_transient_checkpoints(
+                Some(&backup_root),
+                terminal_record.as_ref(),
+                &backups,
+            );
+            if terminal_record.is_some() && !result.obsolete_provider_slots.is_empty() {
+                let gc = cleanup_obsolete_provider_slots(
+                    &result.obsolete_provider_slots,
+                    current_paths,
+                    shared_paths,
+                );
+                result.persistent_session_bytes_reclaimed = result
+                    .persistent_session_bytes_reclaimed
+                    .saturating_add(gc.reclaimed_bytes);
+            }
+            let warning = (!cleanup.warnings.is_empty())
+                .then(|| "增量会话同步已完成，但安全检查点清理未完全完成".to_string());
+            IncrementalSessionRun::after_terminal(receipt, warning, terminal_record.is_some())
+        }
+        Err(_) => {
+            let rolled_back = !mutation_started
+                || (backups.len() == 2
+                    && restore_backup_snapshot(&backups[1].backup_dir, shared_home).is_ok()
+                    && restore_backup_snapshot(&backups[0].backup_dir, current_home).is_ok());
+            let status = if !mutation_started {
+                OperationStatus::Failed
+            } else if rolled_back {
+                OperationStatus::RolledBack
+            } else {
+                OperationStatus::RollbackFailed
+            };
+            let receipt = if budget_deferred {
+                IncrementalSessionSyncReceipt {
+                    status: IncrementalSessionSyncStatus::Deferred,
+                    detected_threads,
+                    synced_threads: 0,
+                    projected_bytes,
+                    duration_ms: clock.elapsed().as_millis(),
+                    requires_full_sync: true,
+                }
+            } else {
+                IncrementalSessionSyncReceipt::failed(
+                    detected_threads,
+                    projected_bytes,
+                    clock.elapsed().as_millis(),
+                )
+            };
+            let terminal_record = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                status,
+                if mutation_started {
+                    OperationPhase::Rollback
+                } else {
+                    OperationPhase::Backup
+                },
+                &backups,
+            );
+            if rolled_back {
+                let _ = release_transient_checkpoints(
+                    Some(&backup_root),
+                    terminal_record.as_ref(),
+                    &backups,
+                );
+            }
+            let terminal_recorded = terminal_record.is_some();
+            let chatgpt_launch_allowed =
+                incremental_chatgpt_launch_allowed(status) && terminal_recorded;
+            IncrementalSessionRun {
+                receipt,
+                warning: Some(if !incremental_chatgpt_launch_allowed(status) {
+                    incremental_rollback_failed_warning()
+                } else if !terminal_recorded {
+                    incremental_terminal_warning()
+                } else if budget_deferred {
+                    incremental_deferred_warning()
+                } else {
+                    incremental_full_sync_warning()
+                }),
+                chatgpt_launch_allowed,
+            }
+        }
+    }
+}
+
+fn incremental_chatgpt_launch_allowed(status: OperationStatus) -> bool {
+    status != OperationStatus::RollbackFailed
+}
+
+fn ensure_incremental_budget(deadline: Instant) -> Result<(), String> {
+    (Instant::now() < deadline)
+        .then_some(())
+        .ok_or_else(|| "incremental session sync exceeded its time budget".to_string())
+}
+
+fn record_incremental_outcome(
+    operation_id: &str,
+    started_at_ms: u128,
+    receipt: &IncrementalSessionSyncReceipt,
+    status: OperationStatus,
+    phase: OperationPhase,
+    backups: &[BackupManifest],
+) -> Option<OperationRecord> {
+    let projected_bytes = usize::try_from(receipt.projected_bytes).unwrap_or(usize::MAX);
+    append_operation_record_with_phase(
+        operation_id,
+        OperationAction::IncrementalSync,
+        status,
+        phase,
+        started_at_ms,
+        backups,
+        BTreeMap::from([
+            ("detectedThreads".to_string(), receipt.detected_threads),
+            ("syncedThreads".to_string(), receipt.synced_threads),
+            (
+                "requiresFullSync".to_string(),
+                usize::from(receipt.requires_full_sync),
+            ),
+            ("projectedBytes".to_string(), projected_bytes),
+        ]),
+    )
+    .ok()
+}
+
+fn incremental_full_sync_warning() -> String {
+    "增量会话同步未完成；请求端切换已成功，请手动执行“完全同步”".to_string()
+}
+
+fn incremental_deferred_warning() -> String {
+    "增量会话变化超出快速切换预算；请求端切换已成功，请手动执行“完全同步”".to_string()
+}
+
+fn incremental_rollback_failed_warning() -> String {
+    "增量会话同步回滚失败；请求端切换已成功，ChatGPT 已保持关闭，请先使用保留的安全检查点恢复"
+        .to_string()
+}
+
+fn incremental_terminal_warning() -> String {
+    "增量会话终态无法持久化；请求端切换已成功，ChatGPT 已保持关闭，请检查操作记录与保留的安全检查点"
+        .to_string()
+}
+
+#[tauri::command]
+pub async fn sync_all_sessions(
+    on_progress: Channel<SessionSyncProgress>,
+) -> Result<SessionSyncReceipt, String> {
+    let worker_progress = on_progress.clone();
+    match tauri::async_runtime::spawn_blocking(move || sync_all_sessions_blocking(worker_progress))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            emit_session_sync_progress(
+                &on_progress,
+                SessionSyncPhase::Failed,
+                Some("session sync worker failed".to_string()),
+            );
+            Err("session sync worker failed".to_string())
+        }
+    }
+}
+
+fn sync_all_sessions_blocking(
+    on_progress: Channel<SessionSyncProgress>,
+) -> Result<SessionSyncReceipt, String> {
     let _mutation_guard = acquire_mutation_lock()?;
     let started = timestamp_millis()?;
     let operation_id = operation_id("sync-sessions")?;
@@ -880,6 +1329,9 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
     let mut failure_status = None;
     let mut failure_phase = OperationPhase::Preflight;
     let mut checkpoint_root = None;
+    let mut launch_target_captured = false;
+    let mut process_gate_entered = false;
+    emit_session_sync_progress(&on_progress, SessionSyncPhase::Preparing, None);
     let mut result = (|| {
         let backup_root = default_backup_root()?;
         checkpoint_root = Some(backup_root.clone());
@@ -887,8 +1339,22 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
         let current_home = managed_codex_home()?;
         let current_paths = resolve_user_codex_paths(&current_home)?;
         let shared_paths = local_codex_paths(&shared_home);
-        let sync_plan = preflight_hot_session_sync_with_paths(&current_paths, &shared_paths)?;
-        let backup_scope = sync_plan.backup_scope();
+        let processes =
+            list_managed_processes_for_closed_mutation("completely syncing active sessions")?;
+        capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
+            let _ = cache_chatgpt_launch_target();
+        });
+        if !processes.is_empty() {
+            emit_session_sync_progress(
+                &on_progress,
+                SessionSyncPhase::ClosingApp,
+                Some(format!("Closing {} ChatGPT process(es)", processes.len())),
+            );
+            close_codex()?;
+        }
+        ensure_codex_closed("completely syncing active sessions")?;
+        process_gate_entered = true;
+        emit_session_sync_progress(&on_progress, SessionSyncPhase::BackingUp, None);
         let current_backup = after_capacity_preflight(
             || {
                 preflight_backup_capacity_for_sources(
@@ -897,12 +1363,12 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
                         BackupCapacitySource {
                             home: &current_home,
                             paths: &current_paths,
-                            scope: backup_scope,
+                            scope: BackupScope::StateOnly,
                         },
                         BackupCapacitySource {
                             home: &shared_home,
                             paths: &shared_paths,
-                            scope: backup_scope,
+                            scope: BackupScope::StateOnly,
                         },
                     ],
                 )
@@ -932,9 +1398,10 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
         )?;
         backups.push(shared_backup.clone());
         ensure_codex_paths_unchanged("session sync", &current_home, &current_paths)?;
+        ensure_codex_closed("completely syncing active sessions")?;
         failure_phase = OperationPhase::Apply;
-        match sync_home_with_shared_preflighted_with_paths(&current_paths, &shared_paths, sync_plan)
-        {
+        emit_session_sync_progress(&on_progress, SessionSyncPhase::Reconciling, None);
+        match sync_home_with_shared_complete_with_paths(&current_paths, &shared_paths) {
             Ok(sync_result) => Ok(SessionSyncReceipt {
                 operation_id: operation_id.clone(),
                 backups: backups.iter().map(BackupReceiptSummary::from).collect(),
@@ -942,25 +1409,23 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
                 rolled_back: false,
                 warnings: Vec::new(),
                 checkpoint_cleanup: CheckpointCleanupSummary::default(),
+                chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
             }),
             Err(error) => {
                 failure_phase = OperationPhase::Rollback;
-                let compensation = compensate_failed_hot_sync(
-                    &current_home,
-                    &current_backup,
-                    &shared_home,
-                    &shared_backup,
-                );
-                if compensation.shared_rolled_back {
-                    failure_status = Some(OperationStatus::Failed);
+                let shared_rolled_back =
+                    restore_backup_snapshot(&shared_backup.backup_dir, &shared_home).is_ok();
+                let current_rolled_back =
+                    restore_backup_snapshot(&current_backup.backup_dir, &current_home).is_ok();
+                if shared_rolled_back && current_rolled_back {
+                    failure_status = Some(OperationStatus::RolledBack);
                     Err(format!(
-                        "session sync failed: {error}; restored shared database state and preserved the current safety checkpoint: {}; monotonic session JSONL/index additions may remain for retry",
-                        compensation.current_backup_dir.display()
+                        "session sync failed: {error}; restored both database states; immutable session JSONL additions may remain for retry"
                     ))
                 } else {
                     failure_status = Some(OperationStatus::RollbackFailed);
                     Err(format!(
-                        "session sync failed: {error}; shared rollback failed and the live current home was left untouched; use the verified backups"
+                        "session sync failed: {error}; database rollback failed; keep ChatGPT closed and use the verified checkpoints"
                     ))
                 }
             }
@@ -968,6 +1433,31 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
     })();
     match &mut result {
         Ok(receipt) => {
+            if let (Ok(current_home), Ok(shared_home), Ok(index_path)) = (
+                managed_codex_home(),
+                default_shared_sessions_root(),
+                default_session_sync_index_path(),
+            ) {
+                if let Ok(current_paths) = resolve_user_codex_paths(&current_home) {
+                    let shared_paths = local_codex_paths(&shared_home);
+                    if save_session_sync_index(&index_path, &current_paths, &shared_paths).is_err()
+                    {
+                        receipt.warnings.push(
+                            "完全同步已完成，但增量索引写入失败；下次切换会要求再次完全同步"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    receipt
+                        .warnings
+                        .push("完全同步已完成，但增量索引路径无法复核".to_string());
+                }
+            } else {
+                receipt
+                    .warnings
+                    .push("完全同步已完成，但增量索引路径无法复核".to_string());
+            }
+            emit_session_sync_progress(&on_progress, SessionSyncPhase::RecordingResult, None);
             let terminal_record = record_success_result(
                 &operation_id,
                 OperationAction::SyncSessions,
@@ -1011,12 +1501,21 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
                         .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
                 }
             }
+            emit_session_sync_progress(&on_progress, SessionSyncPhase::LaunchingApp, None);
+            receipt.chatgpt_launch =
+                launch_chatgpt_after_durable_terminal(terminal_recorded, || {
+                    ChatGptLaunchReceipt::from(launch_cached_chatgpt())
+                });
+            emit_session_sync_progress(&on_progress, SessionSyncPhase::Complete, None);
         }
         Err(error) => {
             let status = failure_status.unwrap_or_else(|| terminal_status(error));
             let terminal_record =
                 record_sync_failure(&operation_id, status, failure_phase, started, &backups).ok();
-            if failure_phase == OperationPhase::Backup && !backups.is_empty() {
+            if !backups.is_empty()
+                && (failure_phase == OperationPhase::Backup
+                    || status == OperationStatus::RolledBack)
+            {
                 let cleanup = release_transient_checkpoints(
                     checkpoint_root.as_deref(),
                     terminal_record.as_ref(),
@@ -1024,9 +1523,35 @@ fn sync_all_sessions_blocking() -> Result<SessionSyncReceipt, String> {
                 );
                 append_warnings_to_error(error, &cleanup.warnings);
             }
+            if process_gate_entered && status != OperationStatus::RollbackFailed {
+                emit_session_sync_progress(&on_progress, SessionSyncPhase::LaunchingApp, None);
+                let launch =
+                    launch_chatgpt_after_durable_terminal(terminal_record.is_some(), || {
+                        ChatGptLaunchReceipt::from(launch_cached_chatgpt())
+                    });
+                if launch.status == ChatGptLaunchStatus::Failed {
+                    append_warnings_to_error(
+                        error,
+                        &["ChatGPT could not be reopened after session sync rollback".to_string()],
+                    );
+                }
+            }
+            emit_session_sync_progress(&on_progress, SessionSyncPhase::Failed, Some(error.clone()));
         }
     }
     result
+}
+
+fn emit_session_sync_progress(
+    on_progress: &Channel<SessionSyncProgress>,
+    phase: SessionSyncPhase,
+    message: Option<String>,
+) {
+    let _ = on_progress.send(SessionSyncProgress {
+        phase,
+        timestamp_ms: timestamp_millis().unwrap_or_default(),
+        message,
+    });
 }
 
 #[tauri::command]
@@ -1683,6 +2208,7 @@ fn release_transient_checkpoints(
     }
 }
 
+#[cfg(test)]
 fn failed_runtime_switch_checkpoints_are_releasable(
     outcome: RuntimeSwitchOutcome,
     backups: &[BackupManifest],
@@ -1705,6 +2231,12 @@ fn default_shared_sessions_root() -> Result<PathBuf, String> {
     Ok(appdata_root()?.join("codex-switch").join("shared-sessions"))
 }
 
+fn default_session_sync_index_path() -> Result<PathBuf, String> {
+    Ok(appdata_root()?
+        .join("codex-switch")
+        .join("session-sync-state-v1.json"))
+}
+
 fn operation_log() -> Result<OperationLog, String> {
     Ok(OperationLog::from_appdata(&appdata_root()?))
 }
@@ -1716,6 +2248,20 @@ fn acquire_mutation_lock() -> Result<MutationGuard<'static>, String> {
 
 fn acquire_mutation_lock_at(lock_path: &Path) -> Result<MutationGuard<'static>, String> {
     MUTATION_COORDINATOR.acquire(lock_path)
+}
+
+fn prepare_app_exit_at(
+    coordinator: &MutationCoordinator,
+    lock_path: &Path,
+) -> Result<bool, String> {
+    match coordinator.acquire(lock_path) {
+        Ok(guard) => {
+            guard.hold_until_process_exit();
+            Ok(true)
+        }
+        Err(error) if error == mutation_busy_error() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
@@ -1827,18 +2373,6 @@ fn validate_backup_selection(backup_root: &Path, selected: &Path) -> Result<Path
         return Err("selected backup is outside the managed backup root".to_string());
     }
     Ok(selected)
-}
-
-fn compensate_failed_hot_sync(
-    _current_home: &Path,
-    current_backup: &BackupManifest,
-    shared_home: &Path,
-    shared_backup: &BackupManifest,
-) -> HotSyncCompensation {
-    HotSyncCompensation {
-        shared_rolled_back: restore_backup_snapshot(&shared_backup.backup_dir, shared_home).is_ok(),
-        current_backup_dir: current_backup.backup_dir.clone(),
-    }
 }
 
 fn sync_counts(result: &SessionSyncResult) -> BTreeMap<String, usize> {
@@ -2312,7 +2846,6 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use rusqlite::Connection;
     use tauri::ipc::{Channel, InvokeResponseBody};
     use tempfile::tempdir;
 
@@ -2320,7 +2853,7 @@ mod tests {
         backup::{
             create_backup, create_runtime_state_backup_with_paths,
             create_runtime_state_checkpoint_with_paths, create_state_backup,
-            create_state_checkpoint_with_paths, BackupScope, CheckpointRole,
+            create_state_checkpoint_with_paths, CheckpointRole,
         },
         codex_paths::resolve_user_codex_paths,
         operation_log::{OperationAction, OperationLog, OperationPhase, OperationStatus},
@@ -2331,20 +2864,21 @@ mod tests {
     use super::{
         acquire_mutation_lock_at, after_capacity_preflight, append_operation_record_to,
         capture_chatgpt_launch_target_once, checkpoint_cleanup_counts, checkpoint_cleanup_terminal,
-        cleanup_automatic_checkpoints, close_codex_processes, compensate_failed_hot_sync,
-        create_full_backup, default_codex_home_from_env, delete_backup, delete_backup_at,
-        emit_runtime_switch_terminal, ensure_codex_closed_from_processes,
-        ensure_codex_paths_unchanged, failed_runtime_switch_checkpoints_are_releasable,
-        finish_session_mutation_with_log, get_app_status, inspect_checkpoint_storage,
+        cleanup_automatic_checkpoints, close_codex_processes,
+        close_runtime_processes_with_progress, create_full_backup, default_codex_home_from_env,
+        delete_backup, delete_backup_at, emit_runtime_switch_terminal,
+        ensure_codex_closed_from_processes, ensure_codex_paths_unchanged,
+        failed_runtime_switch_checkpoints_are_releasable, finish_session_mutation_with_log,
+        get_app_status, incremental_chatgpt_launch_allowed, inspect_checkpoint_storage,
         launch_chatgpt, launch_chatgpt_after_durable_terminal, list_backups, list_backups_at,
-        preflight_before_process_gate, prepare_runtime_switch_before_close, record_result_to_log,
+        preflight_before_process_gate, prepare_app_exit_at, record_result_to_log,
         record_runtime_switch_result_to_log, record_sync_failure_to_log,
-        release_transient_checkpoints, run_runtime_switch_preflight,
-        successful_switch_requests_chatgpt_launch, switch_runtime, sync_all_sessions,
-        validate_backup_selection, BackupDeleteReceipt, BackupReceiptSummary, ChatGptLaunchReceipt,
-        ChatGptLaunchStatus, CheckpointCleanupReceipt, CreateFullBackupReceipt,
-        MutationCoordinator, OperationTerminal, RuntimeSwitchOutcome, RuntimeSwitchPhase,
-        RuntimeSwitchProgress, RuntimeSwitchResult, MAX_LISTED_FULL_BACKUPS,
+        release_transient_checkpoints, successful_switch_requests_chatgpt_launch, switch_runtime,
+        sync_all_sessions, validate_backup_selection, BackupDeleteReceipt, BackupReceiptSummary,
+        ChatGptLaunchReceipt, ChatGptLaunchStatus, CheckpointCleanupReceipt,
+        CreateFullBackupReceipt, IncrementalSessionRun, MutationCoordinator, OperationTerminal,
+        RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
+        SessionSyncProgress, MAX_LISTED_FULL_BACKUPS,
     };
 
     #[cfg(windows)]
@@ -2385,6 +2919,32 @@ mod tests {
         assert_eq!(counts["failedCount"], 1);
         assert_eq!(terminal.status, OperationStatus::Failed);
         assert_eq!(terminal.phase, OperationPhase::Apply);
+    }
+
+    #[test]
+    fn incremental_rollback_failure_keeps_chatgpt_closed() {
+        assert!(incremental_chatgpt_launch_allowed(OperationStatus::Failed));
+        assert!(incremental_chatgpt_launch_allowed(
+            OperationStatus::RolledBack
+        ));
+        assert!(!incremental_chatgpt_launch_allowed(
+            OperationStatus::RollbackFailed
+        ));
+    }
+
+    #[test]
+    fn missing_incremental_terminal_keeps_chatgpt_closed() {
+        let run = IncrementalSessionRun::after_terminal(
+            crate::session_incremental::IncrementalSessionSyncReceipt::skipped(),
+            None,
+            false,
+        );
+
+        assert!(!run.chatgpt_launch_allowed);
+        assert!(run
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("终态无法持久化")));
     }
 
     #[test]
@@ -2493,7 +3053,8 @@ mod tests {
             drop(future);
         }
 
-        assert_future(sync_all_sessions());
+        let on_progress = Channel::<SessionSyncProgress>::new(|_| Ok(()));
+        assert_future(sync_all_sessions(on_progress));
         assert_future(inspect_checkpoint_storage());
         assert_future(cleanup_automatic_checkpoints());
     }
@@ -2808,34 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_preflight_verifies_before_process_detection_and_never_closes_on_failure() {
-        let list_calls = Cell::new(0);
-        let close_calls = Cell::new(0);
-        let mut phases = Vec::new();
-
-        let error = run_runtime_switch_preflight(
-            true,
-            || Err("relay verification failed".to_string()),
-            || {
-                list_calls.set(list_calls.get() + 1);
-                Ok(Vec::new())
-            },
-            || {
-                close_calls.set(close_calls.get() + 1);
-                Ok(())
-            },
-            |phase, _| phases.push(phase),
-        )
-        .unwrap_err();
-
-        assert_eq!(error, "relay verification failed");
-        assert_eq!(phases, vec![RuntimeSwitchPhase::VerifyingRelay]);
-        assert_eq!(list_calls.get(), 0);
-        assert_eq!(close_calls.get(), 0);
-    }
-
-    #[test]
-    fn relay_and_account_preflight_emit_real_process_phases_in_order() {
+    fn process_close_preflight_emits_real_phases_in_order() {
         let root = CodexProcess {
             image_name: "ChatGPT.exe".to_string(),
             pid: 1234,
@@ -2847,9 +3381,7 @@ mod tests {
         let relay_captured = Cell::new(false);
         let relay_closed = Cell::new(false);
         let mut relay_phases = Vec::new();
-        run_runtime_switch_preflight(
-            true,
-            || Ok(()),
+        close_runtime_processes_with_progress(
             || {
                 let processes = relay_listings.pop_front().expect("unexpected listing")?;
                 if !processes.is_empty() {
@@ -2869,99 +3401,19 @@ mod tests {
         assert_eq!(
             relay_phases,
             vec![
-                RuntimeSwitchPhase::VerifyingRelay,
                 RuntimeSwitchPhase::DetectingApp,
                 RuntimeSwitchPhase::ClosingApp,
             ]
         );
 
         let mut account_phases = Vec::new();
-        run_runtime_switch_preflight(
-            false,
-            || panic!("account mode must not verify relay"),
+        close_runtime_processes_with_progress(
             || Ok(Vec::new()),
             || panic!("there is no managed process to close"),
             |phase, _| account_phases.push(phase),
         )
         .unwrap();
         assert_eq!(account_phases, vec![RuntimeSwitchPhase::DetectingApp]);
-    }
-
-    #[test]
-    fn runtime_plan_capacity_and_relay_checks_all_finish_before_chatgpt_closes() {
-        let calls = RefCell::new(Vec::new());
-        let root = CodexProcess {
-            image_name: "ChatGPT.exe".to_string(),
-            pid: 1234,
-            parent_pid: 42,
-            creation_time_100ns: Some(1),
-        };
-        let listings: RefCell<VecDeque<Result<Vec<CodexProcess>, String>>> =
-            RefCell::new(VecDeque::from([Ok(vec![root]), Ok(Vec::new())]));
-        let mut launch_target_captured = false;
-
-        let plan = prepare_runtime_switch_before_close(
-            true,
-            || {
-                calls.borrow_mut().push("config");
-                Ok((true, true))
-            },
-            |_| {
-                calls.borrow_mut().push("capacity");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("relay");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("list");
-                let processes = listings
-                    .borrow_mut()
-                    .pop_front()
-                    .expect("unexpected listing")?;
-                capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                    calls.borrow_mut().push("capture");
-                });
-                Ok(processes)
-            },
-            || {
-                calls.borrow_mut().push("close");
-                Ok(())
-            },
-            |phase, _| match phase {
-                RuntimeSwitchPhase::VerifyingRelay => {
-                    calls.borrow_mut().push("phase:verifyingRelay")
-                }
-                RuntimeSwitchPhase::DetectingApp => calls.borrow_mut().push("phase:detectingApp"),
-                RuntimeSwitchPhase::ClosingApp => calls.borrow_mut().push("phase:closingApp"),
-                RuntimeSwitchPhase::PlanningSessions => {
-                    calls.borrow_mut().push("phase:planningSessions")
-                }
-                _ => panic!("unexpected pre-close phase"),
-            },
-        )
-        .unwrap();
-
-        assert!(plan);
-        assert_eq!(
-            calls.into_inner(),
-            vec![
-                "config",
-                "capacity",
-                "phase:verifyingRelay",
-                "relay",
-                "phase:detectingApp",
-                "list",
-                "capture",
-                "phase:closingApp",
-                "close",
-                "list",
-                "phase:planningSessions",
-                "config",
-                "capacity",
-            ]
-        );
     }
 
     #[test]
@@ -3036,58 +3488,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_config_or_capacity_preflight_never_touches_chatgpt() {
-        let config_error = prepare_runtime_switch_before_close(
-            true,
-            || Err::<(bool, bool), _>("config preflight failed".to_string()),
-            |_| panic!("capacity must not run after config failure"),
-            || panic!("relay must not run after config failure"),
-            || panic!("processes must not be listed after config failure"),
-            || panic!("ChatGPT must not close after config failure"),
-            |_, _| panic!("progress must not advance after config failure"),
-        )
-        .unwrap_err();
-        assert_eq!(config_error, "config preflight failed");
-
-        let capacity_error = prepare_runtime_switch_before_close(
-            true,
-            || Ok((true, true)),
-            |_| Err("capacity preflight failed".to_string()),
-            || panic!("relay must not run after capacity failure"),
-            || panic!("processes must not be listed after capacity failure"),
-            || panic!("ChatGPT must not close after capacity failure"),
-            |_, _| panic!("process progress must not start after capacity failure"),
-        )
-        .unwrap_err();
-        assert_eq!(capacity_error, "capacity preflight failed");
-    }
-
-    #[test]
-    fn exact_account_no_op_skips_close_but_captures_the_launch_target() {
-        let plan = prepare_runtime_switch_before_close(
-            false,
-            || Ok((false, false)),
-            |_| panic!("exact no-op must not scan backup capacity"),
-            || panic!("account mode must not verify relay"),
-            || panic!("exact no-op must not enumerate ChatGPT"),
-            || panic!("exact no-op must not close ChatGPT"),
-            |_, _| panic!("exact no-op has no pre-close process phase"),
-        )
-        .unwrap();
-
-        assert!(!plan);
-        let capture_calls = Cell::new(0);
-        let mut launch_target_captured = false;
-        if !plan {
-            capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                capture_calls.set(capture_calls.get() + 1);
-            });
-        }
-        assert!(launch_target_captured);
-        assert_eq!(capture_calls.get(), 1);
-    }
-
-    #[test]
     fn mutation_lock_rejects_overlapping_commands_and_recovers_after_release() {
         let root = tempdir().unwrap();
         let lock_path = root.path().join("mutation.lock");
@@ -3098,6 +3498,35 @@ mod tests {
 
         drop(first);
         assert!(acquire_mutation_lock_at(&lock_path).is_ok());
+    }
+
+    #[test]
+    fn app_exit_waits_for_mutations_then_holds_the_lock_until_process_exit() {
+        let root = tempdir().unwrap();
+        let lock_path = root.path().join("mutation.lock");
+        let coordinator = MutationCoordinator::new();
+        let mutation = coordinator.acquire(&lock_path).unwrap();
+
+        assert!(!prepare_app_exit_at(&coordinator, &lock_path).unwrap());
+        drop(mutation);
+
+        assert!(prepare_app_exit_at(&coordinator, &lock_path).unwrap());
+        assert!(!coordinator.blocks_shutdown());
+        assert!(coordinator.acquire(&lock_path).is_err());
+    }
+
+    #[test]
+    fn stalled_app_exit_can_release_its_shutdown_reservation() {
+        let root = tempdir().unwrap();
+        let lock_path = root.path().join("mutation.lock");
+        let coordinator = MutationCoordinator::new();
+
+        assert!(prepare_app_exit_at(&coordinator, &lock_path).unwrap());
+        assert!(coordinator.acquire(&lock_path).is_err());
+
+        coordinator.release_shutdown_reservation();
+
+        assert!(coordinator.acquire(&lock_path).is_ok());
     }
 
     #[test]
@@ -3496,60 +3925,5 @@ mod tests {
         );
         assert!(validate_backup_selection(root.path(), &nested).is_err());
         assert!(validate_backup_selection(root.path(), outside.path()).is_err());
-    }
-
-    #[test]
-    fn failed_hot_sync_restores_shared_state_without_reverting_monotonic_files() {
-        let current = tempdir().unwrap();
-        let shared = tempdir().unwrap();
-        let backups = tempdir().unwrap();
-        let current_session = current.path().join("sessions/2026/07/13/current.jsonl");
-        let shared_session = shared.path().join("sessions/2026/07/13/shared.jsonl");
-        fs::create_dir_all(current_session.parent().unwrap()).unwrap();
-        fs::create_dir_all(shared_session.parent().unwrap()).unwrap();
-        fs::write(&current_session, "current-before\n").unwrap();
-        fs::write(&shared_session, "shared-before\n").unwrap();
-        for home in [current.path(), shared.path()] {
-            let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE marker (value TEXT NOT NULL);
-                     INSERT INTO marker (value) VALUES ('before');",
-                )
-                .unwrap();
-        }
-        let current_backup =
-            create_state_backup(current.path(), backups.path(), "sync-current").unwrap();
-        let shared_backup =
-            create_state_backup(shared.path(), backups.path(), "sync-shared").unwrap();
-        assert_eq!(current_backup.scope, BackupScope::StateOnly);
-        assert_eq!(shared_backup.scope, BackupScope::StateOnly);
-
-        let concurrent_session = current.path().join("sessions/2026/07/13/concurrent.jsonl");
-        fs::write(&concurrent_session, "created-while-sync-was-running\n").unwrap();
-        fs::write(&shared_session, "shared-mutated\n").unwrap();
-        Connection::open(shared.path().join("state_5.sqlite"))
-            .unwrap()
-            .execute("UPDATE marker SET value = 'mutated'", [])
-            .unwrap();
-
-        let compensation = compensate_failed_hot_sync(
-            current.path(),
-            &current_backup,
-            shared.path(),
-            &shared_backup,
-        );
-
-        assert!(compensation.shared_rolled_back);
-        assert!(concurrent_session.exists());
-        assert_eq!(
-            fs::read_to_string(&shared_session).unwrap(),
-            "shared-mutated\n"
-        );
-        let restored: String = Connection::open(shared.path().join("state_5.sqlite"))
-            .unwrap()
-            .query_row("SELECT value FROM marker", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(restored, "before");
     }
 }

@@ -305,6 +305,7 @@ export type OperationAction =
   | 'saveRelay'
   | 'verifyRelay'
   | 'switchRuntime'
+  | 'incrementalSync'
   | 'syncSessions'
   | 'deleteSessions'
   | 'restoreVisibility'
@@ -343,18 +344,32 @@ export type SessionSyncResult = {
   rolledBack?: boolean;
   warnings?: string[];
   checkpointCleanup?: CheckpointCleanupSummary;
+  chatgptLaunch: ChatGptLaunchResult;
+};
+
+export type IncrementalSessionSyncStatus =
+  | 'skipped'
+  | 'unchanged'
+  | 'applied'
+  | 'needsFullSync'
+  | 'deferred'
+  | 'failed';
+
+export type IncrementalSessionSyncReceipt = {
+  status: IncrementalSessionSyncStatus;
+  detectedThreads: number;
+  syncedThreads: number;
+  projectedBytes: number;
+  durationMs: number;
+  requiresFullSync: boolean;
 };
 
 export type RuntimeSwitchResult = {
   operationId: string;
   changed: boolean;
   runtime: RuntimeMetadata;
-  backups: BackupReceiptSummary[];
-  toShared: SessionSyncResult;
-  fromShared: SessionSyncResult;
-  rolledBack: boolean;
   warnings?: string[];
-  checkpointCleanup?: CheckpointCleanupSummary;
+  incrementalSessionSync: IncrementalSessionSyncReceipt;
   chatProcessStateRepaired: boolean;
   chatgptLaunch: ChatGptLaunchResult;
 };
@@ -363,6 +378,7 @@ export type ChatGptLaunchStatus =
   | 'launched'
   | 'alreadyRunning'
   | 'failed'
+  | 'blocked'
   | 'notRequested';
 
 export type ChatGptLaunchResult = {
@@ -371,19 +387,18 @@ export type ChatGptLaunchResult = {
 };
 
 export type RuntimeSwitchPhase =
-  | 'planningSessions'
+  | 'loadingRuntime'
+  | 'validatingOfficialAuth'
+  | 'verifyingRelay'
   | 'detectingApp'
   | 'closingApp'
-  | 'verifyingRelay'
-  | 'backingUpCurrent'
-  | 'backingUpShared'
+  | 'preparingRuntime'
   | 'repairingAppState'
-  | 'syncingToShared'
   | 'applyingRuntime'
-  | 'syncingToCurrent'
   | 'verifying'
+  | 'recordingResult'
+  | 'syncingIncrementalSessions'
   | 'rollingBack'
-  | 'cleaningCheckpoints'
   | 'launchingApp'
   | 'complete'
   | 'failed';
@@ -395,14 +410,22 @@ export type RuntimeSwitchProgress = {
   outcome?: 'failedBeforeWrite' | 'rolledBack' | 'rollbackFailed' | null;
 };
 
-export type SyncDryRun = {
-  sourceThreads: number;
-  targetThreads: number;
-  newThreads: number;
-  duplicateThreads: number;
+export type AppExitRequestResult = {
+  scheduled: boolean;
 };
 
-export type AllSessionsDryRun = {
-  toShared: SyncDryRun;
-  toCurrent: SyncDryRun;
+export type SessionSyncPhase =
+  | 'preparing'
+  | 'closingApp'
+  | 'backingUp'
+  | 'reconciling'
+  | 'recordingResult'
+  | 'launchingApp'
+  | 'complete'
+  | 'failed';
+
+export type SessionSyncProgress = {
+  phase: SessionSyncPhase;
+  timestampMs: number;
+  message?: string | null;
 };

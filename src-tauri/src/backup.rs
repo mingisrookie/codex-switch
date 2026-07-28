@@ -226,12 +226,6 @@ pub(crate) struct BackupCapacitySource<'a> {
     pub scope: BackupScope,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct AdditionalCapacityDemand<'a> {
-    pub destination: &'a Path,
-    pub bytes: u64,
-}
-
 pub fn preflight_backup_capacity(
     destination_root: &Path,
     current_home: &Path,
@@ -333,34 +327,6 @@ pub(crate) fn preflight_backup_capacity_for_sources(
     let available_bytes = available_backup_bytes(&destination_root)?;
 
     finish_capacity_preflight(required_bytes, available_bytes)
-}
-
-pub(crate) fn preflight_combined_capacity_for_sources(
-    destination_root: &Path,
-    sources: &[BackupCapacitySource<'_>],
-    additional: &[AdditionalCapacityDemand<'_>],
-) -> Result<Vec<BackupCapacityPreflight>, String> {
-    let destination_root = validate_absolute_root(destination_root, "backup destination root")
-        .map_err(|_| capacity_preflight_error())?;
-    if sources.is_empty() || validate_capacity_sources(&destination_root, sources).is_err() {
-        return Err(capacity_preflight_error());
-    }
-    let capacity = sources
-        .iter()
-        .map(|source| {
-            collect_backup_capacity_metadata(source.home, source.paths, source.scope)
-                .map_err(|_| capacity_preflight_error())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let checkpoint_peak =
-        estimate_backup_peak_without_reserve(&capacity).map_err(|_| capacity_preflight_error())?;
-    let mut demands = Vec::with_capacity(additional.len() + 1);
-    demands.push(AdditionalCapacityDemand {
-        destination: &destination_root,
-        bytes: checkpoint_peak,
-    });
-    demands.extend_from_slice(additional);
-    preflight_grouped_capacity(&demands)
 }
 
 fn validate_capacity_sources(
@@ -687,13 +653,6 @@ fn estimate_backup_peak_with_source_count(
     required_capacity_with_reserve(peak_without_reserve)
 }
 
-fn estimate_backup_peak_without_reserve(
-    sources: &[BackupSourceCapacityMetadata],
-) -> Result<u64, ()> {
-    let source_count = u64::try_from(sources.len()).map_err(|_| ())?;
-    estimate_backup_peak_without_reserve_with_source_count(sources, source_count)
-}
-
 fn estimate_backup_peak_without_reserve_with_source_count(
     sources: &[BackupSourceCapacityMetadata],
     source_count: u64,
@@ -737,53 +696,7 @@ fn required_capacity_with_reserve(peak_without_reserve: u64) -> Result<u64, ()> 
     peak_without_reserve.checked_add(reserve).ok_or(())
 }
 
-#[derive(Debug)]
-struct VolumeCapacityDemand {
-    query_path: PathBuf,
-    bytes: u64,
-}
-
-fn preflight_grouped_capacity(
-    demands: &[AdditionalCapacityDemand<'_>],
-) -> Result<Vec<BackupCapacityPreflight>, String> {
-    let mut grouped = std::collections::BTreeMap::<String, VolumeCapacityDemand>::new();
-    for demand in demands {
-        if demand.bytes == 0 {
-            continue;
-        }
-        let (volume_key, query_path) = capacity_volume(demand.destination)?;
-        add_volume_capacity_demand(&mut grouped, volume_key, query_path, demand.bytes)?;
-    }
-    if grouped.is_empty() {
-        return Err(capacity_preflight_error());
-    }
-    let mut preflights = Vec::with_capacity(grouped.len());
-    for demand in grouped.into_values() {
-        let required_bytes =
-            required_capacity_with_reserve(demand.bytes).map_err(|_| capacity_preflight_error())?;
-        let available_bytes = available_backup_bytes(&demand.query_path)?;
-        preflights.push(finish_capacity_preflight(required_bytes, available_bytes)?);
-    }
-    Ok(preflights)
-}
-
-fn add_volume_capacity_demand(
-    grouped: &mut std::collections::BTreeMap<String, VolumeCapacityDemand>,
-    volume_key: String,
-    query_path: PathBuf,
-    bytes: u64,
-) -> Result<(), String> {
-    let entry = grouped.entry(volume_key).or_insert(VolumeCapacityDemand {
-        query_path,
-        bytes: 0,
-    });
-    entry.bytes = entry
-        .bytes
-        .checked_add(bytes)
-        .ok_or_else(capacity_preflight_error)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn existing_capacity_ancestor(path: &Path) -> Result<PathBuf, String> {
     let mut candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -811,45 +724,6 @@ fn existing_capacity_ancestor(path: &Path) -> Result<PathBuf, String> {
             Err(_) => return Err(capacity_preflight_error()),
         }
     }
-}
-
-#[cfg(windows)]
-fn capacity_volume(path: &Path) -> Result<(String, PathBuf), String> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
-
-    let query_path = existing_capacity_ancestor(path)?;
-    let wide = query_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut buffer = vec![0_u16; 32_768];
-    let ok = unsafe {
-        GetVolumePathNameW(
-            wide.as_ptr(),
-            buffer.as_mut_ptr(),
-            u32::try_from(buffer.len()).map_err(|_| capacity_preflight_error())?,
-        )
-    };
-    if ok == 0 {
-        return Err(capacity_preflight_error());
-    }
-    let end = buffer
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(buffer.len());
-    let volume = std::ffi::OsString::from_wide(&buffer[..end]);
-    let key = volume.to_string_lossy().to_ascii_lowercase();
-    if key.is_empty() {
-        return Err(capacity_preflight_error());
-    }
-    Ok((key, query_path))
-}
-
-#[cfg(not(windows))]
-fn capacity_volume(_path: &Path) -> Result<(String, PathBuf), String> {
-    Err("backup capacity preflight is unsupported on this platform".to_string())
 }
 
 fn percentage_ceil(value: u64, percent: u64) -> Result<u64, ()> {
@@ -982,6 +856,7 @@ pub(crate) fn create_runtime_state_backup_with_paths(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn create_runtime_state_checkpoint_with_paths(
     home: &Path,
     destination_root: &Path,
@@ -1381,6 +1256,14 @@ fn is_transient_checkpoint(manifest: &BackupManifest) -> bool {
                 Some(CheckpointRole::Current)
             ) | (
                 "switch-runtime-shared",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Shared)
+            ) | (
+                "incremental-current",
+                BackupScope::StateOnly,
+                Some(CheckpointRole::Current)
+            ) | (
+                "incremental-shared",
                 BackupScope::StateOnly,
                 Some(CheckpointRole::Shared)
             ) | (
@@ -1833,15 +1716,21 @@ fn is_automatic_checkpoint_terminal(record: &OperationRecord) -> bool {
     matches!(
         (record.action, record.status, record.phase),
         (
-            OperationAction::SwitchRuntime | OperationAction::SyncSessions,
+            OperationAction::SwitchRuntime
+                | OperationAction::IncrementalSync
+                | OperationAction::SyncSessions,
             OperationStatus::Succeeded,
             OperationPhase::Complete
         ) | (
-            OperationAction::SwitchRuntime,
+            OperationAction::SwitchRuntime
+                | OperationAction::IncrementalSync
+                | OperationAction::SyncSessions,
             OperationStatus::RolledBack,
             OperationPhase::Rollback
         ) | (
-            OperationAction::SwitchRuntime | OperationAction::SyncSessions,
+            OperationAction::SwitchRuntime
+                | OperationAction::IncrementalSync
+                | OperationAction::SyncSessions,
             OperationStatus::Failed,
             OperationPhase::Backup
         ) | (
@@ -1855,15 +1744,23 @@ fn is_automatic_checkpoint_terminal(record: &OperationRecord) -> bool {
 fn automatic_checkpoint_count_matches(record: &OperationRecord, count: usize) -> bool {
     match (record.action, record.status, record.phase) {
         (
-            OperationAction::SwitchRuntime | OperationAction::SyncSessions,
+            OperationAction::SwitchRuntime
+            | OperationAction::IncrementalSync
+            | OperationAction::SyncSessions,
             OperationStatus::Succeeded,
             OperationPhase::Complete,
         )
-        | (OperationAction::SwitchRuntime, OperationStatus::RolledBack, OperationPhase::Rollback) => {
-            count == 2
-        }
+        | (
+            OperationAction::SwitchRuntime
+            | OperationAction::IncrementalSync
+            | OperationAction::SyncSessions,
+            OperationStatus::RolledBack,
+            OperationPhase::Rollback,
+        ) => count == 2,
         (
-            OperationAction::SwitchRuntime | OperationAction::SyncSessions,
+            OperationAction::SwitchRuntime
+            | OperationAction::IncrementalSync
+            | OperationAction::SyncSessions,
             OperationStatus::Failed,
             OperationPhase::Backup,
         ) => matches!(count, 1 | 2),
@@ -1904,7 +1801,9 @@ fn checkpoint_selection_matches(
     }
     match (record.action, record.status, record.phase) {
         (
-            OperationAction::SwitchRuntime | OperationAction::SyncSessions,
+            OperationAction::SwitchRuntime
+            | OperationAction::IncrementalSync
+            | OperationAction::SyncSessions,
             OperationStatus::Failed,
             OperationPhase::Backup,
         ) => prewrite_failure_checkpoints_match(record.action, checkpoints),
@@ -1950,6 +1849,16 @@ fn prewrite_failure_checkpoints_match(
                 ) | (
                     OperationAction::SwitchRuntime,
                     "switch-runtime-shared",
+                    BackupScope::StateOnly,
+                    Some(CheckpointRole::Shared),
+                ) | (
+                    OperationAction::IncrementalSync,
+                    "incremental-current",
+                    BackupScope::StateOnly,
+                    Some(CheckpointRole::Current),
+                ) | (
+                    OperationAction::IncrementalSync,
+                    "incremental-shared",
                     BackupScope::StateOnly,
                     Some(CheckpointRole::Shared),
                 ) | (
@@ -2011,6 +1920,12 @@ fn checkpoint_pair_matches(
             current.manifest.reason == "sync-current"
                 && current.manifest.scope == BackupScope::StateOnly
                 && shared.manifest.reason == "sync-shared"
+                && shared.manifest.scope == BackupScope::StateOnly
+        }
+        OperationAction::IncrementalSync => {
+            current.manifest.reason == "incremental-current"
+                && current.manifest.scope == BackupScope::StateOnly
+                && shared.manifest.reason == "incremental-shared"
                 && shared.manifest.scope == BackupScope::StateOnly
         }
         _ => false,
@@ -2190,6 +2105,7 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, String> {
     Ok(manifest)
 }
 
+#[cfg(test)]
 pub(crate) fn load_process_state_checkpoint(
     manifest: &BackupManifest,
     codex_home: &Path,
@@ -3111,7 +3027,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
-        path::{Path, PathBuf},
+        path::Path,
     };
 
     use rusqlite::Connection;
@@ -3120,10 +3036,10 @@ mod tests {
     use crate::operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus};
 
     use super::{
-        add_capacity_file, add_volume_capacity_demand, available_backup_bytes,
-        cleanup_automatic_checkpoints, cleanup_automatic_checkpoints_with_remove,
-        cleanup_transient_checkpoints, collect_backup_capacity_metadata, create_backup,
-        create_local_backup, create_runtime_backup, create_runtime_backup_with_paths,
+        add_capacity_file, available_backup_bytes, cleanup_automatic_checkpoints,
+        cleanup_automatic_checkpoints_with_remove, cleanup_transient_checkpoints,
+        collect_backup_capacity_metadata, create_backup, create_local_backup,
+        create_runtime_backup, create_runtime_backup_with_paths,
         create_runtime_state_backup_with_paths, create_runtime_state_checkpoint_with_paths,
         create_session_backup, create_session_backup_with_paths, create_state_backup,
         create_state_checkpoint_with_paths, delete_verified_full_backup,
@@ -3132,13 +3048,13 @@ mod tests {
         finish_backup_creation_with_cleanup, finish_capacity_preflight, inspect_checkpoint_storage,
         list_recent_backups, load_process_state_checkpoint, migrate_legacy_plaintext_auth,
         percentage_ceil, preflight_backup_capacity, preflight_backup_capacity_for_sources,
-        preflight_backup_capacity_with_paths, required_capacity_with_reserve, restore_backup,
-        restore_staged_backup, restore_verified_backup, sqlite_logical_bytes,
-        stage_backup_payloads, validate_directory_entry, verify_backup, BackupCapacitySource,
-        BackupManifest, BackupScope, BackupSourceCapacityMetadata, CheckpointRole,
-        VolumeCapacityDemand, BACKUP_FILE_OVERHEAD_BYTES, CHAT_PROCESS_STATE_RELATIVE_PATH,
-        MANIFEST_BASE_OVERHEAD_BYTES, MANIFEST_ENTRY_OVERHEAD_BYTES, MAX_DPAPI_PAYLOAD_BYTES,
-        MIN_CAPACITY_RESERVE_BYTES, SCOPED_BACKUP_MANIFEST_VERSION,
+        preflight_backup_capacity_with_paths, restore_backup, restore_staged_backup,
+        restore_verified_backup, sqlite_logical_bytes, stage_backup_payloads,
+        validate_directory_entry, verify_backup, BackupCapacitySource, BackupManifest, BackupScope,
+        BackupSourceCapacityMetadata, CheckpointRole, BACKUP_FILE_OVERHEAD_BYTES,
+        CHAT_PROCESS_STATE_RELATIVE_PATH, MANIFEST_BASE_OVERHEAD_BYTES,
+        MANIFEST_ENTRY_OVERHEAD_BYTES, MAX_DPAPI_PAYLOAD_BYTES, MIN_CAPACITY_RESERVE_BYTES,
+        SCOPED_BACKUP_MANIFEST_VERSION,
     };
 
     fn seed_home(home: &std::path::Path) -> std::path::PathBuf {
@@ -3381,53 +3297,6 @@ mod tests {
             ..BackupSourceCapacityMetadata::default()
         };
         assert!(add_capacity_file(&mut capacity, 1).is_err());
-    }
-
-    #[test]
-    fn grouped_capacity_combines_same_volume_before_reserve_and_separates_other_volumes() {
-        let mut grouped = BTreeMap::<String, VolumeCapacityDemand>::new();
-        add_volume_capacity_demand(
-            &mut grouped,
-            "c:\\".to_string(),
-            PathBuf::from(r"C:\"),
-            1_000,
-        )
-        .unwrap();
-        add_volume_capacity_demand(
-            &mut grouped,
-            "c:\\".to_string(),
-            PathBuf::from(r"C:\sessions"),
-            2_000,
-        )
-        .unwrap();
-        add_volume_capacity_demand(
-            &mut grouped,
-            "d:\\".to_string(),
-            PathBuf::from(r"D:\"),
-            4_000,
-        )
-        .unwrap();
-
-        assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped["c:\\"].bytes, 3_000);
-        assert_eq!(grouped["d:\\"].bytes, 4_000);
-        assert_eq!(
-            required_capacity_with_reserve(grouped["c:\\"].bytes).unwrap(),
-            3_000 + MIN_CAPACITY_RESERVE_BYTES
-        );
-        assert_eq!(
-            required_capacity_with_reserve(grouped["d:\\"].bytes).unwrap(),
-            4_000 + MIN_CAPACITY_RESERVE_BYTES
-        );
-
-        let overflow = add_volume_capacity_demand(
-            &mut grouped,
-            "c:\\".to_string(),
-            PathBuf::from(r"C:\"),
-            u64::MAX,
-        )
-        .unwrap_err();
-        assert_eq!(overflow, "backup capacity preflight failed");
     }
 
     #[test]
@@ -5221,6 +5090,49 @@ mod tests {
     }
 
     #[test]
+    fn completed_incremental_checkpoints_are_removed_as_an_exact_state_only_pair() {
+        let current = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        seed_home(current.path());
+        seed_home(shared.path());
+        let backup_root = tempdir().unwrap();
+        let operation_id = "incremental-transient";
+        let current_checkpoint = state_checkpoint(
+            current.path(),
+            backup_root.path(),
+            "incremental-current",
+            operation_id,
+            CheckpointRole::Current,
+        );
+        let shared_checkpoint = state_checkpoint(
+            shared.path(),
+            backup_root.path(),
+            "incremental-shared",
+            operation_id,
+            CheckpointRole::Shared,
+        );
+        let record = operation_for_checkpoints(
+            operation_id,
+            OperationAction::IncrementalSync,
+            OperationStatus::Succeeded,
+            OperationPhase::Complete,
+            &[&current_checkpoint, &shared_checkpoint],
+        );
+
+        let summary = cleanup_transient_checkpoints(
+            backup_root.path(),
+            &record,
+            &[current_checkpoint.clone(), shared_checkpoint.clone()],
+        );
+
+        assert_eq!(summary.attempted_count, 2);
+        assert_eq!(summary.reclaimed_count, 2);
+        assert_eq!(summary.failed_count, 0);
+        assert!(!current_checkpoint.backup_dir.exists());
+        assert!(!shared_checkpoint.backup_dir.exists());
+    }
+
+    #[test]
     fn explicit_cleanup_keeps_informational_warnings_out_of_the_failure_count() {
         let current = tempdir().unwrap();
         let shared = tempdir().unwrap();
@@ -5727,14 +5639,14 @@ mod tests {
             inspect_checkpoint_storage(backup_root.path(), &[outside_window]).unwrap();
         assert_eq!(outside_status.reclaimable_count, 0);
 
-        let partial_sync_rollback = OperationRecord {
+        let completed_sync_rollback = OperationRecord {
             status: OperationStatus::RolledBack,
             phase: OperationPhase::Rollback,
             ..record.clone()
         };
         let rollback_status =
-            inspect_checkpoint_storage(backup_root.path(), &[partial_sync_rollback]).unwrap();
-        assert_eq!(rollback_status.reclaimable_count, 0);
+            inspect_checkpoint_storage(backup_root.path(), &[completed_sync_rollback]).unwrap();
+        assert_eq!(rollback_status.reclaimable_count, 2);
 
         let valid_status = inspect_checkpoint_storage(backup_root.path(), &[record]).unwrap();
         assert_eq!(valid_status.reclaimable_count, 2);

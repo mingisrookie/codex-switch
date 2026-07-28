@@ -732,6 +732,38 @@ span.section-icon svg {
   overflow-wrap: anywhere;
 }
 
+.switch-exit-pending {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(227, 178, 79, 0.42);
+  background: rgba(111, 78, 18, 0.22);
+  color: #f3dfb0;
+}
+
+.switch-exit-pending svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.switch-exit-pending div {
+  display: grid;
+  gap: 2px;
+}
+
+.switch-exit-pending strong {
+  font-size: 12px;
+}
+
+.switch-exit-pending span {
+  color: #d7c79f;
+  font-size: 10px;
+}
+
 .switch-task-body {
   padding: 18px 22px 22px;
   overflow: auto;
@@ -758,6 +790,16 @@ span.section-icon svg {
   gap: 12px;
   padding: 7px 10px 7px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.switch-step-group {
+  grid-column: 1 / -1;
+  margin: 3px 0 -1px;
+  color: var(--muted);
+  font-family: Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
 }
 
 .switch-timeline li:last-child {

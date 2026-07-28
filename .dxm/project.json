@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "project_root": "G:\\codex-switch",
+  "goal": "Maintain a safe Windows desktop control surface for ChatGPT official-account and Relay request routing, explicit session management, encrypted recovery, Skills, and self-update.",
+  "primary_users": [
+    "Windows users who operate ChatGPT/Codex locally and need auditable request-route switching and recovery"
+  ],
+  "deliverables": [
+    "A Tauri desktop application with a typed React and Rust command boundary",
+    "Official-login-preserving Account and Relay request-route switching",
+    "Explicit session synchronization, encrypted backup and restore, Skill management, and verified self-update",
+    "Executable tests, release gates, and synchronized long-term project documentation"
+  ],
+  "non_goals": [
+    "Replacing the ChatGPT official login flow",
+    "Sharing user credentials or publishing a hosted relay service",
+    "Silently rewriting existing conversation files or terminating unrelated standalone Codex CLI processes"
+  ],
+  "runtime": {
+    "entry_points": [
+      "npm run tauri -- dev",
+      "npm run tauri -- build --no-bundle",
+      "src-tauri\\target\\release\\codex-switch.exe"
+    ],
+    "facts": [
+      "The desktop UI is React/TypeScript and the native backend is Rust/Tauri on Windows.",
+      "The live Codex root resolves from CODEX_HOME and otherwise defaults to the current user .codex directory.",
+      "Official auth.json is sensitive and request-route switching treats it as read-only authority.",
+      "Relay credentials are DPAPI encrypted at rest and projected only into the active managed config.toml provider.",
+      "Request-route switching reaches a durable config-only terminal before optional bounded indexed session closure; manual complete sync remains an explicit closed-state mutation."
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "id": "desktop-native-flow",
+      "description": "The Tauri production artifact renders the dashboard and native window actions complete without a development server.",
+      "evidence_kinds": [
+        "runtime",
+        "screenshot",
+        "test"
+      ]
+    },
+    {
+      "id": "auth-preserving-routing",
+      "description": "Account and Relay routing preserve official login state, apply only the managed request configuration, and fail closed before mutation on invalid prerequisites.",
+      "evidence_kinds": [
+        "runtime",
+        "test",
+        "source"
+      ]
+    },
+    {
+      "id": "storage-and-recovery-safety",
+      "description": "Session, backup, restore, and update mutations remain bounded, encrypted where required, compensating, and independently testable.",
+      "evidence_kinds": [
+        "test",
+        "source"
+      ]
+    },
+    {
+      "id": "quality-and-release-gates",
+      "description": "Frontend and Rust tests, type checks, lint, production builds, release contracts, encoding checks, and secret checks are explicit and reproducible.",
+      "evidence_kinds": [
+        "command",
+        "artifact"
+      ]
+    },
+    {
+      "id": "documentation-governance",
+      "description": "Architecture, file ownership, development workflow, Git boundaries, and observable behavior stay synchronized in the governed project documents.",
+      "evidence_kinds": [
+        "audit",
+        "source"
+      ]
+    }
+  ],
+  "validation_commands": [
+    "npm test -- --run",
+    "npm run typecheck",
+    "npm run build",
+    "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings",
+    "cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets",
+    "npm run tauri -- build --no-bundle",
+    "npm run check:release",
+    "git diff --check"
+  ],
+  "assumptions": [
+    "The maintained target is Windows and current-user DPAPI is available.",
+    "ChatGPT owns official login refreshes; this application does not mint or replace official credentials.",
+    "Git stage, commit, push, PR, tag, and release remain explicit user-authorized actions."
+  ]
+}

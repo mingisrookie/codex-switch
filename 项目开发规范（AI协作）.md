@@ -8,6 +8,8 @@
 
 <!-- DXM-DOC-RULES:START -->
 
+<!-- DXM-CONTRACT:1 -->
+
 ## DXM 文档维护规则
 
 - 本块由 DXM 管理；`--refresh-blocks` 只刷新本块，保留下方项目专属规范和人工补充。
@@ -120,32 +122,34 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 
 ### 1.4 本地高风险写操作合同
 
-涉及 live Codex Home、shared-sessions、运行态凭据或工具备份的 mutation，必须按以下顺序设计和审查：
+涉及 live Codex Home、shared-sessions、运行态凭据或工具备份的 mutation，默认按以下顺序设计和审查：
 
 ```text
-preflight -> plan/dry-run -> capacity -> backup -> apply -> verify -> persist terminal -> cleanup -> typed receipt
+preflight -> plan -> capacity -> backup -> apply -> verify -> persist terminal -> cleanup -> typed receipt
                                                    \-> rollback -> verify rollback -> persist terminal
 ```
 
-- 切换、删除、恢复可见、手工 full backup 和完整恢复必须在后端第一份快照前与最后写入前确认 ChatGPT 受管进程已关闭，并对独立 `codex.exe` CLI fail closed；只有独立会话同步允许热写入。
-- 所有会创建安全快照的 mutation 必须在第一份新快照前完成受管 root 冲突检查与容量预检；关闭态运行态切换必须先计算窄 checkpoint peak、普通/provider rollout、provenance marker、SQLite workspace 与 index 输出，并按真实卷聚合，每个卷分别加入 `max(2 GiB, 15%)` reserve。运行中先做容量初检；关闭 ChatGPT 后必须重新生成 exact plan 并再次检查容量，checkpoint 后、第一笔 session 写入前还要证明 plan 未变化。路径/卷解析、算术溢出或容量不足始终零 session 写入；若关闭前后写集变化，允许在已关闭但尚未创建 checkpoint/写文件时 fail closed。
+- 请求路由切换是上面快照合同的显式窄例外：`validate official auth -> verify relay -> close -> replan config -> repair known process state -> atomic config apply -> verify auth bytes + route -> persist route terminal`。路由 mutation 不得扫描/同步会话、创建 checkpoint、执行 provider slot GC 或写 `auth.json`；配置写后的失败只允许回滚原始 `config.toml`。只有路由 terminal 已持久成功后，才可进入独立有界增量阶段，且增量失败不得回滚请求端。
+- 请求端切换、自动增量、手动完全同步、删除、恢复可见、手工 full backup 和完整恢复必须在最后 live 写入前确认 ChatGPT 受管进程已关闭，并对独立 `codex.exe` CLI fail closed；不再允许 UI 触发运行中 current 热写入。
+- 所有会创建安全快照的 mutation 必须在第一份新快照前完成受管 root 冲突检查与容量预检。自动增量与手动完全同步固定规划双 `StateOnly`；hard delete、手工 Full 与 restore safety 使用各自完整 scope。路径/卷解析、算术溢出或容量不足始终零目标写入。
 - Windows 关闭态操作必须基于 ToolHelp PID/PPID 关系证明受管进程树，只把 `ChatGPT.exe` / `OpenAI.Codex.exe` 作为受管根，不得按模糊进程名误杀独立 `codex.exe` CLI。需要自动重启时，关闭前对所有受管根尝试捕获且统一验证唯一 AppUserModelID；捕获缺失/冲突不得猜测其他目标，也不得阻断运行态切换，而是在成功终态返回 typed launch warning。切换完成后只允许通过 Windows 原生应用激活接口启动并重新验证同一身份，不得执行 PATH 中同名程序或前端传入的路径/命令。
-- changed switch 必须固定创建 current `RuntimeState` + shared `StateOnly`，普通 sync 固定创建双 `StateOnly`；不得为这些高频操作复制 GiB 级 `sessions/` 作为临时点。hard delete、手工 Full 和 restore safety 才使用覆盖四库与完整会话文件集的 Full；恢复可见使用单根 `StateOnly`。
-- 热同步允许 ChatGPT 运行，是关闭态规则的显式例外。Apply 失败只补偿工具内部 shared SQLite，不得用旧状态覆盖可能仍在变化的 live current。会话 JSONL 生产路径必须零 in-place，不得出现半截文件尾；hot shared→current 的 existing + `PreserveExisting` 必须在任何 target candidate 文件处理前直接跳过，不得读取、写入或发布候选，也不得为该既有 thread 制造 orphan。只有实际进入 Create/Import 的路径才可能在失败后保留完整文件，且不得为追求“整洁”而逆向删除。status 仍为 Failed，不得宣称 bit-exact 回到操作前。
+- 请求路由 mutation 禁止创建任何 checkpoint。路由 terminal 后的自动增量与手动完全同步固定创建双 `StateOnly`，不得复制 GiB 级 `sessions/` 作为临时点；hard delete、手工 Full 和 restore safety 才使用覆盖四库与完整会话文件集的 Full，恢复可见使用单根 `StateOnly`。
+- 自动增量只允许在有效持久索引上做有界 metadata inventory：索引缺失/损坏/版本漂移、删除/归档、同 ID 双边变化、shared 改写 existing current、内容分叉、超时或容量/数量超限都必须延期到手动完全同步，禁止 fallback。当前门槛为 inventory 750 ms、最多 32 个变化线程、预计会话输出与双状态库检查点合计 32 MiB、整体目标预算 2 秒。Relay 目标不得重写 existing current provider/path；Account 目标只归一索引证明变化的活跃 ID。
+- 自动增量和手动完全同步的会话 JSONL 生产路径必须零 in-place，不得出现半截文件尾；Apply 失败使用双状态点恢复 current/shared SQLite，已经 atomic no-clobber 发布的完整 JSONL 允许保留供完全同步重试，不得为追求“整洁”而逆向删除。增量/完全同步终态无法持久化或回滚失败时必须保持 ChatGPT 关闭并保留检查点；增量返回 typed `blocked` 启动态且 UI 不得提供直接重启，不得宣称 bit-exact 回到操作前。
 - 需要整文件替换的配置、备份、可写 index 和 `operations.jsonl` 统一走 `file_ops` 同目录完整临时文件 + sync + 原子替换；`operations.jsonl` 在业务上 append-only，但每次必须锁内严格解析旧文件、拒绝损坏历史/重复 ID，再发布完整文件，失败保持旧日志 byte-exact。会话 JSONL 则一律不得覆盖。会话 source 在执行期必须校验完整尾行、session ID、长度和 SHA-256 前后稳定，只能做有界重试。关闭态 provider 归一必须先由 `SelectMostComplete` 选出活动历史，再验证 session ID 是严格 UUID 单组件、选中来源/目标父目录 canonical containment、目标文件名符合 Remote 形态。需要新 provider 或严格增长时只允许 `atomic_create` 一个 immutable successor，并相邻创建严格 v1 provenance marker；marker 记录 thread/provider、最初 origin、`createdBytes` 和 created-prefix 完整 SHA-256，合法 append 后仍可验证 ownership，created prefix 变化则降级为未知文件。候选最多扫描 32 个且必须先完成全扫描再选择第一个空位，禁止裸 append、原地替换、按每次正文无限新建、覆盖或删除未知/用户文件。SQLite provider/path 与活动 JSONL 首条 provider 必须在同一目标事务语义中一致。`PreserveExisting` 仍只允许用于 hot shared→current，在任何 target candidate I/O 前 duplicate+continue，零复制且不得改变既有 SQLite。
 - 所有会修改运行态、凭据、current/shared 或备份目标的 command 必须共用 mutation guard：进程内 try-lock + Windows 独占 `mutation.lock` 文件句柄；新增入口不得绕过同进程/跨进程串行化。
 - 一键更新安装也必须取得同一 mutation guard；helper readiness 成功后父进程进入 shutdown-pending，退出前不得释放跨进程锁或接受新 mutation。前端禁用只能改善体验，不能替代后端互斥。
 - 临时点只有在 terminal operation record 原子持久化后才允许释放。自动 checkpoint 必须是带非空 `operationId + role` 的 BackupManifest v4，并与唯一 terminal record 的 ID、角色、action/status/phase、目录、reason/scope、时间窗及完整 payload hash 全量匹配；恢复可见只允许绑定 v4 单根 `StateOnly`。未绑定 v2/v3 自动点、Apply/回滚/日志失败必须保留。cleanup 在 plan 与 execute 两阶段重新强校验；Summary、Receipt 和日志显式携带 `attemptedCount` / `failedCount`，warning 本身不得作为 partial/Failed 判据。
 - 显式旧检查点清理必须严格解析完整 `operations.jsonl`；普通历史展示可以容忍旧的最后一条截断，但 strict cleanup reader 和后续 terminal publication 均拒绝损坏日志。未绑定 v2/v3 自动点不能由后来的日志认领；经 managed-full 强校验的 v2 legacy Full、v3 Full、v4 Full 仍可显式管理。重复 ID/引用、路径逃逸、无效时间窗、Apply/回滚/日志失败、孤儿或无法分类目录都保留。
-- v0.2.0 风格的 current `Runtime` + shared `Sessions` 全会话自动 checkpoint 禁止重新引入。changed switch 只允许 `RuntimeState + StateOnly` 临时点；普通切换不得生成 updater EXE。允许的长期增长只包括已纳入容量预检且有 Remote 可见性用途的 provider rollout/marker、窄 operation metadata/log 和用户主动/破坏性操作要求的 Full。成功回执必须分别披露 persistent session bytes added/reclaimed/net 与 transient checkpoint reclaimed，不能把两类空间混成“备份已清理”。
+- v0.2.0 风格的 current `Runtime` + shared `Sessions` 全会话自动 checkpoint 禁止重新引入；请求路由 mutation 连 `RuntimeState + StateOnly` 也不得创建。路由 terminal 后的有界增量只能为变化 ID 创建 immutable rollout/marker 和可释放的双 `StateOnly`；不能退化为全池 snapshot。会话/备份长期增长只能来自成功增量、用户显式完全同步、管理、恢复、Full 或安全保留项。
 - 手工 Full、hard delete 和 restore safety 不参与自动清理。Full 列表必须由用户按需加载，最多返回 256 个通过 managed-full 强校验的恢复点；列表和显式删除必须共用同一验证器，覆盖 backup root 直接子目录、Full scope、manifest、精确文件集合/大小与完整 payload SHA-256。extra file、hash drift、路径或 manifest 异常的目录不得显示为 verified，也不得自动删除。删除还必须再次复检，回报 reclaimed bytes 并写独立 `deleteBackup` 审计；禁止按年龄、目录数量、mtime 或容量阈值猜测删除，也禁止普通列表扫描静默 prune。
-- 当前 writer 必须生成 BackupManifest v4：继承 `scope` 与 `trackedDatabases`，自动点成对记录 `operationId + role`；changed switch 使用 current `RuntimeState`（含 `trackedProcessState=true` 与 process-state payload）+ shared `StateOnly`，普通 sync 使用双 `StateOnly`。任何合法 process-state JSON 都按原字节保留，仅明确空/全 NUL 损坏在双 checkpoint 与进程门禁后修复；失败恢复原字节。Full/Sessions 覆盖 active/archived，runtime/state 不扩大；v2/v3/v4 Full 显式兼容，局部点不进入 UI 恢复列表。
+- 当前 writer 必须生成 BackupManifest v4：继承 `scope` 与 `trackedDatabases`，自动点按操作合同记录 `operationId + role`；`IncrementalSync` 与手动 `SyncSessions` 使用各自精确 reason 的双 `StateOnly`。请求路由 mutation 不调用 backup writer；任何合法 process-state JSON 都按原字节保留，仅明确空/全 NUL 损坏在关闭态门禁后修复。Full/Sessions 覆盖 active/archived，runtime/state 不扩大；v2/v3/v4 Full 显式兼容，局部点不进入 UI 恢复列表。
 - 纳入 scope 的 SQLite 必须使用 Online Backup API，不得直接复制 WAL/SHM。所有 payload 必须 DPAPI 加密并记录大小/SHA-256；容量估算必须显式接收一个或多个 `home + CodexPaths + BackupScope` source，累加实际 payload、逐文件 DPAPI 与动态 manifest 开销，使用最大的 SQLite workspace，并加入至少 2 GiB 或 15% 安全余量。overflow、路径冲突、容量查询失败必须 fail closed，`available == required` 必须允许继续；恢复后按 `trackedDatabases` 执行适用的 `quick_check`。
-- 运行态切换双向证明 JSONL 与 `session_index.jsonl` 都无需写入时必须冻结 `SessionFileWritePolicy::Deny`；需要合并时使用 `Allow`，但检查点仍保持 `RuntimeState + StateOnly`，不得扩大为 Runtime/Sessions。`Deny` 的 late drift 必须 fail closed，不能静默切回 `Allow`。
+- `SessionFileWritePolicy::Deny/Allow` 只属于路由 terminal 之后的独立增量或用户触发的完全同步，不得接入请求路由 apply 事务。同步证明 JSONL 与 `session_index.jsonl` 都无需写入时使用 `Deny`，需要合并时使用零 in-place 的 `Allow`；late drift 必须 fail closed。
 - 会话 plan 不能作为执行授权：source 必须按完整尾行/session ID/len/hash 重新冻结，Create/Import 抢先出现时重新比较或 fail closed。活动路径选择与 provider 发布必须解耦：先完成 completeness/divergence 选择，再对最终路径创建或复用 immutable provider slot；provider 匹配不能绕过 `SelectMostComplete`。provider-aware closed sync 必须从最终最完整 source 直接发布目标 provider 文件，禁止先落 raw import 再复制一份等价 provider 文件。hot shared→current existing `PreserveExisting` 不是文件 plan，必须在 target rollout path 查询和 `copy_rollout_file` 前直接跳过。所有计划的完整输出 bytes 必须进入同卷容量需求，关闭后 exact plan 与 checkpoint 后重验任一变化都必须 fail closed，不能超出已授权写集。
 - 备份创建失败必须尝试移除 partial 目录；如果清理同样失败，错误必须同时报告残留路径/原因并写入审计上下文，不得吞错或留下看似完整的无记录目录。
 - 完整备份列表固定按需最多返回 256 个强校验通过的 full snapshot，不是只检查 256 个新候选。损坏、extra/hash drift 候选必须跳过且不得标 verified；局部 scope 始终排除，前端不得再次裁成 5 项。删除必须重新执行同一 managed-full 强校验；恢复也必须在 mutation 时重新校验所选 manifest/payload，不能复用列表时结果。
-- 成功回执必须包含可关联的 operation ID、备份引用、计数、`chatProcessStateRepaired`、回滚终态、警告、persistent session bytes added/reclaimed/net、transient checkpoint reclaimed 和 typed ChatGPT launch result；cleanup 还必须分别显示计划数与失败数。高风险长流程必须通过后端 `Channel` 上报真实阶段和 typed 终态；运行态切换必须包含 `planningSessions`、`repairingAppState`、`cleaningCheckpoints`。provider predecessor 只允许在终态持久化后回收，删除顺序必须先删 JSONL、成功后再删 provenance marker，防止删除失败时永久丢失 ownership。ChatGPT launch 必须排在 exact verify、持久终态、临时点清理和 provider GC 尝试之后。
+- 成功回执必须包含可关联的 operation ID 和 typed ChatGPT launch result。请求端切换还必须披露 route changed、官方 auth preserved、`chatProcessStateRepaired` 与 typed incremental status；不得保留恒空 backup/toShared/fromShared/checkpoint 字段或渲染“0 会话已同步”。高风险长流程必须通过后端 `Channel` 上报真实阶段和 typed 终态；后端原始 phase/timestamp 不得丢失，UI 可聚合为不超过 7 个用户步骤。ChatGPT launch 必须排在 route exact/durable terminal 与本轮有界增量收口之后。
 
 ## 2. 新增功能接入规范
 
@@ -163,7 +167,9 @@ preflight -> plan/dry-run -> capacity -> backup -> apply -> verify -> persist te
 
 本项目当前运行态是固定的 `plus`（ChatGPT 账号内部兼容 ID）和 `relay` 两槽位。扩展为任意账号池属于产品范围变化，必须先更新 PRD，不能仅通过循环 UI 或复用 legacy profile command 偷渡。
 
-Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文，scheme/host/port 改变必须输入新 Key。Key 不得回填或回显。连通性验证不得跟随重定向、不得输出响应正文或 Key，成功响应也必须设置严格字节上限，并要求 `/models.data` 非空且包含配置的精确 model ID；同一次 Relay 验证失败只能进入一个页面错误面，不得由局部和全局路径重复显示。运行态 `exact` 判定必须比较所有影响请求路由的 provider 字段，包括 Relay Base URL。
+Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文，scheme/host/port 改变必须输入新 Key。Key 不得回填或回显。槽位中只存 DPAPI 密文；受管 Relay provider ID 必须由单一常量定义，当前只接受 `openai_custom`。激活 Relay 时允许且仅允许把解密值写入 live `config.toml` 的受管 `experimental_bearer_token`，切回 Account 必须按同一来源删除整个受管 provider 表；账号 overlay 未保存 `model` / `service_tier` 时必须删除 Relay-only 遗留值。任何 TOML 解析错误、日志、回执或 UI 都不得包含 Key。连通性验证不得跟随重定向、不得输出响应正文或 Key，成功响应也必须设置严格字节上限，并要求 `/models.data` 非空且包含配置的精确 model ID；同一次 Relay 验证失败只能进入一个页面错误面。运行态 `exact` 判定必须比较所有影响请求路由的 provider 字段，包括 Base URL 与 bearer。
+
+Relay 切换必须在进程检测/关闭之前完成有界 `/models` 验证；验证失败不得枚举/关闭 ChatGPT 或写配置。请求路由 mutation 禁止进入大会话 planning/capacity/checkpoint 链路；路由 terminal 后的增量只能进入有有效索引、有数量/字节/时间上限的窄链路。
 
 内置 Skill 接入必须使用编译期固定 ID、固定文件 allowlist、来源/版本/hash manifest 和后端推导目标；不得让前端传任意下载 URL、源路径、目标路径或文件名。Skill 状态必须区分 missing/current/update available/local drift/unmanaged/invalid，未知目录和本地修改不得静默覆盖。安装/更新属于关闭态 mutation，必须共用 mutation guard、同卷 stage、完整旧目录备份、原子激活、后置 hash 验证、崩溃 journal 恢复和 typed receipt。
 
@@ -172,24 +178,24 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 ### 2.4 前后端状态与回执
 
 - Dashboard 数据必须按领域建模为 `loading | ready | error`；某个 Tauri command 失败时保留该域错误，禁止替换成空数组、零计数或绿色安全状态。
-- 应用首屏只加载 runtime 必需域；会话扫描、managed inventory 和备份 payload 哈希等昂贵域必须按需加载。切换完成后只刷新 runtime 域，并把 session/backup 标记 stale，禁止为了“看起来同步”立即重复全量扫描。
+- 应用首屏只加载 runtime 必需域；会话扫描、managed inventory 和备份 payload 哈希等昂贵域必须按需加载。请求路由结果始终刷新 runtime 域；只有 typed incremental `applied` 才标记 session stale，apply `failed/deferred` 可标记 backup stale。禁止为了“看起来同步”触发全量扫描。
 - 备份域按需加载时应把可恢复 full backup 与检查点空间状态作为独立 `DomainState` 返回；先完成会执行 legacy 迁移的备份列表读取，再调用持 mutation guard 的检查点 inspect，禁止两个 guard 入口并发。空间状态必须区分总占用、严格证据可回收项、安全保留项、警告和最近清理结果。手工清理没有后端 typed 子阶段时，只能通过当前页面展示单一 indeterminate 运行态，并按 `attemptedCount` / `failedCount` 区分成功、成功但有保留说明和真实 partial；不使用确认弹窗、伪造分步进度、伪造百分比或模糊“已优化”文案。
 - 备份域刷新若已有 Promise 执行中，新的 mutation 后刷新请求必须标记 queued，并在旧请求 settle 后至少补跑一次最新扫描；不得永久复用 mutation 前快照或在成功回执旁继续显示旧可回收数值。
 - 写操作门禁必须依赖真实文件/SQLite/运行态域，而不是“页面加载完成”或“文件路径存在”。
-- 窗口关闭监听必须在应用挂载时预注册；注册未 ready 或失败时切换必须 fail closed。切换 invoke 前同步激活 guard，结束后解除；切换完成后的 runtime refresh pending 必须继续禁用两个切换入口，直到最新请求 settle。
+- 窗口关闭监听必须在应用挂载时预注册；注册未 ready 或失败时切换必须 fail closed。前端必须阻止所有原生 close event，再调用零参数 typed `request_app_exit`；后端取得同一 mutation guard 后才允许 `app.exit(0)`，但调度后进程仍存活不得永久泄漏 shutdown reservation：必须有有界 watchdog 释放，前端在 watchdog 之后重试。mutation 繁忙时返回 pending，前端必须显示已排队，不得丢失关闭请求或直接 destroy 窗口；不得为未使用的 `destroy()` 扩大 capability。切换完成后的 runtime refresh pending 必须继续禁用两个切换入口，直到最新请求 settle。
 - mutation 失败、后台刷新失败与 unknown/缺失终态不得在多个全局/局部 banner 重复显示。unknown 终态必须保守提示用户先不要重新打开 ChatGPT，不能在没有 typed 证据时承诺“数据未变化”。
 - 运行态的“已保存”“当前激活”“最近验证”是三个独立概念；只有 `confidence = exact` 可标记当前并跳过切换，`mode` 只能提示重新应用。
 - 跨层 mutation 返回 typed receipt；新增/修改字段时必须同步 Rust serde、`src/types.ts`、`src/api.ts`、UI 展示和契约测试。
-- `switch_runtime` 等包含网络、scoped 备份和大量 SQLite/文件 I/O 的命令必须放入 Tauri blocking worker；进度通过 `Channel<RuntimeSwitchProgress>` 从真实后端阶段产生，并明确区分写入前失败、已回滚和回滚失败。
-- 切换 task overlay 是唯一运行态焦点层：invoke 前打开，真实 phase/终态/launch warning 全部在同一实例展示；重复点击不得创建第二层，运行中不得因 Escape、遮罩或关闭按钮隐藏。终态可关闭时必须恢复触发点焦点，reduced-motion 下禁用非必要位移动效，screen-reader 名称和 live region 必须完整。
-- `sync_all_sessions`、检查点 inspect/cleanup 等包含容量扫描、目录遍历、SQLite/JSONL 或严格日志解析的命令也必须使用 async wrapper + blocking worker；inspect/cleanup 等会扫描或删除检查点目录的入口必须持 mutation guard。
+- `switch_runtime` 包含网络验证、进程等待、配置 I/O 和路由终态后的窄增量，必须放入 Tauri blocking worker；请求路由 apply 不得混入 scoped backup 或 SQLite/session I/O，增量必须作为 durable terminal 后的独立操作记录。进度通过 `Channel<RuntimeSwitchProgress>` 从真实后端阶段产生，并明确区分写入前失败、配置已回滚和回滚失败。
+- 切换 task overlay 是唯一运行态焦点层：invoke 前打开，真实 phase/终态/incremental/launch warning 全部在同一实例展示；后端细 phase 聚合成 Account 最多 6 步、Relay 最多 7 步，逐步展示由相邻时间戳计算的耗时并在终态标出最慢步骤，不展示伪造百分比。重复点击不得创建第二层，运行中不得因 Escape、遮罩或关闭按钮隐藏；若收到应用退出请求，同一层必须显示安全排队回执。
+- `sync_all_sessions` 必须表示用户显式的关闭态活跃会话完全同步，不得在前端先运行重复 dry-run；它和检查点 inspect/cleanup 等包含容量扫描、目录遍历、SQLite/JSONL 或严格日志解析的命令都必须使用 async wrapper + blocking worker，并用独立进度 Channel 显示关闭、备份、对账、记录、启动阶段。
 
 ### 2.5 前端交互与视觉合同
 
-- 生产 UI 禁止使用 `window.alert`、`window.confirm`、`window.prompt` 和原生 `<dialog>` 触发浏览器/系统模态弹窗。配置、覆盖、dry-run、删除确认、错误与恢复提示都必须在当前页面内完成；运行态切换只允许一个 portal/modal task overlay，并保留可访问名称、焦点捕获/恢复和 `role="status"` / `role="alert"` 等语义。
+- 生产 UI 禁止使用 `window.alert`、`window.confirm`、`window.prompt` 和原生 `<dialog>` 触发浏览器/系统模态弹窗。配置、覆盖、完全同步、删除确认、错误与恢复提示都必须在当前页面内完成；运行态切换只允许一个 portal/modal task overlay，并保留可访问名称、焦点捕获/恢复和 `role="status"` / `role="alert"` 等语义。
 - 图标统一使用 `lucide-react`；界面文案和装饰禁止 emoji，存在对应 Lucide 图标时禁止手写 SVG。图标按钮必须有可访问名称，不熟悉的纯图标操作必须提供 tooltip。
 - 视觉调整必须延续 ChatGPT Switch 的统一响应式系统，避免卡片嵌套、无意义装饰和信息遮挡；至少实际检查 1200×820、900×640、390×844，页面不得横向 overflow，overlay 内容可独立滚动且底部操作可达。
-- 长流程必须让用户看到当前真实阶段、已完成阶段、耗时和终态；按钮 busy、页面任务执行器和后端终态必须来自同一操作，不得出现命令已结束但 UI 仍永久 loading 的分叉状态。
+- 长流程必须让用户看到当前真实阶段、当前步骤耗时、已完成步骤各自耗时、最慢步骤和终态；耗时按事件顺序取下一条后端时间戳，同毫秒事件不得共享后一阶段耗时。按钮 busy、页面任务执行器和后端终态必须来自同一操作，不得出现命令已结束但 UI 仍永久 loading 的分叉状态。
 
 ### 2.6 平台边界与外部只读集成
 
@@ -230,15 +236,17 @@ npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path src-tauri/Cargo.toml
+npm run tauri -- build --no-bundle
 npm run tauri -- build
 npm run check:release
 .\scripts\pack-windows-release.ps1 -UpxPath "<verified-upx.exe>"
 ```
 
+- 桌面 UI/原生交互实测必须使用 Tauri CLI 产物；`npm run tauri -- build --no-bundle` 是不生成安装包的快速候选，仍执行前端构建并绑定生产 custom protocol。裸 `cargo build --release` 只属于 Rust 编译证据，可能继续访问 `devUrl`，不得把其页面错误误判为产品回归或当作 UI E2E 通过。
 - `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建、Rust fmt/clippy/test、raw Tauri release 编译/合同、固定官方 UPX ZIP/EXE 双 hash、copy-only packing、`upx -t`、packed 合同/3,000,000 bytes 上限，以及只留存 packed artifact；CI 文件存在不等于本轮已通过。
 - 备份、切换、双根同步/删除/恢复等高风险变化必须有临时目录或临时 `CODEX_HOME` 测试，至少覆盖幂等、故障注入和回滚终态。
-- 备份测试必须覆盖 v4 scope/binding/role、`trackedProcessState`、changed switch `RuntimeState + StateOnly`、sync 双 `StateOnly`、Full/Sessions active+archived、hard delete/manual Full/restore safety 四库、损坏候选回填和局部点排除。临时清理覆盖 bound v4 success/rollback/prewrite/restore-visible、role/operationId 置换保留、v2/v3 unbound 保留、强 hash 漂移与原子 operation-log 发布失败 byte-exact；Full 治理覆盖 v2/v3/v4 显式兼容和绝不自动删 Full。
-- 切换测试必须覆盖真实 phase（含 `repairingAppState`、`launchingApp`）、写入前失败/已回滚/回滚失败/unknown、process-state 合法 JSON 原样、空/全 NUL 修复、后续失败 exact rollback、进程重启阻断恢复、changed switch 始终 `RuntimeState + StateOnly`、`Deny/Allow`、关闭门禁、runtime refresh pending、单一错误面和按需域刷新；所有成功切换只在 durable terminal 后启动 ChatGPT，launch failed 不回滚且可重试。
+- 备份测试必须覆盖 v4 scope/binding/role、sync 双 `StateOnly`、Full/Sessions active+archived、hard delete/manual Full/restore safety 四库、损坏候选回填和局部点排除，并单独断言请求端切换不会创建任何 backup/checkpoint。临时清理覆盖 bound v4 success/rollback/prewrite/restore-visible、role/operationId 置换保留、v2/v3 unbound 保留、强 hash 漂移与原子 operation-log 发布失败 byte-exact；Full 治理覆盖 v2/v3/v4 显式兼容和绝不自动删 Full。
+- 请求端切换测试必须覆盖真实 phase（含 `validatingOfficialAuth`、`repairingAppState`、`launchingApp`）、缺失/非官方 auth 写前失败、Account↔Relay 前后 auth bytes/mtime 不变、Relay bearer 写入与 Account 清除、配置写后失败只回滚 config、进程重启阻断恢复、零 session scan/sync/checkpoint/GC、runtime refresh pending、单一错误面和按需域不失效；所有成功切换只在 durable terminal 后启动 ChatGPT，launch failed 不回滚且可重试。
 - 会话同步测试必须覆盖 source 尾行/session ID/len/hash 漂移与 bounded retry、抢先 Create、普通严格扩展与 Divergent 的完整 import、旧短文件 bytes/hash/mtime 不变；Remote provider 还必须覆盖 completeness-first、SQLite/JSONL provider 一致、官方文件名、严格 UUID/containment、legacy `-imported`、provider slot 幂等、immutable successor、marker created-prefix append/篡改边界、候选先复用后选空位、shared-long 只发布最终 provider 文件、真实 divergence、account↔relay 连续往返无增长，以及终态后 GC 的双库引用/late append/marker drift fail-closed。较短 shared/current divergent 不得替换活动 current。hot shared→current existing 必须继续零 target candidate I/O、`copied_session_files = 0` 和 SQLite 不变。
 - 备份前端测试必须覆盖旧扫描 pending 时 queued rerun 的最终状态、按需列表不再裁成 5 项、Full 删除二次确认/回执，以及恢复点删除后刷新显示更旧候选；不得只验证 invoke 次数。
 - Windows 进程控制测试必须覆盖 PID reuse、受管根/后代、独立 CLI 阻断、最后写前复检、温和关闭与强制兜底；ChatGPT launch 还必须覆盖 AUMID 缺失/冲突、已运行、原生激活失败、验证超时和成功后同身份根出现，禁止 PATH/任意 EXE fallback。updater 测试必须覆盖 30 秒/10 分钟超时合同、helper kill + wait、cleanup retry、DACL、目录句柄、journal 中断、hash 篡改和 Ready ACK。

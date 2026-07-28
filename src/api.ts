@@ -1,5 +1,6 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
+  AppExitRequestResult,
   AppStatus,
   BackupDeleteReceipt,
   BackupDashboardData,
@@ -19,8 +20,8 @@ import type {
   RuntimeMetadata,
   SessionMutationResult,
   SessionInventory,
+  SessionSyncProgress,
   SessionSyncResult,
-  AllSessionsDryRun,
   OperationRecord,
   RuntimeDashboardData,
   RuntimeKind,
@@ -37,6 +38,10 @@ import type {
 
 export function getAppStatus() {
   return invoke<AppStatus>('get_app_status');
+}
+
+export function requestAppExit() {
+  return invoke<AppExitRequestResult>('request_app_exit');
 }
 
 export function checkForUpdates() {
@@ -170,12 +175,9 @@ export function launchChatgpt() {
   return invoke<ChatGptLaunchResult>('launch_chatgpt');
 }
 
-export function syncAllSessions() {
-  return invoke<SessionSyncResult>('sync_all_sessions');
-}
-
-export function dryRunAllSessions() {
-  return invoke<AllSessionsDryRun>('dry_run_all_sessions');
+export function syncAllSessions(onProgress: (event: SessionSyncProgress) => void) {
+  const onProgressChannel = new Channel<SessionSyncProgress>(onProgress);
+  return invoke<SessionSyncResult>('sync_all_sessions', { onProgress: onProgressChannel });
 }
 
 export function verifyRelayRuntime() {

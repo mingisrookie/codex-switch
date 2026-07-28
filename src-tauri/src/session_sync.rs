@@ -34,12 +34,14 @@ pub struct SessionSyncResult {
     pub(crate) obsolete_provider_slots: Vec<ObsoleteProviderSlot>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionStorageDemand {
     pub destination: PathBuf,
     pub bytes: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RuntimeSessionStoragePlan {
     demands: HashMap<PathBuf, u64>,
@@ -54,6 +56,7 @@ pub(crate) struct ProviderSlotGcSummary {
     pub warnings: Vec<String>,
 }
 
+#[cfg(test)]
 impl RuntimeSessionStoragePlan {
     fn add(&mut self, destination: PathBuf, bytes: u64) -> Result<(), String> {
         self.session_file_writes_required = true;
@@ -80,10 +83,6 @@ impl RuntimeSessionStoragePlan {
             .collect::<Vec<_>>();
         demands.sort_by(|left, right| left.destination.cmp(&right.destination));
         demands
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        !self.session_file_writes_required
     }
 }
 
@@ -221,6 +220,7 @@ struct SessionSyncPolicy {
     existing_rollout_path: ExistingRolloutPathPolicy,
     session_files: SessionFileWritePolicy,
     session_index: SessionIndexWritePolicy,
+    copy_dependent_rows: bool,
 }
 
 impl SessionSyncPolicy {
@@ -235,6 +235,7 @@ impl SessionSyncPolicy {
             existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
             session_files,
             session_index: SessionIndexWritePolicy::closed(session_files),
+            copy_dependent_rows: true,
         }
     }
 
@@ -245,6 +246,33 @@ impl SessionSyncPolicy {
             existing_rollout_path: ExistingRolloutPathPolicy::PreserveExisting,
             session_files,
             session_index: SessionIndexWritePolicy::hot(session_files),
+            copy_dependent_rows: true,
+        }
+    }
+
+    fn incremental(update_existing_provider: bool, preserve_existing: bool) -> Self {
+        Self {
+            allow_existing_replacement: !preserve_existing,
+            update_existing_provider,
+            existing_rollout_path: if preserve_existing {
+                ExistingRolloutPathPolicy::PreserveExisting
+            } else {
+                ExistingRolloutPathPolicy::SelectMostComplete
+            },
+            session_files: SessionFileWritePolicy::Allow,
+            session_index: SessionIndexWritePolicy::Skip,
+            copy_dependent_rows: true,
+        }
+    }
+
+    fn incremental_self_provider() -> Self {
+        Self {
+            allow_existing_replacement: true,
+            update_existing_provider: true,
+            existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
+            session_files: SessionFileWritePolicy::Allow,
+            session_index: SessionIndexWritePolicy::Skip,
+            copy_dependent_rows: false,
         }
     }
 }
@@ -266,7 +294,7 @@ impl SessionIndexWritePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionFileRelation {
+pub(crate) enum SessionFileRelation {
     Equal,
     LeftExtendsRight,
     RightExtendsLeft,
@@ -474,20 +502,51 @@ pub(crate) fn sync_shared_to_user_home_hot_with_policy(
     )
 }
 
-pub(crate) fn runtime_switch_session_files_are_unchanged_with_paths(
+pub(crate) fn sync_selected_user_home_to_shared_with_paths(
     current: &CodexPaths,
     shared: &CodexPaths,
-    target_provider: Option<&str>,
-) -> Result<bool, String> {
-    if !shared.state_db.is_file() {
-        return Ok(false);
-    }
-    let current = root_from_paths(current.clone());
-    let shared = root_from_paths(shared.clone());
-    Ok(session_root_files_are_unchanged(&current, &shared, None)?
-        && session_root_files_are_unchanged(&shared, &current, target_provider)?)
+    ids: &HashSet<String>,
+) -> Result<SessionSyncResult, String> {
+    sync_selected_session_roots(
+        &root_from_paths(current.clone()),
+        root_from_paths(shared.clone()),
+        ids,
+        None,
+        SessionSyncPolicy::incremental(false, false),
+    )
 }
 
+pub(crate) fn sync_selected_shared_to_user_home_hot_with_paths(
+    shared: &CodexPaths,
+    current: &CodexPaths,
+    ids: &HashSet<String>,
+    provider_id: &str,
+) -> Result<SessionSyncResult, String> {
+    sync_selected_session_roots(
+        &root_from_paths(shared.clone()),
+        root_from_paths(current.clone()),
+        ids,
+        Some(provider_id),
+        SessionSyncPolicy::incremental(false, true),
+    )
+}
+
+pub(crate) fn normalize_selected_user_home_provider_with_paths(
+    current: &CodexPaths,
+    ids: &HashSet<String>,
+    provider_id: &str,
+) -> Result<SessionSyncResult, String> {
+    let root = root_from_paths(current.clone());
+    sync_selected_session_roots(
+        &root,
+        root.clone(),
+        ids,
+        Some(provider_id),
+        SessionSyncPolicy::incremental_self_provider(),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn plan_runtime_session_storage_with_paths(
     current: &CodexPaths,
     shared: &CodexPaths,
@@ -510,6 +569,7 @@ pub(crate) fn plan_runtime_session_storage_with_paths(
     Ok(plan)
 }
 
+#[cfg(test)]
 fn plan_root_storage_writes(
     source_root: &SyncRoot,
     target_root: &SyncRoot,
@@ -558,6 +618,7 @@ fn plan_root_storage_writes(
     Ok(())
 }
 
+#[cfg(test)]
 fn plan_provider_storage_writes(
     current_root: &SyncRoot,
     shared_root: &SyncRoot,
@@ -658,6 +719,7 @@ fn plan_provider_storage_writes(
     Ok(())
 }
 
+#[cfg(test)]
 fn add_session_index_plan(
     target_root: &SyncRoot,
     index: &SessionIndexMergePlan,
@@ -692,6 +754,7 @@ fn add_session_index_plan(
     plan.add(target_root.session_index.clone(), output_bytes)
 }
 
+#[cfg(test)]
 fn plan_state_database_workspace(
     current_root: &SyncRoot,
     shared_root: &SyncRoot,
@@ -708,6 +771,7 @@ fn plan_state_database_workspace(
     Ok(())
 }
 
+#[cfg(test)]
 fn sqlite_workspace_bytes(database: &Path) -> Result<u64, String> {
     let mut bytes = fs::metadata(database)
         .map_err(|error| format!("failed to inspect session database: {error}"))?
@@ -721,67 +785,6 @@ fn sqlite_workspace_bytes(database: &Path) -> Result<u64, String> {
         }
     }
     Ok(bytes)
-}
-
-fn session_root_files_are_unchanged(
-    source_root: &SyncRoot,
-    target_root: &SyncRoot,
-    target_provider: Option<&str>,
-) -> Result<bool, String> {
-    let source_conn = open_source_conn(source_root)?;
-    let source_scan = read_source_threads(source_root, source_conn.as_ref())?;
-    let target_conn = if target_root.state_db.is_file() {
-        Some(
-            Connection::open_with_flags(&target_root.state_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|error| format!("failed to open target state_5.sqlite: {error}"))?,
-        )
-    } else {
-        None
-    };
-    for thread in &source_scan.threads {
-        let action = plan_rollout_file(target_root, thread)?;
-        if action.writes_session_file() {
-            return Ok(false);
-        }
-        if let Some(provider_id) = target_provider {
-            validate_remote_thread_id(&thread.id)?;
-            let existing_rollout = target_conn
-                .as_ref()
-                .map(|conn| existing_thread_rollout_path(conn, target_root, &thread.id))
-                .transpose()?
-                .flatten();
-            let selected = select_target_rollout_path(
-                existing_rollout.as_deref(),
-                action.target_path().to_string_lossy().as_ref(),
-            )?;
-            if plan_provider_rollout(target_root, Path::new(&selected), &thread.id, provider_id)?
-                .action
-                .writes_session_file()
-            {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(
-        plan_session_index_merge(source_root, target_root, &source_scan.candidate_ids)?
-            .lines
-            .is_empty(),
-    )
-}
-
-pub(crate) fn preflight_session_database(path: &Path, label: &str) -> Result<(), String> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| format!("failed to open {label} state_5.sqlite"))?;
-    conn.busy_timeout(Duration::from_secs(2))
-        .map_err(|_| format!("failed to inspect {label} state_5.sqlite"))?;
-    let quick_check: String = conn
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|_| format!("failed to inspect {label} state_5.sqlite"))?;
-    if quick_check != "ok" {
-        return Err(format!("{label} state_5.sqlite failed quick_check"));
-    }
-    validate_target_threads_schema(&conn)
-        .map_err(|error| format!("{label} state_5.sqlite is incompatible: {error}"))
 }
 
 fn root_from_paths(paths: CodexPaths) -> SyncRoot {
@@ -805,8 +808,44 @@ fn sync_session_roots(
         policy.session_files,
         policy.session_index,
     )?;
+    sync_prepared_session_roots(
+        source_roots,
+        &prepared_sources,
+        target_root,
+        provider_id,
+        policy,
+    )
+}
+
+fn sync_selected_session_roots(
+    source_root: &SyncRoot,
+    target_root: SyncRoot,
+    ids: &HashSet<String>,
+    provider_id: Option<&str>,
+    policy: SessionSyncPolicy,
+) -> Result<SessionSyncResult, String> {
+    if ids.is_empty() {
+        return Ok(empty_session_sync_result());
+    }
+    let prepared_sources = prepare_selected_sources(std::slice::from_ref(source_root), ids)?;
+    sync_prepared_session_roots(
+        std::slice::from_ref(source_root),
+        &prepared_sources,
+        target_root,
+        provider_id,
+        policy,
+    )
+}
+
+fn sync_prepared_session_roots(
+    source_roots: &[SyncRoot],
+    prepared_sources: &[PreparedSource],
+    target_root: SyncRoot,
+    provider_id: Option<&str>,
+    policy: SessionSyncPolicy,
+) -> Result<SessionSyncResult, String> {
     if policy.update_existing_provider {
-        for prepared in &prepared_sources {
+        for prepared in prepared_sources {
             for planned in &prepared.threads {
                 validate_remote_thread_id(&planned.thread.id)?;
             }
@@ -822,7 +861,7 @@ fn sync_session_roots(
         .map_err(|error| format!("failed to start session sync transaction: {error}"))?;
 
     let result = sync_sessions_in_transaction(
-        &prepared_sources,
+        prepared_sources,
         &target_root,
         &target_conn,
         provider_id,
@@ -841,7 +880,7 @@ fn sync_session_roots(
                     "target state_5.sqlite failed quick_check: {quick_check}"
                 ));
             }
-            for (source_root, prepared) in source_roots.iter().zip(&prepared_sources) {
+            for (source_root, prepared) in source_roots.iter().zip(prepared_sources) {
                 result.merged_session_index_entries += merge_session_index_with_policy(
                     source_root,
                     &target_root,
@@ -855,6 +894,20 @@ fn sync_session_roots(
             let _ = target_conn.execute_batch("ROLLBACK");
             Err(error)
         }
+    }
+}
+
+fn empty_session_sync_result() -> SessionSyncResult {
+    SessionSyncResult {
+        inserted_threads: 0,
+        copied_session_files: 0,
+        duplicate_threads: 0,
+        skipped_missing_session_files: 0,
+        skipped_archived_threads: 0,
+        merged_session_index_entries: 0,
+        persistent_session_bytes_added: 0,
+        persistent_session_bytes_reclaimed: 0,
+        obsolete_provider_slots: Vec::new(),
     }
 }
 
@@ -874,7 +927,7 @@ fn prepare_sources(
                 let rollout_action = plan_rollout_file(target_root, &thread)?;
                 if rollout_action.writes_session_file() {
                     return Err(
-                        "session JSONL changed after fast-path planning; retry the runtime switch"
+                        "session JSONL changed after fast-path planning; retry the session sync"
                             .to_string(),
                     );
                 }
@@ -887,10 +940,34 @@ fn prepare_sources(
                 .is_empty()
         {
             return Err(
-                "session index changed after fast-path planning; retry the runtime switch"
+                "session index changed after fast-path planning; retry the session sync"
                     .to_string(),
             );
         }
+        prepared_sources.push(PreparedSource {
+            source_conn,
+            threads,
+            candidate_ids: source_scan.candidate_ids,
+            skipped_archived_threads: source_scan.skipped_archived_threads,
+            skipped_missing_session_files: source_scan.skipped_missing_session_files,
+        });
+    }
+    Ok(prepared_sources)
+}
+
+fn prepare_selected_sources(
+    source_roots: &[SyncRoot],
+    ids: &HashSet<String>,
+) -> Result<Vec<PreparedSource>, String> {
+    let mut prepared_sources = Vec::with_capacity(source_roots.len());
+    for source_root in source_roots {
+        let source_conn = open_source_conn(source_root)?;
+        let source_scan = read_source_threads_selected(source_root, source_conn.as_ref(), ids)?;
+        let threads = source_scan
+            .threads
+            .into_iter()
+            .map(|thread| PlannedSourceThread { thread })
+            .collect();
         prepared_sources.push(PreparedSource {
             source_conn,
             threads,
@@ -1078,7 +1155,10 @@ fn sync_sessions_in_transaction(
                 copied_session_files += 1;
             }
         }
-        if let Some(source_conn) = prepared.source_conn.as_ref() {
+        if policy.copy_dependent_rows {
+            let Some(source_conn) = prepared.source_conn.as_ref() else {
+                continue;
+            };
             copy_dependent_rows(source_conn, target_conn, &prepared.candidate_ids)?;
         }
     }
@@ -1202,6 +1282,61 @@ fn read_source_threads(
         threads,
         candidate_ids,
         skipped_archived_threads: skipped_archived,
+        skipped_missing_session_files,
+    })
+}
+
+fn read_source_threads_selected(
+    source_root: &SyncRoot,
+    source_conn: Option<&Connection>,
+    ids: &HashSet<String>,
+) -> Result<SourceScan, String> {
+    let Some(conn) = source_conn else {
+        return Err("state_5.sqlite is required for incremental session sync".to_string());
+    };
+    let source_rows = read_source_thread_rows(conn)?;
+    let mut threads = Vec::with_capacity(ids.len());
+    let mut skipped_archived_threads = 0;
+    let mut skipped_missing_session_files = 0;
+
+    for id in ids {
+        let Some(row) = source_rows.get(id) else {
+            skipped_missing_session_files += 1;
+            continue;
+        };
+        if source_row_is_archived(row) {
+            skipped_archived_threads += 1;
+            continue;
+        }
+        let Some(session_file) = existing_thread_rollout_path(conn, source_root, id)? else {
+            skipped_missing_session_files += 1;
+            continue;
+        };
+        let session_file = PathBuf::from(session_file);
+        let Some(meta) = session_file_meta(&session_file)? else {
+            skipped_missing_session_files += 1;
+            continue;
+        };
+        if meta.id != *id {
+            return Err("selected source session JSONL does not match its thread id".to_string());
+        }
+        threads.push(SourceThread {
+            id: id.clone(),
+            values_by_column: row.values_by_column.clone(),
+            session_file,
+            meta,
+        });
+    }
+
+    threads.sort_by(|left, right| left.session_file.cmp(&right.session_file));
+    let candidate_ids = threads
+        .iter()
+        .map(|thread| thread.id.clone())
+        .collect::<HashSet<_>>();
+    Ok(SourceScan {
+        threads,
+        candidate_ids,
+        skipped_archived_threads,
         skipped_missing_session_files,
     })
 }
@@ -1455,63 +1590,6 @@ fn thread_value_for_target_column(
     Ok(value)
 }
 
-fn validate_target_threads_schema(conn: &Connection) -> Result<(), String> {
-    if !table_exists(conn, "threads")? {
-        return Err("threads table is missing".to_string());
-    }
-    let schema = table_schema(conn, "threads")?;
-    for required in ["id", "rollout_path"] {
-        if !schema.iter().any(|column| column.name == required) {
-            return Err(format!("threads.{required} is missing"));
-        }
-    }
-    for column in schema {
-        if column.not_null && column.default_value.is_none() && !known_target_column(&column.name) {
-            return Err(format!(
-                "unsupported threads schema: required column {} has no known value or default",
-                column.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn known_target_column(name: &str) -> bool {
-    matches!(
-        name,
-        "id" | "rollout_path"
-            | "model_provider"
-            | "created_at"
-            | "updated_at"
-            | "recency_at"
-            | "created_at_ms"
-            | "updated_at_ms"
-            | "recency_at_ms"
-            | "source"
-            | "cwd"
-            | "cli_version"
-            | "title"
-            | "preview"
-            | "first_user_message"
-            | "sandbox_policy"
-            | "approval_mode"
-            | "tokens_used"
-            | "has_user_event"
-            | "archived"
-            | "memory_mode"
-            | "thread_source"
-            | "agent_nickname"
-            | "agent_role"
-            | "agent_path"
-            | "model"
-            | "reasoning_effort"
-            | "archived_at"
-            | "git_sha"
-            | "git_branch"
-            | "git_origin_url"
-    )
-}
-
 fn thread_exists(conn: &Connection, id: &str) -> Result<bool, String> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM threads WHERE id = ?1", [id], |row| {
@@ -1657,7 +1735,7 @@ fn copy_rollout_file(
         } = plan_stable_rollout_file(target_root, thread, publish_extensions)?;
         if action.writes_session_file() && file_write_policy == SessionFileWritePolicy::Deny {
             return Err(
-                "session JSONL changed after fast-path planning; retry the runtime switch"
+                "session JSONL changed after fast-path planning; retry the session sync"
                     .to_string(),
             );
         }
@@ -1844,7 +1922,7 @@ fn ensure_provider_rollout_from_source(
         let source = plan.source;
         if action.writes_session_file() && file_write_policy == SessionFileWritePolicy::Deny {
             return Err(
-                "session JSONL changed after fast-path planning; retry the runtime switch"
+                "session JSONL changed after fast-path planning; retry the session sync"
                     .to_string(),
             );
         }
@@ -2057,21 +2135,6 @@ fn set_imported_file_name(target_path: &mut PathBuf, source_hash: &[u8]) {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     target_path.set_file_name(format!("{stem}-imported-{hash_suffix}.jsonl"));
-}
-
-fn plan_provider_rollout(
-    target_root: &SyncRoot,
-    selected_rollout: &Path,
-    thread_id: &str,
-    provider_id: &str,
-) -> Result<StableProviderRolloutPlan, String> {
-    plan_provider_rollout_from_source(
-        target_root,
-        selected_rollout,
-        selected_rollout,
-        thread_id,
-        provider_id,
-    )
 }
 
 fn plan_provider_rollout_from_source(
@@ -2441,6 +2504,7 @@ fn encode_sha256(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[cfg(test)]
 fn provider_output_len(
     source_path: &Path,
     expected_id: &str,
@@ -2826,7 +2890,10 @@ fn imported_base_stem(stem: &str) -> &str {
     base
 }
 
-fn session_file_relation(left: &Path, right: &Path) -> Result<SessionFileRelation, String> {
+pub(crate) fn session_file_relation(
+    left: &Path,
+    right: &Path,
+) -> Result<SessionFileRelation, String> {
     let left = fs::File::open(left)
         .map_err(|error| format!("failed to open left session candidate: {error}"))?;
     let right = fs::File::open(right)
@@ -3025,7 +3092,7 @@ fn merge_session_index_with_policy(
             open_existing_session_index(&target_root.session_index, true, "target")?
         else {
             return Err(
-                "session index changed after fast-path planning; retry the runtime switch"
+                "session index changed after fast-path planning; retry the session sync"
                     .to_string(),
             );
         };
@@ -3034,7 +3101,7 @@ fn merge_session_index_with_policy(
             return Ok(0);
         }
         return Err(
-            "session index changed after fast-path planning; retry the runtime switch".to_string(),
+            "session index changed after fast-path planning; retry the session sync".to_string(),
         );
     }
 
@@ -3530,20 +3597,23 @@ fn system_time_millis(time: SystemTime) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write};
+    use std::{collections::HashSet, fs, io::Write};
 
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
-        copy_rollout_file, merge_session_index, merge_session_index_with_policy, open_source_conn,
+        copy_rollout_file, merge_session_index, merge_session_index_with_policy,
+        normalize_selected_user_home_provider_with_paths, open_source_conn,
         plan_session_index_merge, read_source_threads, read_stable_source, root_from_paths,
-        sha256_file, sync_sessions, sync_sessions_for_provider, sync_shared_to_user_home,
-        sync_shared_to_user_home_hot, sync_shared_to_user_home_hot_with_paths,
-        sync_shared_to_user_home_hot_with_policy, sync_shared_to_user_home_with_paths,
-        sync_user_home_to_shared, sync_user_home_to_shared_with_paths, write_session_file,
-        SessionFileWritePolicy, SessionIndexWritePolicy,
+        sha256_file, sync_selected_user_home_to_shared_with_paths, sync_sessions,
+        sync_sessions_for_provider, sync_shared_to_user_home, sync_shared_to_user_home_hot,
+        sync_shared_to_user_home_hot_with_paths, sync_shared_to_user_home_hot_with_policy,
+        sync_shared_to_user_home_with_paths, sync_user_home_to_shared,
+        sync_user_home_to_shared_with_paths, write_session_file, SessionFileWritePolicy,
+        SessionIndexWritePolicy,
     };
+    use crate::codex_paths::local_codex_paths;
 
     const REMOTE_THREAD_A: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a6";
     const REMOTE_THREAD_B: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a7";
@@ -4025,6 +4095,8 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("changed after fast-path planning"));
+        assert!(error.contains("retry the session sync"));
+        assert!(!error.contains("runtime switch"));
         assert_eq!(
             fs::read(target.path().join("session_index.jsonl")).unwrap(),
             drifted
@@ -4618,7 +4690,125 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("changed after fast-path planning"));
+        assert!(error.contains("retry the session sync"));
+        assert!(!error.contains("runtime switch"));
         assert_eq!(fs::read(&current_jsonl).unwrap(), bytes.as_bytes());
+    }
+
+    #[test]
+    fn incremental_copy_only_reads_and_publishes_selected_threads() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let source_a = source.path().join(format!(
+            "sessions/2026/07/28/rollout-{REMOTE_THREAD_A}.jsonl"
+        ));
+        let source_b = source.path().join(format!(
+            "sessions/2026/07/28/rollout-{REMOTE_THREAD_B}.jsonl"
+        ));
+        fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        for (path, id) in [(&source_a, REMOTE_THREAD_A), (&source_b, REMOTE_THREAD_B)] {
+            fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        create_official_like_db(
+            &source.path().join("state_5.sqlite"),
+            &[
+                (REMOTE_THREAD_A, source_a.to_str().unwrap()),
+                (REMOTE_THREAD_B, source_b.to_str().unwrap()),
+            ],
+        );
+        create_official_like_db(&target.path().join("state_5.sqlite"), &[]);
+
+        let result = sync_selected_user_home_to_shared_with_paths(
+            &local_codex_paths(source.path()),
+            &local_codex_paths(target.path()),
+            &HashSet::from([REMOTE_THREAD_A.to_string()]),
+        )
+        .unwrap();
+
+        assert_eq!(result.inserted_threads, 1);
+        let conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let selected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = ?1",
+                [REMOTE_THREAD_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unselected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = ?1",
+                [REMOTE_THREAD_B],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((selected, unselected), (1, 0));
+    }
+
+    #[test]
+    fn account_incremental_normalizes_only_selected_current_threads() {
+        let home = tempdir().unwrap();
+        let relay_a = home.path().join(format!(
+            "sessions/2026/07/28/rollout-{REMOTE_THREAD_A}.jsonl"
+        ));
+        let relay_b = home.path().join(format!(
+            "sessions/2026/07/28/rollout-{REMOTE_THREAD_B}.jsonl"
+        ));
+        fs::create_dir_all(relay_a.parent().unwrap()).unwrap();
+        for (path, id) in [(&relay_a, REMOTE_THREAD_A), (&relay_b, REMOTE_THREAD_B)] {
+            fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai_custom\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        create_official_like_db(
+            &home.path().join("state_5.sqlite"),
+            &[
+                (REMOTE_THREAD_A, relay_a.to_str().unwrap()),
+                (REMOTE_THREAD_B, relay_b.to_str().unwrap()),
+            ],
+        );
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        conn.execute("UPDATE threads SET model_provider = 'openai_custom'", [])
+            .unwrap();
+        drop(conn);
+
+        normalize_selected_user_home_provider_with_paths(
+            &local_codex_paths(home.path()),
+            &HashSet::from([REMOTE_THREAD_A.to_string()]),
+            "openai",
+        )
+        .unwrap();
+
+        let conn = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        let selected: (String, String) = conn
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                [REMOTE_THREAD_A],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let unselected: (String, String) = conn
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                [REMOTE_THREAD_B],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(selected.0, "openai");
+        assert!(fs::read_to_string(selected.1)
+            .unwrap()
+            .contains(r#""model_provider":"openai""#));
+        assert_eq!(unselected.0, "openai_custom");
+        assert_eq!(unselected.1, relay_b.to_string_lossy());
     }
 
     #[test]

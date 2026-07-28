@@ -31,13 +31,22 @@ import {
   loadDashboard,
   loadRuntimeDashboard,
   loadSessionDashboard,
+  requestAppExit,
   saveSkillConfig,
   switchRuntime,
+  syncAllSessions,
 } from './api';
 import type { BackupSummary } from './types';
 
 describe('dashboard API', () => {
   beforeEach(() => invoke.mockReset());
+
+  it('requests a backend-owned process exit without frontend paths or flags', async () => {
+    invoke.mockResolvedValue({ scheduled: true });
+
+    await expect(requestAppExit()).resolves.toEqual({ scheduled: true });
+    expect(invoke).toHaveBeenCalledWith('request_app_exit');
+  });
 
   it('keeps successful domains when one dashboard scan fails', async () => {
     invoke.mockImplementation((command: string) => {
@@ -333,6 +342,23 @@ describe('dashboard API', () => {
     });
     payload.onProgress.onmessage({ phase: 'detectingApp' });
     expect(events).toEqual(['detectingApp']);
+  });
+
+  it('runs manual full sync once with a progress channel and no dry-run command', async () => {
+    invoke.mockResolvedValue({ operationId: 'sync-1' });
+    const phases: string[] = [];
+
+    await syncAllSessions((event) => phases.push(event.phase));
+
+    const payload = invoke.mock.calls[0][1] as {
+      onProgress: { onmessage: (event: { phase: string; timestampMs: number }) => void };
+    };
+    expect(invoke).toHaveBeenCalledWith('sync_all_sessions', {
+      onProgress: expect.any(Channel),
+    });
+    payload.onProgress.onmessage({ phase: 'reconciling', timestampMs: 10 });
+    expect(phases).toEqual(['reconciling']);
+    expect(invoke).not.toHaveBeenCalledWith('dry_run_all_sessions');
   });
 
   it('retries ChatGPT launch through the fixed backend command without path arguments', async () => {

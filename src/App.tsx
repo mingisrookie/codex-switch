@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeftRight,
   Check,
@@ -31,7 +31,6 @@ import {
   createFullBackup,
   deleteBackup,
   deleteManagedSessions,
-  dryRunAllSessions,
   importPlusRuntime,
   getAppStatus as defaultGetAppStatus,
   getUpdateStartupNotice as defaultGetUpdateStartupNotice,
@@ -42,6 +41,7 @@ import {
   loadRuntimeDashboard as defaultLoadRuntimeDashboard,
   loadSessionDashboard as defaultLoadSessionDashboard,
   loadingDashboard,
+  requestAppExit as defaultRequestAppExit,
   restoreBackup,
   restoreSessionsVisible,
   switchRuntime,
@@ -58,8 +58,8 @@ import {
 import { SessionManagementPage } from './SessionManagementPage';
 import { SkillsManagementPage } from './SkillsManagementPage';
 import type {
+  AppExitRequestResult,
   BackupSummary,
-  AllSessionsDryRun,
   BackupDashboardData,
   CheckpointCleanupReceipt,
   CheckpointStorageStatus,
@@ -75,6 +75,7 @@ import type {
   SessionDashboardData,
   OperationRecord,
   SessionMutationResult,
+  SessionSyncProgress,
   SessionSyncResult,
   UpdateCheckResult,
 } from './types';
@@ -85,6 +86,7 @@ type AppProps = {
   loadSessionDashboard?: () => Promise<SessionDashboardData>;
   loadBackupDashboard?: () => Promise<BackupDashboardData>;
   registerCloseGuard?: RegisterCloseGuard;
+  requestExit?: () => Promise<AppExitRequestResult>;
 };
 
 type CloseGuardEvent = { preventDefault: () => void };
@@ -94,7 +96,7 @@ type RegisterCloseGuard = (
 
 type PendingConfirmation =
   | { kind: 'importAccount' }
-  | { kind: 'syncSessions'; dryRun: AllSessionsDryRun }
+  | { kind: 'syncSessions' }
   | { kind: 'restoreBackup'; backup: BackupSummary }
   | { kind: 'deleteBackup'; backup: BackupSummary };
 
@@ -124,6 +126,7 @@ function App({
   loadSessionDashboard = defaultLoadSessionDashboard,
   loadBackupDashboard = defaultLoadBackupDashboard,
   registerCloseGuard = defaultRegisterCloseGuard,
+  requestExit = defaultRequestAppExit,
 }: AppProps) {
   const [data, setData] = useState<DashboardData>(() => loadingDashboard());
   const [error, setError] = useState<string | null>(null);
@@ -150,6 +153,7 @@ function App({
   const [startupUpdateError, setStartupUpdateError] = useState<string | null>(null);
   const [closeGuardStatus, setCloseGuardStatus] =
     useState<'loading' | 'ready' | 'failed'>('loading');
+  const [closePending, setClosePending] = useState(false);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const loadRequestId = useRef(0);
   const runtimeRequestId = useRef(0);
@@ -167,7 +171,28 @@ function App({
   const startupCheckStarted = useRef(false);
   const updateCheckInFlight = useRef(false);
   const exclusiveActionInFlight = useRef(false);
-  const switchCloseGuardActive = useRef(false);
+  const closeRequestInFlight = useRef(false);
+  const exitScheduled = useRef(false);
+
+  const attemptAppExit = useCallback(async () => {
+    if (exclusiveActionInFlight.current) {
+      setClosePending(true);
+      return;
+    }
+    if (closeRequestInFlight.current) return;
+    closeRequestInFlight.current = true;
+    try {
+      const result = await requestExit();
+      exitScheduled.current = result.scheduled;
+      setClosePending(true);
+    } catch (reason) {
+      exitScheduled.current = false;
+      setClosePending(false);
+      setError(`关闭 ChatGPT Switch 失败：${errorMessage(reason)}`);
+    } finally {
+      closeRequestInFlight.current = false;
+    }
+  }, [requestExit]);
 
   useEffect(() => {
     let cancelled = false;
@@ -225,7 +250,9 @@ function App({
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void registerCloseGuard((event) => {
-      if (switchCloseGuardActive.current) event.preventDefault();
+      event.preventDefault();
+      setClosePending(true);
+      void attemptAppExit();
     })
       .then((stopListening) => {
         if (disposed) {
@@ -242,7 +269,23 @@ function App({
       disposed = true;
       unlisten?.();
     };
-  }, [registerCloseGuard]);
+  }, [attemptAppExit, registerCloseGuard]);
+
+  useEffect(() => {
+    if (!closePending) return undefined;
+    const retry = window.setInterval(() => {
+      if (!exitScheduled.current) void attemptAppExit();
+    }, 500);
+    const recover = window.setTimeout(() => {
+      if (!exitScheduled.current) return;
+      exitScheduled.current = false;
+      void attemptAppExit();
+    }, 2_500);
+    return () => {
+      window.clearInterval(retry);
+      window.clearTimeout(recover);
+    };
+  }, [attemptAppExit, closePending]);
 
   useEffect(() => {
     if (
@@ -532,7 +575,6 @@ function App({
       document.activeElement instanceof HTMLElement ? document.activeElement : null
     );
     exclusiveActionInFlight.current = true;
-    switchCloseGuardActive.current = true;
     const attemptId = ++switchAttemptId.current;
     const startedAtMs = Date.now();
     setBusy(label);
@@ -545,19 +587,9 @@ function App({
       startedAtMs,
     });
 
-    let mutationObserved = false;
-    let backupObserved = false;
     try {
       const result: RuntimeSwitchResult = await switchRuntime(runtimeId, (event) => {
         if (attemptId !== switchAttemptId.current) return;
-        if (!backupObserved && event.phase === 'backingUpShared') {
-          backupObserved = true;
-          markBackupsStale();
-        }
-        if (!mutationObserved && mutatesSessionData(event)) {
-          mutationObserved = true;
-          markSessionsStale();
-        }
         setSwitchFlow((current) => {
           if (!current || current.target !== runtimeId) return current;
           const failedPhase = event.phase === 'rollingBack'
@@ -577,8 +609,17 @@ function App({
         });
       });
       if (attemptId !== switchAttemptId.current) return;
-      if (result.changed && !mutationObserved) markSessionsStale();
-      if (result.changed && !backupObserved) markBackupsStale();
+      if (result.incrementalSessionSync.status === 'applied') {
+        markSessionsStale();
+        markBackupsStale();
+      } else if (
+        result.incrementalSessionSync.status === 'failed'
+        || result.incrementalSessionSync.status === 'deferred'
+      ) {
+        // A failed/deferred apply can retain a fail-closed checkpoint even
+        // though the request route itself succeeded.
+        markBackupsStale();
+      }
       setSwitchFlow((current) => current ? {
         ...current,
         status: 'succeeded',
@@ -609,7 +650,6 @@ function App({
       });
     } finally {
       if (attemptId === switchAttemptId.current) {
-        switchCloseGuardActive.current = false;
         exclusiveActionInFlight.current = false;
         setBusy(null);
       }
@@ -669,27 +709,21 @@ function App({
     });
   }
 
-  async function handleSyncSessions() {
+  function handleSyncSessions() {
     if (!canSync || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
-    exclusiveActionInFlight.current = true;
-    setBusy('会话同步预检');
-    setError(null);
-    setReceipt(null);
-    try {
-      const dryRun = await dryRunAllSessions();
-      requestConfirmation({ kind: 'syncSessions', dryRun });
-    } catch (reason) {
-      const message = errorMessage(reason);
-      setError(message);
-      refreshInBackground('dashboard');
-    } finally {
-      exclusiveActionInFlight.current = false;
-      setBusy(null);
-    }
+    requestConfirmation({ kind: 'syncSessions' });
   }
 
   async function performSyncSessions() {
-    await runAction('同步会话', syncAllSessions, syncReceipt);
+    const progressEvents: SessionSyncProgress[] = [];
+    await runAction(
+      '完全同步',
+      () => syncAllSessions((event) => {
+        progressEvents.push(event);
+        setBusy(sessionSyncProgressLabel(event));
+      }),
+      (result) => syncReceipt(result, progressEvents),
+    );
   }
 
   async function handleDeleteSessions(ids: string[], confirmed: boolean) {
@@ -909,6 +943,12 @@ function App({
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}
       {activePage !== 'skills' && error ? <p className="error-banner" role="alert">{error}</p> : null}
+      {closePending && !switchFlow ? (
+        <p className="busy-banner shutdown-pending" role="status" aria-live="polite">
+          <LoaderCircle className="spin" aria-hidden="true" />
+          正在安全完成当前任务，完成后将自动退出
+        </p>
+      ) : null}
       {busy && !switchFlow ? <p className="busy-banner" role="status" aria-live="polite"><LoaderCircle className="spin" aria-hidden="true" />{busy}处理中</p> : null}
       {!switchFlow && !busy && runtimeRefreshPending ? (
         <p className="busy-banner" role="status" aria-live="polite">
@@ -934,8 +974,8 @@ function App({
               <p className="eyebrow">LOCAL RUNTIME / CONTROL 01</p>
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
               <p className="runtime-intro-lede">
-                在一个受保护的任务链中切换认证、模型与会话索引。每一步都有真实状态，
-                完成后自动回到 ChatGPT。
+                保持 ChatGPT 官方登录态不变，只切换模型与请求端。会话同步已独立，
+                每一步都展示真实耗时，完成后自动回到 ChatGPT。
               </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
@@ -963,7 +1003,7 @@ function App({
 
           <section className="runtime-grid" aria-label="运行态">
             <RuntimeCard
-              title="ChatGPT 账号态" kind="plus" description="本机账号登录态"
+              title="ChatGPT 账号态" kind="plus" description="官方登录不变，使用 OpenAI 请求端。"
               runtime={plusRuntime} runtimeStatus={runtimeStatus} baseUrlFallback="本机 ChatGPT 登录态"
               runtimeDomainStatus={data.runtimes.status} runtimeStatusDomainStatus={data.runtimeStatus.status}
               onPrimary={() => void handleImportPlus()} primaryAction="保存当前账号态"
@@ -973,7 +1013,7 @@ function App({
               switchDisabled={exclusiveBusy || !canSwitchRuntime || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
             />
             <RuntimeCard
-              title="API 中转站态" kind="relay" description="URL、模型和加密保存的 API Key。"
+              title="API 中转站态" kind="relay" description="Key 加密保存；激活时明文投影到当前请求配置。"
               runtime={relayRuntime} runtimeStatus={runtimeStatus} baseUrlFallback="尚未配置"
               runtimeDomainStatus={data.runtimes.status} runtimeStatusDomainStatus={data.runtimeStatus.status}
               onPrimary={() => { setRelaySubmitError(null); setRelayEditorOpen(true); }} primaryAction="配置中转站"
@@ -996,9 +1036,9 @@ function App({
 
           <section className="runtime-operations" aria-label="数据与恢复">
             <aside className="detail-panel session-panel" aria-label="会话同步">
-              <div className="card-title-row"><Database className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SESSION POOL</p><h2>会话热同步</h2></div></div>
+              <div className="card-title-row"><Database className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SESSION POOL</p><h2>完全同步</h2></div></div>
               <div className="sync-stats"><strong>{threadCount}<span>threads</span></strong><strong>{jsonlCount}<span>JSONL</span></strong></div>
-              <button className="primary-button full" onClick={() => void handleSyncSessions()} disabled={exclusiveBusy || !canSync}><RefreshCw className="button-icon" aria-hidden="true" />立即同步</button>
+              <button className="primary-button full" onClick={handleSyncSessions} disabled={exclusiveBusy || !canSync}><RefreshCw className="button-icon" aria-hidden="true" />完全同步</button>
             </aside>
             <SafetyPanel data={data} sessionsStale={sessionsStale} backupsStale={backupsStale} />
             <BackupRecoveryPanel
@@ -1046,6 +1086,7 @@ function App({
       <RuntimeSwitchProgressPanel
         flow={switchFlow}
         closeDisabled={runtimeRefreshPending}
+        closePending={closePending}
         onClose={closeSwitchTask}
         onRetryLaunch={() => void handleRetryChatGptLaunch()}
       />
@@ -1084,13 +1125,10 @@ function InlineConfirmation({
     detail = '当前账号态会先归档，再写入新的加密快照。';
     confirmLabel = '确认覆盖';
   } else if (pending.kind === 'syncSessions') {
-    const newThreads = pending.dryRun.toShared.newThreads + pending.dryRun.toCurrent.newThreads;
-    const duplicates = pending.dryRun.toShared.duplicateThreads
-      + pending.dryRun.toCurrent.duplicateThreads;
-    title = '会话同步预检已完成';
-    detail = '确认后开始创建备份并执行双向同步。';
-    metrics = [`新增 ${newThreads} 个线程`, `识别 ${duplicates} 个重复线程`];
-    confirmLabel = '开始同步';
+    title = '完全同步活跃会话';
+    detail = '确认后会安全关闭 ChatGPT，一次性对账两边活跃会话，完成后自动重新打开。归档会话不会被改动。';
+    metrics = ['不执行重复 dry-run', '完整扫描与切换耗时分离'];
+    confirmLabel = '开始完全同步';
   } else if (pending.kind === 'restoreBackup') {
     title = '恢复已验证备份';
     detail = `来源：${pending.backup.sourceRoot}`;
@@ -1291,9 +1329,9 @@ function BackupRecoveryPanel({
                 <div><dt>安全保留</dt><dd>{storage.data.retainedCount}</dd></div>
               </dl>
               <p className="checkpoint-storage-copy">
-                普通同步与切换只创建覆盖实际写集的轻量临时检查点。同步或切换成功、切换完整回滚、
-                Backup 阶段写入前失败、恢复可见成功等可证明终态会自动释放；写入后失败、回滚失败、
-                孤儿和证据不足项继续保留。完整备份由你通过“删除恢复点”显式管理。
+                请求端切换不创建检查点。会话同步等写操作只创建覆盖实际写集的轻量临时点；
+                成功或可证明的写入前失败会自动释放，写入后失败、回滚失败、孤儿和证据不足项
+                继续保留。完整备份由你通过“删除恢复点”显式管理。
               </p>
               <button
                 className="ghost-button inline checkpoint-cleanup-button"
@@ -1467,15 +1505,6 @@ function isExactRuntime(status: RuntimeStatus | null, runtimeId: RuntimeKind) {
   return status?.activeRuntimeId === runtimeId && status.confidence === 'exact';
 }
 
-function mutatesSessionData(event: RuntimeSwitchProgress) {
-  return [
-    'syncingToShared',
-    'applyingRuntime',
-    'syncingToCurrent',
-    'rollingBack',
-  ].includes(event.phase);
-}
-
 function lastRuntimeWorkPhase(events: RuntimeSwitchProgress[]) {
   return [...events]
     .reverse()
@@ -1510,7 +1539,8 @@ function stateClass(label: string) {
 function operationActionLabel(action: OperationRecord['action']) {
   const labels: Record<OperationRecord['action'], string> = {
     importAccount: '保存账号态', saveRelay: '保存中转站', verifyRelay: '验证中转站',
-    switchRuntime: '切换运行态', syncSessions: '同步会话', deleteSessions: '删除会话',
+    switchRuntime: '切换运行态', incrementalSync: '增量会话同步',
+    syncSessions: '完全同步会话', deleteSessions: '删除会话',
     restoreVisibility: '恢复会话可见', restoreBackup: '恢复备份', createBackup: '创建完整备份',
     deleteBackup: '删除恢复点', cleanupCheckpoints: '清理自动检查点',
     installSkill: '安装技能', configureSkill: '配置技能',
@@ -1534,7 +1564,10 @@ function dashboardErrors(data: DashboardData) {
   return domains.flatMap(([domain, state]) => state.status === 'error' ? [{ domain, message: state.error }] : []);
 }
 
-function syncReceipt(result: SessionSyncResult): OperationView {
+function syncReceipt(
+  result: SessionSyncResult,
+  progressEvents: SessionSyncProgress[] = [],
+): OperationView {
   const backups = result.backups ?? [];
   const cleanupComplete = result.checkpointCleanup
     && result.checkpointCleanup.failedCount === 0
@@ -1542,7 +1575,7 @@ function syncReceipt(result: SessionSyncResult): OperationView {
   const sessionNetBytes = result.persistentSessionBytesAdded
     - result.persistentSessionBytesReclaimed;
   return {
-    label: '会话同步完成',
+    label: '完全同步完成',
     operationId: result.operationId,
     backupCount: cleanupComplete ? 0 : backups.length,
     backupPaths: cleanupComplete ? [] : backups.map((backup) => backup.backupDir),
@@ -1560,8 +1593,58 @@ function syncReceipt(result: SessionSyncResult): OperationView {
       ...(result.checkpointCleanup
         ? [`临时检查点已释放：${formatBytes(result.checkpointCleanup.reclaimedBytes)}`]
         : []),
+      ...sessionSyncTimingMetrics(progressEvents),
+      `ChatGPT：${chatGptLaunchLabel(result.chatgptLaunch.status)}`,
     ],
   };
+}
+
+function sessionSyncTimingMetrics(events: SessionSyncProgress[]) {
+  const labels: Partial<Record<SessionSyncProgress['phase'], string>> = {
+    preparing: '准备',
+    closingApp: '关闭 ChatGPT',
+    backingUp: '创建安全检查点',
+    reconciling: '对账活跃会话',
+    recordingResult: '记录与清理',
+    launchingApp: '重新打开 ChatGPT',
+  };
+  const timings = events.flatMap((event, index) => {
+    const label = labels[event.phase];
+    const next = events[index + 1];
+    if (!label || !next) return [];
+    const duration = Math.max(0, next.timestampMs - event.timestampMs);
+    return [`耗时·${label}：${(duration / 1000).toFixed(1)}s`];
+  });
+  const first = events[0];
+  const terminal = [...events].reverse().find((event) => (
+    event.phase === 'complete' || event.phase === 'failed'
+  ));
+  if (first && terminal) {
+    timings.push(`完全同步总耗时：${(Math.max(0, terminal.timestampMs - first.timestampMs) / 1000).toFixed(1)}s`);
+  }
+  return timings;
+}
+
+function sessionSyncProgressLabel(event: SessionSyncProgress) {
+  const labels: Record<SessionSyncProgress['phase'], string> = {
+    preparing: '完全同步：准备',
+    closingApp: '完全同步：关闭 ChatGPT',
+    backingUp: '完全同步：创建安全检查点',
+    reconciling: '完全同步：对账活跃会话',
+    recordingResult: '完全同步：记录结果',
+    launchingApp: '完全同步：重新打开 ChatGPT',
+    complete: '完全同步：完成',
+    failed: '完全同步：失败',
+  };
+  return labels[event.phase];
+}
+
+function chatGptLaunchLabel(status: SessionSyncResult['chatgptLaunch']['status']) {
+  if (status === 'launched') return '已重新打开';
+  if (status === 'alreadyRunning') return '已在运行';
+  if (status === 'failed') return '打开失败';
+  if (status === 'blocked') return '为安全保持关闭';
+  return '未请求';
 }
 
 function mutationReceipt(label: string) {

@@ -22,16 +22,6 @@ function result(
   status: ChatGptLaunchStatus,
   message: string | null = null,
 ): RuntimeSwitchResult {
-  const sync = {
-    insertedThreads: 0,
-    copiedSessionFiles: 0,
-    duplicateThreads: 0,
-    skippedMissingSessionFiles: 0,
-    skippedArchivedThreads: 0,
-    mergedSessionIndexEntries: 0,
-    persistentSessionBytesAdded: 0,
-    persistentSessionBytesReclaimed: 0,
-  };
   return {
     operationId: 'switch-1',
     changed: true,
@@ -45,10 +35,14 @@ function result(
       lastUsedAtMs: 2,
       lastVerifiedAtMs: 3,
     },
-    backups: [],
-    toShared: { ...sync },
-    fromShared: { ...sync },
-    rolledBack: false,
+    incrementalSessionSync: {
+      status: 'unchanged',
+      detectedThreads: 0,
+      syncedThreads: 0,
+      projectedBytes: 0,
+      durationMs: 20,
+      requiresFullSync: false,
+    },
     chatProcessStateRepaired: false,
     chatgptLaunch: { status, message },
   };
@@ -58,12 +52,14 @@ function renderPanel(
   flow: RuntimeSwitchFlow,
   onClose = vi.fn(),
   onRetryLaunch = vi.fn(),
+  closePending = false,
 ) {
   return {
     ...render(
       <RuntimeSwitchProgressPanel
         flow={flow}
         now={1_100}
+        closePending={closePending}
         onClose={onClose}
         onRetryLaunch={onRetryLaunch}
       />,
@@ -92,6 +88,7 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.getByRole('status').textContent).toBe('验证中转站');
     expect(dialog.querySelector('.switch-task-clock')?.textContent).toContain('1.0s');
     expect(dialog.querySelector('.switch-timeline li.active')?.textContent).toContain('验证中转站');
+    expect(dialog.querySelectorAll('.switch-timeline > li')).toHaveLength(7);
     expect(document.activeElement).toBe(within(dialog).getByRole('heading'));
   });
 
@@ -110,18 +107,60 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.queryByRole('button', { name: '关闭任务' })).toBeNull();
   });
 
-  it('shows the Remote continuity check as a real backend phase', () => {
+  it('shows the immutable official-auth check as a real backend phase', () => {
     renderPanel({
       status: 'running',
       target: 'plus',
       startedAtMs: 100,
-      events: [event('repairingAppState', 150)],
+      events: [event('validatingOfficialAuth', 150)],
     });
 
     const dialog = screen.getByRole('dialog');
-    expect(screen.getByRole('status').textContent).toBe('校验 Remote 连续性');
+    expect(screen.getByRole('status').textContent).toBe('准备目标与登录态');
     expect(dialog.querySelector('.switch-timeline li.active')?.textContent)
-      .toContain('校验 Remote 连续性');
+      .toContain('准备目标与登录态');
+  });
+
+  it('shows fine-grained phase timing, grouped steps, and a queued close receipt', () => {
+    renderPanel({
+      status: 'running',
+      target: 'plus',
+      startedAtMs: 100,
+      events: [
+        event('loadingRuntime', 100),
+        event('validatingOfficialAuth', 200),
+        event('detectingApp', 500),
+        event('preparingRuntime', 700),
+      ],
+    }, vi.fn(), vi.fn(), true);
+
+    expect(screen.getByText('本步骤已用 0.4s')).toBeTruthy();
+    expect(screen.getByText('已收到关闭请求')).toBeTruthy();
+    expect(screen.getByText(/到达可靠终态后会自动退出/)).toBeTruthy();
+    expect(screen.getByText('准备')).toBeTruthy();
+    expect(screen.getByText('保护')).toBeTruthy();
+    expect(screen.getByText('切换')).toBeTruthy();
+    expect(screen.getByText('收尾')).toBeTruthy();
+    const authStep = screen.getByText('准备目标与登录态', { selector: 'strong' }).closest('li');
+    expect(authStep?.textContent).toContain('0.4s');
+  });
+
+  it('identifies the slowest completed step in the terminal receipt', () => {
+    renderPanel({
+      status: 'succeeded',
+      target: 'plus',
+      startedAtMs: 100,
+      completedAtMs: 1_100,
+      events: [
+        event('loadingRuntime', 100),
+        event('validatingOfficialAuth', 100),
+        event('detectingApp', 800),
+        event('complete', 1_100),
+      ],
+      result: result('launched'),
+    });
+
+    expect(screen.getByText('耗时最长：准备目标与登录态 · 0.7s')).toBeTruthy();
   });
 
   it('does not present a complete progress event as terminal before the command result settles', () => {
@@ -130,7 +169,7 @@ describe('RuntimeSwitchProgressPanel', () => {
       target: 'plus',
       startedAtMs: 100,
       events: [
-        event('cleaningCheckpoints', 150),
+        event('recordingResult', 150),
         event('launchingApp', 170),
         event('complete', 190),
       ],
@@ -175,7 +214,7 @@ describe('RuntimeSwitchProgressPanel', () => {
       startedAtMs: 100,
       completedAtMs: 220,
       events: [
-        event('cleaningCheckpoints', 160),
+        event('recordingResult', 160),
         event('launchingApp', 180),
         event('complete', 210),
       ],
@@ -193,23 +232,50 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('uses typed retained counts and reports persistent session storage separately', () => {
-    const receipt = result('launched');
-    receipt.backups = [
-      { backupDir: 'C:\\backup-a', sourceRoot: 'C:\\home', reason: 'a', createdAtMs: 1, scope: 'runtimeState', trackedDatabaseCount: 1, completeSessions: false },
-      { backupDir: 'C:\\backup-b', sourceRoot: 'C:\\shared', reason: 'b', createdAtMs: 1, scope: 'stateOnly', trackedDatabaseCount: 1, completeSessions: false },
-    ];
-    receipt.checkpointCleanup = {
-      attemptedCount: 2,
-      reclaimedCount: 1,
-      reclaimedBytes: 4096,
-      retainedCount: 1,
-      failedCount: 0,
-      warnings: [],
+  it('keeps ChatGPT closed without a retry action after incremental rollback failure', () => {
+    const receipt = result(
+      'blocked',
+      'ChatGPT was kept closed because incremental session rollback failed.',
+    );
+    receipt.incrementalSessionSync = {
+      status: 'failed',
+      detectedThreads: 1,
+      syncedThreads: 0,
+      projectedBytes: 1024,
+      durationMs: 450,
+      requiresFullSync: true,
     };
-    receipt.toShared.persistentSessionBytesAdded = 8192;
-    receipt.fromShared.persistentSessionBytesReclaimed = 2048;
+
+    renderPanel({
+      status: 'succeeded',
+      target: 'plus',
+      startedAtMs: 100,
+      completedAtMs: 220,
+      events: [
+        event('syncingIncrementalSessions', 170),
+        event('complete', 210),
+      ],
+      result: receipt,
+    });
+
+    expect(screen.getAllByText('切换成功，ChatGPT 已保持关闭').length).toBeGreaterThan(0);
+    expect(screen.getByRole('alert').textContent).toContain('必须先检查操作记录与保留的安全检查点');
+    expect(screen.queryByRole('button', { name: '重试打开 ChatGPT' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '稍后手动打开' })).toBeNull();
+    expect(screen.getByRole('button', { name: '完成' })).toBeTruthy();
+  });
+
+  it('reports the auth-preserving request-route contract instead of session mutations', () => {
+    const receipt = result('launched');
     receipt.chatProcessStateRepaired = true;
+    receipt.incrementalSessionSync = {
+      status: 'applied',
+      detectedThreads: 2,
+      syncedThreads: 2,
+      projectedBytes: 2048,
+      durationMs: 480,
+      requiresFullSync: false,
+    };
     renderPanel({
       status: 'succeeded',
       target: 'plus',
@@ -219,15 +285,15 @@ describe('RuntimeSwitchProgressPanel', () => {
       result: receipt,
     });
 
-    expect(screen.getByText('保留检查点').nextSibling?.textContent).toBe('1');
-    expect(screen.getByText('会话新增占用').nextSibling?.textContent).toBe('8.0 KiB');
-    expect(screen.getByText('旧槽位回收').nextSibling?.textContent).toBe('2.0 KiB');
-    expect(screen.getByText('会话净变化').nextSibling?.textContent).toBe('+6.0 KiB');
-    expect(screen.getByText('Remote 状态').nextSibling?.textContent).toBe('已修复');
-    expect(screen.getByText('检查点回收').nextSibling?.textContent).toBe('4.0 KiB');
+    expect(screen.getByText('目标请求端').nextSibling?.textContent).toBe('API Relay');
+    expect(screen.getByText('官方登录态').nextSibling?.textContent).toBe('已验证保持不变');
+    expect(screen.getByText('配置变更').nextSibling?.textContent).toBe('已原子应用');
+    expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('已安全修复');
+    expect(screen.getByText('会话增量').nextSibling?.textContent)
+      .toContain('已同步 2 个变化 · 0.5s');
   });
 
-  it('does not claim Remote state was checked for an exact no-op', () => {
+  it('does not claim process state was checked for an exact no-op', () => {
     const receipt = result('alreadyRunning');
     receipt.changed = false;
     renderPanel({
@@ -239,7 +305,7 @@ describe('RuntimeSwitchProgressPanel', () => {
       result: receipt,
     });
 
-    expect(screen.getByText('Remote 状态').nextSibling?.textContent).toBe('未检查');
+    expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('未检查');
   });
 
   it('renders rollback as the switch terminal and never offers app launch', () => {
@@ -257,10 +323,10 @@ describe('RuntimeSwitchProgressPanel', () => {
       ],
     });
 
-    expect(screen.getByText('已恢复切换前状态')).toBeTruthy();
-    expect(screen.getByRole('alert').textContent).toContain('切换失败，已恢复切换前状态');
+    expect(screen.getByText('已恢复原始请求配置')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('切换失败，已恢复原始请求配置');
     expect(screen.queryByRole('button', { name: /打开 ChatGPT/ })).toBeNull();
-    const interrupted = screen.getByText('应用运行态', { selector: 'strong' }).closest('li');
+    const interrupted = screen.getByText('应用最小配置补丁', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');
   });
 
