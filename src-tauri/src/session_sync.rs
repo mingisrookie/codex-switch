@@ -1363,14 +1363,22 @@ fn insert_thread(
     provider_id: Option<&str>,
 ) -> Result<(), String> {
     let schema = table_schema(conn, "threads")?;
-    let columns = schema
-        .iter()
-        .map(|column| column.name.clone())
-        .collect::<Vec<_>>();
-    let values = schema
-        .iter()
-        .map(|column| thread_value_for_target_column(thread, column, rollout_path, provider_id))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut columns = Vec::with_capacity(schema.len());
+    let mut values = Vec::with_capacity(schema.len());
+    for column in &schema {
+        let value = thread_value_for_target_column(thread, column, rollout_path, provider_id)?;
+        // Binding NULL would bypass SQLite's declared default and can violate a new NOT NULL
+        // column. Omit a missing/default-backed NULL, but preserve an explicit source NULL when
+        // the target remains nullable.
+        let use_target_default = matches!(value, Value::Null)
+            && column.default_value.is_some()
+            && (column.not_null || !thread.values_by_column.contains_key(&column.name));
+        if use_target_default {
+            continue;
+        }
+        columns.push(column.name.clone());
+        values.push(value);
+    }
     let placeholders = (0..columns.len())
         .map(|_| "?")
         .collect::<Vec<_>>()
@@ -2710,7 +2718,7 @@ where
         }
         let value = serde_json::from_slice::<JsonValue>(body)
             .map_err(|_| source_changed("the file has an incomplete or invalid JSONL tail"))?;
-        if value.get("type").and_then(JsonValue::as_str) == Some("session_meta") {
+        if meta.is_none() && value.get("type").and_then(JsonValue::as_str) == Some("session_meta") {
             let parsed = session_meta_from_value(&value).ok_or_else(|| {
                 source_changed("the file contains session_meta without a valid id")
             })?;
@@ -2720,15 +2728,7 @@ where
                     parsed.id
                 ));
             }
-            if meta
-                .as_ref()
-                .is_some_and(|existing: &SessionMeta| existing.id != parsed.id)
-            {
-                return Err("source session JSONL contains conflicting session ids".to_string());
-            }
-            if meta.is_none() {
-                meta = Some(parsed);
-            }
+            meta = Some(parsed);
         }
         normalized_line_hashes.push(sha256_bytes(&normalized_session_line(&value, body)?));
         on_line(&raw, body, &value)?;
@@ -2945,13 +2945,16 @@ fn write_session_file(
     provider_id: Option<&str>,
     expected_version: &StableSourceVersion,
 ) -> Result<(), String> {
+    let mut authoritative_meta_written = false;
     let observed = read_stable_source(source_path, expected_id, |raw, body, value| {
         let Some(provider_id) = provider_id else {
             return output
                 .write_all(raw)
                 .map_err(|error| format!("failed to copy session JSONL: {error}"));
         };
-        if value.get("type").and_then(JsonValue::as_str) != Some("session_meta") {
+        if authoritative_meta_written
+            || value.get("type").and_then(JsonValue::as_str) != Some("session_meta")
+        {
             return output
                 .write_all(raw)
                 .map_err(|error| format!("failed to copy session JSONL: {error}"));
@@ -2965,6 +2968,7 @@ fn write_session_file(
             "model_provider".to_string(),
             JsonValue::String(provider_id.to_string()),
         );
+        authoritative_meta_written = true;
         let rewritten = serde_json::to_vec(&value)
             .map_err(|error| format!("failed to serialize session metadata: {error}"))?;
         output
@@ -3537,8 +3541,8 @@ mod tests {
         sha256_file, sync_sessions, sync_sessions_for_provider, sync_shared_to_user_home,
         sync_shared_to_user_home_hot, sync_shared_to_user_home_hot_with_paths,
         sync_shared_to_user_home_hot_with_policy, sync_shared_to_user_home_with_paths,
-        sync_user_home_to_shared, sync_user_home_to_shared_with_paths, SessionFileWritePolicy,
-        SessionIndexWritePolicy,
+        sync_user_home_to_shared, sync_user_home_to_shared_with_paths, write_session_file,
+        SessionFileWritePolicy, SessionIndexWritePolicy,
     };
 
     const REMOTE_THREAD_A: &str = "019f8ced-fc55-7a93-8cc5-a18d5b96b4a6";
@@ -3769,6 +3773,71 @@ mod tests {
             .unwrap();
         assert_eq!(provider, "openai");
         assert_eq!(cwd, r"C:\repo");
+    }
+
+    #[test]
+    fn target_schema_default_is_used_for_a_new_required_column_missing_from_source() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let thread_id = "thread-target-default";
+        let source_jsonl = source
+            .path()
+            .join("sessions/2026/07/27/rollout-thread-target-default.jsonl");
+        fs::create_dir_all(source_jsonl.parent().unwrap()).unwrap();
+        fs::write(
+            &source_jsonl,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"openai\"}}}}"
+            ),
+        )
+        .unwrap();
+        create_official_like_db(
+            &source.path().join("state_5.sqlite"),
+            &[(thread_id, source_jsonl.to_str().unwrap())],
+        );
+        let source_conn = Connection::open(source.path().join("state_5.sqlite")).unwrap();
+        source_conn
+            .execute(
+                "ALTER TABLE threads ADD COLUMN nullable_note TEXT DEFAULT 'source'",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute(
+                "UPDATE threads SET nullable_note = NULL WHERE id = ?1",
+                [thread_id],
+            )
+            .unwrap();
+        drop(source_conn);
+        create_official_like_db(&target.path().join("state_5.sqlite"), &[]);
+        let target_conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        target_conn
+            .execute(
+                "ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy'",
+                [],
+            )
+            .unwrap();
+        target_conn
+            .execute(
+                "ALTER TABLE threads ADD COLUMN nullable_note TEXT DEFAULT 'target'",
+                [],
+            )
+            .unwrap();
+        drop(target_conn);
+
+        let result = sync_sessions(&[source.path().to_path_buf()], target.path()).unwrap();
+
+        assert_eq!(result.inserted_threads, 1);
+        let target_conn = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let (history_mode, nullable_note): (String, Option<String>) = target_conn
+            .query_row(
+                "SELECT history_mode, nullable_note FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history_mode, "legacy");
+        assert_eq!(nullable_note, None);
     }
 
     #[test]
@@ -4414,6 +4483,81 @@ mod tests {
         .unwrap_err();
 
         assert!(error.starts_with(super::SOURCE_CHANGED_PREFIX));
+    }
+
+    #[test]
+    fn derived_rollout_keeps_only_the_first_session_meta_authoritative() {
+        let source = tempdir().unwrap();
+        let source_jsonl = source.path().join("rollout-derived.jsonl");
+        let original = format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"model_provider\":\"openai_custom\"}}}}\n",
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"model_provider\":\"openai\"}}}}\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"history\"}}}}\n",
+            ),
+            REMOTE_THREAD_A, REMOTE_THREAD_B
+        );
+        fs::write(&source_jsonl, original.as_bytes()).unwrap();
+
+        let stable = read_stable_source(&source_jsonl, REMOTE_THREAD_A, |_, _, _| Ok(()))
+            .expect("the first session_meta owns the derived rollout");
+        assert_eq!(stable.version.meta.id, REMOTE_THREAD_A);
+
+        let target_jsonl = source.path().join("rollout-derived-relay.jsonl");
+        let mut target = fs::File::create(&target_jsonl).unwrap();
+        write_session_file(
+            &source_jsonl,
+            &mut target,
+            REMOTE_THREAD_A,
+            Some("relay"),
+            &stable.version,
+        )
+        .unwrap();
+        drop(target);
+
+        assert_eq!(fs::read(&source_jsonl).unwrap(), original.as_bytes());
+        let target = fs::read_to_string(target_jsonl).unwrap();
+        let lines = target.lines().collect::<Vec<_>>();
+        let authoritative =
+            serde_json::from_str::<serde_json::Value>(lines.first().unwrap()).unwrap();
+        assert_eq!(
+            authoritative["payload"]["id"].as_str(),
+            Some(REMOTE_THREAD_A)
+        );
+        assert_eq!(
+            authoritative["payload"]["model_provider"].as_str(),
+            Some("relay")
+        );
+        let inherited = serde_json::from_str::<serde_json::Value>(lines.get(1).unwrap()).unwrap();
+        assert_eq!(inherited["payload"]["id"].as_str(), Some(REMOTE_THREAD_B));
+        assert_eq!(
+            inherited["payload"]["model_provider"].as_str(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn stable_source_rejects_a_wrong_authoritative_session_meta() {
+        let source = tempdir().unwrap();
+        let source_jsonl = source.path().join("rollout-wrong-authority.jsonl");
+        fs::write(
+            &source_jsonl,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n",
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n",
+                ),
+                REMOTE_THREAD_B, REMOTE_THREAD_A
+            ),
+        )
+        .unwrap();
+
+        let error =
+            read_stable_source(&source_jsonl, REMOTE_THREAD_A, |_, _, _| Ok(())).unwrap_err();
+
+        assert!(error.contains(&format!(
+            "source session JSONL id changed from {REMOTE_THREAD_A} to {REMOTE_THREAD_B}"
+        )));
     }
 
     #[test]
