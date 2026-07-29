@@ -43,6 +43,7 @@ function result(
       durationMs: 20,
       requiresFullSync: false,
     },
+    relayValidation: 'verified',
     chatProcessStateRepaired: false,
     chatgptLaunch: { status, message },
   };
@@ -289,8 +290,8 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.getByText('官方登录态').nextSibling?.textContent).toBe('已验证保持不变');
     expect(screen.getByText('配置变更').nextSibling?.textContent).toBe('已原子应用');
     expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('已安全修复');
-    expect(screen.getByText('会话增量').nextSibling?.textContent)
-      .toContain('已同步 2 个变化 · 0.5s');
+    expect(screen.getByText('会话视图').nextSibling?.textContent)
+      .toContain('已准备 2 条会话索引 · 0.5s');
   });
 
   it('does not claim process state was checked for an exact no-op', () => {
@@ -326,7 +327,7 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.getByText('已恢复原始请求配置')).toBeTruthy();
     expect(screen.getByRole('alert').textContent).toContain('切换失败，已恢复原始请求配置');
     expect(screen.queryByRole('button', { name: /打开 ChatGPT/ })).toBeNull();
-    const interrupted = screen.getByText('应用最小配置补丁', { selector: 'strong' }).closest('li');
+    const interrupted = screen.getByText('应用请求端配置', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');
   });
 

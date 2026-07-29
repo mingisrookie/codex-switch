@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.4 - 2026-07-29
+
+### Added
+
+- 新增默认开启的“手机连续性”cutover：升级后首次运行只记录现有 thread ID，不扫描或上传旧会话；以后只自动处理 cutover 后新建、未归档且由受管 Relay 创建的会话。
+- 新增 `%APPDATA%\codex-switch\mobile-continuity-v1.json` 持久队列，记录 thread、source fingerprint、typed 状态、尝试次数和脱敏失败分类，不保存会话正文、路径内容或凭据。
+- 新增隔离的 Relay SQLite 会话视图：切入 Relay 前用 SQLite Online Backup 从 Account 四库生成 `%APPDATA%\codex-switch\relay-sqlite`，只在副本中把 thread provider 归一为 `openai_custom`；Account 原库和共享 `sessions/` 正文保持不变，因此切换请求端后历史会话不会因 provider 过滤而消失。
+- 会话页新增 Remote 状态和旧 Relay 会话“同步此会话”入口；首页新增待发布、已发布、部分可见、冲突/需处理总览以及手机连续性开关。
+- Relay 首次切换或地址/凭据变化后新增页面内选择：“验证连接后切换”或“直接切换”；选择随当前 Relay 配置保存。
+
+### Changed
+
+- live `auth.json` 从 preflight 到写后校验始终 byte-exact 不变。Relay provider 显式写入 `requires_openai_auth = true`，让 Desktop 继续识别官方 ChatGPT 账户；实际 Relay 请求仍使用该 provider 的 `experimental_bearer_token`。
+- 切回 Account 前在 ChatGPT 仍关闭的窗口内处理手机连续性队列，最多 4 批、每批 8 个且 8 MiB，并受 30 秒总预算约束。若仍有排队会话则停止切换并保留 Relay 请求端，避免用户切回后看到会话暂时消失；旧历史与旧会话追加仍由单会话或“完全同步”手动处理。
+- 手机连续性发布使用 immutable/no-clobber `openai` provider successor、SQLite transaction/`PRAGMA quick_check`、受管路径与首条 metadata 复核。兼容内容保持原样；本地文件/附件字段在 Remote successor 中替换为“部分内容仅本机”，原始 Relay JSONL bytes 不变并返回 `partial`。
+- 分叉不再被静默视为成功：既有分支与新 no-clobber successor 均保留，并返回 `conflict` 状态。
+- Relay 验证缩窄为 URL/TLS/HTTP/鉴权检查：仍请求 `<base>/models`，但不读取、推荐或判断模型列表。直接切换路径不会发起 Relay 网络验证，成功后显示“未验证”和“一键返回 Account”。
+- 连续性发布期间关闭 Switch 会显示“继续等待 / 仍然退出”；确认退出会等待当前原子 mutation 结束、持久化队列并真正退出。
+- 删除未使用的 `core:window:allow-destroy` 权限；安全退出调度若进程未退出会在 2 秒后释放 shutdown reservation，避免后续 mutation 永久 busy。
+
+### Validation
+
+- 发布前必须通过 Rust/前端单元测试、TypeScript、fmt、clippy、production build、Windows portable EXE 与 release contract；真实 Account ↔ Relay 切换还需确认历史会话和官方登录态均保持可见。
+
 ## v0.2.3 - 2026-07-28
 
 ### 关闭、切换耗时与任务体验

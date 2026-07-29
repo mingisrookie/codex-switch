@@ -21,6 +21,7 @@ import {
   deleteBackup,
   deleteManagedSessions,
   getAppStatus,
+  getMobileContinuityStatus,
   getUpdateStartupNotice,
   importPlusRuntime,
   installUpdate,
@@ -32,6 +33,9 @@ import {
   loadRuntimeDashboard,
   loadSessionDashboard,
   requestAppExit,
+  acknowledgeMobileContinuityNotice,
+  publishMobileContinuitySession,
+  setMobileContinuityEnabled,
   saveSkillConfig,
   switchRuntime,
   syncAllSessions,
@@ -46,6 +50,24 @@ describe('dashboard API', () => {
 
     await expect(requestAppExit()).resolves.toEqual({ scheduled: true });
     expect(invoke).toHaveBeenCalledWith('request_app_exit');
+  });
+
+  it('uses fixed mobile-continuity commands and passes only typed settings or thread ids', async () => {
+    invoke.mockResolvedValue({ enabled: true, items: [] });
+
+    await getMobileContinuityStatus();
+    await setMobileContinuityEnabled(false);
+    await acknowledgeMobileContinuityNotice();
+    await publishMobileContinuitySession('11111111-1111-4111-8111-111111111111');
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_mobile_continuity_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'set_mobile_continuity_enabled', {
+      enabled: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'acknowledge_mobile_continuity_notice');
+    expect(invoke).toHaveBeenNthCalledWith(4, 'publish_mobile_continuity_session', {
+      threadId: '11111111-1111-4111-8111-111111111111',
+    });
   });
 
   it('keeps successful domains when one dashboard scan fails', async () => {
@@ -330,7 +352,7 @@ describe('dashboard API', () => {
     invoke.mockResolvedValue({ changed: true });
     const events: string[] = [];
 
-    await switchRuntime('relay', (event) => events.push(event.phase));
+    await switchRuntime('relay', (event) => events.push(event.phase), 'direct');
 
     const payload = invoke.mock.calls[0][1] as {
       runtimeId: string;
@@ -338,6 +360,7 @@ describe('dashboard API', () => {
     };
     expect(invoke).toHaveBeenCalledWith('switch_runtime', {
       runtimeId: 'relay',
+      relayPreference: 'direct',
       onProgress: expect.any(Channel),
     });
     payload.onProgress.onmessage({ phase: 'detectingApp' });

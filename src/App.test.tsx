@@ -25,6 +25,10 @@ const apiMocks = vi.hoisted(() => ({
   importPlusRuntime: vi.fn(),
   upsertRelayRuntime: vi.fn(),
   verifyRelayRuntime: vi.fn(),
+  getMobileContinuityStatus: vi.fn(),
+  setMobileContinuityEnabled: vi.fn(),
+  acknowledgeMobileContinuityNotice: vi.fn(),
+  publishMobileContinuitySession: vi.fn(),
   listCodexProcesses: vi.fn(),
   closeCodexProcesses: vi.fn(),
   launchChatgpt: vi.fn(),
@@ -163,6 +167,18 @@ describe('App release-hardening UI', () => {
     apiMocks.requestAppExit.mockResolvedValue({ scheduled: true });
     apiMocks.launchChatgpt.mockResolvedValue({ status: 'alreadyRunning', message: null });
     apiMocks.listSkills.mockResolvedValue([]);
+    apiMocks.getMobileContinuityStatus.mockResolvedValue({
+      enabled: true,
+      noticePending: false,
+      initializedAtMs: 1,
+      queued: 0,
+      publishing: 0,
+      remotePublished: 0,
+      partial: 0,
+      conflict: 0,
+      needsManual: 0,
+      items: [],
+    });
     const initial = dashboardData();
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: initial.codexHome,
@@ -1399,6 +1415,7 @@ describe('App release-hardening UI', () => {
       changed: boolean;
       runtime: (typeof dashboard.runtimes.data)[number];
       incrementalSessionSync: ReturnType<typeof emptyIncrementalSyncResult>;
+      relayValidation: 'notApplicable';
       chatProcessStateRepaired: boolean;
       chatgptLaunch: { status: 'launched'; message: null };
     }>();
@@ -1427,7 +1444,7 @@ describe('App release-hardening UI', () => {
       onProgress({ phase: 'closingApp', timestampMs: 110 });
       onProgress({ phase: 'preparingRuntime', timestampMs: 120 });
     });
-    expect(progress.querySelector('.switch-timeline li.active')?.textContent).toContain('应用最小配置补丁');
+    expect(progress.querySelector('.switch-timeline li.active')?.textContent).toContain('准备增量会话视图');
     expect(within(progress).getByText('安全关闭 ChatGPT', { selector: 'strong' }).closest('li')?.className).toBe('done');
 
     expect(screen.queryByRole('button', { name: '技能' })).toBeNull();
@@ -1438,6 +1455,7 @@ describe('App release-hardening UI', () => {
     pendingSwitch.resolve({
       operationId: 'switch-1', changed: true, runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1460,7 +1478,8 @@ describe('App release-hardening UI', () => {
         changed: true,
         runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
-        chatProcessStateRepaired: false,
+        relayValidation: 'notApplicable',
+      chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'launched', message: null },
       };
     });
@@ -1512,7 +1531,8 @@ describe('App release-hardening UI', () => {
         changed: true,
         runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
-        chatProcessStateRepaired: false,
+        relayValidation: 'notApplicable',
+      chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'failed' as const, message: 'activation unavailable' },
       };
     });
@@ -1566,6 +1586,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1587,6 +1608,7 @@ describe('App release-hardening UI', () => {
         detectedThreads: 1,
         syncedThreads: 1,
       },
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1599,9 +1621,49 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
   });
 
+  it('asks once before the first relay switch and direct mode skips frontend verification', async () => {
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    if (dashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    dashboard.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'exact',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 20,
+    };
+    dashboard.runtimes.data[1].relaySwitchPreference = null;
+    apiMocks.switchRuntime.mockResolvedValue({
+      operationId: 'switch-direct',
+      changed: true,
+      runtime: {
+        ...dashboard.runtimes.data[1],
+        relaySwitchPreference: 'direct',
+      },
+      incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'skipped',
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
+    });
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到中转站' }));
+
+    expect(await screen.findByRole('region', { name: '选择中转站切换方式' })).toBeTruthy();
+    expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '直接切换' }));
+
+    await waitFor(() => expect(apiMocks.switchRuntime).toHaveBeenCalledWith(
+      'relay',
+      expect.any(Function),
+      'direct',
+    ));
+  });
+
   it('ignores progress from an older switch after a newer switch has started', async () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
+    dashboard.runtimes.data[1].relaySwitchPreference = 'direct';
     const first = deferred<RuntimeSwitchResult>();
     const second = deferred<RuntimeSwitchResult>();
     const progress: Array<(event: RuntimeSwitchProgress) => void> = [];
@@ -1616,6 +1678,8 @@ describe('App release-hardening UI', () => {
       });
     const plusDashboard = dashboardData();
     if (plusDashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    if (plusDashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    plusDashboard.runtimes.data[1].relaySwitchPreference = 'direct';
     plusDashboard.runtimeStatus.data = {
       activeRuntimeId: 'plus',
       confidence: 'exact',
@@ -1637,6 +1701,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1659,6 +1724,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[1],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1676,6 +1742,7 @@ describe('App release-hardening UI', () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
     if (dashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    dashboard.runtimes.data[1].relaySwitchPreference = 'direct';
     dashboard.runtimeStatus.data = {
       activeRuntimeId: 'plus',
       confidence: 'exact',
@@ -1709,6 +1776,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[1],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
     });
@@ -1742,6 +1810,49 @@ describe('App release-hardening UI', () => {
     expect(event.preventDefault).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(apiMocks.requestAppExit).toHaveBeenCalledTimes(1));
     expect(apiMocks.requestAppExit).toHaveBeenCalledWith();
+  });
+
+  it('asks before exiting while mobile continuity publication is active', async () => {
+    const pendingSwitch = deferred<RuntimeSwitchResult>();
+    let closeHandler: ((event: { preventDefault: () => void }) => void) | undefined;
+    let onProgress!: (event: RuntimeSwitchProgress) => void;
+    const dashboard = dashboardData();
+    if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
+    apiMocks.switchRuntime.mockImplementation((_runtimeId, callback) => {
+      onProgress = callback;
+      return pendingSwitch.promise;
+    });
+    render(
+      <App
+        loadDashboard={() => Promise.resolve(dashboard)}
+        registerCloseGuard={async (handler) => {
+          closeHandler = handler;
+          return () => undefined;
+        }}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+    act(() => onProgress({ phase: 'syncingIncrementalSessions', timestampMs: 20 }));
+    const closeEvent = { preventDefault: vi.fn() };
+    act(() => closeHandler?.(closeEvent));
+
+    expect(closeEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole('dialog', { name: '会话正在同步' })).toBeTruthy();
+    expect(apiMocks.requestAppExit).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '继续等待' }));
+    expect(screen.queryByRole('dialog', { name: '会话正在同步' })).toBeNull();
+
+    pendingSwitch.resolve({
+      operationId: 'switch-mobile-close',
+      changed: true,
+      runtime: dashboard.runtimes.data[0],
+      incrementalSessionSync: emptyIncrementalSyncResult(),
+      relayValidation: 'notApplicable',
+      chatProcessStateRepaired: false,
+      chatgptLaunch: { status: 'launched', message: null },
+    });
+    expect(await screen.findByText('switch-mobile-close')).toBeTruthy();
   });
 
   it('fails closed when the window close guard cannot be registered', async () => {
@@ -1816,7 +1927,8 @@ function emptyIncrementalSyncResult() {
       return {
         operationId: 'switch-lazy', changed: true, runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
-        chatProcessStateRepaired: false,
+        relayValidation: 'notApplicable',
+      chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'launched', message: null },
       };
     });
@@ -1862,7 +1974,7 @@ function emptyIncrementalSyncResult() {
 
     const progress = await screen.findByRole('dialog', { name: '切换到 ChatGPT 账号态' });
     await waitFor(() => expect(within(progress).getByText('已恢复原始请求配置')).toBeTruthy());
-    const interrupted = within(progress).getByText('应用最小配置补丁', { selector: 'strong' }).closest('li');
+    const interrupted = within(progress).getByText('应用请求端配置', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');
     expect(within(interrupted as HTMLElement).getByText('中断')).toBeTruthy();
     expect(within(progress).queryByText('正在恢复原始请求配置')).toBeNull();

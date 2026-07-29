@@ -93,8 +93,17 @@ pub struct RuntimeSwitchResult {
     pub runtime: RuntimeMetadata,
     pub warnings: Vec<String>,
     pub incremental_session_sync: IncrementalSessionSyncReceipt,
+    pub relay_validation: RelayValidationStatus,
     pub chat_process_state_repaired: bool,
     pub chatgpt_launch: ChatGptLaunchReceipt,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RelayValidationStatus {
+    NotApplicable,
+    Verified,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -160,6 +169,9 @@ pub(crate) fn combine_session_sync_results(
         .ok_or_else(|| "session storage accounting overflowed".to_string())?;
     let mut obsolete_provider_slots = to_shared.obsolete_provider_slots.clone();
     obsolete_provider_slots.extend(from_shared.obsolete_provider_slots.clone());
+    let mut preserved_divergent_thread_ids = to_shared.preserved_divergent_thread_ids.clone();
+    preserved_divergent_thread_ids
+        .extend(from_shared.preserved_divergent_thread_ids.iter().cloned());
     Ok(SessionSyncResult {
         inserted_threads: to_shared.inserted_threads + from_shared.inserted_threads,
         copied_session_files: to_shared.copied_session_files + from_shared.copied_session_files,
@@ -173,6 +185,7 @@ pub(crate) fn combine_session_sync_results(
         persistent_session_bytes_added,
         persistent_session_bytes_reclaimed,
         obsolete_provider_slots,
+        preserved_divergent_thread_ids,
     })
 }
 

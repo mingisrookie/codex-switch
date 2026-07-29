@@ -84,6 +84,47 @@ describe('SessionManagementPage', () => {
     expect(within(region).getByRole('table', { name: '会话列表' })).toBeTruthy();
   });
 
+  it('offers legacy relay sessions a manual Remote publication action and renders typed status', () => {
+    const onPublishMobile = vi.fn();
+    render(
+      <SessionManagementPage
+        inventory={inventory([session(2), session(4)])}
+        busy={false}
+        syncDisabled={false}
+        mutationDisabled={false}
+        onSync={vi.fn()}
+        onDelete={vi.fn()}
+        onRestoreVisible={vi.fn()}
+        mobileContinuity={{
+          enabled: true,
+          noticePending: false,
+          initializedAtMs: 1,
+          queued: 0,
+          publishing: 0,
+          remotePublished: 1,
+          partial: 0,
+          conflict: 0,
+          needsManual: 0,
+          items: [{
+            threadId: 'thread-04',
+            status: 'remotePublished',
+            attempts: 1,
+            nextRetryAtMs: null,
+            updatedAtMs: 2,
+            failureCategory: null,
+            sourceFingerprint: null,
+          }],
+        }}
+        onPublishMobile={onPublishMobile}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '同步此会话' }));
+
+    expect(onPublishMobile).toHaveBeenCalledWith('thread-02');
+    expect(screen.getByText('本机 Remote')).toBeTruthy();
+  });
+
   it('keeps selections across pages and exposes the partial-page indeterminate state', () => {
     const sessions = Array.from({ length: 55 }, (_, index) => session(index + 1));
     renderPage(sessions);

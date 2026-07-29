@@ -32,6 +32,8 @@ pub struct SessionSyncResult {
     pub persistent_session_bytes_reclaimed: u64,
     #[serde(skip)]
     pub(crate) obsolete_provider_slots: Vec<ObsoleteProviderSlot>,
+    #[serde(skip)]
+    pub(crate) preserved_divergent_thread_ids: HashSet<String>,
 }
 
 #[cfg(test)]
@@ -150,6 +152,7 @@ struct RolloutCopy {
     created_bytes: u64,
     source_meta: SessionMeta,
     obsolete_provider_slot: Option<ObsoleteProviderSlot>,
+    preserved_divergence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +224,7 @@ struct SessionSyncPolicy {
     session_files: SessionFileWritePolicy,
     session_index: SessionIndexWritePolicy,
     copy_dependent_rows: bool,
+    sanitize_local_only_content: bool,
 }
 
 impl SessionSyncPolicy {
@@ -236,6 +240,7 @@ impl SessionSyncPolicy {
             session_files,
             session_index: SessionIndexWritePolicy::closed(session_files),
             copy_dependent_rows: true,
+            sanitize_local_only_content: false,
         }
     }
 
@@ -247,21 +252,20 @@ impl SessionSyncPolicy {
             session_files,
             session_index: SessionIndexWritePolicy::hot(session_files),
             copy_dependent_rows: true,
+            sanitize_local_only_content: false,
         }
     }
 
-    fn incremental(update_existing_provider: bool, preserve_existing: bool) -> Self {
+    #[cfg(test)]
+    fn incremental() -> Self {
         Self {
-            allow_existing_replacement: !preserve_existing,
-            update_existing_provider,
-            existing_rollout_path: if preserve_existing {
-                ExistingRolloutPathPolicy::PreserveExisting
-            } else {
-                ExistingRolloutPathPolicy::SelectMostComplete
-            },
+            allow_existing_replacement: true,
+            update_existing_provider: false,
+            existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
             session_files: SessionFileWritePolicy::Allow,
             session_index: SessionIndexWritePolicy::Skip,
             copy_dependent_rows: true,
+            sanitize_local_only_content: false,
         }
     }
 
@@ -273,6 +277,14 @@ impl SessionSyncPolicy {
             session_files: SessionFileWritePolicy::Allow,
             session_index: SessionIndexWritePolicy::Skip,
             copy_dependent_rows: false,
+            sanitize_local_only_content: false,
+        }
+    }
+
+    fn mobile_provider_publication() -> Self {
+        Self {
+            sanitize_local_only_content: true,
+            ..Self::incremental_self_provider()
         }
     }
 }
@@ -343,6 +355,7 @@ enum ProviderRolloutAction {
     Create {
         path: PathBuf,
         supersedes: Option<Box<OwnedProviderSlot>>,
+        preserved_divergence: bool,
     },
 }
 
@@ -502,6 +515,7 @@ pub(crate) fn sync_shared_to_user_home_hot_with_policy(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn sync_selected_user_home_to_shared_with_paths(
     current: &CodexPaths,
     shared: &CodexPaths,
@@ -512,25 +526,11 @@ pub(crate) fn sync_selected_user_home_to_shared_with_paths(
         root_from_paths(shared.clone()),
         ids,
         None,
-        SessionSyncPolicy::incremental(false, false),
+        SessionSyncPolicy::incremental(),
     )
 }
 
-pub(crate) fn sync_selected_shared_to_user_home_hot_with_paths(
-    shared: &CodexPaths,
-    current: &CodexPaths,
-    ids: &HashSet<String>,
-    provider_id: &str,
-) -> Result<SessionSyncResult, String> {
-    sync_selected_session_roots(
-        &root_from_paths(shared.clone()),
-        root_from_paths(current.clone()),
-        ids,
-        Some(provider_id),
-        SessionSyncPolicy::incremental(false, true),
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn normalize_selected_user_home_provider_with_paths(
     current: &CodexPaths,
     ids: &HashSet<String>,
@@ -543,6 +543,29 @@ pub(crate) fn normalize_selected_user_home_provider_with_paths(
         ids,
         Some(provider_id),
         SessionSyncPolicy::incremental_self_provider(),
+    )
+}
+
+pub(crate) fn publish_selected_user_home_provider_for_mobile_between_paths(
+    source: &CodexPaths,
+    target: &CodexPaths,
+    ids: &HashSet<String>,
+    provider_id: &str,
+) -> Result<SessionSyncResult, String> {
+    if source.codex_home != target.codex_home
+        || source.sessions_dir != target.sessions_dir
+        || source.session_index != target.session_index
+    {
+        return Err(
+            "mobile publication source and target must share the managed Codex Home".to_string(),
+        );
+    }
+    sync_selected_session_roots(
+        &root_from_paths(source.clone()),
+        root_from_paths(target.clone()),
+        ids,
+        Some(provider_id),
+        SessionSyncPolicy::mobile_provider_publication(),
     )
 }
 
@@ -908,6 +931,7 @@ fn empty_session_sync_result() -> SessionSyncResult {
         persistent_session_bytes_added: 0,
         persistent_session_bytes_reclaimed: 0,
         obsolete_provider_slots: Vec::new(),
+        preserved_divergent_thread_ids: HashSet::new(),
     }
 }
 
@@ -993,6 +1017,7 @@ fn sync_sessions_in_transaction(
     let mut skipped_archived_threads = 0;
     let mut persistent_session_bytes_added = 0_u64;
     let mut obsolete_provider_slots = Vec::new();
+    let mut preserved_divergent_thread_ids = HashSet::new();
 
     for prepared in prepared_sources {
         skipped_archived_threads += prepared.skipped_archived_threads;
@@ -1019,8 +1044,10 @@ fn sync_sessions_in_transaction(
                     existing_rollout.as_deref(),
                     provider_id,
                     policy.session_files,
+                    policy.sanitize_local_only_content,
                 )?;
                 if let Some(raw) = preserved_raw.as_ref() {
+                    preserved_divergent_thread_ids.insert(thread.id.clone());
                     record_rollout_storage(
                         raw,
                         &mut persistent_session_bytes_added,
@@ -1033,6 +1060,9 @@ fn sync_sessions_in_transaction(
                     &mut persistent_session_bytes_added,
                     &mut obsolete_provider_slots,
                 )?;
+                if provider_rollout.preserved_divergence {
+                    preserved_divergent_thread_ids.insert(thread.id.clone());
+                }
                 copied_session_files += usize::from(provider_rollout.copied);
                 let mut stable_thread = thread.clone();
                 stable_thread.meta = provider_rollout.source_meta.clone();
@@ -1063,6 +1093,7 @@ fn sync_sessions_in_transaction(
                         None,
                         provider_id,
                         policy.session_files,
+                        policy.sanitize_local_only_content,
                     )?;
                     debug_assert!(preserved_raw.is_none());
                     record_rollout_storage(
@@ -1070,6 +1101,9 @@ fn sync_sessions_in_transaction(
                         &mut persistent_session_bytes_added,
                         &mut obsolete_provider_slots,
                     )?;
+                    if provider_rollout.preserved_divergence {
+                        preserved_divergent_thread_ids.insert(thread.id.clone());
+                    }
                     let mut stable_thread = thread.clone();
                     stable_thread.meta = provider_rollout.source_meta.clone();
                     insert_thread(
@@ -1112,6 +1146,7 @@ fn sync_sessions_in_transaction(
                     created_bytes: 0,
                     source_meta: copied_rollout.source_meta.clone(),
                     obsolete_provider_slot: None,
+                    preserved_divergence: false,
                 };
                 let provider_for_thread =
                     if copied_rollout.copied && copied_rollout.path == selected_rollout.path {
@@ -1173,6 +1208,7 @@ fn sync_sessions_in_transaction(
         persistent_session_bytes_added,
         persistent_session_bytes_reclaimed: 0,
         obsolete_provider_slots,
+        preserved_divergent_thread_ids,
     })
 }
 
@@ -1759,6 +1795,7 @@ fn copy_rollout_file(
                     &thread.id,
                     provider_id,
                     &source.version,
+                    false,
                 ) {
                     Ok(true) => {
                         let output_provider =
@@ -1855,6 +1892,7 @@ fn rollout_copy(
         created_bytes,
         source_meta: source.version.meta.clone(),
         obsolete_provider_slot: None,
+        preserved_divergence: false,
     }
 }
 
@@ -1864,6 +1902,7 @@ fn copy_provider_rollout_for_closed_sync(
     existing_rollout: Option<&str>,
     provider_id: &str,
     file_write_policy: SessionFileWritePolicy,
+    sanitize_local_only_content: bool,
 ) -> Result<(RolloutCopy, Option<RolloutCopy>), String> {
     let existing = existing_rollout.map(PathBuf::from);
     let mut preserved_raw = None;
@@ -1897,6 +1936,7 @@ fn copy_provider_rollout_for_closed_sync(
         &thread.id,
         provider_id,
         file_write_policy,
+        sanitize_local_only_content,
     )?;
     Ok((provider, preserved_raw))
 }
@@ -1908,6 +1948,7 @@ fn ensure_provider_rollout_from_source(
     thread_id: &str,
     provider_id: &str,
     file_write_policy: SessionFileWritePolicy,
+    sanitize_local_only_content: bool,
 ) -> Result<RolloutCopy, String> {
     let mut last_source_change = None;
     for attempt in 0..SOURCE_STABILITY_ATTEMPTS {
@@ -1945,13 +1986,18 @@ fn ensure_provider_rollout_from_source(
                     "the selected provider rollout changed before it was finalized",
                 ));
             }
-            ProviderRolloutAction::Create { supersedes, .. } => {
+            ProviderRolloutAction::Create {
+                supersedes,
+                preserved_divergence,
+                ..
+            } => {
                 match create_session_file_if_absent(
                     source_rollout,
                     &target_path,
                     thread_id,
                     Some(provider_id),
                     &source.version,
+                    sanitize_local_only_content,
                 ) {
                     Ok(true) => {
                         let (successor_marker, marker_bytes) = match write_provider_slot_marker(
@@ -1979,6 +2025,7 @@ fn ensure_provider_rollout_from_source(
                                 "provider session storage accounting overflowed".to_string()
                             })?;
                         let mut copy = rollout_copy(&target_path, true, created_bytes, &source);
+                        copy.preserved_divergence = preserved_divergence;
                         copy.obsolete_provider_slot = supersedes.map(|obsolete| {
                             let obsolete = *obsolete;
                             ObsoleteProviderSlot {
@@ -2032,9 +2079,17 @@ fn create_session_file_if_absent(
     expected_id: &str,
     provider_id: Option<&str>,
     expected_version: &StableSourceVersion,
+    sanitize_local_only_content: bool,
 ) -> Result<bool, String> {
     atomic_create(target, |output| {
-        write_session_file(source, output, expected_id, provider_id, expected_version)
+        write_session_file(
+            source,
+            output,
+            expected_id,
+            provider_id,
+            expected_version,
+            sanitize_local_only_content,
+        )
     })
 }
 
@@ -2215,6 +2270,7 @@ fn provider_rollout_variant(
 
     let mut supersedes = None;
     let mut first_free = None;
+    let mut preserved_divergence = false;
     for sequence in 0_u32..PROVIDER_SLOT_ALLOCATION_ATTEMPTS {
         let candidate = provider_candidate_path(
             parent,
@@ -2261,11 +2317,17 @@ fn provider_rollout_variant(
                     }));
                 }
             }
-            SessionFileRelation::Divergent => {}
+            SessionFileRelation::Divergent => {
+                preserved_divergence = true;
+            }
         }
     }
     if let Some(path) = first_free {
-        return Ok(ProviderRolloutAction::Create { path, supersedes });
+        return Ok(ProviderRolloutAction::Create {
+            path,
+            supersedes,
+            preserved_divergence,
+        });
     }
     Err(format!(
         "failed to allocate a provider-normalized session JSONL beside {}",
@@ -2554,7 +2616,7 @@ fn provider_output_len(
     Ok(output_bytes)
 }
 
-fn validate_remote_thread_id(thread_id: &str) -> Result<(), String> {
+pub(crate) fn validate_remote_thread_id(thread_id: &str) -> Result<(), String> {
     let path = Path::new(thread_id);
     if thread_id.len() != 36
         || path.file_name().and_then(|value| value.to_str()) != Some(thread_id)
@@ -2658,7 +2720,7 @@ fn rollout_date_from_parent(path: &Path) -> Option<String> {
     valid_rollout_date(&date).then_some(date)
 }
 
-fn is_remote_rollout_path(path: &Path, thread_id: &str) -> bool {
+pub(crate) fn is_remote_rollout_path(path: &Path, thread_id: &str) -> bool {
     let file_name = path.file_name().and_then(|name| name.to_str());
     let timestamp = file_name
         .and_then(|name| name.strip_prefix("rollout-"))
@@ -3011,31 +3073,34 @@ fn write_session_file(
     expected_id: &str,
     provider_id: Option<&str>,
     expected_version: &StableSourceVersion,
+    sanitize_local_only_content: bool,
 ) -> Result<(), String> {
     let mut authoritative_meta_written = false;
     let observed = read_stable_source(source_path, expected_id, |raw, body, value| {
-        let Some(provider_id) = provider_id else {
-            return output
-                .write_all(raw)
-                .map_err(|error| format!("failed to copy session JSONL: {error}"));
-        };
-        if authoritative_meta_written
-            || value.get("type").and_then(JsonValue::as_str) != Some("session_meta")
-        {
+        let rewrite_provider = provider_id.is_some()
+            && !authoritative_meta_written
+            && value.get("type").and_then(JsonValue::as_str) == Some("session_meta");
+        let contains_local_only = sanitize_local_only_content && has_local_only_value(value);
+        if !rewrite_provider && !contains_local_only {
             return output
                 .write_all(raw)
                 .map_err(|error| format!("failed to copy session JSONL: {error}"));
         }
         let mut value = value.clone();
-        let payload = value
-            .get_mut("payload")
-            .and_then(JsonValue::as_object_mut)
-            .ok_or_else(|| "session_meta payload must be an object".to_string())?;
-        payload.insert(
-            "model_provider".to_string(),
-            JsonValue::String(provider_id.to_string()),
-        );
-        authoritative_meta_written = true;
+        if rewrite_provider {
+            let payload = value
+                .get_mut("payload")
+                .and_then(JsonValue::as_object_mut)
+                .ok_or_else(|| "session_meta payload must be an object".to_string())?;
+            payload.insert(
+                "model_provider".to_string(),
+                JsonValue::String(provider_id.expect("checked above").to_string()),
+            );
+            authoritative_meta_written = true;
+        }
+        if contains_local_only {
+            sanitize_local_only_value(&mut value);
+        }
         let rewritten = serde_json::to_vec(&value)
             .map_err(|error| format!("failed to serialize session metadata: {error}"))?;
         output
@@ -3051,6 +3116,37 @@ fn write_session_file(
         ));
     }
     Ok(())
+}
+
+fn has_local_only_value(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Object(object) => object.iter().any(|(key, value)| {
+            matches!(key.as_str(), "local_file" | "file_path" | "attachment")
+                || has_local_only_value(value)
+        }),
+        JsonValue::Array(values) => values.iter().any(has_local_only_value),
+        _ => false,
+    }
+}
+
+fn sanitize_local_only_value(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "local_file" | "file_path" | "attachment") {
+                    *value = JsonValue::String("部分内容仅本机".to_string());
+                } else {
+                    sanitize_local_only_value(value);
+                }
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                sanitize_local_only_value(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -4583,6 +4679,7 @@ mod tests {
             REMOTE_THREAD_A,
             Some("relay"),
             &stable.version,
+            false,
         )
         .unwrap();
         drop(target);

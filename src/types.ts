@@ -151,6 +151,7 @@ export type SessionMutationResult = {
 };
 
 export type RuntimeKind = 'plus' | 'relay';
+export type RelaySwitchPreference = 'validate' | 'direct';
 
 export type RuntimeMetadata = {
   id: string;
@@ -161,6 +162,7 @@ export type RuntimeMetadata = {
   createdAtMs: number;
   lastUsedAtMs: number | null;
   lastVerifiedAtMs: number | null;
+  relaySwitchPreference?: RelaySwitchPreference | null;
 };
 
 export type RuntimeConfidence = 'exact' | 'mode' | 'unknown';
@@ -347,6 +349,43 @@ export type SessionSyncResult = {
   chatgptLaunch: ChatGptLaunchResult;
 };
 
+export type MobileContinuityItemStatus =
+  | 'queued'
+  | 'publishing'
+  | 'remotePublished'
+  | 'partial'
+  | 'conflict'
+  | 'retrying'
+  | 'needsManual'
+  | 'paused';
+
+export type MobileContinuityItem = {
+  threadId: string;
+  status: MobileContinuityItemStatus;
+  attempts: number;
+  nextRetryAtMs: number | null;
+  updatedAtMs: number;
+  failureCategory: string | null;
+  sourceFingerprint: {
+    size: number;
+    modifiedAtMs: number;
+    sha256: string;
+  } | null;
+};
+
+export type MobileContinuityStatus = {
+  enabled: boolean;
+  noticePending: boolean;
+  initializedAtMs: number;
+  queued: number;
+  publishing: number;
+  remotePublished: number;
+  partial: number;
+  conflict: number;
+  needsManual: number;
+  items: MobileContinuityItem[];
+};
+
 export type IncrementalSessionSyncStatus =
   | 'skipped'
   | 'unchanged'
@@ -370,6 +409,7 @@ export type RuntimeSwitchResult = {
   runtime: RuntimeMetadata;
   warnings?: string[];
   incrementalSessionSync: IncrementalSessionSyncReceipt;
+  relayValidation: 'notApplicable' | 'verified' | 'skipped';
   chatProcessStateRepaired: boolean;
   chatgptLaunch: ChatGptLaunchResult;
 };

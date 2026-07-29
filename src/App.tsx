@@ -33,6 +33,7 @@ import {
   deleteManagedSessions,
   importPlusRuntime,
   getAppStatus as defaultGetAppStatus,
+  getMobileContinuityStatus,
   getUpdateStartupNotice as defaultGetUpdateStartupNotice,
   installUpdate as defaultInstallUpdate,
   launchChatgpt,
@@ -42,9 +43,12 @@ import {
   loadSessionDashboard as defaultLoadSessionDashboard,
   loadingDashboard,
   requestAppExit as defaultRequestAppExit,
+  acknowledgeMobileContinuityNotice,
+  publishMobileContinuitySession,
   restoreBackup,
   restoreSessionsVisible,
   switchRuntime,
+  setMobileContinuityEnabled,
   syncAllSessions,
   upsertRelayRuntime,
   verifyRelayRuntime,
@@ -65,7 +69,9 @@ import type {
   CheckpointStorageStatus,
   DashboardData,
   DomainState,
+  MobileContinuityStatus,
   RelayRuntimeInput,
+  RelaySwitchPreference,
   RuntimeKind,
   RuntimeMetadata,
   RuntimeStatus,
@@ -134,6 +140,11 @@ function App({
   const [receipt, setReceipt] = useState<OperationView | null>(null);
   const [relayEditorOpen, setRelayEditorOpen] = useState(false);
   const [relaySubmitError, setRelaySubmitError] = useState<string | null>(null);
+  const [relaySwitchPrompt, setRelaySwitchPrompt] = useState<{
+    label: string;
+    trigger: HTMLElement | null;
+  } | null>(null);
+  const [mobileContinuity, setMobileContinuity] = useState<MobileContinuityStatus | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [switchFlow, setSwitchFlow] = useState<RuntimeSwitchFlow | null>(null);
   const [sessionsStale, setSessionsStale] = useState(() => loadDashboard === undefined);
@@ -154,6 +165,8 @@ function App({
   const [closeGuardStatus, setCloseGuardStatus] =
     useState<'loading' | 'ready' | 'failed'>('loading');
   const [closePending, setClosePending] = useState(false);
+  const [continuityCloseChoice, setContinuityCloseChoice] =
+    useState<'pending' | 'exit' | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const loadRequestId = useRef(0);
   const runtimeRequestId = useRef(0);
@@ -173,6 +186,12 @@ function App({
   const exclusiveActionInFlight = useRef(false);
   const closeRequestInFlight = useRef(false);
   const exitScheduled = useRef(false);
+  const continuitySyncActive = switchFlow?.status === 'running'
+    && switchFlow.events.some((event) => event.phase === 'syncingIncrementalSessions');
+  const continuitySyncActiveRef = useRef(false);
+  const continuityCloseChoiceRef = useRef<'pending' | 'exit' | null>(null);
+  continuitySyncActiveRef.current = continuitySyncActive;
+  continuityCloseChoiceRef.current = continuityCloseChoice;
 
   const attemptAppExit = useCallback(async () => {
     if (exclusiveActionInFlight.current) {
@@ -227,6 +246,11 @@ function App({
       })
       .catch(() => undefined);
     void runUpdateCheck(false);
+    void getMobileContinuityStatus()
+      .then(setMobileContinuity)
+      .catch((reason: unknown) => {
+        setError(`手机连续性已暂停：${errorMessage(reason)}。旧会话不会自动上传，请使用手动同步处理。`);
+      });
   }, []);
 
   useEffect(() => {
@@ -252,6 +276,14 @@ function App({
     void registerCloseGuard((event) => {
       event.preventDefault();
       setClosePending(true);
+      if (
+        continuitySyncActiveRef.current
+        && continuityCloseChoiceRef.current !== 'exit'
+      ) {
+        continuityCloseChoiceRef.current = 'pending';
+        setContinuityCloseChoice('pending');
+        return;
+      }
       void attemptAppExit();
     })
       .then((stopListening) => {
@@ -274,6 +306,7 @@ function App({
   useEffect(() => {
     if (!closePending) return undefined;
     const retry = window.setInterval(() => {
+      if (continuityCloseChoiceRef.current === 'pending') return;
       if (!exitScheduled.current) void attemptAppExit();
     }, 500);
     const recover = window.setTimeout(() => {
@@ -569,8 +602,27 @@ function App({
     }), undefined, 'runtime');
   }
 
-  async function handleSwitch(runtimeId: RuntimeKind, label: string, trigger?: HTMLElement) {
+  async function handleSwitch(
+    runtimeId: RuntimeKind,
+    label: string,
+    trigger?: HTMLElement,
+    requestedRelayPreference?: RelaySwitchPreference,
+  ) {
     if (!canSwitchRuntime || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
+    let relayPreference = requestedRelayPreference;
+    if (runtimeId === 'relay' && relayPreference === undefined) {
+      relayPreference = relayRuntime?.relaySwitchPreference ?? undefined;
+      if (relayPreference === undefined) {
+        setRelaySwitchPrompt({
+          label,
+          trigger: trigger ?? (
+            document.activeElement instanceof HTMLElement ? document.activeElement : null
+          ),
+        });
+        return;
+      }
+    }
+    setRelaySwitchPrompt(null);
     switchTrigger.current = trigger ?? (
       document.activeElement instanceof HTMLElement ? document.activeElement : null
     );
@@ -588,7 +640,7 @@ function App({
     });
 
     try {
-      const result: RuntimeSwitchResult = await switchRuntime(runtimeId, (event) => {
+      const onProgress = (event: RuntimeSwitchProgress) => {
         if (attemptId !== switchAttemptId.current) return;
         setSwitchFlow((current) => {
           if (!current || current.target !== runtimeId) return current;
@@ -607,7 +659,10 @@ function App({
             failedPhase,
           };
         });
-      });
+      };
+      const result: RuntimeSwitchResult = runtimeId === 'relay'
+        ? await switchRuntime(runtimeId, onProgress, relayPreference ?? null)
+        : await switchRuntime(runtimeId, onProgress);
       if (attemptId !== switchAttemptId.current) return;
       if (result.incrementalSessionSync.status === 'applied') {
         markSessionsStale();
@@ -626,6 +681,11 @@ function App({
         result,
         completedAtMs: Date.now(),
       } : current);
+      if (runtimeId === 'plus') {
+        void getMobileContinuityStatus()
+          .then(setMobileContinuity)
+          .catch(() => undefined);
+      }
       refreshInBackground('runtime', (reason) => {
         setSwitchFlow((current) => current ? {
           ...current,
@@ -689,6 +749,52 @@ function App({
       exclusiveActionInFlight.current = false;
       setBusy(null);
     }
+  }
+
+  async function handleMobileContinuityToggle() {
+    if (!mobileContinuity || exclusiveBusy) return;
+    await runAction(
+      mobileContinuity.enabled ? '关闭手机连续性' : '开启手机连续性',
+      () => setMobileContinuityEnabled(!mobileContinuity.enabled),
+      (status) => ({
+        label: status.enabled ? '手机连续性已开启' : '手机连续性已关闭',
+        metrics: ['只影响升级后新建的 Relay 会话'],
+      }),
+      undefined,
+      'none',
+    ).then((status) => {
+      if (status) setMobileContinuity(status);
+    });
+  }
+
+  async function handleAcknowledgeMobileContinuity() {
+    try {
+      setMobileContinuity(await acknowledgeMobileContinuityNotice());
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function handlePublishMobileContinuitySession(threadId: string) {
+    const status = await runAction(
+      '发布单个会话',
+      () => publishMobileContinuitySession(threadId),
+      (next) => ({
+        label: '会话已提交到手机同步',
+        metrics: [
+          `本机 Remote：${next.remotePublished}`,
+          `部分可见：${next.partial}`,
+        ],
+      }),
+      undefined,
+      'runtime',
+    );
+    if (status) {
+      setMobileContinuity(status);
+      markSessionsStale();
+      return true;
+    }
+    return false;
   }
 
   function closeSwitchTask() {
@@ -974,8 +1080,8 @@ function App({
               <p className="eyebrow">LOCAL RUNTIME / CONTROL 01</p>
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
               <p className="runtime-intro-lede">
-                保持 ChatGPT 官方登录态不变，只切换模型与请求端。会话同步已独立，
-                每一步都展示真实耗时，完成后自动回到 ChatGPT。
+            保持 ChatGPT 官方登录态不变，只切换请求端。新建 Relay 会话可在切回 Account
+            后发布到本机 Remote；每一步都展示真实耗时，完成后自动回到 ChatGPT。
               </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
@@ -1026,6 +1132,91 @@ function App({
             />
           </section>
 
+          {relaySwitchPrompt ? (
+            <section className="home-setup-notice relay-switch-choice" aria-label="选择中转站切换方式">
+              <ShieldCheck aria-hidden="true" />
+              <div>
+                <p className="eyebrow">RELAY CHECK</p>
+                <h2>切换前是否验证中转站连接？</h2>
+                <p>只验证地址、网络和鉴权，不检查模型。你的选择会保留到地址或凭据变化。</p>
+              </div>
+              <div className="relay-switch-choice-actions">
+                <button
+                  className="primary-button"
+                  onClick={() => void handleSwitch(
+                    'relay',
+                    relaySwitchPrompt.label,
+                    relaySwitchPrompt.trigger ?? undefined,
+                    'validate',
+                  )}
+                  disabled={exclusiveBusy}
+                >
+                  验证连接后切换
+                </button>
+                <button
+                  className="ghost-button"
+                  onClick={() => void handleSwitch(
+                    'relay',
+                    relaySwitchPrompt.label,
+                    relaySwitchPrompt.trigger ?? undefined,
+                    'direct',
+                  )}
+                  disabled={exclusiveBusy}
+                >
+                  直接切换
+                </button>
+                <button
+                  className="ghost-button"
+                  onClick={() => setRelaySwitchPrompt(null)}
+                  disabled={exclusiveBusy}
+                >
+                  取消
+                </button>
+              </div>
+            </section>
+          ) : null}
+
+          {isExactRuntime(runtimeStatus, 'relay')
+            && relayRuntime?.relaySwitchPreference === 'direct' ? (
+              <section className="home-setup-notice relay-direct-notice" aria-label="中转站未验证">
+                <CircleAlert aria-hidden="true" />
+                <div>
+                  <p className="eyebrow">RELAY UNVERIFIED</p>
+                  <h2>当前中转站未验证</h2>
+                  <p>请求端已直接切换；如果无法使用，可安全返回 OpenAI 官方请求端。</p>
+                </div>
+                <button
+                  className="primary-button"
+                  onClick={(event) => void handleSwitch(
+                    'plus',
+                    '返回 ChatGPT 账号',
+                    event.currentTarget,
+                  )}
+                  disabled={exclusiveBusy || !plusRuntime}
+                >
+                  一键返回 Account
+                </button>
+              </section>
+            ) : null}
+
+          {mobileContinuity?.noticePending ? (
+            <section className="home-setup-notice mobile-continuity-notice" aria-label="手机连续性已开启">
+              <MessagesSquare aria-hidden="true" />
+              <div>
+                <p className="eyebrow">MOBILE CONTINUITY</p>
+                <h2>升级后新建的 Relay 会话会在切回 Account 时自动发布</h2>
+                <p>发布在本机安全关闭窗口内完成；旧会话继续由你手动同步。</p>
+              </div>
+              <button
+                className="ghost-button"
+                onClick={() => void handleAcknowledgeMobileContinuity()}
+                disabled={exclusiveBusy}
+              >
+                知道了
+              </button>
+            </section>
+          ) : null}
+
           {relayEditorOpen ? (
             <RelayRuntimeDialog
               runtime={relayRuntime} fallbackModel={plusRuntime?.model ?? ''} busy={exclusiveBusy}
@@ -1035,6 +1226,34 @@ function App({
           ) : null}
 
           <section className="runtime-operations" aria-label="数据与恢复">
+            <aside className="detail-panel session-panel mobile-continuity-panel" aria-label="手机连续性">
+              <div className="card-title-row">
+                <MessagesSquare className="section-icon" aria-hidden="true" />
+                <div><p className="eyebrow">REMOTE PUBLICATION</p><h2>手机连续性</h2></div>
+              </div>
+              {mobileContinuity ? (
+                <>
+                  <div className="continuity-stats">
+                    <strong>{mobileContinuity.queued + mobileContinuity.publishing}<span>待发布</span></strong>
+                    <strong>{mobileContinuity.remotePublished}<span>本机 Remote</span></strong>
+                    <strong>{mobileContinuity.partial}<span>部分可见</span></strong>
+                    <strong>{mobileContinuity.conflict + mobileContinuity.needsManual}<span>需处理</span></strong>
+                  </div>
+                  <p className="continuity-copy">
+                    {mobileContinuity.enabled
+                      ? '已开启：只自动处理本版本启用后新建的 Relay 会话。'
+                      : '已关闭：不会领取新的自动发布任务，已有状态不会删除。'}
+                  </p>
+                  <button
+                    className="ghost-button full"
+                    onClick={() => void handleMobileContinuityToggle()}
+                    disabled={exclusiveBusy}
+                  >
+                    {mobileContinuity.enabled ? '关闭自动发布' : '开启自动发布'}
+                  </button>
+                </>
+              ) : <p className="continuity-copy">连续性状态读取中…</p>}
+            </aside>
             <aside className="detail-panel session-panel" aria-label="会话同步">
               <div className="card-title-row"><Database className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SESSION POOL</p><h2>完全同步</h2></div></div>
               <div className="sync-stats"><strong>{threadCount}<span>threads</span></strong><strong>{jsonlCount}<span>JSONL</span></strong></div>
@@ -1072,6 +1291,9 @@ function App({
           syncDisabled={!canSync} mutationDisabled={!canMutateSessions}
           onSync={() => void handleSyncSessions()} onDelete={handleDeleteSessions}
           onRestoreVisible={handleRestoreSessionsVisible}
+          mobileContinuity={mobileContinuity}
+          onPublishMobile={(threadId) => handlePublishMobileContinuitySession(threadId)}
+          mobilePublishDisabled={!isExactRuntime(runtimeStatus, 'plus')}
         />
       ) : activePage === 'sessions' ? <DomainPlaceholder state={data.managedSessions} /> : null}
 
@@ -1090,6 +1312,37 @@ function App({
         onClose={closeSwitchTask}
         onRetryLaunch={() => void handleRetryChatGptLaunch()}
       />
+    ) : null}
+    {continuityCloseChoice === 'pending' ? (
+      <section className="close-choice-overlay" role="dialog" aria-modal="true" aria-label="会话正在同步">
+        <div className="close-choice-card">
+          <p className="eyebrow">REMOTE PUBLICATION</p>
+          <h2>会话正在同步</h2>
+          <p>继续等待可完成当前发布；仍然退出会在当前原子步骤结束后保存队列并真正退出。</p>
+          <div className="relay-switch-choice-actions">
+            <button
+              className="primary-button"
+              onClick={() => {
+                continuityCloseChoiceRef.current = null;
+                setContinuityCloseChoice(null);
+                setClosePending(false);
+              }}
+            >
+              继续等待
+            </button>
+            <button
+              className="ghost-button"
+              onClick={() => {
+                continuityCloseChoiceRef.current = 'exit';
+                setContinuityCloseChoice('exit');
+                void attemptAppExit();
+              }}
+            >
+              仍然退出
+            </button>
+          </div>
+        </div>
+      </section>
     ) : null}
     </>
   );

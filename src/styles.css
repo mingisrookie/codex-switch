@@ -1096,6 +1096,78 @@ span.section-icon svg {
   font-size: 11px;
 }
 
+.relay-switch-choice-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.relay-direct-notice {
+  border-color: #d8b365;
+}
+
+.continuity-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 18px 0 12px;
+}
+
+.continuity-stats strong {
+  display: grid;
+  gap: 3px;
+  padding: 10px 8px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  font-size: 20px;
+  text-align: center;
+}
+
+.continuity-stats span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.continuity-copy {
+  min-height: 34px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.close-choice-overlay {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(16, 20, 21, 0.58);
+}
+
+.close-choice-card {
+  width: min(480px, 100%);
+  padding: 24px;
+  border: 1px solid var(--ink);
+  border-top: 5px solid var(--amber);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.close-choice-card h2 {
+  margin: 6px 0 8px;
+}
+
+.close-choice-card > p:not(.eyebrow) {
+  margin-bottom: 18px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .runtime-card,
 .skill-card {
   min-width: 0;
@@ -1870,13 +1942,13 @@ span.section-icon svg {
 }
 
 .session-table {
-  min-width: 850px;
+  min-width: 1020px;
 }
 
 .session-table-head,
 .session-row {
   display: grid;
-  grid-template-columns: 34px minmax(260px, 1.8fr) minmax(110px, 0.7fr) 90px 90px 150px;
+  grid-template-columns: 34px minmax(260px, 1.8fr) minmax(110px, 0.7fr) 90px 90px 150px minmax(150px, auto);
   align-items: center;
   gap: 10px;
   min-height: 58px;
@@ -2046,6 +2118,23 @@ span.section-icon svg {
 
 .spin {
   animation: spin 900ms linear infinite;
+}
+
+.session-remote-action {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.session-remote-action .pill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.muted-dash {
+  color: var(--muted);
 }
 
 .spin-slow {

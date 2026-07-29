@@ -4,15 +4,20 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     chat_process_state::{read_snapshot as read_chat_process_state, repair_after_shutdown},
-    config_patch::{plan_runtime_config_patch, ConfigPatchPlan, RuntimeConfigKind},
+    config_patch::{
+        apply_sqlite_home_patch, plan_runtime_config_patch, ConfigPatchPlan, RuntimeConfigKind,
+    },
     file_ops::atomic_write,
     operation_log::operation_id,
+    runtime_session_view::{
+        plan_transition, prepare_transition, SessionViewTarget, SessionViewTransition,
+    },
     runtime_store::{
         relay_api_key_from_auth, RuntimeConfidence, RuntimeKind, RuntimeMetadata, RuntimeStore,
     },
     runtime_switcher::{
-        ChatGptLaunchReceipt, RuntimeSwitchFailure, RuntimeSwitchOutcome, RuntimeSwitchPhase,
-        RuntimeSwitchResult,
+        ChatGptLaunchReceipt, RelayValidationStatus, RuntimeSwitchFailure, RuntimeSwitchOutcome,
+        RuntimeSwitchPhase, RuntimeSwitchResult,
     },
     session_incremental::IncrementalSessionSyncReceipt,
 };
@@ -24,6 +29,7 @@ pub(crate) struct RequestRouteSwitchPlan {
     config_plan: ConfigPatchPlan,
     auth_snapshot: Vec<u8>,
     config_snapshot: Vec<u8>,
+    session_view_transition: SessionViewTransition,
     requires_change: bool,
 }
 
@@ -112,6 +118,20 @@ fn switch_request_route_from_plan(
         repair_after_shutdown(codex_home, process_state_bytes.as_deref())
             .map_err(|message| before_write_failure(message, &operation_id))?;
 
+    let incremental_session_sync = if matches!(
+        &closed_plan.session_view_transition,
+        SessionViewTransition::None
+    ) {
+        IncrementalSessionSyncReceipt::skipped()
+    } else {
+        on_progress(RuntimeSwitchPhase::SyncingIncrementalSessions);
+        prepare_transition(
+            &closed_plan.session_view_transition,
+            closed_plan.operation_id.as_str(),
+        )
+        .map_err(|message| before_write_failure(message, &operation_id))?
+    };
+
     on_progress(RuntimeSwitchPhase::ApplyingRuntime);
     atomic_write(
         &codex_home.join("config.toml"),
@@ -139,7 +159,8 @@ fn switch_request_route_from_plan(
             changed: true,
             runtime,
             warnings: Vec::new(),
-            incremental_session_sync: IncrementalSessionSyncReceipt::skipped(),
+            incremental_session_sync,
+            relay_validation: RelayValidationStatus::NotApplicable,
             chat_process_state_repaired,
             chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
         }),
@@ -200,21 +221,35 @@ fn build_request_route_switch_plan(
             Some(relay_api_key_from_auth(&runtime_files.auth_json)?),
         ),
     };
-    let config_plan = plan_runtime_config_patch(
+    let session_view = plan_transition(
+        codex_home,
         live_config,
-        &runtime_files.config_toml,
-        config_kind,
-        relay_bearer_token.as_deref(),
+        match runtime.kind {
+            RuntimeKind::Plus => SessionViewTarget::Account,
+            RuntimeKind::Relay => SessionViewTarget::Relay,
+        },
+        &store.data_root()?,
+    )?;
+    let config_plan = apply_sqlite_home_patch(
+        plan_runtime_config_patch(
+            live_config,
+            &runtime_files.config_toml,
+            config_kind,
+            relay_bearer_token.as_deref(),
+        )?,
+        &session_view.sqlite_home_patch,
     )?;
     let active = store.detect_active_runtime(codex_home)?;
     let requires_change = active.active_runtime_id.as_deref() != Some(runtime_id)
-        || active.confidence != RuntimeConfidence::Exact;
+        || active.confidence != RuntimeConfidence::Exact
+        || !config_plan.changed_keys.is_empty();
     Ok(RequestRouteSwitchPlan {
         operation_id,
         runtime,
         config_plan,
         auth_snapshot,
         config_snapshot,
+        session_view_transition: session_view.transition,
         requires_change,
     })
 }
@@ -287,6 +322,7 @@ fn no_op_result(
         runtime,
         warnings: Vec::new(),
         incremental_session_sync: IncrementalSessionSyncReceipt::skipped(),
+        relay_validation: RelayValidationStatus::NotApplicable,
         chat_process_state_repaired: false,
         chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
     })
@@ -304,6 +340,7 @@ fn before_write_failure(message: String, operation_id: &str) -> RuntimeSwitchFai
 mod tests {
     use std::fs;
 
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
@@ -323,6 +360,35 @@ mod tests {
         fs::write(
             home.path().join("config.toml"),
             "model = \"account-model\"\nmodel_instructions_file = \"global\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.path().join("sessions")).unwrap();
+        Connection::open(home.path().join("state_5.sqlite"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT,
+                    model_provider TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO threads (
+                    id, rollout_path, model_provider, archived
+                ) VALUES (
+                    '019fa68f-dd42-76b3-8299-84a865ab553c',
+                    'sessions/rollout-2026-07-29T00-00-00-019fa68f-dd42-76b3-8299-84a865ab553c.jsonl',
+                    'openai',
+                    0
+                );",
+            )
+            .unwrap();
+        fs::write(
+            home.path()
+                .join("sessions")
+                .join(
+                    "rollout-2026-07-29T00-00-00-019fa68f-dd42-76b3-8299-84a865ab553c.jsonl",
+                ),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"019fa68f-dd42-76b3-8299-84a865ab553c\",\"model_provider\":\"openai\"}}\n",
         )
         .unwrap();
         let store = RuntimeStore::new(store_root.path().join("runtimes"));
@@ -365,11 +431,43 @@ mod tests {
         let relay_config = fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert!(relay_config.contains("model_provider = \"openai_custom\""));
         assert!(relay_config.contains("experimental_bearer_token = \"sk-relay-secret\""));
+        assert!(relay_config.contains("requires_openai_auth = true"));
+        let relay_doc = relay_config.parse::<toml_edit::DocumentMut>().unwrap();
+        let relay_sqlite_home = relay_doc
+            .get("sqlite_home")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap();
+        assert_ne!(std::path::Path::new(relay_sqlite_home), home.path());
+        assert_eq!(
+            Connection::open(home.path().join("state_5.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider FROM threads
+                     WHERE id = '019fa68f-dd42-76b3-8299-84a865ab553c'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "openai"
+        );
+        assert_eq!(
+            Connection::open(std::path::Path::new(relay_sqlite_home).join("state_5.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider FROM threads
+                     WHERE id = '019fa68f-dd42-76b3-8299-84a865ab553c'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "openai_custom"
+        );
         assert_eq!(
             phases,
             vec![
                 RuntimeSwitchPhase::PreparingRuntime,
                 RuntimeSwitchPhase::RepairingAppState,
+                RuntimeSwitchPhase::SyncingIncrementalSessions,
                 RuntimeSwitchPhase::ApplyingRuntime,
                 RuntimeSwitchPhase::Verifying,
             ]
@@ -400,6 +498,7 @@ mod tests {
         let account_config = fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert!(!account_config.contains("openai_custom"));
         assert!(!account_config.contains("sk-relay-secret"));
+        assert!(!account_config.contains("sqlite_home"));
     }
 
     #[test]
@@ -473,5 +572,72 @@ mod tests {
             config_before
         );
         assert!(phases.contains(&RuntimeSwitchPhase::RollingBack));
+    }
+
+    #[test]
+    fn deferred_account_publication_keeps_relay_route_active() {
+        let (home, _store_root, store, auth) = setup();
+        let relay_plan =
+            preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        switch_request_route_from_plan(
+            &store,
+            home.path(),
+            relay_plan,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let relay_config = fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let relay_doc = relay_config.parse::<toml_edit::DocumentMut>().unwrap();
+        let relay_sqlite_home = relay_doc
+            .get("sqlite_home")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap();
+        let relay_db = std::path::Path::new(relay_sqlite_home).join("state_5.sqlite");
+        let connection = Connection::open(&relay_db).unwrap();
+        for index in 0..33 {
+            let id = format!("30000000-0000-4000-8000-{index:012}");
+            let filename = format!("rollout-2026-07-29T00-00-{index:02}-{id}.jsonl");
+            let relative = format!("sessions/{filename}");
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path, model_provider, archived)
+                     VALUES (?1, ?2, 'openai_custom', 0)",
+                    [&id, &relative],
+                )
+                .unwrap();
+            fs::write(
+                home.path().join("sessions").join(filename),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai_custom\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        drop(connection);
+
+        let account_plan =
+            preflight_request_route_switch(&store, PLUS_RUNTIME_ID, home.path()).unwrap();
+        let failure = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            account_plan,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::FailedBeforeWrite);
+        assert!(failure
+            .message
+            .contains("仍有 1 个 Relay 会话未完成增量同步"));
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            relay_config
+        );
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
     }
 }

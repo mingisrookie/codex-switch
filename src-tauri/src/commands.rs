@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -31,6 +31,7 @@ use crate::{
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
     },
+    mobile_continuity::{self, MobileContinuityStatus},
     operation_log::{
         operation_id, timestamp_millis, OperationAction, OperationLog, OperationPhase,
         OperationRecord, OperationStatus,
@@ -45,18 +46,16 @@ use crate::{
         preflight_request_route_switch, switch_request_route_preflighted_with_progress,
     },
     runtime_store::{
-        RelayRuntimeInput, RuntimeMetadata, RuntimeStatus, RuntimeStore, PLUS_RUNTIME_ID,
-        RELAY_RUNTIME_ID,
+        RelayRuntimeInput, RelaySwitchPreference, RuntimeMetadata, RuntimeStatus, RuntimeStore,
+        PLUS_RUNTIME_ID, RELAY_RUNTIME_ID,
     },
     runtime_switcher::{
-        combine_session_sync_results, sync_home_with_shared_complete_with_paths,
-        BackupReceiptSummary, ChatGptLaunchReceipt, ChatGptLaunchStatus, RuntimeSwitchOutcome,
-        RuntimeSwitchPhase, RuntimeSwitchResult,
+        sync_home_with_shared_complete_with_paths, BackupReceiptSummary, ChatGptLaunchReceipt,
+        ChatGptLaunchStatus, RelayValidationStatus, RuntimeSwitchOutcome, RuntimeSwitchPhase,
+        RuntimeSwitchResult,
     },
     session_incremental::{
-        plan_incremental_session_sync, save_session_sync_index, save_session_sync_index_bounded,
-        IncrementalSessionPlan, IncrementalSessionSyncReceipt, IncrementalSessionSyncStatus,
-        MAX_INCREMENTAL_TOTAL_DURATION,
+        save_session_sync_index, IncrementalSessionSyncReceipt, IncrementalSessionSyncStatus,
     },
     session_manager::{
         delete_managed_sessions_detailed_with_prepare as delete_sessions,
@@ -65,11 +64,7 @@ use crate::{
         SessionMutationResult,
     },
     session_scan::{scan_sessions as scan_session_inventory, SessionInventory},
-    session_sync::{
-        cleanup_obsolete_provider_slots, normalize_selected_user_home_provider_with_paths,
-        sync_selected_shared_to_user_home_hot_with_paths,
-        sync_selected_user_home_to_shared_with_paths, SessionSyncResult,
-    },
+    session_sync::{cleanup_obsolete_provider_slots, SessionSyncResult},
     skill_manager::{
         install_skill_at, list_skills_at, save_skill_config_at, SkillConfigInput, SkillId,
         SkillMutationReceipt, SkillStatus,
@@ -377,6 +372,130 @@ pub fn list_runtimes() -> Result<Vec<RuntimeMetadata>, String> {
 }
 
 #[tauri::command]
+pub async fn get_mobile_continuity_status() -> Result<MobileContinuityStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let current_home = managed_codex_home()?;
+        let current_paths = resolve_user_codex_paths(&current_home)?;
+        mobile_continuity::initialize_status(
+            &default_mobile_continuity_state_path()?,
+            &current_paths,
+        )
+    })
+    .await
+    .map_err(|_| "mobile continuity status worker failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_mobile_continuity_enabled(
+    enabled: bool,
+) -> Result<MobileContinuityStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let current_home = managed_codex_home()?;
+        let current_paths = resolve_user_codex_paths(&current_home)?;
+        mobile_continuity::set_enabled(
+            &default_mobile_continuity_state_path()?,
+            &current_paths,
+            enabled,
+        )
+    })
+    .await
+    .map_err(|_| "mobile continuity settings worker failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn acknowledge_mobile_continuity_notice() -> Result<MobileContinuityStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let current_home = managed_codex_home()?;
+        let current_paths = resolve_user_codex_paths(&current_home)?;
+        mobile_continuity::acknowledge_notice(
+            &default_mobile_continuity_state_path()?,
+            &current_paths,
+        )
+    })
+    .await
+    .map_err(|_| "mobile continuity notice worker failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn publish_mobile_continuity_session(
+    thread_id: String,
+) -> Result<MobileContinuityStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started_at_ms = timestamp_millis()?;
+        let operation_id = operation_id("mobile-continuity-manual")?;
+        let result = (|| {
+            let current_home = managed_codex_home()?;
+            let runtime_status =
+                RuntimeStore::from_default_root()?.detect_active_runtime(&current_home)?;
+            if runtime_status.active_runtime_id.as_deref() != Some(PLUS_RUNTIME_ID) {
+                return Err("请先切回 OpenAI 官方请求端，再发布单个会话".to_string());
+            }
+            let current_paths = resolve_user_codex_paths(&current_home)?;
+            let auth_snapshot = fs::read(current_home.join("auth.json"))
+                .map_err(|error| format!("failed to read official auth state: {error}"))?;
+            let processes =
+                list_managed_processes_for_closed_mutation("publishing a session to Remote")?;
+            let _ = cache_chatgpt_launch_target();
+            if !processes.is_empty() {
+                close_codex().map(|_| ())?;
+            }
+            ensure_codex_closed("publishing a session to Remote")?;
+            let publication = mobile_continuity::publish_single_account_session(
+                &default_mobile_continuity_state_path()?,
+                &current_paths,
+                &thread_id,
+            );
+            let auth_after = fs::read(current_home.join("auth.json"))
+                .map_err(|error| format!("failed to verify official auth state: {error}"));
+            let launch = ChatGptLaunchReceipt::from(launch_cached_chatgpt());
+            if auth_after? != auth_snapshot {
+                return Err(
+                    "official auth state changed unexpectedly; session publication stopped"
+                        .to_string(),
+                );
+            }
+            let publication = publication?;
+            if launch.status == ChatGptLaunchStatus::Failed {
+                return Err(format!(
+                    "会话发布已完成，但 ChatGPT 重新打开失败：{}",
+                    launch
+                        .message
+                        .as_deref()
+                        .unwrap_or("未能确认 Windows 应用已启动")
+                ));
+            }
+            Ok(publication)
+        })();
+        let counts = result
+            .as_ref()
+            .map(|status| {
+                BTreeMap::from([
+                    ("remotePublished".to_string(), status.remote_published),
+                    ("partial".to_string(), status.partial),
+                    ("conflict".to_string(), status.conflict),
+                    ("needsManual".to_string(), status.needs_manual),
+                ])
+            })
+            .unwrap_or_default();
+        let _ = record_result(
+            &operation_id,
+            OperationAction::IncrementalSync,
+            started_at_ms,
+            &result,
+            &[],
+            counts,
+        );
+        result
+    })
+    .await
+    .map_err(|_| "mobile continuity publication worker failed".to_string())?
+}
+
+#[tauri::command]
 pub fn scan_runtime_status() -> Result<RuntimeStatus, String> {
     RuntimeStore::from_default_root()?.detect_active_runtime(&managed_codex_home()?)
 }
@@ -428,7 +547,7 @@ pub fn test_relay_connection() -> Result<RuntimeMetadata, String> {
     let result = (|| {
         let store = RuntimeStore::from_default_root()?;
         let connection = store.load_relay_connection()?;
-        verify_relay(&connection.base_url, &connection.api_key, &connection.model)?;
+        verify_relay(&connection.base_url, &connection.api_key)?;
         store.mark_verified(RELAY_RUNTIME_ID)
     })();
     let _ = record_result(
@@ -467,11 +586,12 @@ pub async fn launch_chatgpt() -> Result<ChatGptLaunchReceipt, String> {
 #[tauri::command]
 pub async fn switch_runtime(
     runtime_id: String,
+    relay_preference: Option<RelaySwitchPreference>,
     on_progress: Channel<RuntimeSwitchProgress>,
 ) -> Result<RuntimeSwitchResult, String> {
     let worker_progress = on_progress.clone();
     match tauri::async_runtime::spawn_blocking(move || {
-        switch_runtime_blocking(runtime_id, worker_progress)
+        switch_runtime_blocking(runtime_id, relay_preference, worker_progress)
     })
     .await
     {
@@ -490,6 +610,7 @@ pub async fn switch_runtime(
 
 fn switch_runtime_blocking(
     runtime_id: String,
+    relay_preference: Option<RelaySwitchPreference>,
     on_progress: Channel<RuntimeSwitchProgress>,
 ) -> Result<RuntimeSwitchResult, String> {
     let _mutation_guard = match acquire_mutation_lock() {
@@ -528,11 +649,12 @@ fn switch_runtime_blocking(
     let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
     let mut failure_operation_id = None;
     let target_is_account = runtime_id == PLUS_RUNTIME_ID;
+    let mut relay_validation = RelayValidationStatus::NotApplicable;
+    let mut launch_target_captured = false;
     emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LoadingRuntime, None);
     let mut result = (|| {
         let store = RuntimeStore::from_default_root()?;
         let current_home = managed_codex_home()?;
-        let mut launch_target_captured = false;
         emit_runtime_switch_progress(
             &on_progress,
             RuntimeSwitchPhase::ValidatingOfficialAuth,
@@ -540,12 +662,31 @@ fn switch_runtime_blocking(
         );
         let plan = preflight_request_route_switch(&store, &runtime_id, &current_home)?;
         if runtime_id == RELAY_RUNTIME_ID {
-            emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::VerifyingRelay, None);
-            let connection = store.load_relay_connection()?;
-            verify_relay(&connection.base_url, &connection.api_key, &connection.model)?;
-            store.mark_verified(RELAY_RUNTIME_ID)?;
+            let preference = match relay_preference {
+                Some(preference) => {
+                    store.set_relay_switch_preference(preference)?;
+                    preference
+                }
+                None => store
+                    .load_metadata(RELAY_RUNTIME_ID)?
+                    .relay_switch_preference
+                    .ok_or_else(|| "请选择“验证连接后切换”或“直接切换”后再继续".to_string())?,
+            };
+            if preference == RelaySwitchPreference::Validate {
+                emit_runtime_switch_progress(
+                    &on_progress,
+                    RuntimeSwitchPhase::VerifyingRelay,
+                    None,
+                );
+            }
+            relay_validation = verify_relay_for_switch(preference, || {
+                let connection = store.load_relay_connection()?;
+                verify_relay(&connection.base_url, &connection.api_key)?;
+                store.mark_verified(RELAY_RUNTIME_ID)?;
+                Ok(())
+            })?;
         }
-        if plan.requires_change() {
+        if plan.requires_change() || target_is_account {
             close_runtime_processes_with_progress(
                 || {
                     let processes =
@@ -561,8 +702,8 @@ fn switch_runtime_blocking(
                 |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
             )?;
         } else {
-            // A no-op does not enter the process-close gate, so retain the
-            // running package identity for the controlled launcher.
+            // A Relay no-op does not enter the process-close gate, so retain
+            // the running package identity for the controlled launcher.
             capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
                 let _ = cache_chatgpt_launch_target();
             });
@@ -595,6 +736,14 @@ fn switch_runtime_blocking(
                     "chatProcessStateRepaired".to_string(),
                     usize::from(receipt.chat_process_state_repaired),
                 ),
+                (
+                    "sessionViewDetectedThreads".to_string(),
+                    receipt.incremental_session_sync.detected_threads,
+                ),
+                (
+                    "sessionViewSyncedThreads".to_string(),
+                    receipt.incremental_session_sync.synced_threads,
+                ),
             ]),
         ),
         Err(_) => (
@@ -610,7 +759,12 @@ fn switch_runtime_blocking(
     let terminal_recorded = terminal_record.is_some();
     let mut incremental_launch_allowed = true;
     if let Ok(receipt) = &mut result {
-        if receipt.changed && terminal_recorded {
+        receipt.relay_validation = relay_validation;
+        if should_run_legacy_incremental_after_route(
+            target_is_account,
+            terminal_recorded,
+            receipt.incremental_session_sync.status,
+        ) {
             emit_runtime_switch_progress(
                 &on_progress,
                 RuntimeSwitchPhase::SyncingIncrementalSessions,
@@ -622,8 +776,6 @@ fn switch_runtime_blocking(
             if let Some(warning) = incremental.warning {
                 receipt.warnings.push(warning);
             }
-        } else {
-            receipt.incremental_session_sync = IncrementalSessionSyncReceipt::skipped();
         }
         if successful_switch_requests_chatgpt_launch(receipt.changed) {
             if terminal_recorded && incremental_launch_allowed {
@@ -643,9 +795,38 @@ fn switch_runtime_blocking(
                 }
             };
         }
+    } else if launch_target_captured
+        && matches!(
+            failure_outcome,
+            RuntimeSwitchOutcome::FailedBeforeWrite | RuntimeSwitchOutcome::RolledBack
+        )
+    {
+        emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LaunchingApp, None);
+        let launch = ChatGptLaunchReceipt::from(launch_cached_chatgpt());
+        if launch.status == ChatGptLaunchStatus::Failed {
+            if let Err(message) = &mut result {
+                message.push_str("；请求端未变更或已安全回滚，但 ChatGPT 重新打开失败");
+            }
+        }
     }
     emit_runtime_switch_terminal(&on_progress, &result, failure_outcome);
     result
+}
+
+fn verify_relay_for_switch<Verify>(
+    preference: RelaySwitchPreference,
+    verify: Verify,
+) -> Result<RelayValidationStatus, String>
+where
+    Verify: FnOnce() -> Result<(), String>,
+{
+    match preference {
+        RelaySwitchPreference::Validate => {
+            verify()?;
+            Ok(RelayValidationStatus::Verified)
+        }
+        RelaySwitchPreference::Direct => Ok(RelayValidationStatus::Skipped),
+    }
 }
 
 fn capture_chatgpt_launch_target_once<Capture>(captured: &mut bool, capture: Capture)
@@ -663,6 +844,16 @@ fn successful_switch_requests_chatgpt_launch(_changed: bool) -> bool {
     // Product contract: both an applied switch and a successful no-op finish
     // by bringing ChatGPT to a running state.
     true
+}
+
+fn should_run_legacy_incremental_after_route(
+    target_is_account: bool,
+    terminal_recorded: bool,
+    session_view_status: IncrementalSessionSyncStatus,
+) -> bool {
+    target_is_account
+        && terminal_recorded
+        && session_view_status == IncrementalSessionSyncStatus::Skipped
 }
 
 fn launch_chatgpt_after_durable_terminal<Launch>(
@@ -777,6 +968,7 @@ impl IncrementalSessionRun {
         }
     }
 
+    #[cfg(test)]
     fn after_terminal(
         receipt: IncrementalSessionSyncReceipt,
         warning: Option<String>,
@@ -799,457 +991,82 @@ impl IncrementalSessionRun {
 
 fn run_incremental_session_sync_after_route(target_is_account: bool) -> IncrementalSessionRun {
     let clock = Instant::now();
-    let deadline = clock + MAX_INCREMENTAL_TOTAL_DURATION;
+    if !target_is_account {
+        return IncrementalSessionRun::safe(IncrementalSessionSyncReceipt::skipped(), None);
+    }
     let started_at_ms = timestamp_millis().unwrap_or_default();
-    let operation_id = operation_id("sync-incremental")
-        .unwrap_or_else(|_| format!("sync-incremental-{started_at_ms}"));
-    let current_home = match managed_codex_home() {
-        Ok(path) => path,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-    let shared_home = match default_shared_sessions_root() {
-        Ok(path) => path,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-    let current_paths = match resolve_user_codex_paths(&current_home) {
-        Ok(paths) => paths,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-    let shared_paths = local_codex_paths(&shared_home);
-    let index_path = match default_session_sync_index_path() {
-        Ok(path) => path,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-    let target_provider = target_is_account.then_some("openai");
-    let plan = match plan_incremental_session_sync(
-        &index_path,
-        &current_paths,
-        &shared_paths,
-        target_provider,
-    ) {
-        Ok(plan) => plan,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(0, 0, clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-
-    match plan {
-        IncrementalSessionPlan::Unchanged => {
+    let operation_id = operation_id("mobile-continuity")
+        .unwrap_or_else(|_| format!("mobile-continuity-{started_at_ms}"));
+    let outcome = (|| {
+        let current_home = managed_codex_home()?;
+        let current_paths = resolve_user_codex_paths(&current_home)?;
+        let state_path = default_mobile_continuity_state_path()?;
+        mobile_continuity::prepare_account_publication(&state_path, &current_paths)
+    })();
+    match outcome {
+        Ok(preparation) => {
+            let synced_threads = preparation
+                .published_threads
+                .saturating_add(preparation.partial_threads);
+            let status = if synced_threads > 0 {
+                IncrementalSessionSyncStatus::Applied
+            } else if preparation.deferred_threads > 0 {
+                IncrementalSessionSyncStatus::Deferred
+            } else {
+                IncrementalSessionSyncStatus::Unchanged
+            };
             let receipt = IncrementalSessionSyncReceipt {
-                status: IncrementalSessionSyncStatus::Unchanged,
+                status,
+                detected_threads: preparation.detected_threads,
+                synced_threads,
+                projected_bytes: 0,
+                duration_ms: clock.elapsed().as_millis(),
+                requires_full_sync: false,
+            };
+            let _ = record_incremental_outcome(
+                &operation_id,
+                started_at_ms,
+                &receipt,
+                OperationStatus::Succeeded,
+                OperationPhase::Complete,
+                &[],
+            );
+            let warning = (preparation.partial_threads > 0).then(|| {
+                format!(
+                    "{} 个会话已完成本机 Remote 发布，但部分内容仅本机可见",
+                    preparation.partial_threads
+                )
+            });
+            IncrementalSessionRun::safe(receipt, warning)
+        }
+        Err(_) => {
+            let receipt = IncrementalSessionSyncReceipt {
+                status: IncrementalSessionSyncStatus::Failed,
                 detected_threads: 0,
                 synced_threads: 0,
                 projected_bytes: 0,
                 duration_ms: clock.elapsed().as_millis(),
                 requires_full_sync: false,
             };
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Succeeded,
-                OperationPhase::Complete,
-                &[],
-            )
-            .is_some();
-            IncrementalSessionRun::after_terminal(receipt, None, terminal_recorded)
-        }
-        IncrementalSessionPlan::NeedsFullSync => {
-            let receipt =
-                IncrementalSessionSyncReceipt::needs_full_sync(clock.elapsed().as_millis());
-            let terminal_recorded = record_incremental_outcome(
+            let _ = record_incremental_outcome(
                 &operation_id,
                 started_at_ms,
                 &receipt,
                 OperationStatus::Failed,
-                OperationPhase::Preflight,
+                OperationPhase::Apply,
                 &[],
-            )
-            .is_some();
-            IncrementalSessionRun::after_terminal(
+            );
+            IncrementalSessionRun::safe(
                 receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
+                Some("手机连续性发布未完成；请求端已成功切换，可稍后手动同步".to_string()),
             )
-        }
-        IncrementalSessionPlan::Deferred {
-            detected_threads,
-            projected_bytes,
-        } => {
-            let receipt = IncrementalSessionSyncReceipt {
-                status: IncrementalSessionSyncStatus::Deferred,
-                detected_threads,
-                synced_threads: 0,
-                projected_bytes,
-                duration_ms: clock.elapsed().as_millis(),
-                requires_full_sync: true,
-            };
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_deferred_warning()),
-                terminal_recorded,
-            )
-        }
-        IncrementalSessionPlan::Ready {
-            current_ids,
-            shared_ids,
-            normalize_current_ids,
-            projected_bytes,
-        } => run_incremental_session_plan(
-            operation_id,
-            started_at_ms,
-            clock,
-            &current_home,
-            &shared_home,
-            &current_paths,
-            &shared_paths,
-            &index_path,
-            current_ids,
-            shared_ids,
-            normalize_current_ids,
-            projected_bytes,
-            deadline,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_incremental_session_plan(
-    operation_id: String,
-    started_at_ms: u128,
-    clock: Instant,
-    current_home: &Path,
-    shared_home: &Path,
-    current_paths: &CodexPaths,
-    shared_paths: &CodexPaths,
-    index_path: &Path,
-    current_ids: HashSet<String>,
-    shared_ids: HashSet<String>,
-    normalize_current_ids: HashSet<String>,
-    projected_bytes: u64,
-    deadline: Instant,
-) -> IncrementalSessionRun {
-    let detected_threads = current_ids
-        .union(&normalize_current_ids)
-        .count()
-        .saturating_add(shared_ids.len());
-    let backup_root = match default_backup_root() {
-        Ok(root) => root,
-        Err(_) => {
-            let receipt = IncrementalSessionSyncReceipt::failed(
-                detected_threads,
-                projected_bytes,
-                clock.elapsed().as_millis(),
-            );
-            let terminal_recorded = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Failed,
-                OperationPhase::Preflight,
-                &[],
-            )
-            .is_some();
-            return IncrementalSessionRun::after_terminal(
-                receipt,
-                Some(incremental_full_sync_warning()),
-                terminal_recorded,
-            );
-        }
-    };
-    let mut backups = Vec::new();
-    let mut combined_result = None;
-    let mut mutation_started = false;
-    let mut budget_deferred = false;
-    let result = (|| {
-        ensure_incremental_budget(deadline).inspect_err(|_| {
-            budget_deferred = true;
-        })?;
-        ensure_codex_closed("incrementally syncing sessions")?;
-        preflight_backup_capacity_for_sources(
-            &backup_root,
-            &[
-                BackupCapacitySource {
-                    home: current_home,
-                    paths: current_paths,
-                    scope: BackupScope::StateOnly,
-                },
-                BackupCapacitySource {
-                    home: shared_home,
-                    paths: shared_paths,
-                    scope: BackupScope::StateOnly,
-                },
-            ],
-        )
-        .map(|_| ())?;
-        ensure_incremental_budget(deadline).inspect_err(|_| {
-            budget_deferred = true;
-        })?;
-        ensure_codex_paths_unchanged(
-            "incrementally syncing sessions",
-            current_home,
-            current_paths,
-        )?;
-        let current_backup = create_hot_sync_backup_with_paths(
-            current_home,
-            &backup_root,
-            "incremental-current",
-            current_paths.clone(),
-            &operation_id,
-            CheckpointRole::Current,
-        )?;
-        backups.push(current_backup);
-        ensure_incremental_budget(deadline).inspect_err(|_| {
-            budget_deferred = true;
-        })?;
-        let shared_backup = create_hot_sync_backup_with_paths(
-            shared_home,
-            &backup_root,
-            "incremental-shared",
-            shared_paths.clone(),
-            &operation_id,
-            CheckpointRole::Shared,
-        )?;
-        backups.push(shared_backup);
-        ensure_incremental_budget(deadline).inspect_err(|_| {
-            budget_deferred = true;
-        })?;
-        ensure_codex_closed("incrementally syncing sessions")?;
-        ensure_codex_paths_unchanged(
-            "incrementally syncing sessions",
-            current_home,
-            current_paths,
-        )?;
-
-        mutation_started = true;
-        let to_shared = sync_selected_user_home_to_shared_with_paths(
-            current_paths,
-            shared_paths,
-            &current_ids,
-        )?;
-        let from_shared = sync_selected_shared_to_user_home_hot_with_paths(
-            shared_paths,
-            current_paths,
-            &shared_ids,
-            "openai",
-        )?;
-        let mut combined = combine_session_sync_results(to_shared, from_shared)?;
-        if !normalize_current_ids.is_empty() {
-            let normalized = normalize_selected_user_home_provider_with_paths(
-                current_paths,
-                &normalize_current_ids,
-                "openai",
-            )?;
-            combined = combine_session_sync_results(combined, normalized)?;
-        }
-        if !save_session_sync_index_bounded(index_path, current_paths, shared_paths, deadline)? {
-            budget_deferred = true;
-            return Err("incremental session sync exceeded its time budget".to_string());
-        }
-        combined_result = Some(combined);
-        Ok::<_, String>(())
-    })();
-
-    match result {
-        Ok(()) => {
-            let mut result = combined_result.expect("successful incremental sync has a result");
-            let receipt = IncrementalSessionSyncReceipt {
-                status: IncrementalSessionSyncStatus::Applied,
-                detected_threads,
-                synced_threads: detected_threads,
-                projected_bytes,
-                duration_ms: clock.elapsed().as_millis(),
-                requires_full_sync: false,
-            };
-            let terminal_record = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                OperationStatus::Succeeded,
-                OperationPhase::Complete,
-                &backups,
-            );
-            let cleanup = release_transient_checkpoints(
-                Some(&backup_root),
-                terminal_record.as_ref(),
-                &backups,
-            );
-            if terminal_record.is_some() && !result.obsolete_provider_slots.is_empty() {
-                let gc = cleanup_obsolete_provider_slots(
-                    &result.obsolete_provider_slots,
-                    current_paths,
-                    shared_paths,
-                );
-                result.persistent_session_bytes_reclaimed = result
-                    .persistent_session_bytes_reclaimed
-                    .saturating_add(gc.reclaimed_bytes);
-            }
-            let warning = (!cleanup.warnings.is_empty())
-                .then(|| "增量会话同步已完成，但安全检查点清理未完全完成".to_string());
-            IncrementalSessionRun::after_terminal(receipt, warning, terminal_record.is_some())
-        }
-        Err(_) => {
-            let rolled_back = !mutation_started
-                || (backups.len() == 2
-                    && restore_backup_snapshot(&backups[1].backup_dir, shared_home).is_ok()
-                    && restore_backup_snapshot(&backups[0].backup_dir, current_home).is_ok());
-            let status = if !mutation_started {
-                OperationStatus::Failed
-            } else if rolled_back {
-                OperationStatus::RolledBack
-            } else {
-                OperationStatus::RollbackFailed
-            };
-            let receipt = if budget_deferred {
-                IncrementalSessionSyncReceipt {
-                    status: IncrementalSessionSyncStatus::Deferred,
-                    detected_threads,
-                    synced_threads: 0,
-                    projected_bytes,
-                    duration_ms: clock.elapsed().as_millis(),
-                    requires_full_sync: true,
-                }
-            } else {
-                IncrementalSessionSyncReceipt::failed(
-                    detected_threads,
-                    projected_bytes,
-                    clock.elapsed().as_millis(),
-                )
-            };
-            let terminal_record = record_incremental_outcome(
-                &operation_id,
-                started_at_ms,
-                &receipt,
-                status,
-                if mutation_started {
-                    OperationPhase::Rollback
-                } else {
-                    OperationPhase::Backup
-                },
-                &backups,
-            );
-            if rolled_back {
-                let _ = release_transient_checkpoints(
-                    Some(&backup_root),
-                    terminal_record.as_ref(),
-                    &backups,
-                );
-            }
-            let terminal_recorded = terminal_record.is_some();
-            let chatgpt_launch_allowed =
-                incremental_chatgpt_launch_allowed(status) && terminal_recorded;
-            IncrementalSessionRun {
-                receipt,
-                warning: Some(if !incremental_chatgpt_launch_allowed(status) {
-                    incremental_rollback_failed_warning()
-                } else if !terminal_recorded {
-                    incremental_terminal_warning()
-                } else if budget_deferred {
-                    incremental_deferred_warning()
-                } else {
-                    incremental_full_sync_warning()
-                }),
-                chatgpt_launch_allowed,
-            }
         }
     }
 }
 
+#[cfg(test)]
 fn incremental_chatgpt_launch_allowed(status: OperationStatus) -> bool {
     status != OperationStatus::RollbackFailed
-}
-
-fn ensure_incremental_budget(deadline: Instant) -> Result<(), String> {
-    (Instant::now() < deadline)
-        .then_some(())
-        .ok_or_else(|| "incremental session sync exceeded its time budget".to_string())
 }
 
 fn record_incremental_outcome(
@@ -1281,19 +1098,7 @@ fn record_incremental_outcome(
     .ok()
 }
 
-fn incremental_full_sync_warning() -> String {
-    "增量会话同步未完成；请求端切换已成功，请手动执行“完全同步”".to_string()
-}
-
-fn incremental_deferred_warning() -> String {
-    "增量会话变化超出快速切换预算；请求端切换已成功，请手动执行“完全同步”".to_string()
-}
-
-fn incremental_rollback_failed_warning() -> String {
-    "增量会话同步回滚失败；请求端切换已成功，ChatGPT 已保持关闭，请先使用保留的安全检查点恢复"
-        .to_string()
-}
-
+#[cfg(test)]
 fn incremental_terminal_warning() -> String {
     "增量会话终态无法持久化；请求端切换已成功，ChatGPT 已保持关闭，请检查操作记录与保留的安全检查点"
         .to_string()
@@ -2237,6 +2042,10 @@ fn default_session_sync_index_path() -> Result<PathBuf, String> {
         .join("session-sync-state-v1.json"))
 }
 
+fn default_mobile_continuity_state_path() -> Result<PathBuf, String> {
+    mobile_continuity::default_state_path()
+}
+
 fn operation_log() -> Result<OperationLog, String> {
     Ok(OperationLog::from_appdata(&appdata_root()?))
 }
@@ -2858,6 +2667,7 @@ mod tests {
         codex_paths::resolve_user_codex_paths,
         operation_log::{OperationAction, OperationLog, OperationPhase, OperationStatus},
         process_control::CodexProcess,
+        session_incremental::IncrementalSessionSyncStatus,
         session_manager::SessionMutationResult,
     };
 
@@ -2873,9 +2683,10 @@ mod tests {
         launch_chatgpt, launch_chatgpt_after_durable_terminal, list_backups, list_backups_at,
         preflight_before_process_gate, prepare_app_exit_at, record_result_to_log,
         record_runtime_switch_result_to_log, record_sync_failure_to_log,
-        release_transient_checkpoints, successful_switch_requests_chatgpt_launch, switch_runtime,
-        sync_all_sessions, validate_backup_selection, BackupDeleteReceipt, BackupReceiptSummary,
-        ChatGptLaunchReceipt, ChatGptLaunchStatus, CheckpointCleanupReceipt,
+        release_transient_checkpoints, should_run_legacy_incremental_after_route,
+        successful_switch_requests_chatgpt_launch, switch_runtime, sync_all_sessions,
+        validate_backup_selection, verify_relay_for_switch, BackupDeleteReceipt,
+        BackupReceiptSummary, ChatGptLaunchReceipt, ChatGptLaunchStatus, CheckpointCleanupReceipt,
         CreateFullBackupReceipt, IncrementalSessionRun, MutationCoordinator, OperationTerminal,
         RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
         SessionSyncProgress, MAX_LISTED_FULL_BACKUPS,
@@ -2957,7 +2768,45 @@ mod tests {
         }
 
         let on_progress = Channel::<RuntimeSwitchProgress>::new(|_| Ok(()));
-        assert_future(switch_runtime("relay".to_string(), on_progress));
+        assert_future(switch_runtime("relay".to_string(), None, on_progress));
+    }
+
+    #[test]
+    fn direct_relay_switch_does_not_call_the_network_verifier() {
+        let mut called = false;
+
+        let status =
+            verify_relay_for_switch(crate::runtime_store::RelaySwitchPreference::Direct, || {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::runtime_switcher::RelayValidationStatus::Skipped
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn validated_relay_switch_calls_the_network_verifier_once() {
+        let mut calls = 0;
+
+        let status = verify_relay_for_switch(
+            crate::runtime_store::RelaySwitchPreference::Validate,
+            || {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            crate::runtime_switcher::RelayValidationStatus::Verified
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -3485,6 +3334,25 @@ mod tests {
         assert_eq!(launch_calls.get(), 1);
         assert_eq!(receipt.status, ChatGptLaunchStatus::AlreadyRunning);
         assert_eq!(receipt.message, None);
+    }
+
+    #[test]
+    fn prepared_session_view_receipt_is_not_replaced_by_legacy_incremental_sync() {
+        assert!(should_run_legacy_incremental_after_route(
+            true,
+            true,
+            IncrementalSessionSyncStatus::Skipped
+        ));
+        assert!(!should_run_legacy_incremental_after_route(
+            true,
+            true,
+            IncrementalSessionSyncStatus::Applied
+        ));
+        assert!(!should_run_legacy_incremental_after_route(
+            false,
+            true,
+            IncrementalSessionSyncStatus::Skipped
+        ));
     }
 
     #[test]

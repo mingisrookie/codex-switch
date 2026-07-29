@@ -4,7 +4,7 @@
 
 **保留官方登录态，只切换请求端，并把会话同步从十分钟级切换主链中拆出来。**
 
-保存当前账号配置；配置一个 OpenAI-compatible API 中转站；live `auth.json` 始终保留官方 ChatGPT 登录，切换只原子修改 `config.toml` 请求路由。请求路由成功落盘后只尝试一个目标不超过 2 秒的有界增量会话收口，任何索引缺失、冲突或超限都直接提示手动“完全同步”，绝不在切换中退化为全量扫描。手动完全同步关闭 ChatGPT、完整对账两边活跃会话并保持归档不动。切换由单一应用内 task overlay 展示不超过 7 个真实步骤及耗时，成功后受控重新打开 ChatGPT。
+保存当前账号配置；配置一个 OpenAI-compatible API 中转站；live `auth.json` 始终保留官方 ChatGPT 登录。切入 Relay 时使用隔离 SQLite 会话视图，历史会话继续可见；切回 Account 前把本轮新 Relay 会话有界发布到 Account 视图，未收口时保留 Relay 而不是让会话暂时消失。旧历史不会被自动上传，可按单个会话或手动“完全同步”处理。切换由单一应用内 task overlay 展示不超过 7 个真实步骤及耗时，成功后受控重新打开 ChatGPT。
 
 [快速使用](#快速使用) · [下载 Release](https://github.com/mingisrookie/codex-switch/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](#安全说明) · [开发](#开发)
 
@@ -25,7 +25,7 @@
 
 ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步、可管理。公开 UI 和窗口标题使用 ChatGPT Switch；仓库名、`.codex`、`CODEX_HOME` 和 `plus` 等标识继续保留兼容命名。GitHub Release 资产仍必须唯一命名为 `codex-switch.exe`，因为 v0.1.9 updater 固定校验该资产名，不能改成 `chatgpt-switch.exe`。
 
-> 当前源码目标版本为 `v0.2.3`；正式可下载资产及校验结果以 GitHub Releases 的 latest stable 为准。
+> 当前源码目标版本为 `v0.2.4`；正式可下载资产及校验结果以 GitHub Releases 的 latest stable 为准。
 
 ## 开发过程
 
@@ -41,17 +41,19 @@ ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 
 
 - 固定管理两个槽位：一个 ChatGPT 账号态、一个 API 中转站态；当前版本不承诺任意数量账号池。
 - 保存当前 ChatGPT 账号配置前验证 live `auth.json` 的 `auth_mode = chatgpt`；覆盖已有账号槽位使用页面内确认，并保留加密历史版本。保存的认证副本只用于槽位历史/恢复证据，请求端切换不会把它写回 live `auth.json`。
-- 配置一个 API 中转站：填写 Base URL、模型名和 API Key；Key 不回填，留空可保留同一 origin 的已保存 Key，并可独立验证连接。保存失败时页面内表单保留本次 Key 方便重试，保存成功或取消后销毁输入值；origin 改变时必须输入新 Key。
+- 配置一个 API 中转站：填写 Base URL、模型名和 API Key；Key 不回填，留空可保留同一 origin 的已保存 Key，并可独立验证连接。保存失败时页面内表单保留本次 Key 方便重试，保存成功或取消后销毁输入值；origin 改变时必须输入新 Key。首次切换或地址/凭据变化后，页面询问“验证连接后切换”还是“直接切换”，并记住选择。
 - 在独立“技能”页安装固定来源的 `newapi-image2-client` 和 `grok-search`；Skill 按页面懒加载，不会让技能扫描故障污染运行态 Dashboard。
 - Image2 与 Grok 分别填写自己的服务 URL 和 API Key；Key 使用当前 Windows 用户的 DPAPI 加密，Skill、非敏感配置、UI、回执和日志中都不保存明文。
 - 分开显示“已保存”“当前运行”“最近验证”；live `auth.json` 只需保持官方 `chatgpt` 登录态，请求路由字段必须精确匹配。官方 token 正常刷新不会把当前态误判为失配。
-- 切换基于 live `config.toml` 应用最小请求路由 patch，只修改模型/service tier/provider 绑定，不覆盖 `model_instructions_file`、MCP、项目和其他全局设置。切换到 Relay 时把已用 DPAPI 保存的 Key 投影为受管 provider 的 `experimental_bearer_token`；切回账号态会删除整个受管 `openai_custom` provider 表和其中的明文 token。
+- 切换基于 live `config.toml` 应用最小请求路由 patch，只修改模型/service tier/provider/受管 `sqlite_home` 绑定，不覆盖 `model_instructions_file`、MCP、项目和其他全局设置。切换到 Relay 时把已用 DPAPI 保存的 Key 投影为受管 provider 的 `experimental_bearer_token`，同时写入 `requires_openai_auth = true` 保持 Desktop 官方账户识别；切回账号态会删除整个受管 `openai_custom` provider 表和其中的明文 token，并恢复原 Account SQLite home。
 - 点击切换后只显示一个页面内 task overlay；后端原始 phase/timestamp 全部保留，UI 聚合为“准备、验证 Relay、关闭 ChatGPT、应用请求端、验证并记录、增量会话、启动 ChatGPT”最多 7 步。请求路由 mutation 不进入会话全量扫描/同步、容量规划、checkpoint 或 provider GC；`auth.json` 从 preflight 到后置验证必须 byte-exact 不变。只有 `config.toml` 写入后的失败会回滚原始配置，官方登录态始终不参与回滚写入。
-- 请求路由终态持久化后才运行有界增量：只有有效 `%APPDATA%\codex-switch\session-sync-state-v1.json` 才读取 current/shared 的轻量元数据并定位变化 ID；单次最多 32 个线程、预计写入与双库状态检查点合计不超过 32 MiB，inventory 最多 750 ms，整体目标预算 2 秒。索引缺失/损坏、删除/归档、双边同 ID 变化、分叉、超时或超限均返回“需要完全同步”，不会回滚已成功的请求路由，也不会自动全量扫描。
-- 增量只处理索引证明变化的活跃 ID，并使用 current/shared 双 `StateOnly` 临时点、SQLite transaction/quick-check 和 immutable/no-clobber JSONL。Relay 目标不重写既有 current provider/path；切回 Account 时只把变化集合归一为手机 Remote 兼容的 `openai`。成功或已安全回滚的临时点只有在 durable terminal 与完整强校验通过后才释放。
-- 手动“完全同步”关闭 ChatGPT，跳过旧的前端 dry-run 重复扫描，完整对账 current ↔ shared 的活跃会话；`archived_sessions/` 与已归档 SQLite 行不参与、不复活。完成后建立增量索引并受控重启 ChatGPT。手工 full backup、hard delete 和完整恢复 safety backup 仍是持久恢复点，不参与自动清理。
-- v0.2.0 每次 changed switch 会永久保留 current `Runtime` + shared `Sessions` 全会话 checkpoint，已确认这是 C 盘按次下降的直接原因；当前**请求路由事务**不创建 checkpoint，也不生成或复制会话正文/provider 槽位。路由终态后的有界增量只有在索引可证明小变化时才使用双 `StateOnly` 并发布必要的 immutable 会话文件；普通切换不会生成 updater EXE。
-- 窗口关闭监听在应用挂载时预注册，未注册成功前切换按钮保持禁用；关闭按钮现在始终走后端安全退出：空闲时取得 mutation lock 并退出，切换或其他写操作期间显示“已收到关闭请求”，到达可靠终态后自动退出，不再出现点关闭无反应或强拆写操作。切换后会先显示“正在确认当前运行态”，确认完成前不允许再次切换。mutation 错误只出现在一个页面错误面，Relay 验证失败不再重复显示，刷新失败单独表达；未收到可信终态时页面会保守提示先不要重新打开 ChatGPT。
+- 切入 Relay 前通过 SQLite Online Backup 把 Account 的 `state_5/logs_2/goals_1/memories_1.sqlite` 刷新到 `%APPDATA%\codex-switch\relay-sqlite`，只在副本中把 thread provider 归一为 `openai_custom`。会话正文仍使用同一个受管 `sessions/`，Account 原库不被改写。
+- 首次启用手机连续性时只从 SQLite 记录当前全部 thread ID 作为 cutover，不扫描或上传既有 JSONL。以后只把 cutover 后全新出现、未归档且 provider 为受管 Relay 的会话加入 `%APPDATA%\codex-switch\mobile-continuity-v1.json` 持久队列；旧会话后续追加仍保持手动。
+- 切回 Account 的配置写入前，在 ChatGPT 仍关闭的窗口中最多处理 4 批；每批最多 8 个、合计 8 MiB，总预算 30 秒。发布使用 immutable/no-clobber `openai` provider successor、SQLite transaction/quick-check 和官方 Remote 文件名/首条 provider 复核；预算内仍有排队项时 fail closed 并保持 Relay 请求端，不会让会话因提前切回 Account 而暂时消失。
+- UI 只显示“本机 Remote 已发布”或“已提交到手机同步”，不把本地成功误报成“手机已同步”。发现本地附件/文件标记时显示“部分内容仅本机”；冲突或不满足安全证明时保留原分支并要求手动处理。删除与归档不传播、不提示。
+- 手动“完全同步”关闭 ChatGPT，跳过旧的前端 dry-run 重复扫描，完整对账 current ↔ shared 的活跃会话；`archived_sessions/` 与已归档 SQLite 行不参与、不复活。旧 Relay 会话也可在 Account 请求端下逐条点击“同步此会话”。手工 full backup、hard delete 和完整恢复 safety backup 仍是持久恢复点，不参与自动清理。
+- v0.2.0 每次 changed switch 会永久保留 current `Runtime` + shared `Sessions` 全会话 checkpoint，已确认这是 C 盘按次下降的直接原因；当前请求路由和手机连续性发布都不创建全会话 checkpoint。普通切换不会生成 updater EXE。
+- 窗口关闭监听在应用挂载时预注册，未注册成功前切换按钮保持禁用；关闭按钮始终走后端安全退出。手机连续性正在发布时会明确询问“继续等待 / 仍然退出”；确认退出后等待当前原子步骤、持久化队列并真正退出，下次切回 Account 继续处理。
 - 命令完成后按钮会解除 busy；自动增量或手动完全同步改变会话后，会话页按 revision 刷新，备份只在用户点击加载时校验。已有备份扫描尚未结束时收到的新刷新请求会排队补跑，不复用 mutation 前的旧快照。
 - 自动识别 Codex 的 `sqlite_home` / `CODEX_SQLITE_HOME`，避免把会话库固定写死在 `%USERPROFILE%\.codex`。
 - 手动完全同步继续使用 JSONL-first、完整度选择、source 稳定复检、SQLite transaction/quick-check 与 immutable/no-clobber 发布；既有文件不原地覆盖，必要时发布 Remote-compatible successor。current→shared 与 shared→current 都在 ChatGPT 关闭后执行，最终 current 活跃会话统一为 `openai` provider，供切回官方请求端后手机 Remote 正常识别。
@@ -113,7 +115,7 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 - 如果 Base URL 没写 `http://` 或 `https://`，工具默认按 `https://` 处理；路径未以 `/v1` 结尾时会补上 `/v1`，且不接受内嵌用户名/密码、query 或 fragment。
 - 非 loopback 的明文 `http://` 地址会被拒绝；HTTP 只允许 localhost 或回环地址。
 - 首次保存必须输入 API Key；以后只在 URL origin 不变时允许 Key 留空并保留已加密值，改变 scheme/host/port 必须输入新 Key。
-- “验证连接”会用 Bearer 认证请求 `<Base URL>/models`，10 秒超时且禁止重定向；返回列表必须非空且包含配置的精确 model ID，错误不会回显 Key 或响应正文。
+- “验证连接”会用 Bearer 认证请求 `<Base URL>/models`，10 秒超时且禁止重定向；只以 2xx 判断地址、网络和鉴权可用，不读取或判断模型列表，错误不会回显 Key 或响应正文。
 - 槽位存储中的 Key 始终是 DPAPI 密文；切换到 Relay 时，工具会把 Key 投影到 live `config.toml` 的 `[model_providers.openai_custom].experimental_bearer_token`。这是当前请求端路由所需的明文运行态；切回账号态会删除整个受管 provider 表。工具不会改写 `auth.json`。
 
 ### 3. 切换到中转站
@@ -126,13 +128,13 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 
 点击后页面立即进入任务执行器，不会再弹系统确认框。后端原始 phase/timestamp 全部保留，界面聚合为最多 7 个可见步骤，显示当前步骤耗时、每个已完成步骤耗时和终态最慢步骤；这些时间来自真实后端事件，不是伪造百分比。后端依次执行：
 
-1. 读取目标槽位并校验 live `auth.json` 是官方 `chatgpt` 登录态；缺失、损坏或非官方模式都在任何进程/配置 mutation 前 fail closed。Relay 目标随后验证 `/models`，无效地址、Key 或模型只消耗一次有界网络探测。
+1. 读取目标槽位并校验 live `auth.json` 是官方 `chatgpt` 登录态；缺失、损坏或非官方模式都在任何进程/配置 mutation 前 fail closed。Relay 首次切换或地址/凭据变化后由用户选择“验证连接后切换”或“直接切换”；直接切换不会发起 Relay 网络请求。
 2. 从受管 ChatGPT 根进程捕获并校验唯一 Windows AppUserModelID，再用 ToolHelp 检测/关闭进程树。先温和关闭并等待，超时才强制结束仍能证明身份的受管根；独立 `codex.exe` CLI 永远不会被结束。
-3. ChatGPT 关闭后重新读取官方登录态与 live 配置，生成只涉及模型/service tier/受管 provider 的最小 patch；同时仅检查并按既有规则修复 `process_manager/chat_processes.json` 的明确空/全 NUL 损坏。
-4. 原子替换 live `config.toml`。Relay 路由注入 `experimental_bearer_token`；账号路由移除整个 `model_providers.openai_custom` 受管表。请求路由 mutation 不扫描会话正文、不做全量同步/容量规划、不创建会话 checkpoint，也不做 provider slot GC。
-5. 重新读取 `auth.json` 并与关闭后快照逐字节比较，再精确验证目标请求路由。官方 token 可在 preflight 与关闭之间由 ChatGPT 正常刷新，但 switcher 自己绝不写入认证文件。
-6. 若配置写入后的验证或元数据记录失败，只恢复原始 `config.toml` 并再次证明 `auth.json` 未变；页面区分写入前失败、配置已回滚和回滚失败。
-7. 持久化脱敏请求路由终态。只有实际发生切换时，才在重开 ChatGPT 前尝试有界增量会话收口；缺少有效索引、变化冲突、超限或超时会明确标记“需要完全同步”，不会退化为全量扫描，也不会撤销已经成功的请求路由。随后通过关闭前捕获的 AppUserModelID 受控打开 ChatGPT；exact no-op 只激活/确认现有实例。启动失败不会撤销成功路由，并在同一 task overlay 提供重试。
+3. ChatGPT 关闭后重新读取官方登录态与 live 配置，生成只涉及模型/service tier/受管 provider/受管 `sqlite_home` 的最小 patch；同时仅检查并按既有规则修复 `process_manager/chat_processes.json` 的明确空/全 NUL 损坏。
+4. 切入 Relay 时先从 Account 四库生成隔离的 Relay SQLite 会话视图；切回 Account 时先在 30 秒预算内发布新 Relay 会话，若队列未收口则保持 Relay。该步骤不全量扫描/复制 JSONL、不创建会话 checkpoint，也不做 provider slot GC。
+5. 原子替换 live `config.toml`。Relay 路由注入 `experimental_bearer_token`、`requires_openai_auth = true` 和受管 `sqlite_home`；账号路由移除整个 `model_providers.openai_custom` 受管表并恢复原 SQLite home。
+6. 重新读取 `auth.json` 并与关闭后快照逐字节比较，再精确验证目标请求路由和 SQLite home。官方 token 可在 preflight 与关闭之间由 ChatGPT 正常刷新，但 switcher 自己绝不写入认证文件。
+7. 若配置写入后的验证或元数据记录失败，只恢复原始 `config.toml` 并再次证明 `auth.json` 未变；随后持久化脱敏终态，通过关闭前捕获的 AppUserModelID 受控打开 ChatGPT。启动失败不会撤销成功路由，并在同一 task overlay 提供重试。
 
 如果 UI 只显示“模式匹配”而不是“当前运行”，按钮会显示“重新应用”；只有官方 `chatgpt` 登录模式和模型/provider/Relay 路由字段（包括 bearer token）都精确匹配才会跳过重复写入。官方 token 自身的正常刷新不影响账号态 exact 判定。
 
@@ -146,7 +148,7 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 切换到 ChatGPT 账号
 ```
 
-流程同样先校验官方登录态并安全关闭 ChatGPT，然后只在 live `config.toml` 上应用账号态 overlay，同时删除受管 Relay provider 表与明文 token。保存的账号 overlay 若没有 `model` / `service_tier`，会主动删除 live 中遗留的 Relay-only 值，避免切回官方后继续使用中转站模型。不会恢复或改写保存的账号态 `auth.json`。请求路由终态落盘后会尝试不超过预算的小批量增量收口；Relay 期间新增会话允许到这一步才发布为手机 Remote 兼容的 `openai` provider。
+流程同样先校验官方登录态并安全关闭 ChatGPT。配置写入前先把 Relay 期间新增会话发布为 Account/手机 Remote 兼容的 `openai` successor；30 秒预算内仍有待处理项就保留 Relay 并提示完全同步，而不是先切回再隐藏会话。随后应用账号态 overlay，删除受管 Relay provider 表与明文 token，并恢复切入 Relay 前的 Account SQLite home。保存的账号 overlay 若没有 `model` / `service_tier`，会主动删除 live 中遗留的 Relay-only 值。全程不会恢复或改写保存的账号态 `auth.json`。
 
 ### 5. 手动完全同步
 
@@ -262,7 +264,8 @@ C:\Users\<你>\.codex
 - 加密后的运行态
 - 切换/同步的临时回滚检查点，以及删除/恢复/手工创建的持久加密备份
 - 共享会话池
-- `session-sync-state-v1.json` 增量会话基线；缺失、损坏或版本不兼容时只要求手动完全同步，不自动重建
+- `mobile-continuity-v1.json` 手机连续性 cutover 与持久队列；只保存 thread ID、source fingerprint、typed 状态、重试元数据和脱敏失败分类
+- `session-sync-state-v1.json` 仅供既有手动完全同步维护 current/shared 对账基线，不再进入普通请求端切换
 - 脱敏操作记录
 - Image2 / Grok 的非敏感配置与 DPAPI 加密凭据
 
@@ -270,7 +273,7 @@ Codex 会话存储说明：
 
 - 官方会话索引默认是 `state_5.sqlite`，辅助 thread 数据还可能位于 `goals_1.sqlite`、`memories_1.sqlite` 和 `logs_2.sqlite`；这些库可能被 `config.toml` 的 `sqlite_home` 或环境变量 `CODEX_SQLITE_HOME` 一起改到别的位置。
 - 活跃会话正文位于 Codex home 下的 `sessions/**/*.jsonl`，原生归档正文可能位于 `archived_sessions/**/*.jsonl`；自动增量与手动完全同步只处理活跃 `sessions/`，Full/Sessions 备份与硬删除覆盖两者。
-- `session_index.jsonl` 是 Codex 自身会话索引文件；工具的有界增量基线是独立的 `%APPDATA%\codex-switch\session-sync-state-v1.json`，两者不能混用。
+- `session_index.jsonl` 是 Codex 自身会话索引文件；手机连续性状态是独立的 `%APPDATA%\codex-switch\mobile-continuity-v1.json`，两者不能混用。
 - `sqlite/codex-dev.db` 不是当前同步算法依赖的会话来源。
 
 会话管理删除会同时处理当前 Codex Home 和 shared-sessions 的 active/archived 会话；恢复可见只处理当前 Codex Home。
@@ -303,11 +306,11 @@ Codex 会话存储说明：
 - 本工具不会在 UI 中展示真实 Token 或 API Key。
 - Image2 / Grok Key 只以当前 Windows 用户可解密的 DPAPI 密文保存；前端只拿到“已配置/未配置”，安装包、Skill 文件、操作记录和回执不包含 Key。
 - Skill 安装只处理两个编译期固定 allowlist；目标路径由后端从绝对 `CODEX_HOME` 推导，拒绝符号链接、junction/reparse point 和未确认的本地漂移。
-- 当前 writer 生成 BackupManifest v4：继承 `scope` 与 `trackedDatabases`，并为会创建自动点的操作绑定 `operationId + role`；请求路由事务不创建 checkpoint，路由终态后的有界增量和手动完全同步固定使用双 `StateOnly`，不把 live 会话正文复制进临时点。Full/Sessions scope 覆盖 `sessions/` 与 `archived_sessions/`，runtime/state scope 不扩大。hard delete、手工 full backup 和 restore safety 覆盖四个受管 SQLite。所有 payload 使用当前 Windows 用户的 DPAPI 加密并记录大小/SHA-256；经强校验的 v2/v3/v4 Full 仍可显式恢复。
+- 当前 writer 生成 BackupManifest v4：继承 `scope` 与 `trackedDatabases`，并为会创建自动点的操作绑定 `operationId + role`；请求路由和手机连续性发布都不创建全会话 checkpoint，手动完全同步继续使用双 `StateOnly`。Full/Sessions scope 覆盖 `sessions/` 与 `archived_sessions/`，runtime/state scope 不扩大。hard delete、手工 full backup 和 restore safety 覆盖四个受管 SQLite。所有 payload 使用当前 Windows 用户的 DPAPI 加密并记录大小/SHA-256；经强校验的 v2/v3/v4 Full 仍可显式恢复。
 - 会话文件 `Allow` 路径保持零 in-place：Create 原子 no-clobber；普通 import 的严格扩展与分叉来源使用完整文件发布，旧文件 bytes/hash/mtime 不变。closed/current→shared 先用 `SelectMostComplete` 选活动历史，随后才为目标 provider 在 32 个受管候选中复用完整槽位或发布 immutable successor；marker 不超过 16 KiB，并用 `createdBytes` 前缀 SHA-256 证明创建后 append 没有篡改创建前缀。首次/增长只写最终 provider 文件，旧槽位不覆盖；durable terminal 后只有 successor 完整包含 predecessor 且 current/shared SQLite 都不再引用时才回收，无法证明即保留。hot shared→current 的 existing + `PreserveExisting` 必须在 target path 查询/复制前直接跳过，保持零 target candidate I/O、零 orphan 和 `copied_session_files = 0`。live current index 使用 `Skip`，关闭态或工具独占的 shared index 用完整 merged bytes 原子替换；`Deny` 零写入，`Unchanged` 返回前复检。
 - 自动释放只接受与唯一 durable terminal 精确绑定的 v4 自动点，并要求 operation ID、role、action/status/phase、时间窗、reason/source root/scope、路径和删除前 payload hash 全部通过复检。未绑定 v2/v3 自动点、Full、Apply/回滚/日志失败、孤儿和证据不足目录保留，不按年龄/数量/mtime 推测。经强校验的 v2 legacy Full、v3 Full、v4 Full 只能通过页面内显式确认删除。
 - 所有受管 SQLite 备份使用 SQLite Online Backup API，不直接复制可能不一致的 WAL/SHM 文件。
-- 所有会创建安全快照的操作都在第一份新快照前检查受管根互不重叠和容量。请求端切换不属于该类操作：它在关闭 ChatGPT 后重新冻结 `auth.json` 与 `config.toml`，只原子替换请求配置，并在写后逐字节验证官方登录态。
+- 所有会创建安全快照的操作都在第一份新快照前检查受管根互不重叠和容量。请求端切换不创建安全快照：它在关闭 ChatGPT 后重新冻结 `auth.json` 与 `config.toml`，按目标准备隔离 SQLite 会话视图或有界发布队列，再原子替换请求配置，并在写后逐字节验证官方登录态。
 - 关闭态 mutation 会在入口和最后写入前复检受管 ChatGPT 与独立 `codex.exe` CLI；只关闭受管 ChatGPT 进程树，独立 CLI 只作为 fail-closed 阻断信号。自动重启只使用关闭前从受管根捕获并在启动后重新验证的 AppUserModelID，不按 PATH 或任意 EXE 路径执行。
 - 需要整文件替换的配置、备份、可写 index 与 `operations.jsonl` 先生成同目录完整临时文件并同步，再用 Windows `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` 原子替换。`operations.jsonl` 业务语义 append-only，但每次会锁内严格解析旧文件、拒绝损坏历史和重复 operation ID，再原子发布完整新文件；失败时旧日志 byte-exact。会话 JSONL 的 Create/Import/provider successor 使用同目录完整临时文件 + hard-link no-clobber，生产路径绝不覆盖已有 JSONL；任何策略允许的 SQLite 引用切换都只能发生在完整新文件与 provenance marker 发布后。
 - 后端用进程内 try-lock + Windows 独占 `%APPDATA%\codex-switch\mutation.lock` 文件句柄串行化保存、验证、切换、同步、删除、恢复、一键更新安装和应用退出；同一进程或第二个 ChatGPT Switch 进程已有写操作时，新操作会立即拒绝。普通退出只有取得同一锁并把它保留到进程终止后才执行；繁忙时前端排队重试。更新进入退出阶段后锁同样保持到父进程终止，前端同时双向禁用其他 mutation。

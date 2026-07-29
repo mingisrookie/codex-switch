@@ -6,12 +6,15 @@ mod commands;
 pub mod config_patch;
 pub mod crypto;
 pub mod file_ops;
+pub mod mobile_continuity;
 pub mod operation_log;
 pub mod process_control;
 pub mod relay_verify;
 mod request_route_switcher;
+mod runtime_session_view;
 pub mod runtime_store;
 pub mod runtime_switcher;
+#[allow(dead_code)]
 pub mod session_incremental;
 pub mod session_manager;
 pub mod session_scan;
@@ -32,6 +35,10 @@ pub fn run() {
             commands::scan_sessions,
             commands::scan_managed_sessions,
             commands::list_runtimes,
+            commands::get_mobile_continuity_status,
+            commands::set_mobile_continuity_enabled,
+            commands::acknowledge_mobile_continuity_notice,
+            commands::publish_mobile_continuity_session,
             commands::scan_runtime_status,
             commands::import_plus_runtime,
             commands::upsert_relay_runtime,

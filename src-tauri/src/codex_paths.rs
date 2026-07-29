@@ -35,6 +35,15 @@ pub fn local_codex_paths(codex_home: &Path) -> CodexPaths {
     build_paths(codex_home, codex_home)
 }
 
+pub(crate) fn codex_paths_with_sqlite_home(
+    codex_home: &Path,
+    sqlite_home: &Path,
+) -> Result<CodexPaths, String> {
+    let codex_home = validate_absolute_root(codex_home, "CODEX_HOME")?;
+    let sqlite_home = validate_absolute_root(sqlite_home, "SQLite home")?;
+    Ok(build_paths(&codex_home, &sqlite_home))
+}
+
 fn build_paths(codex_home: &Path, sqlite_home: &Path) -> CodexPaths {
     CodexPaths {
         codex_home: codex_home.to_path_buf(),

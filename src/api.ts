@@ -14,6 +14,8 @@ import type {
   ChatGptLaunchResult,
   ManagedSessionInventory,
   RelayRuntimeInput,
+  RelaySwitchPreference,
+  MobileContinuityStatus,
   RestoreResult,
   RuntimeStatus,
   RuntimeSwitchResult,
@@ -166,9 +168,14 @@ export function closeCodexProcesses() {
 export function switchRuntime(
   runtimeId: RuntimeKind,
   onProgress: (event: RuntimeSwitchProgress) => void,
+  relayPreference: RelaySwitchPreference | null = null,
 ) {
   const onProgressChannel = new Channel<RuntimeSwitchProgress>(onProgress);
-  return invoke<RuntimeSwitchResult>('switch_runtime', { runtimeId, onProgress: onProgressChannel });
+  return invoke<RuntimeSwitchResult>('switch_runtime', {
+    runtimeId,
+    relayPreference,
+    onProgress: onProgressChannel,
+  });
 }
 
 export function launchChatgpt() {
@@ -182,6 +189,22 @@ export function syncAllSessions(onProgress: (event: SessionSyncProgress) => void
 
 export function verifyRelayRuntime() {
   return invoke<RuntimeMetadata>('test_relay_connection');
+}
+
+export function getMobileContinuityStatus() {
+  return invoke<MobileContinuityStatus>('get_mobile_continuity_status');
+}
+
+export function setMobileContinuityEnabled(enabled: boolean) {
+  return invoke<MobileContinuityStatus>('set_mobile_continuity_enabled', { enabled });
+}
+
+export function acknowledgeMobileContinuityNotice() {
+  return invoke<MobileContinuityStatus>('acknowledge_mobile_continuity_notice');
+}
+
+export function publishMobileContinuitySession(threadId: string) {
+  return invoke<MobileContinuityStatus>('publish_mobile_continuity_session', { threadId });
 }
 
 export function deleteManagedSessions(ids: string[], confirmed: boolean) {

@@ -9,7 +9,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { ManagedSessionInventory, ManagedSessionRecord } from './types';
+import type {
+  ManagedSessionInventory,
+  ManagedSessionRecord,
+  MobileContinuityItemStatus,
+  MobileContinuityStatus,
+} from './types';
 
 type SessionFilter = 'all' | 'visible' | 'archived' | 'current' | 'shared';
 type SessionSort = 'updated-desc' | 'updated-asc' | 'title-asc' | 'title-desc';
@@ -22,6 +27,9 @@ type SessionManagementPageProps = {
   onSync: () => void;
   onDelete: (ids: string[], confirmed: boolean) => boolean | void | Promise<boolean | void>;
   onRestoreVisible: (ids: string[]) => boolean | void | Promise<boolean | void>;
+  mobileContinuity?: MobileContinuityStatus | null;
+  onPublishMobile?: (threadId: string) => boolean | void | Promise<boolean | void>;
+  mobilePublishDisabled?: boolean;
 };
 
 const numberFormat = new Intl.NumberFormat('zh-CN');
@@ -41,6 +49,9 @@ export function SessionManagementPage({
   onSync,
   onDelete,
   onRestoreVisible,
+  mobileContinuity = null,
+  onPublishMobile = () => undefined,
+  mobilePublishDisabled = false,
 }: SessionManagementPageProps) {
   const [filter, setFilter] = useState<SessionFilter>('all');
   const [query, setQuery] = useState('');
@@ -74,6 +85,10 @@ export function SessionManagementPage({
       .slice()
       .sort((left, right) => compareSessions(left, right, sort));
   }, [filter, inventory.sessions, query, sort]);
+  const continuityByThread = useMemo(
+    () => new Map(mobileContinuity?.items.map((item) => [item.threadId, item.status]) ?? []),
+    [mobileContinuity?.items],
+  );
 
   const pageCount = Math.max(1, Math.ceil(filteredSessions.length / pageSize));
   const currentPage = Math.min(page, pageCount);
@@ -294,6 +309,7 @@ export function SessionManagementPage({
               <span role="columnheader">状态</span>
               <span role="columnheader">来源</span>
               <span role="columnheader">更新时间</span>
+              <span role="columnheader">Remote</span>
             </div>
             {sessions.length === 0 ? (
               <div role="row"><p className="empty-state" role="cell">当前筛选下没有会话。</p></div>
@@ -304,6 +320,9 @@ export function SessionManagementPage({
                 selected={selectedIds.has(session.id)}
                 disabled={busy || Boolean(deleteRequest)}
                 onToggle={() => toggleSession(session.id)}
+                continuityStatus={continuityByThread.get(session.id) ?? null}
+                onPublish={() => void onPublishMobile(session.id)}
+                mobilePublishDisabled={mobilePublishDisabled}
               />
             ))}
           </div>
@@ -400,11 +419,30 @@ export function SessionManagementPage({
   );
 }
 
-function SessionRow({ session, selected, disabled, onToggle }: { session: ManagedSessionRecord; selected: boolean; disabled: boolean; onToggle: () => void }) {
+function SessionRow({
+  session,
+  selected,
+  disabled,
+  onToggle,
+  continuityStatus,
+  onPublish,
+  mobilePublishDisabled,
+}: {
+  session: ManagedSessionRecord;
+  selected: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+  continuityStatus: MobileContinuityItemStatus | null;
+  onPublish: () => void;
+  mobilePublishDisabled: boolean;
+}) {
   const displayTitle = session.title || session.preview || '未命名会话';
   const path = effectivePath(session);
+  const legacyRelay = !session.archived
+    && session.modelProvider === 'openai_custom'
+    && continuityStatus === null;
   return (
-    <label className={`session-row ${selected ? 'selected' : ''}`} title={session.id} role="row">
+    <div className={`session-row ${selected ? 'selected' : ''}`} title={session.id} role="row">
       <span role="cell"><input type="checkbox" checked={selected} disabled={disabled} onChange={onToggle} aria-label={`选择 ${session.id}：${displayTitle}`} /></span>
       <span className="session-title-cell" role="cell">
         <strong title={displayTitle}>{displayTitle}</strong>
@@ -414,8 +452,39 @@ function SessionRow({ session, selected, disabled, onToggle }: { session: Manage
       <span className={`pill ${session.archived ? 'orange' : 'teal'}`} role="cell">{session.archived ? '已归档' : '未归档'}</span>
       <span role="cell">{sourceLabel(session.scope)}</span>
       <span role="cell">{formatTime(session.updatedAtMs ?? session.updatedAt)}</span>
-    </label>
+      <span className="session-remote-action" role="cell">
+        {continuityStatus ? (
+          <span className={`pill ${continuityStatus === 'remotePublished' ? 'teal' : 'orange'}`}>
+            {continuityStatusLabel(continuityStatus)}
+          </span>
+        ) : legacyRelay ? (
+          <button
+            className="ghost-button inline"
+            disabled={disabled || mobilePublishDisabled}
+            title={mobilePublishDisabled ? '请先切回 OpenAI 官方请求端' : undefined}
+            onClick={onPublish}
+          >
+            <Repeat2 className="button-icon" aria-hidden="true" />
+            同步此会话
+          </button>
+        ) : <span className="muted-dash">—</span>}
+      </span>
+    </div>
   );
+}
+
+function continuityStatusLabel(status: MobileContinuityItemStatus) {
+  const labels: Record<MobileContinuityItemStatus, string> = {
+    queued: '待发布',
+    publishing: '发布中',
+    remotePublished: '本机 Remote',
+    partial: '部分内容仅本机',
+    conflict: '冲突待处理',
+    retrying: '重试中',
+    needsManual: '需手动处理',
+    paused: '已暂停',
+  };
+  return labels[status];
 }
 
 function FilterButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {

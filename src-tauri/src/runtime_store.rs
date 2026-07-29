@@ -31,6 +31,13 @@ pub enum RuntimeKind {
     Relay,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RelaySwitchPreference {
+    Validate,
+    Direct,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeConfidence {
@@ -62,6 +69,8 @@ pub struct RuntimeMetadata {
     pub last_used_at_ms: Option<u128>,
     #[serde(default)]
     pub last_verified_at_ms: Option<u128>,
+    #[serde(default)]
+    pub relay_switch_preference: Option<RelaySwitchPreference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +121,13 @@ impl RuntimeStore {
         self.root.join(runtime_id)
     }
 
+    pub(crate) fn data_root(&self) -> Result<PathBuf, String> {
+        self.root
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "runtime store has no data root".to_string())
+    }
+
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeMetadata>, String> {
         let mut runtimes = Vec::new();
         for id in [PLUS_RUNTIME_ID, RELAY_RUNTIME_ID] {
@@ -160,6 +176,7 @@ impl RuntimeStore {
             created_at_ms,
             last_used_at_ms: None,
             last_verified_at_ms: Some(timestamp_millis()?),
+            relay_switch_preference: None,
         };
         self.write_runtime(&metadata, &auth, &config_overlay)?;
         Ok(metadata)
@@ -206,6 +223,10 @@ impl RuntimeStore {
             .as_ref()
             .map(|metadata| metadata.created_at_ms)
             .unwrap_or(timestamp_millis()?);
+        let preserve_switch_preference = input.api_key.trim().is_empty()
+            && existing.as_ref().is_some_and(|metadata| {
+                metadata.base_url.as_deref() == Some(normalized_base_url.as_str())
+            });
         let metadata = RuntimeMetadata {
             id: RELAY_RUNTIME_ID.to_string(),
             name: "API 中转站".to_string(),
@@ -217,6 +238,13 @@ impl RuntimeStore {
                 .as_ref()
                 .and_then(|metadata| metadata.last_used_at_ms),
             last_verified_at_ms: None,
+            relay_switch_preference: preserve_switch_preference
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|metadata| metadata.relay_switch_preference)
+                })
+                .flatten(),
         };
         if existing.is_some() {
             self.archive_runtime(RELAY_RUNTIME_ID)?;
@@ -296,9 +324,7 @@ impl RuntimeStore {
 
     pub fn mark_used(&self, runtime_id: &str) -> Result<RuntimeMetadata, String> {
         let (mut metadata, _) = self.load_runtime_bundle(runtime_id)?;
-        let now = timestamp_millis()?;
-        metadata.last_used_at_ms = Some(now);
-        metadata.last_verified_at_ms = Some(now);
+        metadata.last_used_at_ms = Some(timestamp_millis()?);
         self.write_metadata_and_bundle(runtime_id, &metadata)?;
         Ok(metadata)
     }
@@ -307,6 +333,16 @@ impl RuntimeStore {
         let (mut metadata, _) = self.load_runtime_bundle(runtime_id)?;
         metadata.last_verified_at_ms = Some(timestamp_millis()?);
         self.write_metadata_and_bundle(runtime_id, &metadata)?;
+        Ok(metadata)
+    }
+
+    pub fn set_relay_switch_preference(
+        &self,
+        preference: RelaySwitchPreference,
+    ) -> Result<RuntimeMetadata, String> {
+        let (mut metadata, _) = self.load_runtime_bundle(RELAY_RUNTIME_ID)?;
+        metadata.relay_switch_preference = Some(preference);
+        self.write_metadata_and_bundle(RELAY_RUNTIME_ID, &metadata)?;
         Ok(metadata)
     }
 
@@ -902,6 +938,7 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
     provider["name"] = value(MANAGED_RELAY_PROVIDER_ID);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(true);
     provider["supports_websockets"] = value(false);
     provider["request_max_retries"] = value(6);
     provider["stream_max_retries"] = value(3);
@@ -1092,9 +1129,13 @@ fn provider_config_fingerprint_with_bearer(
     entries.retain(|(key, _)| {
         !matches!(
             key.as_str(),
-            "api_key" | "env_key" | "goal" | "experimental_bearer_token"
+            "api_key" | "env_key" | "goal" | "experimental_bearer_token" | "requires_openai_auth"
         )
     });
+    entries.push((
+        "requires_openai_auth".to_string(),
+        SemanticToml::Boolean(true),
+    ));
     entries.push((
         "experimental_bearer_token".to_string(),
         SemanticToml::String(bearer_token.to_string()),
@@ -1180,7 +1221,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{RuntimeConfidence, RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID};
+    use super::{
+        RelaySwitchPreference, RuntimeConfidence, RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID,
+        RELAY_RUNTIME_ID,
+    };
     use crate::config_patch::{plan_runtime_config_patch, RuntimeConfigKind};
 
     fn activate_relay_route(store: &RuntimeStore, home: &std::path::Path) {
@@ -1327,6 +1371,137 @@ mod tests {
                 .as_deref(),
             Some("new")
         );
+    }
+
+    #[test]
+    fn relay_switch_preference_survives_model_only_updates() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/gateway".to_string(),
+                    api_key: "sk-preserved".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        store
+            .set_relay_switch_preference(RelaySwitchPreference::Direct)
+            .unwrap();
+
+        let updated = store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/gateway".to_string(),
+                    api_key: String::new(),
+                    model: "new".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.relay_switch_preference,
+            Some(RelaySwitchPreference::Direct)
+        );
+    }
+
+    #[test]
+    fn relay_switch_preference_is_cleared_when_credentials_change() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-old".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        store
+            .set_relay_switch_preference(RelaySwitchPreference::Validate)
+            .unwrap();
+
+        let updated = store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-new".to_string(),
+                    model: "new".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.relay_switch_preference, None);
+    }
+
+    #[test]
+    fn direct_use_does_not_claim_that_the_relay_was_verified() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-old".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        store
+            .set_relay_switch_preference(RelaySwitchPreference::Direct)
+            .unwrap();
+
+        let used = store.mark_used(RELAY_RUNTIME_ID).unwrap();
+
+        assert!(used.last_used_at_ms.is_some());
+        assert_eq!(used.last_verified_at_ms, None);
+    }
+
+    #[test]
+    fn relay_switch_preference_is_cleared_when_the_saved_address_changes() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/gateway".to_string(),
+                    api_key: "sk-old".to_string(),
+                    model: "old".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        store
+            .set_relay_switch_preference(RelaySwitchPreference::Direct)
+            .unwrap();
+
+        let updated = store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/edge".to_string(),
+                    api_key: String::new(),
+                    model: "new".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.relay_switch_preference, None);
     }
 
     #[test]
@@ -2258,6 +2433,7 @@ mod tests {
             created_at_ms: 1,
             last_used_at_ms: None,
             last_verified_at_ms: None,
+            relay_switch_preference: None,
         };
         let runtime_dir = store.runtime_dir(RELAY_RUNTIME_ID);
         let mut writes = 0;

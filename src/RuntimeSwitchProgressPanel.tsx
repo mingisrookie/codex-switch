@@ -61,7 +61,7 @@ const steps: Step[] = [
     phases: ['verifyingRelay'],
     group: '准备',
     label: '验证中转站',
-    description: '确认地址、模型与认证可用',
+    description: '仅确认地址、网络与鉴权可用，不检查模型',
     icon: RadioTower,
     relayOnly: true,
   },
@@ -75,11 +75,20 @@ const steps: Step[] = [
     optional: true,
   },
   {
-    id: 'apply',
-    phases: ['preparingRuntime', 'repairingAppState', 'applyingRuntime'],
+    id: 'incremental',
+    phases: ['preparingRuntime', 'repairingAppState', 'syncingIncrementalSessions'],
     group: '保护',
-    label: '应用最小配置补丁',
-    description: '修复关闭状态并只原子替换 config.toml',
+    label: '准备增量会话视图',
+    description: 'Relay 使用隔离索引；返回 Account 只发布新增会话',
+    icon: RadioTower,
+    optional: true,
+  },
+  {
+    id: 'apply',
+    phases: ['applyingRuntime'],
+    group: '切换',
+    label: '应用请求端配置',
+    description: '原子切换请求路由和对应的会话索引',
     icon: Settings2,
   },
   {
@@ -87,17 +96,8 @@ const steps: Step[] = [
     phases: ['verifying', 'recordingResult'],
     group: '切换',
     label: '验证并记录请求端',
-    description: '确认登录态未变、路由匹配并持久化终态',
+    description: '确认登录态、路由和会话索引匹配并持久化终态',
     icon: ShieldCheck,
-  },
-  {
-    id: 'incremental',
-    phases: ['syncingIncrementalSessions'],
-    group: '收尾',
-    label: '增量收口会话',
-    description: '仅处理索引证明的小批量变化，超限立即延期',
-    icon: RadioTower,
-    optional: true,
   },
   {
     id: 'launch',
@@ -354,7 +354,7 @@ export function RuntimeSwitchProgressPanel({
 
         {flow.status === 'failed' ? (
           <footer className="switch-task-footer">
-            <p>失败或回滚状态不会自动打开 ChatGPT。</p>
+            <p>写入前失败或已回滚时会尝试重新打开 ChatGPT；回滚失败则保持关闭。</p>
             <button className="primary-button" onClick={onClose} disabled={closeDisabled}>
               <X className="button-icon" aria-hidden="true" />
               关闭任务
@@ -409,6 +409,18 @@ function SwitchSuccessResult({
       <dl className="switch-receipt" aria-label="切换回执">
         <div><dt>操作 ID</dt><dd>{result.operationId}</dd></div>
         <div><dt>目标请求端</dt><dd>{result.runtime.kind === 'plus' ? 'OpenAI 官方' : 'API Relay'}</dd></div>
+        {result.runtime.kind === 'relay' ? (
+          <div>
+            <dt>Relay 验证</dt>
+            <dd>
+              {result.relayValidation === 'verified'
+                ? '连接与鉴权已验证'
+                : result.relayValidation === 'skipped'
+                  ? '未验证（直接切换）'
+                  : '不适用'}
+            </dd>
+          </div>
+        ) : null}
         <div><dt>官方登录态</dt><dd>已验证保持不变</dd></div>
         <div><dt>配置变更</dt><dd>{result.changed ? '已原子应用' : '无需变更'}</dd></div>
         <div>
@@ -420,8 +432,8 @@ function SwitchSuccessResult({
           </dd>
         </div>
         <div>
-          <dt>会话增量</dt>
-          <dd>{incrementalSyncLabel(result.incrementalSessionSync)}</dd>
+          <dt>会话视图</dt>
+          <dd>{incrementalSyncLabel(result.incrementalSessionSync, result.runtime.kind)}</dd>
         </div>
       </dl>
 
@@ -569,8 +581,14 @@ function slowestObservedStep(
     .sort((left, right) => right.durationMs - left.durationMs)[0] ?? null;
 }
 
-function incrementalSyncLabel(result: RuntimeSwitchResult['incrementalSessionSync']) {
+function incrementalSyncLabel(
+  result: RuntimeSwitchResult['incrementalSessionSync'],
+  runtimeKind: RuntimeKind,
+) {
   const duration = `${(result.durationMs / 1000).toFixed(1)}s`;
+  if (runtimeKind === 'relay' && result.status === 'applied') {
+    return `已准备 ${result.detectedThreads} 条会话索引 · ${duration}`;
+  }
   if (result.status === 'applied') return `已同步 ${result.syncedThreads} 个变化 · ${duration}`;
   if (result.status === 'unchanged') return `无变化 · ${duration}`;
   if (result.status === 'needsFullSync') return '需要手动完全同步';

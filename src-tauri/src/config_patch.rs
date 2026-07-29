@@ -5,6 +5,13 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 pub const MANAGED_RELAY_PROVIDER_ID: &str = "openai_custom";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteHomePatch {
+    Keep,
+    Set(String),
+    Remove,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeConfigKind {
     Account,
@@ -220,6 +227,7 @@ pub fn plan_runtime_config_patch(
                 target_table.insert(key, item.clone());
             }
             target_table["experimental_bearer_token"] = value(relay_bearer_token);
+            target_table["requires_openai_auth"] = value(true);
             changed_keys.push(format!("model_providers.{provider}"));
         }
     }
@@ -233,9 +241,42 @@ pub fn plan_runtime_config_patch(
     })
 }
 
+pub fn apply_sqlite_home_patch(
+    plan: ConfigPatchPlan,
+    patch: &SqliteHomePatch,
+) -> Result<ConfigPatchPlan, String> {
+    if patch == &SqliteHomePatch::Keep {
+        return Ok(plan);
+    }
+    let mut doc = DocumentMut::from_str(&plan.patched_toml)
+        .map_err(|_| "patched config.toml is invalid".to_string())?;
+    let mut changed_keys = plan.changed_keys;
+    match patch {
+        SqliteHomePatch::Keep => {}
+        SqliteHomePatch::Set(path) => {
+            if doc.get("sqlite_home").and_then(Item::as_str) != Some(path) {
+                doc["sqlite_home"] = value(path);
+                changed_keys.push("sqlite_home".to_string());
+            }
+        }
+        SqliteHomePatch::Remove => {
+            if doc.remove("sqlite_home").is_some() {
+                changed_keys.push("sqlite_home".to_string());
+            }
+        }
+    }
+    Ok(ConfigPatchPlan {
+        patched_toml: doc.to_string(),
+        changed_keys,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{plan_config_patch, plan_runtime_config_patch, ConfigOverlay, RuntimeConfigKind};
+    use super::{
+        apply_sqlite_home_patch, plan_config_patch, plan_runtime_config_patch, ConfigOverlay,
+        RuntimeConfigKind, SqliteHomePatch,
+    };
 
     #[test]
     fn patches_login_bound_fields_while_preserving_global_config() {
@@ -379,6 +420,34 @@ supports_websockets = false
         assert!(plan
             .patched_toml
             .contains("experimental_bearer_token = \"sk-relay-secret\""));
+        assert!(plan.patched_toml.contains("requires_openai_auth = true"));
+    }
+
+    #[test]
+    fn sqlite_home_patch_sets_and_restores_only_the_managed_key() {
+        let base = plan_config_patch(
+            "model = \"gpt-5.6-sol\"\n[features]\nfast_mode = true\n",
+            &ConfigOverlay::default(),
+        )
+        .unwrap();
+        let relay =
+            apply_sqlite_home_patch(base, &SqliteHomePatch::Set(r"C:\relay-view".to_string()))
+                .unwrap();
+        let relay_doc = relay
+            .patched_toml
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            relay_doc
+                .get("sqlite_home")
+                .and_then(toml_edit::Item::as_str),
+            Some(r"C:\relay-view")
+        );
+        assert!(relay.patched_toml.contains("fast_mode = true"));
+
+        let account = apply_sqlite_home_patch(relay, &SqliteHomePatch::Remove).unwrap();
+        assert!(!account.patched_toml.contains("sqlite_home"));
+        assert!(account.patched_toml.contains("fast_mode = true"));
     }
 
     #[test]
