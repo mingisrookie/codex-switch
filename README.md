@@ -25,7 +25,7 @@
 
 ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步、可管理。公开 UI 和窗口标题使用 ChatGPT Switch；仓库名、`.codex`、`CODEX_HOME` 和 `plus` 等标识继续保留兼容命名。GitHub Release 资产仍必须唯一命名为 `codex-switch.exe`，因为 v0.1.9 updater 固定校验该资产名，不能改成 `chatgpt-switch.exe`。
 
-> 当前源码目标版本为 `v0.2.4`；正式可下载资产及校验结果以 GitHub Releases 的 latest stable 为准。
+> 当前源码目标版本为 `v0.2.5`；正式可下载资产及校验结果以 GitHub Releases 的 latest stable 为准。
 
 ## 开发过程
 
@@ -45,7 +45,7 @@ ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 
 - 在独立“技能”页安装固定来源的 `newapi-image2-client` 和 `grok-search`；Skill 按页面懒加载，不会让技能扫描故障污染运行态 Dashboard。
 - Image2 与 Grok 分别填写自己的服务 URL 和 API Key；Key 使用当前 Windows 用户的 DPAPI 加密，Skill、非敏感配置、UI、回执和日志中都不保存明文。
 - 分开显示“已保存”“当前运行”“最近验证”；live `auth.json` 只需保持官方 `chatgpt` 登录态，请求路由字段必须精确匹配。官方 token 正常刷新不会把当前态误判为失配。
-- 切换基于 live `config.toml` 应用最小请求路由 patch，只修改模型/service tier/provider/受管 `sqlite_home` 绑定，不覆盖 `model_instructions_file`、MCP、项目和其他全局设置。切换到 Relay 时把已用 DPAPI 保存的 Key 投影为受管 provider 的 `experimental_bearer_token`，同时写入 `requires_openai_auth = true` 保持 Desktop 官方账户识别；切回账号态会删除整个受管 `openai_custom` provider 表和其中的明文 token，并恢复原 Account SQLite home。
+- 切换基于 live `config.toml` 应用最小请求路由 patch，只修改模型/service tier/provider/受管 `sqlite_home` 绑定，不覆盖 `model_instructions_file`、MCP、项目和其他全局设置。切换到 Relay 时把已用 DPAPI 保存的 Key 投影为受管 provider 的 `experimental_bearer_token`，同时写入 `requires_openai_auth = true` 保持 Desktop 官方账户识别，并写入 `supports_websockets = true` 允许 Responses WebSocket；切回账号态会删除整个受管 `openai_custom` provider 表和其中的明文 token，并恢复原 Account SQLite home。
 - 点击切换后只显示一个页面内 task overlay；后端原始 phase/timestamp 全部保留，UI 聚合为“准备、验证 Relay、关闭 ChatGPT、应用请求端、验证并记录、增量会话、启动 ChatGPT”最多 7 步。请求路由 mutation 不进入会话全量扫描/同步、容量规划、checkpoint 或 provider GC；`auth.json` 从 preflight 到后置验证必须 byte-exact 不变。只有 `config.toml` 写入后的失败会回滚原始配置，官方登录态始终不参与回滚写入。
 - 切入 Relay 前通过 SQLite Online Backup 把 Account 的 `state_5/logs_2/goals_1/memories_1.sqlite` 刷新到 `%APPDATA%\codex-switch\relay-sqlite`，只在副本中把 thread provider 归一为 `openai_custom`。会话正文仍使用同一个受管 `sessions/`，Account 原库不被改写。
 - 首次启用手机连续性时只从 SQLite 记录当前全部 thread ID 作为 cutover，不扫描或上传既有 JSONL。以后只把 cutover 后全新出现、未归档且 provider 为受管 Relay 的会话加入 `%APPDATA%\codex-switch\mobile-continuity-v1.json` 持久队列；旧会话后续追加仍保持手动。
@@ -116,7 +116,7 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 - 非 loopback 的明文 `http://` 地址会被拒绝；HTTP 只允许 localhost 或回环地址。
 - 首次保存必须输入 API Key；以后只在 URL origin 不变时允许 Key 留空并保留已加密值，改变 scheme/host/port 必须输入新 Key。
 - “验证连接”会用 Bearer 认证请求 `<Base URL>/models`，10 秒超时且禁止重定向；只以 2xx 判断地址、网络和鉴权可用，不读取或判断模型列表，错误不会回显 Key 或响应正文。
-- 槽位存储中的 Key 始终是 DPAPI 密文；切换到 Relay 时，工具会把 Key 投影到 live `config.toml` 的 `[model_providers.openai_custom].experimental_bearer_token`。这是当前请求端路由所需的明文运行态；切回账号态会删除整个受管 provider 表。工具不会改写 `auth.json`。
+- 槽位存储中的 Key 始终是 DPAPI 密文；切换到 Relay 时，工具会在 live `config.toml` 的 `[model_providers.openai_custom]` 中投影 `experimental_bearer_token`，并权威写入 `supports_websockets = true`。这是当前请求端路由所需的运行态；切回账号态会删除整个受管 provider 表。工具不会改写 `auth.json`。
 
 ### 3. 切换到中转站
 
@@ -132,7 +132,7 @@ ChatGPT Switch 每次启动只在当前进程内检查一次更新，不安装�
 2. 从受管 ChatGPT 根进程捕获并校验唯一 Windows AppUserModelID，再用 ToolHelp 检测/关闭进程树。先温和关闭并等待，超时才强制结束仍能证明身份的受管根；独立 `codex.exe` CLI 永远不会被结束。
 3. ChatGPT 关闭后重新读取官方登录态与 live 配置，生成只涉及模型/service tier/受管 provider/受管 `sqlite_home` 的最小 patch；同时仅检查并按既有规则修复 `process_manager/chat_processes.json` 的明确空/全 NUL 损坏。
 4. 切入 Relay 时先从 Account 四库生成隔离的 Relay SQLite 会话视图；切回 Account 时先在 30 秒预算内发布新 Relay 会话，若队列未收口则保持 Relay。该步骤不全量扫描/复制 JSONL、不创建会话 checkpoint，也不做 provider slot GC。
-5. 原子替换 live `config.toml`。Relay 路由注入 `experimental_bearer_token`、`requires_openai_auth = true` 和受管 `sqlite_home`；账号路由移除整个 `model_providers.openai_custom` 受管表并恢复原 SQLite home。
+5. 原子替换 live `config.toml`。Relay 路由注入 `experimental_bearer_token`、`requires_openai_auth = true`、`supports_websockets = true` 和受管 `sqlite_home`；账号路由移除整个 `model_providers.openai_custom` 受管表并恢复原 SQLite home。
 6. 重新读取 `auth.json` 并与关闭后快照逐字节比较，再精确验证目标请求路由和 SQLite home。官方 token 可在 preflight 与关闭之间由 ChatGPT 正常刷新，但 switcher 自己绝不写入认证文件。
 7. 若配置写入后的验证或元数据记录失败，只恢复原始 `config.toml` 并再次证明 `auth.json` 未变；随后持久化脱敏终态，通过关闭前捕获的 AppUserModelID 受控打开 ChatGPT。启动失败不会撤销成功路由，并在同一 task overlay 提供重试。
 

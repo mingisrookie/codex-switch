@@ -228,6 +228,7 @@ pub fn plan_runtime_config_patch(
             }
             target_table["experimental_bearer_token"] = value(relay_bearer_token);
             target_table["requires_openai_auth"] = value(true);
+            target_table["supports_websockets"] = value(true);
             changed_keys.push(format!("model_providers.{provider}"));
         }
     }
@@ -421,6 +422,32 @@ supports_websockets = false
             .patched_toml
             .contains("experimental_bearer_token = \"sk-relay-secret\""));
         assert!(plan.patched_toml.contains("requires_openai_auth = true"));
+        assert!(plan.patched_toml.contains("supports_websockets = true"));
+        assert!(!plan.patched_toml.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn relay_runtime_patch_adds_websocket_support_when_the_saved_field_is_missing() {
+        let plan = plan_runtime_config_patch(
+            "model = \"account\"\n",
+            "model = \"relay\"\nmodel_provider = \"openai_custom\"\n\
+             [model_providers.openai_custom]\nbase_url = \"https://relay.example.com/v1\"\n",
+            RuntimeConfigKind::Relay,
+            Some("sk-relay-secret"),
+        )
+        .unwrap();
+        let patched = plan.patched_toml.parse::<toml_edit::DocumentMut>().unwrap();
+
+        assert_eq!(
+            patched
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|providers| providers.get("openai_custom"))
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|provider| provider.get("supports_websockets"))
+                .and_then(toml_edit::Item::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.5 - 2026-08-01
+
+### Fixed
+
+- 修复 Relay 槽位和请求路由把 `supports_websockets` 保存为 `false` 的问题。新旧 Relay 槽位在切换时都会向 live `config.toml` 的受管 provider 写入 `supports_websockets = true`；该字段为 `false` 或缺失时不再误报为当前精确匹配。
+
 ## v0.2.4 - 2026-07-29
 
 ### Added

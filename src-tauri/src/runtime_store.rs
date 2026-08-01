@@ -939,7 +939,7 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
-    provider["supports_websockets"] = value(false);
+    provider["supports_websockets"] = value(true);
     provider["request_max_retries"] = value(6);
     provider["stream_max_retries"] = value(3);
     provider["stream_idle_timeout_ms"] = value(180_000);
@@ -1129,7 +1129,12 @@ fn provider_config_fingerprint_with_bearer(
     entries.retain(|(key, _)| {
         !matches!(
             key.as_str(),
-            "api_key" | "env_key" | "goal" | "experimental_bearer_token" | "requires_openai_auth"
+            "api_key"
+                | "env_key"
+                | "goal"
+                | "experimental_bearer_token"
+                | "requires_openai_auth"
+                | "supports_websockets"
         )
     });
     entries.push((
@@ -1139,6 +1144,10 @@ fn provider_config_fingerprint_with_bearer(
     entries.push((
         "experimental_bearer_token".to_string(),
         SemanticToml::String(bearer_token.to_string()),
+    ));
+    entries.push((
+        "supports_websockets".to_string(),
+        SemanticToml::Boolean(true),
     ));
     entries.sort_unstable();
     Some(entries)
@@ -1316,7 +1325,7 @@ mod tests {
             .contains("[model_providers.openai_custom]"));
         assert!(files.config_toml.contains("name = \"openai_custom\""));
         assert!(files.config_toml.contains("wire_api = \"responses\""));
-        assert!(files.config_toml.contains("supports_websockets = false"));
+        assert!(files.config_toml.contains("supports_websockets = true"));
         assert!(files.config_toml.contains("request_max_retries = 6"));
         assert!(files.config_toml.contains("stream_max_retries = 3"));
         assert!(files
@@ -1953,7 +1962,8 @@ mod tests {
 
         for (from, to) in [
             ("wire_api = \"responses\"", "wire_api = \"chat\""),
-            ("supports_websockets = false", "supports_websockets = true"),
+            ("supports_websockets = true", "supports_websockets = false"),
+            ("supports_websockets = true\n", ""),
             ("request_max_retries = 6", "request_max_retries = 2"),
             ("stream_max_retries = 3", "stream_max_retries = 1"),
             (

@@ -433,6 +433,16 @@ mod tests {
         assert!(relay_config.contains("experimental_bearer_token = \"sk-relay-secret\""));
         assert!(relay_config.contains("requires_openai_auth = true"));
         let relay_doc = relay_config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            relay_doc
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|providers| providers.get("openai_custom"))
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|provider| provider.get("supports_websockets"))
+                .and_then(toml_edit::Item::as_bool),
+            Some(true)
+        );
         let relay_sqlite_home = relay_doc
             .get("sqlite_home")
             .and_then(toml_edit::Item::as_str)
