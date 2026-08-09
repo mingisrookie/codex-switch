@@ -83,6 +83,51 @@ export type AppStatus = {
   codexHome: string;
 };
 
+export type DiagnosticStatus = {
+  available: boolean;
+  eventCount: number;
+  totalBytes: number;
+  retentionDays: number;
+  maxBytes: number;
+  oldestEventAtMs: number | null;
+  newestEventAtMs: number | null;
+  warnings: string[];
+};
+
+export type DiagnosticExportReceipt = {
+  exportId: string;
+  path: string;
+  filename: string;
+  bytes: number;
+  sha256: string;
+  eventCount: number;
+  selection: DiagnosticExportSelection;
+  warnings: string[];
+};
+
+export type DiagnosticExportSelection = {
+  mode: 'operation' | 'retainedWindow';
+  operationId?: string;
+  fromTimestampMs: number;
+  throughTimestampMs: number;
+};
+
+export type DiagnosticExportFailure = {
+  kind: 'preparation' | 'destination';
+  message: string;
+  retryId?: string;
+};
+
+export type DiagnosticExportTarget = 'downloads' | 'diagnosticDirectory';
+
+export type FrontendDiagnosticInput = {
+  level: 'error';
+  component: 'frontend';
+  eventKind: 'unhandledError' | 'unhandledRejection';
+  errorCode: 'frontend.unhandled_error' | 'frontend.unhandled_rejection';
+  safeMessage: string;
+};
+
 export type UpdateCheckResult = {
   currentVersion: string;
   latestVersion: string;
@@ -446,6 +491,7 @@ export type RuntimeSwitchPhase =
 export type RuntimeSwitchProgress = {
   phase: RuntimeSwitchPhase;
   timestampMs: number;
+  operationId?: string | null;
   message?: string | null;
   outcome?: 'failedBeforeWrite' | 'rolledBack' | 'rollbackFailed' | null;
 };
@@ -467,5 +513,6 @@ export type SessionSyncPhase =
 export type SessionSyncProgress = {
   phase: SessionSyncPhase;
   timestampMs: number;
+  operationId?: string | null;
   message?: string | null;
 };

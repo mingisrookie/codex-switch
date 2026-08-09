@@ -105,7 +105,10 @@ describe('SkillsManagementPage', () => {
 
   it('keeps replacement confirmation open after an install error and closes it after retry', async () => {
     const installSkill = vi.fn()
-      .mockRejectedValueOnce(new Error('覆盖失败'))
+      .mockRejectedValueOnce({
+        message: '覆盖失败',
+        operationId: 'install-skill-attempt-1780000000000-42-3',
+      })
       .mockResolvedValueOnce({ ...receipt, skillId: 'grokSearch', action: 'update' });
     render(<SkillsManagementPage
       active busy={false} onBusyChange={vi.fn()} ensureCodexClosed={vi.fn()}
@@ -119,6 +122,7 @@ describe('SkillsManagementPage', () => {
     await waitFor(() => expect(document.activeElement).toBe(heading));
     fireEvent.click(screen.getByRole('button', { name: '确认覆盖' }));
     expect((await screen.findByRole('alert')).textContent).toContain('覆盖失败');
+    expect(screen.getByRole('button', { name: '导出本次诊断' })).toBeTruthy();
     expect(screen.getByRole('heading', { name: '覆盖安装 Grok 搜索' })).toBeTruthy();
     expect(document.activeElement).toBe(heading);
 
@@ -150,6 +154,7 @@ describe('SkillsManagementPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存技能配置' }));
 
     expect((await screen.findByRole('alert')).textContent).toContain('保存失败');
+    expect(screen.queryByRole('button', { name: '导出最近诊断' })).toBeNull();
     expect((screen.getByLabelText('API Key') as HTMLInputElement).value).toBe('sk-user-secret');
 
     fireEvent.click(screen.getByRole('button', { name: '保存技能配置' }));

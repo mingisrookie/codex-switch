@@ -315,6 +315,7 @@ describe('RuntimeSwitchProgressPanel', () => {
       target: 'relay',
       startedAtMs: 100,
       completedAtMs: 150,
+      operationId: 'switch-failed-1',
       failedPhase: 'applyingRuntime',
       error: 'runtime apply failed',
       events: [
@@ -326,6 +327,7 @@ describe('RuntimeSwitchProgressPanel', () => {
 
     expect(screen.getByText('已恢复原始请求配置')).toBeTruthy();
     expect(screen.getByRole('alert').textContent).toContain('切换失败，已恢复原始请求配置');
+    expect(screen.getByRole('button', { name: '导出本次诊断' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /打开 ChatGPT/ })).toBeNull();
     const interrupted = screen.getByText('应用请求端配置', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');

@@ -15,6 +15,13 @@ import type {
 
 const apiMocks = vi.hoisted(() => ({
   getAppStatus: vi.fn(),
+  getDiagnosticStatus: vi.fn(),
+  exportDiagnostics: vi.fn(),
+  retryDiagnosticExport: vi.fn(),
+  openDiagnosticExport: vi.fn(),
+  openDiagnosticLogDirectory: vi.fn(),
+  clearDiagnosticLogs: vi.fn(),
+  recordFrontendDiagnostic: vi.fn(),
   requestAppExit: vi.fn(),
   getUpdateStartupNotice: vi.fn(),
   checkForUpdates: vi.fn(),
@@ -179,6 +186,16 @@ describe('App release-hardening UI', () => {
       needsManual: 0,
       items: [],
     });
+    apiMocks.getDiagnosticStatus.mockResolvedValue({
+      available: true,
+      eventCount: 0,
+      totalBytes: 0,
+      retentionDays: 14,
+      maxBytes: 10 * 1024 * 1024,
+      oldestEventAtMs: null,
+      newestEventAtMs: null,
+      warnings: [],
+    });
     const initial = dashboardData();
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: initial.codexHome,
@@ -299,12 +316,18 @@ describe('App release-hardening UI', () => {
       currentVersion: '0.1.5', latestVersion: '0.1.6', updateAvailable: true,
       releaseNotes: null, checkedAtMs: 10,
     });
-    apiMocks.installUpdate.mockRejectedValue(new Error('digest mismatch'));
+    apiMocks.installUpdate.mockRejectedValue({
+      message: 'digest mismatch',
+      operationId: 'install-update-1780000000000-42-1',
+    });
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
     const install = await screen.findByRole('button', { name: '立即更新' });
     fireEvent.click(install);
     expect(await screen.findByText('digest mismatch')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '导出本次诊断' }));
+    await waitFor(() => expect(apiMocks.exportDiagnostics)
+      .toHaveBeenCalledWith('install-update-1780000000000-42-1'));
     await waitFor(() => expect((screen.getByRole('button', { name: '立即更新' }) as HTMLButtonElement).disabled).toBe(false));
   });
 
@@ -529,6 +552,92 @@ describe('App release-hardening UI', () => {
     expect(screen.queryByRole('button', { name: '刷新' })).toBeNull();
   });
 
+  it('opens diagnostics from the toolbar as a page region and restores trigger focus', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    const trigger = await screen.findByRole('button', { name: '诊断' });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const panel = screen.getByRole('region', { name: '诊断与支持' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    expect(trigger.getAttribute('aria-controls')).toBe('diagnostic-panel');
+    expect(panel.textContent).toContain('已自动脱敏，不含凭据和聊天内容');
+    await waitFor(() => expect(document.activeElement).toBe(
+      within(panel).getByRole('heading', { name: '诊断与支持' }),
+    ));
+
+    fireEvent.click(within(panel).getByRole('button', { name: '关闭诊断面板' }));
+    await waitFor(() => expect(screen.queryByRole('region', { name: '诊断与支持' })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('keeps the diagnostic panel mounted while export is busy and restores focus after completion', async () => {
+    let resolveExport: ((receipt: object) => void) | undefined;
+    apiMocks.exportDiagnostics.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveExport = resolve; }),
+    );
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    const trigger = await screen.findByRole('button', { name: '诊断' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const panel = screen.getByRole('region', { name: '诊断与支持' });
+    const exportButton = within(panel).getByRole('button', { name: '导出最近诊断' });
+    exportButton.focus();
+    fireEvent.click(exportButton);
+
+    await waitFor(() => expect(trigger).toHaveProperty('disabled', true));
+    fireEvent.click(trigger);
+    expect(screen.getByRole('region', { name: '诊断与支持' })).toBeTruthy();
+    expect(apiMocks.exportDiagnostics).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveExport?.({
+        exportId: 'export-busy-1',
+        path: 'C:\\isolated\\diagnostics.zip',
+        filename: 'diagnostics.zip',
+        bytes: 128,
+        sha256: 'a'.repeat(64),
+        eventCount: 1,
+        selection: {
+          mode: 'retainedWindow',
+          fromTimestampMs: 1,
+          throughTimestampMs: 2,
+        },
+        warnings: [],
+      });
+    });
+    await screen.findByText('诊断包已保存');
+    await waitFor(() => expect(trigger).toHaveProperty('disabled', false));
+    expect(document.activeElement).toBe(exportButton);
+
+    trigger.focus();
+    fireEvent.click(trigger);
+    await waitFor(() => expect(screen.queryByRole('region', { name: '诊断与支持' })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('records only fixed safe classifications for unhandled frontend failures', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    await screen.findByRole('button', { name: '诊断' });
+
+    window.dispatchEvent(new ErrorEvent('error', {
+      message: 'sk-user-secret',
+      filename: 'file:///C:/Users/alice/private.ts',
+      error: new Error('private stack value'),
+    }));
+
+    await waitFor(() => expect(apiMocks.recordFrontendDiagnostic).toHaveBeenCalledTimes(1));
+    expect(apiMocks.recordFrontendDiagnostic).toHaveBeenCalledWith({
+      level: 'error',
+      component: 'frontend',
+      eventKind: 'unhandledError',
+      errorCode: 'frontend.unhandled_error',
+      safeMessage: '前端发生未处理异常',
+    });
+    expect(JSON.stringify(apiMocks.recordFrontendDiagnostic.mock.calls)).not.toContain('sk-user-secret');
+    expect(JSON.stringify(apiMocks.recordFrontendDiagnostic.mock.calls)).not.toContain('alice');
+  });
+
   it('does not disable a switch when the backend only has a mode-level match', async () => {
     const data = dashboardData();
     if (data.runtimeStatus.status !== 'ready') throw new Error('fixture must include runtime status');
@@ -676,7 +785,10 @@ describe('App release-hardening UI', () => {
       runtimeStatus: DashboardData['runtimeStatus'];
       operations: DashboardData['operations'];
     }>();
-    apiMocks.upsertRelayRuntime.mockRejectedValue(new Error('relay store unavailable'));
+    apiMocks.upsertRelayRuntime.mockRejectedValue({
+      message: 'relay store unavailable',
+      operationId: 'save-relay-1780000000000-42-2',
+    });
     apiMocks.loadRuntimeDashboard.mockReturnValueOnce(pendingRefresh.promise);
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
     fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
@@ -687,6 +799,9 @@ describe('App release-hardening UI', () => {
 
     expect(await within(panel).findByText('relay store unavailable')).toBeTruthy();
     expect(screen.getAllByText('relay store unavailable')).toHaveLength(1);
+    fireEvent.click(within(panel).getByRole('button', { name: '导出本次诊断' }));
+    await waitFor(() => expect(apiMocks.exportDiagnostics)
+      .toHaveBeenCalledWith('save-relay-1780000000000-42-2'));
     await waitFor(() => expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1));
     const saveEnabledBeforeRefresh = !(within(panel).getByRole('button', { name: '保存中转站' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('history refresh failed'));
@@ -851,12 +966,20 @@ describe('App release-hardening UI', () => {
     const load = vi.fn()
       .mockResolvedValueOnce(dashboardData())
       .mockReturnValueOnce(pendingRefresh.promise);
-    apiMocks.syncAllSessions.mockRejectedValue(new Error('sync apply failed'));
+    apiMocks.syncAllSessions.mockImplementation(async (onProgress) => {
+      onProgress({
+        phase: 'failed',
+        timestampMs: 21,
+        operationId: 'sync-failed-1',
+      });
+      throw new Error('sync apply failed');
+    });
     render(<App loadDashboard={load} />);
     fireEvent.click(await screen.findByRole('button', { name: '完全同步' }));
     fireEvent.click(await screen.findByRole('button', { name: '开始完全同步' }));
 
     expect(await screen.findByText('sync apply failed')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '导出本次诊断' })).toBeTruthy();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
     const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled;
     pendingRefresh.resolve(failed);

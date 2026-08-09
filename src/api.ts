@@ -12,6 +12,11 @@ import type {
   DashboardData,
   BackupSummary,
   ChatGptLaunchResult,
+  DiagnosticExportReceipt,
+  DiagnosticExportFailure,
+  DiagnosticExportTarget,
+  DiagnosticStatus,
+  FrontendDiagnosticInput,
   ManagedSessionInventory,
   RelayRuntimeInput,
   RelaySwitchPreference,
@@ -38,12 +43,129 @@ import type {
   UpdateStartupNotice,
 } from './types';
 
+const mutationErrorEnvelopePrefix = '__CHATGPT_SWITCH_MUTATION_ERROR_V1__';
+const maxMutationErrorMessageBytes = 16 * 1024;
+const maxMutationErrorEnvelopeChars = 128 * 1024;
+const maxMutationCorrelationIdLength = 160;
+const mutationCorrelationIdPattern = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
+
+export type MutationFailure = Readonly<{
+  message: string;
+  operationId: string;
+}>;
+
+async function invokeMutation<T>(command: string, args?: Record<string, unknown>) {
+  try {
+    return args === undefined
+      ? await invoke<T>(command)
+      : await invoke<T>(command, args);
+  } catch (reason) {
+    throw decodeMutationFailure(reason) ?? reason;
+  }
+}
+
+function decodeMutationFailure(reason: unknown): MutationFailure | null {
+  const encoded = typeof reason === 'string'
+    ? reason
+    : reason instanceof Error
+      ? reason.message
+      : null;
+  if (!encoded?.startsWith(mutationErrorEnvelopePrefix)) return null;
+  const payload = encoded.slice(mutationErrorEnvelopePrefix.length);
+  if (!payload || payload.length > maxMutationErrorEnvelopeChars) return null;
+  try {
+    const candidate = JSON.parse(payload) as unknown;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const fields = candidate as Record<string, unknown>;
+    const keys = Object.keys(fields);
+    if (keys.length !== 2 || !keys.includes('message') || !keys.includes('operationId')) return null;
+    if (typeof fields.message !== 'string'
+      || new TextEncoder().encode(fields.message).length > maxMutationErrorMessageBytes
+      || typeof fields.operationId !== 'string'
+      || fields.operationId.length > maxMutationCorrelationIdLength
+      || !mutationCorrelationIdPattern.test(fields.operationId)) {
+      return null;
+    }
+    return { message: fields.message, operationId: fields.operationId };
+  } catch {
+    return null;
+  }
+}
+
 export function getAppStatus() {
   return invoke<AppStatus>('get_app_status');
 }
 
 export function requestAppExit() {
-  return invoke<AppExitRequestResult>('request_app_exit');
+  return invokeMutation<AppExitRequestResult>('request_app_exit');
+}
+
+export function getDiagnosticStatus() {
+  return invoke<DiagnosticStatus>('get_diagnostic_status');
+}
+
+const diagnosticRetryIdPattern = /^diagnostic-export-context-[0-9a-f]{32}$/;
+
+export function normalizeDiagnosticExportFailure(reason: unknown): DiagnosticExportFailure {
+  if (reason && typeof reason === 'object') {
+    const candidate = reason as { kind?: unknown; message?: unknown; retryId?: unknown };
+    const message = typeof candidate.message === 'string' && candidate.message.trim()
+      ? candidate.message.slice(0, 512)
+      : '诊断导出请求失败';
+    if (candidate.kind === 'destination'
+      && typeof candidate.retryId === 'string'
+      && diagnosticRetryIdPattern.test(candidate.retryId)) {
+      return { kind: 'destination', message, retryId: candidate.retryId };
+    }
+    if (candidate.kind === 'preparation') return { kind: 'preparation', message };
+  }
+  if (reason instanceof Error && reason.message.trim()) {
+    return { kind: 'preparation', message: reason.message.slice(0, 512) };
+  }
+  if (typeof reason === 'string' && reason.trim()) {
+    return { kind: 'preparation', message: reason.slice(0, 512) };
+  }
+  return { kind: 'preparation', message: '诊断导出请求失败' };
+}
+
+async function invokeDiagnosticExport(
+  command: string,
+  args: Record<string, string>,
+) {
+  try {
+    return await invoke<DiagnosticExportReceipt>(command, args);
+  } catch (reason) {
+    throw normalizeDiagnosticExportFailure(reason);
+  }
+}
+
+export function exportDiagnostics(operationId?: string) {
+  return invokeDiagnosticExport('export_diagnostics', operationId ? { operationId } : {});
+}
+
+export function retryDiagnosticExport(
+  retryId: string,
+  target: DiagnosticExportTarget,
+) {
+  return target === 'downloads'
+    ? invokeDiagnosticExport('export_diagnostics', { retryId })
+    : invokeDiagnosticExport('export_diagnostics_to_diagnostic_directory', { retryId });
+}
+
+export function openDiagnosticExport(exportId: string) {
+  return invoke<void>('open_diagnostic_export', { exportId });
+}
+
+export function openDiagnosticLogDirectory() {
+  return invoke<void>('open_diagnostic_log_directory');
+}
+
+export function clearDiagnosticLogs() {
+  return invoke<void>('clear_diagnostic_logs');
+}
+
+export function recordFrontendDiagnostic(input: FrontendDiagnosticInput) {
+  return invoke<void>('record_frontend_diagnostic', { input });
 }
 
 export function checkForUpdates() {
@@ -51,7 +173,7 @@ export function checkForUpdates() {
 }
 
 export function installUpdate() {
-  return invoke<UpdateInstallReceipt>('install_update');
+  return invokeMutation<UpdateInstallReceipt>('install_update');
 }
 
 export function getUpdateStartupNotice() {
@@ -150,11 +272,11 @@ export function loadingDashboard(): DashboardData {
 }
 
 export function importPlusRuntime(confirmOverwrite: boolean) {
-  return invoke<RuntimeMetadata>('import_plus_runtime', { confirmOverwrite });
+  return invokeMutation<RuntimeMetadata>('import_plus_runtime', { confirmOverwrite });
 }
 
 export function upsertRelayRuntime(input: RelayRuntimeInput) {
-  return invoke<RuntimeMetadata>('upsert_relay_runtime', { input });
+  return invokeMutation<RuntimeMetadata>('upsert_relay_runtime', { input });
 }
 
 export function listCodexProcesses() {
@@ -162,7 +284,7 @@ export function listCodexProcesses() {
 }
 
 export function closeCodexProcesses() {
-  return invoke<CodexProcess[]>('close_codex_processes');
+  return invokeMutation<CodexProcess[]>('close_codex_processes');
 }
 
 export function switchRuntime(
@@ -171,7 +293,7 @@ export function switchRuntime(
   relayPreference: RelaySwitchPreference | null = null,
 ) {
   const onProgressChannel = new Channel<RuntimeSwitchProgress>(onProgress);
-  return invoke<RuntimeSwitchResult>('switch_runtime', {
+  return invokeMutation<RuntimeSwitchResult>('switch_runtime', {
     runtimeId,
     relayPreference,
     onProgress: onProgressChannel,
@@ -179,16 +301,16 @@ export function switchRuntime(
 }
 
 export function launchChatgpt() {
-  return invoke<ChatGptLaunchResult>('launch_chatgpt');
+  return invokeMutation<ChatGptLaunchResult>('launch_chatgpt');
 }
 
 export function syncAllSessions(onProgress: (event: SessionSyncProgress) => void) {
   const onProgressChannel = new Channel<SessionSyncProgress>(onProgress);
-  return invoke<SessionSyncResult>('sync_all_sessions', { onProgress: onProgressChannel });
+  return invokeMutation<SessionSyncResult>('sync_all_sessions', { onProgress: onProgressChannel });
 }
 
 export function verifyRelayRuntime() {
-  return invoke<RuntimeMetadata>('test_relay_connection');
+  return invokeMutation<RuntimeMetadata>('test_relay_connection');
 }
 
 export function getMobileContinuityStatus() {
@@ -196,39 +318,39 @@ export function getMobileContinuityStatus() {
 }
 
 export function setMobileContinuityEnabled(enabled: boolean) {
-  return invoke<MobileContinuityStatus>('set_mobile_continuity_enabled', { enabled });
+  return invokeMutation<MobileContinuityStatus>('set_mobile_continuity_enabled', { enabled });
 }
 
 export function acknowledgeMobileContinuityNotice() {
-  return invoke<MobileContinuityStatus>('acknowledge_mobile_continuity_notice');
+  return invokeMutation<MobileContinuityStatus>('acknowledge_mobile_continuity_notice');
 }
 
 export function publishMobileContinuitySession(threadId: string) {
-  return invoke<MobileContinuityStatus>('publish_mobile_continuity_session', { threadId });
+  return invokeMutation<MobileContinuityStatus>('publish_mobile_continuity_session', { threadId });
 }
 
 export function deleteManagedSessions(ids: string[], confirmed: boolean) {
-  return invoke<SessionMutationResult>('delete_managed_sessions', { ids, confirmed });
+  return invokeMutation<SessionMutationResult>('delete_managed_sessions', { ids, confirmed });
 }
 
 export function restoreSessionsVisible(ids: string[]) {
-  return invoke<SessionMutationResult>('restore_sessions_visible', { ids });
+  return invokeMutation<SessionMutationResult>('restore_sessions_visible', { ids });
 }
 
 export function restoreBackup(backupDir: string) {
-  return invoke<RestoreResult>('restore_backup', { backupDir });
+  return invokeMutation<RestoreResult>('restore_backup', { backupDir });
 }
 
 export function createFullBackup() {
-  return invoke<CreateFullBackupReceipt>('create_full_backup');
+  return invokeMutation<CreateFullBackupReceipt>('create_full_backup');
 }
 
 export function deleteBackup(backupDir: string, confirmed: true) {
-  return invoke<BackupDeleteReceipt>('delete_backup', { backupDir, confirmed });
+  return invokeMutation<BackupDeleteReceipt>('delete_backup', { backupDir, confirmed });
 }
 
 export function cleanupAutomaticCheckpoints() {
-  return invoke<CheckpointCleanupReceipt>('cleanup_automatic_checkpoints');
+  return invokeMutation<CheckpointCleanupReceipt>('cleanup_automatic_checkpoints');
 }
 
 export function listSkills() {
@@ -236,11 +358,11 @@ export function listSkills() {
 }
 
 export function installSkill(skillId: SkillId, confirmReplace: boolean) {
-  return invoke<SkillMutationReceipt>('install_skill', { skillId, confirmReplace });
+  return invokeMutation<SkillMutationReceipt>('install_skill', { skillId, confirmReplace });
 }
 
 export function saveSkillConfig(input: SkillConfigInput) {
-  return invoke<SkillMutationReceipt>('save_skill_config', { input });
+  return invokeMutation<SkillMutationReceipt>('save_skill_config', { input });
 }
 
 function settledDomain<T>(result: PromiseSettledResult<T>) {

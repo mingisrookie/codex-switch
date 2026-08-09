@@ -111,15 +111,25 @@ const forbidden = [
   ['workspace path', root.replaceAll('\\', '/')],
   ['user home path', homedir()],
   ['user home path', homedir().replaceAll('\\', '/')],
-  ['GitHub token prefix', 'ghp_'],
-  ['GitHub token prefix', 'gho_'],
-  ['GitHub token prefix', 'ghu_'],
-  ['GitHub token prefix', 'ghs_'],
-  ['GitHub token prefix', 'ghr_'],
-  ['GitHub token prefix', 'github_pat_'],
 ].map(([label, value]) => [label, value.toLowerCase()]);
 for (const [label, marker] of forbidden) {
   if (ascii.includes(marker) || utf16.includes(marker)) {
+    fail(`release artifact contains forbidden ${label}`);
+  }
+}
+
+// The diagnostics sanitizer intentionally embeds bare credential prefixes so it
+// can recognize them in user-facing errors. Reject complete token-shaped values
+// rather than making that defensive scanner fail the release gate itself.
+const forbiddenCredentials = [
+  ['GitHub token', /gh[pousr]_[a-z0-9]{20,}/],
+  // Fine-grained PATs have a long random body. A shorter threshold produces a
+  // false positive when the sanitizer's adjacent prefix table is folded into
+  // the release binary (for example `github_pat_ghp_gho_...`).
+  ['GitHub token', /github_pat_[a-z0-9_]{60,}/],
+];
+for (const [label, pattern] of forbiddenCredentials) {
+  if (pattern.test(ascii) || pattern.test(utf16)) {
     fail(`release artifact contains forbidden ${label}`);
   }
 }

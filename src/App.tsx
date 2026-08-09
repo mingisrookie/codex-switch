@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeftRight,
+  Bug,
   Check,
   CircleAlert,
   CloudCog,
@@ -45,6 +46,7 @@ import {
   requestAppExit as defaultRequestAppExit,
   acknowledgeMobileContinuityNotice,
   publishMobileContinuitySession,
+  recordFrontendDiagnostic,
   restoreBackup,
   restoreSessionsVisible,
   switchRuntime,
@@ -54,6 +56,7 @@ import {
   verifyRelayRuntime,
 } from './api';
 import { OperationResultPanel, type OperationView } from './OperationResultPanel';
+import { DiagnosticExportAction, DiagnosticPanel } from './DiagnosticPanel';
 import { RelayRuntimeDialog } from './RelayRuntimeDialog';
 import {
   RuntimeSwitchProgressPanel,
@@ -113,7 +116,9 @@ type CheckpointCleanupFlow = {
   completedAtMs?: number;
   receipt?: CheckpointCleanupReceipt;
   error?: string;
+  operationId?: string;
 };
+type OperationFailureView = { message: string; operationId?: string };
 const numberFormat = new Intl.NumberFormat('zh-CN');
 
 async function defaultRegisterCloseGuard(
@@ -135,11 +140,13 @@ function App({
   requestExit = defaultRequestAppExit,
 }: AppProps) {
   const [data, setData] = useState<DashboardData>(() => loadingDashboard());
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<OperationFailureView | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<OperationView | null>(null);
   const [relayEditorOpen, setRelayEditorOpen] = useState(false);
-  const [relaySubmitError, setRelaySubmitError] = useState<string | null>(null);
+  const [diagnosticPanelOpen, setDiagnosticPanelOpen] = useState(false);
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
+  const [relaySubmitError, setRelaySubmitError] = useState<OperationFailureView | null>(null);
   const [relaySwitchPrompt, setRelaySwitchPrompt] = useState<{
     label: string;
     trigger: HTMLElement | null;
@@ -159,7 +166,7 @@ function App({
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
-  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateError, setUpdateError] = useState<OperationFailureView | null>(null);
   const [updateNotice, setUpdateNotice] = useState<string | null>(null);
   const [startupUpdateError, setStartupUpdateError] = useState<string | null>(null);
   const [closeGuardStatus, setCloseGuardStatus] =
@@ -207,7 +214,8 @@ function App({
     } catch (reason) {
       exitScheduled.current = false;
       setClosePending(false);
-      setError(`关闭 ChatGPT Switch 失败：${errorMessage(reason)}`);
+      const failure = operationFailure(reason);
+      setError({ ...failure, message: `关闭 ChatGPT Switch 失败：${failure.message}` });
     } finally {
       closeRequestInFlight.current = false;
     }
@@ -229,7 +237,9 @@ function App({
           }
         }
       })
-      .catch((reason: unknown) => { if (!cancelled && requestId === loadRequestId.current) setError(errorMessage(reason)); });
+      .catch((reason: unknown) => {
+        if (!cancelled && requestId === loadRequestId.current) setError(operationFailure(reason));
+      });
     return () => { cancelled = true; };
   }, [loadDashboard, loadRuntimeDashboard]);
 
@@ -249,8 +259,42 @@ function App({
     void getMobileContinuityStatus()
       .then(setMobileContinuity)
       .catch((reason: unknown) => {
-        setError(`手机连续性已暂停：${errorMessage(reason)}。旧会话不会自动上传，请使用手动同步处理。`);
+        setError({
+          message: `手机连续性已暂停：${errorMessage(reason)}。旧会话不会自动上传，请使用手动同步处理。`,
+        });
       });
+  }, []);
+
+  useEffect(() => {
+    const record = (
+      eventKind: 'unhandledError' | 'unhandledRejection',
+      errorCode: 'frontend.unhandled_error' | 'frontend.unhandled_rejection',
+      safeMessage: string,
+    ) => {
+      void recordFrontendDiagnostic({
+        level: 'error',
+        component: 'frontend',
+        eventKind,
+        errorCode,
+        safeMessage,
+      }).catch(() => undefined);
+    };
+    const handleError = () => record(
+      'unhandledError',
+      'frontend.unhandled_error',
+      '前端发生未处理异常',
+    );
+    const handleRejection = () => record(
+      'unhandledRejection',
+      'frontend.unhandled_rejection',
+      '前端发生未处理 Promise 拒绝',
+    );
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleRejection);
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleRejection);
+    };
   }, []);
 
   useEffect(() => {
@@ -330,7 +374,7 @@ function App({
     ) return;
     if (requestedSessionRevision.current === sessionRevision) return;
     requestedSessionRevision.current = sessionRevision;
-    void refreshSessionDomains().catch((reason: unknown) => setError(errorMessage(reason)));
+    void refreshSessionDomains().catch((reason: unknown) => setError(operationFailure(reason)));
   }, [activePage, busy, sessionRevision, sessionsStale, switchFlow?.status, updateInstalling]);
 
   const codexHome = readyData(data.codexHome);
@@ -428,9 +472,9 @@ function App({
         setBackupLoading(false);
         if (backupRefreshQueued.current) {
           backupRefreshQueued.current = false;
-          void refreshBackupDomains().catch((reason: unknown) => setError(
-            `备份状态刷新失败：${errorMessage(reason)}`,
-          ));
+          void refreshBackupDomains().catch((reason: unknown) => setError({
+            message: `备份状态刷新失败：${errorMessage(reason)}`,
+          }));
         }
       });
     backupLoadInFlight.current = task;
@@ -467,10 +511,10 @@ function App({
     if (exclusiveBusy || exclusiveActionInFlight.current) return;
     setError(null);
     if (activePage === 'sessions') {
-      void refreshSessionDomains().catch((reason: unknown) => setError(errorMessage(reason)));
+      void refreshSessionDomains().catch((reason: unknown) => setError(operationFailure(reason)));
       return;
     }
-    refreshInBackground('runtime', (reason) => setError(errorMessage(reason)));
+    refreshInBackground('runtime', (reason) => setError(operationFailure(reason)));
   }
 
   function handleLoadBackups() {
@@ -480,7 +524,7 @@ function App({
       backups: { status: 'loading' },
       backupStorage: { status: 'loading' },
     }));
-    void refreshBackupDomains().catch((reason: unknown) => setError(errorMessage(reason)));
+    void refreshBackupDomains().catch((reason: unknown) => setError(operationFailure(reason)));
   }
 
   function requestConfirmation(pending: PendingConfirmation) {
@@ -506,7 +550,7 @@ function App({
       setUpdateResult(result);
       setUpdateError(null);
     } catch (reason) {
-      if (reportFailure) setUpdateError(errorMessage(reason));
+      if (reportFailure) setUpdateError({ message: errorMessage(reason) });
     } finally {
       updateCheckInFlight.current = false;
       setUpdateChecking(false);
@@ -523,7 +567,7 @@ function App({
       const result = await defaultInstallUpdate();
       setUpdateNotice(`v${result.toVersion} 已下载并校验，正在重启完成更新…`);
     } catch (reason) {
-      setUpdateError(errorMessage(reason));
+      setUpdateError(operationFailure(reason));
       setUpdateInstalling(false);
       exclusiveActionInFlight.current = false;
     }
@@ -533,7 +577,7 @@ function App({
     label: string,
     action: () => Promise<T>,
     view: (result: T) => OperationView,
-    onFailure?: (message: string) => void,
+    onFailure?: (message: string, operationId?: string) => void,
     refreshScope: RefreshScope = 'dashboard',
     onStart?: () => void,
     reportFailureGlobally = true,
@@ -549,15 +593,16 @@ function App({
       try {
         result = await action();
       } catch (reason) {
-        const message = errorMessage(reason);
-        if (reportFailureGlobally) setError(message);
-        onFailure?.(message);
+        const failure = operationFailure(reason);
+        const message = failure.message;
+        if (reportFailureGlobally) setError(failure);
+        onFailure?.(message, failure.operationId);
         refreshInBackground(refreshScope);
         return null;
       }
       setReceipt(view(result));
       refreshInBackground(refreshScope, (reason) => {
-        setError(`操作已成功，但状态刷新失败：${errorMessage(reason)}`);
+        setError({ message: `操作已成功，但状态刷新失败：${errorMessage(reason)}` });
       });
       return result;
     } finally {
@@ -592,7 +637,7 @@ function App({
     setRelaySubmitError(null);
     const saved = await runAction('配置中转站', () => upsertRelayRuntime(input), (runtime) => ({
       label: 'API 中转站已保存', metrics: [`模型：${runtime.model ?? '未设置'}`],
-    }), setRelaySubmitError, 'runtime', undefined, false);
+    }), (message, operationId) => setRelaySubmitError({ message, operationId }), 'runtime', undefined, false);
     if (saved) setRelayEditorOpen(false);
   }
 
@@ -657,6 +702,7 @@ function App({
             ...current,
             events,
             failedPhase,
+            operationId: event.operationId ?? current.operationId,
           };
         });
       };
@@ -678,6 +724,7 @@ function App({
       setSwitchFlow((current) => current ? {
         ...current,
         status: 'succeeded',
+        operationId: result.operationId,
         result,
         completedAtMs: Date.now(),
       } : current);
@@ -694,11 +741,12 @@ function App({
       });
     } catch (reason) {
       if (attemptId !== switchAttemptId.current) return;
-      const message = errorMessage(reason);
+      const failure = operationFailure(reason);
       setSwitchFlow((current) => current ? {
         ...current,
         status: 'failed',
-        error: message,
+        error: failure.message,
+        operationId: failure.operationId ?? current.operationId,
         failedPhase: current.failedPhase ?? lastRuntimeWorkPhase(current.events),
         completedAtMs: Date.now(),
       } : current);
@@ -771,7 +819,7 @@ function App({
     try {
       setMobileContinuity(await acknowledgeMobileContinuityNotice());
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(operationFailure(reason));
     }
   }
 
@@ -824,10 +872,19 @@ function App({
     const progressEvents: SessionSyncProgress[] = [];
     await runAction(
       '完全同步',
-      () => syncAllSessions((event) => {
-        progressEvents.push(event);
-        setBusy(sessionSyncProgressLabel(event));
-      }),
+      async () => {
+        try {
+          return await syncAllSessions((event) => {
+            progressEvents.push(event);
+            setBusy(sessionSyncProgressLabel(event));
+          });
+        } catch (reason) {
+          const operationId = [...progressEvents]
+            .reverse()
+            .find((event) => event.operationId)?.operationId ?? undefined;
+          throw correlatedFailure(reason, operationId);
+        }
+      },
       (result) => syncReceipt(result, progressEvents),
     );
   }
@@ -931,12 +988,13 @@ function App({
             `安全保留：${cleanup.retainedCount}`,
           ],
         }),
-        (message) => {
+        (message, operationId) => {
           setCheckpointCleanupFlow({
             status: 'failed',
             startedAtMs,
             completedAtMs: Date.now(),
             error: message,
+            operationId,
           });
         },
         'backup',
@@ -1007,11 +1065,31 @@ function App({
             {updateChecking ? <LoaderCircle className="button-icon spin" aria-hidden="true" /> : <Download className="button-icon" aria-hidden="true" />}
             {updateChecking ? '检查中' : updateInstalling ? '更新中' : '检查更新'}
           </button>
+          <button
+            className="ghost-button"
+            aria-expanded={diagnosticPanelOpen}
+            aria-controls="diagnostic-panel"
+            onClick={() => {
+              if (!diagnosticBusy) setDiagnosticPanelOpen((current) => !current);
+            }}
+            disabled={diagnosticBusy}
+          >
+            <Bug className="button-icon" aria-hidden="true" />诊断
+          </button>
           {activePage !== 'skills' ? <button className="ghost-button" onClick={() => {
             handleManualRefresh();
           }} disabled={exclusiveBusy}><RefreshCw className="button-icon" aria-hidden="true" />刷新</button> : null}
         </div>
       </header>
+
+      {diagnosticPanelOpen ? (
+        <DiagnosticPanel
+          onClose={() => {
+            if (!diagnosticBusy) setDiagnosticPanelOpen(false);
+          }}
+          onBusyChange={setDiagnosticBusy}
+        />
+      ) : null}
 
       {updateVisible && updateResult ? (
         <section className="update-banner" aria-label="发现新版本" aria-live="polite" aria-busy={updateInstalling}>
@@ -1039,7 +1117,14 @@ function App({
       ) : null}
       {updateNotice ? <p className="busy-banner" role="status" aria-live="polite">{updateNotice}</p> : null}
       {startupUpdateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{startupUpdateError}</span></p> : null}
-      {updateError ? <p className="error-banner" role="alert"><strong>更新：</strong><span>{updateError}</span></p> : null}
+      {updateError ? (
+        <section className="error-banner operation-error-banner">
+          <span role="alert"><strong>更新：</strong>{updateError.message}</span>
+          {updateError.operationId ? (
+            <DiagnosticExportAction operationId={updateError.operationId} />
+          ) : null}
+        </section>
+      ) : null}
       {closeGuardStatus === 'failed' ? (
         <p className="error-banner" role="alert">
           窗口保护初始化失败，运行态切换已禁用。请重新启动 ChatGPT Switch 后重试。
@@ -1048,7 +1133,12 @@ function App({
       {activePage !== 'skills' ? domainErrors.map(({ domain, message }) => (
         <p className="error-banner" role="alert" key={domain}><strong>{domain}：</strong><span>{message}</span></p>
       )) : null}
-      {activePage !== 'skills' && error ? <p className="error-banner" role="alert">{error}</p> : null}
+      {activePage !== 'skills' && error ? (
+        <section className="error-banner operation-error-banner">
+          <span role="alert">{error.message}</span>
+          {error.operationId ? <DiagnosticExportAction operationId={error.operationId} /> : null}
+        </section>
+      ) : null}
       {closePending && !switchFlow ? (
         <p className="busy-banner shutdown-pending" role="status" aria-live="polite">
           <LoaderCircle className="spin" aria-hidden="true" />
@@ -1711,7 +1801,12 @@ function CheckpointCleanupProgress({ flow }: { flow: CheckpointCleanupFlow }) {
           {flow.receipt.retainedCount} 项因恢复职责或证据不足继续保留。
         </p>
       ) : null}
-      {flow.error ? <p role="alert">{flow.error}</p> : null}
+      {flow.error ? (
+        <>
+          <p role="alert">{flow.error}</p>
+          {flow.operationId ? <DiagnosticExportAction operationId={flow.operationId} /> : null}
+        </>
+      ) : null}
     </section>
   );
 }
@@ -1937,7 +2032,30 @@ function formatBytes(value: number) {
 }
 
 function errorMessage(reason: unknown) {
-  return reason instanceof Error ? reason.message : String(reason);
+  if (reason instanceof Error) return reason.message;
+  if (reason && typeof reason === 'object' && 'message' in reason) {
+    const message = (reason as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+  }
+  return String(reason);
+}
+
+function operationFailure(reason: unknown): OperationFailureView {
+  return {
+    message: errorMessage(reason),
+    operationId: operationIdFromError(reason),
+  };
+}
+
+function operationIdFromError(reason: unknown) {
+  if (!reason || typeof reason !== 'object' || !('operationId' in reason)) return undefined;
+  const operationId = (reason as { operationId?: unknown }).operationId;
+  return typeof operationId === 'string' && operationId.trim() ? operationId : undefined;
+}
+
+function correlatedFailure(reason: unknown, operationId?: string | null) {
+  if (!operationId || operationIdFromError(reason)) return reason;
+  return { message: errorMessage(reason), operationId };
 }
 
 export default App;

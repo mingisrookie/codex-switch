@@ -151,6 +151,20 @@ preflight -> plan -> capacity -> backup -> apply -> verify -> persist terminal -
 - 完整备份列表固定按需最多返回 256 个强校验通过的 full snapshot，不是只检查 256 个新候选。损坏、extra/hash drift 候选必须跳过且不得标 verified；局部 scope 始终排除，前端不得再次裁成 5 项。删除必须重新执行同一 managed-full 强校验；恢复也必须在 mutation 时重新校验所选 manifest/payload，不能复用列表时结果。
 - 成功回执必须包含可关联的 operation ID 和 typed ChatGPT launch result。请求端切换还必须披露 route changed、官方 auth preserved、`chatProcessStateRepaired`、Relay validation status 与手机连续性 typed status；不得保留恒空 backup/toShared/fromShared/checkpoint 字段或渲染“0 会话已同步”。高风险长流程必须通过后端 `Channel` 上报真实阶段和 typed 终态；后端原始 phase/timestamp 不得丢失，UI 可聚合为不超过 7 个用户步骤。ChatGPT launch 必须排在 route exact/durable terminal 与本轮严格有界发布准备之后。
 
+### 1.5 诊断日志与支持包合同
+
+- 支持诊断是统一横切能力，必须复用同一 event schema、sanitizer、bounded store、operation correlation 和 exporter，不能在各业务 command 中临时拼接自由文本日志。已有 durable operation ID 必须复用；外层 command 尚未拿到 durable ID 时先生成随机 attempt ID，拿到后显式绑定。Windows ID 优先使用 OS CSPRNG，失败后用 `CoCreateGuid`，最终 fail-open fallback 也必须是进程局部且不可稳定关联。阶段来自 typed backend phase，不得从 UI 文案反解析；operation state 只在 terminal 事件确实持久化后封闭，封闭后必须拒绝再次 bind/phase/branch/terminal。所有用户主动 mutation 在发布前必须审计 start、真实 phase、关键安全分支、typed terminal/failed 覆盖；普通成功 query/render/后台刷新不持久化，后台失败和前端未处理异常才记录。
+- `%APPDATA%\codex-switch\logs\operations.jsonl` 继续是检查点清理依赖的严格 durable 终态账本；诊断事件必须分库存放在 `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl`。诊断层不得改变 operation-log schema、严格解析、原子整文件发布或 cleanup 证明。导出只读严格 operation 记录并生成去掉备份路径等字段的脱敏子集；清除、轮转和导出都不得截断或删除账本。
+- diagnostics store 不取得 mutation guard、不参与业务事务，但 Windows 同一登录会话、同一词法规范化诊断根的 append/read/status/prune/clear 必须先取得 root-scoped `Local\` named mutex，实现跨进程协调；command/lifecycle recorder 与 panic 都必须使用零等待 best-effort，锁忙立即放弃，只有低层管理 API 允许有界等待。不同登录会话或同目录的不同路径别名不保证共享锁。事件先结构化、限长、限制深度/字段/数组数量并集中脱敏后才 append + `sync_data`。默认总量上限 10 MiB、单 segment 512 KiB；年龄 prune 必须逐条解析，只能删除 clean 且全部事件过期的段，不能用 segment 创建时间替代 event Unix epoch 毫秒 `timestamp`；容量上限仍可淘汰结构有效、clean 的最旧段，dirty/corrupt/schema drift 不得借 prune 删除。
+- store 读取时每个 segment 只允许忽略唯一的未完成尾记录，内部损坏必须明确失败；current segment 只有为空或以换行结尾时才可复用，dirty/partial tail 必须封存并创建新段。append/read 都必须拒绝非当前 schema；创建根前后逐级拒绝 symlink/Windows reparse/非目录 ancestor，segment 必须是受管 regular non-reparse file。open/write/sync 失败必须放弃 current 复用；事件已 `sync_data` 成功后，post-prune 仅 best-effort，其失败不得把 durable append 反报为失败。任何诊断初始化、锁、写入、轮转或清理失败都不得阻止应用启动、改变原 mutation 结果、触发回滚或伪造 terminal。
+- 应用必须尽早创建每次启动随机、不可跨安装稳定关联的 session ID，记录含 PID、`timestampUnit` 以及系统允许时 best-effort 进程 creation stamp 的 `sessionStarted`；在 Tauri Ready/正常 Exit 记录 `appReady` / `sessionEnded`。下次启动只有在上一 session 无 clean terminal，且可用的 PID + creation stamp 不能证明原进程仍存活时才记录 `previousSessionUnclean`；liveness 证据可得时不得因另一个仍运行实例或 PID reuse 误报。panic hook 只做 root lock/state try-lock 的最小 best-effort 记录并继续调用既有 hook，release `panic = "abort"` 保持不变；前端 `error` / `unhandledrejection` 只允许固定分类和限长安全文案，不传原始 Error、stack、文件名、Promise reason 或业务 payload。
+- 生命周期诊断不等于崩溃捕获保证。不得引入 watchdog、常驻服务、自动 WER 或 panic 恢复；访问冲突、强制结束、断电、硬卡死及其他来不及执行落盘代码的硬崩溃可以没有 panic/session terminal。`previousSessionUnclean` 只能证明上一诊断 session 缺少 clean terminal，不能单独归因为 panic 或具体业务步骤。
+- 导出层必须在落盘 sanitizer 之外，对 diagnostics、operation 子集、health 与 metadata 再执行更严格的禁用字段删除、受管路径映射、未知绝对路径/身份字面值/秘密形态拒绝，再构建固定五文件 ZIP：`README.txt`、`manifest.json`、`diagnostics.jsonl`、`operations.jsonl`、`health.json`。manifest 记录 schema、应用/构建版本、时区化导出时间、平台/架构、选择窗口、脱敏策略、负载 bytes/SHA-256 以及 unavailable/warning；必须用 `timestampUnit = unixEpochMilliseconds` 明确 event `timestamp` 为 Unix epoch 毫秒，且不递归记录自身 hash。health 只允许只读结构化摘要：应用/平台、存储、route/auth mode、受管/standalone 进程计数及四个受管 SQLite 的 present/readable/bytes/`schema_version`；collector 缺失或失败必须逐项 unavailable，禁止伪造空列表、绿色健康或成功 quick-check。
+- 默认诊断包不得包含凭据、API Key、token、Authorization、cookie、聊天/会话正文、原始 session JSONL、SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、用户名或稳定设备 ID。已知根只允许映射为 `%CODEX_HOME%` / `%APPDATA%` / `%USERPROFILE%` 等逻辑 token；未知绝对路径不得原样导出。诊断包仍是用户主动、私下发送的支持材料，应用不得自动上传。
+- exporter 默认使用 Windows `SHGetKnownFolderPath(FOLDERID_Downloads)` 解析真实下载目录，不得拼接 `%USERPROFILE%\Downloads`。固定五文件必须先在受控内存完成脱敏、逐项 hash、ZIP 与 manifest 自检，再在目标目录写同目录 staging 并用 write-through、no-clobber 原子发布。只有 destination resolve/publish 失败才返回有界、短期 opaque retry ID；Downloads 重试和用户显式选择的固定 `%APPDATA%\codex-switch\diagnostic-exports` 必须复用同一 prepared bytes/hash/selection，不能重新采集，也不能把 preparation failure 误报为下载失败。成功后只通过后端登记的 opaque export ID 重新验证 containment 并打开所在位置。
+- 顶部工具栏提供页面内可访问“诊断”面板，不新增主导航页签、原生 `<dialog>` 或额外窗口；必须覆盖 390px 可达、键盘/Escape、焦点进入/恢复、busy/error/success 单一状态面，busy 时外层 toolbar 也不得卸载面板或重置去重状态。所有 mutation rejection 通过固定、严格限长的信封携带真实 durable operation ID 或本次 attempt ID，API 统一解包并兼容裸字符串；业务失败入口只有拿到真实 ID 时才导出该 attempt 的完整事件及开始前 10 分钟上下文，不猜最新操作。
+- “清除诊断日志”必须页面内确认，只删除受管 diagnostic event segments；不得删除 `operations.jsonl`、备份、会话、配置、凭据、用户已经导出的 ZIP（包括 `%APPDATA%\codex-switch\diagnostic-exports` 中的用户主动备用包）或导出硬中断遗留的同目录 staging。exporter 正常返回/错误 unwind 必须尽力删除 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`，但强杀/断电前来不及执行 Drop 时可以残留，测试与支持文档必须保留该边界。`health.json` 的 Windows 版本、route/auth、进程计数或单库只读 schema collector 失败时必须逐项 unavailable；即使采集成功，也不得把这些摘要宣传成完整配置/认证、进程命令行、SQLite `quick_check`、磁盘取证或“已覆盖所有首轮归因证据”。
+
 ## 2. 新增功能接入规范
 
 ### 2.1 新增配置项
@@ -200,6 +214,7 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - 图标统一使用 `lucide-react`；界面文案和装饰禁止 emoji，存在对应 Lucide 图标时禁止手写 SVG。图标按钮必须有可访问名称，不熟悉的纯图标操作必须提供 tooltip。
 - 视觉调整必须延续 ChatGPT Switch 的统一响应式系统，避免卡片嵌套、无意义装饰和信息遮挡；至少实际检查 1200×820、900×640、390×844，页面不得横向 overflow，overlay 内容可独立滚动且底部操作可达。
 - 长流程必须让用户看到当前真实阶段、当前步骤耗时、已完成步骤各自耗时、最慢步骤和终态；耗时按事件顺序取下一条后端时间戳，同毫秒事件不得共享后一阶段耗时。按钮 busy、页面任务执行器和后端终态必须来自同一操作，不得出现命令已结束但 UI 仍永久 loading 的分叉状态。
+- 诊断面板和失败导出属于同一页面内支持 UI：必须使用 Lucide、保持隐私说明常驻、只展示状态/占用/导出回执而不展示原始事件；导出、打开位置和清理各自保持真实 busy/error/success，关闭或切页不得泄漏局部任务状态，也不得让诊断错误替代原 mutation 反馈。
 
 ### 2.6 平台边界与外部只读集成
 
@@ -257,6 +272,9 @@ npm run check:release
 - 容量测试必须覆盖 checkpoint peak + provider rollout/index 同卷聚合、跨卷独立 reserve、`u64` overflow fail closed、缺失子目录使用已存在 ancestor 查询，以及空间不足时在 ChatGPT close/第一份 checkpoint/任何 JSONL 发布前零写入。
 - 会话性能回归必须使用临时 Home 证明多文件内容等价场景保持 JSONL 文件数、bytes、hash 与 mtime 不变、零 imported 副本，并验证 SQLite provider 的必要更新；不得把合成代理误述为真实 ChatGPT 重索引 wall-clock。
 - Skill 安装测试必须使用临时 `CODEX_HOME` / `APPDATA`，覆盖 clean install、幂等 current、未知目录/漂移确认、旧目录备份、URL 拒绝、Key 密文与空 Key 保留；vendored PowerShell/Python 至少做语法解析，并验证 Rust DPAPI 密文可被 Windows PowerShell 读取。
+- 诊断专项测试必须覆盖 event schema/ID/operation binding、所有用户主动 mutation 的 begin-before-lock/spawn/早退、真实 phase/安全 branch、attempt 到 durable operation 的只绑定关联、worker join/后置步骤和唯一 typed terminal、无 durable record 的完整 lifecycle、后台成功不落盘/失败落盘，以及 operation-log 写入失败时仍保持 diagnostics fail-open 和原业务 `Result`。还必须覆盖字段与文本脱敏、受管路径 tokenization/未知绝对路径拒绝、敏感 key/secret shape、长度/深度/数量边界、每段唯一截断尾/dirty tail 封存与内部损坏、segment 创建时间轮转、event timestamp 最近 14 天精确过滤、10 MiB/512 KiB 容量、独立 store 与 Windows root named mutex 并发、panic 零等待、post-prune 终态、schema/ancestor reparse/clear。必须证明诊断 append/rotate/export/clear 前后 `operations.jsonl` byte-exact 不变。
+- 导出专项测试必须覆盖固定五文件 allowlist、每项 bytes/SHA-256、manifest unavailable/warning、health 只读字段与逐项降级、ZIP 前后自检、包大小上限、Known Folder 解析/重定向/权限失败、用户显式备用诊断目录、同名冲突数字后缀、same-directory staging、正常失败的 staging Drop 清理与 clear 排除边界、write-through no-clobber、opaque export ID containment 和打开目录失败。前端必须覆盖顶部面板、失败页有/无真实 ID、下载失败后的重试/主动改存、隐私说明、busy/成功/失败、原业务错误保留、清理确认、焦点恢复和 390×844 可达。
+- `v0.2.6` 发布必须在隔离 `APPDATA` / `CODEX_HOME` 做失败注入并从生成 ZIP 外部扫描凭据、正文、用户名/机器名和原始绝对路径，再用真实 packed EXE 完成导出 UI/E2E。PR/main/tag CI、annotated tag、唯一 tag-CI packed 资产、GitHub Release/Latest、公开回下载 bytes/hash/PE/双版本/UPX 合同和正式 `v0.2.5 -> v0.2.6` updater smoke 任一未完成时，只能标记目标/草稿/pending，不能写成已发布或已验证。
 - 发布回执必须区分已运行、未运行和被环境阻断的检查；不得把局部测试写成“全量通过”。
 - 本地临时候选大小/hash 不能写成最终 Release。只有 tag-CI packed artifact 的大小/hash、Release 重下载合同和真实 `v0.2.0 -> v0.2.1` 一键更新全部完成后，才能宣称首跳交付闭环。
 - 敏感扫描和中文乱码检查是发布门禁，不得被普通单元测试替代。

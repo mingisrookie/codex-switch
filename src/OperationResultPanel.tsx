@@ -1,3 +1,6 @@
+import { CheckCircle2, RotateCcw, TriangleAlert } from 'lucide-react';
+import { DiagnosticExportAction } from './DiagnosticPanel';
+
 export type OperationView = {
   label: string;
   operationId?: string;
@@ -26,7 +29,9 @@ export function OperationResultPanel({ result }: { result: OperationView }) {
         {result.warnings?.map((warning) => <span className="receipt-warning" key={warning}><TriangleAlert aria-hidden="true" />警告：{warning}</span>)}
         {result.rolledBack ? <span>结果：已回滚</span> : <span>结果：成功</span>}
       </div>
+      {result.rolledBack && result.operationId ? (
+        <DiagnosticExportAction operationId={result.operationId} />
+      ) : null}
     </section>
   );
 }
-import { CheckCircle2, RotateCcw, TriangleAlert } from 'lucide-react';
