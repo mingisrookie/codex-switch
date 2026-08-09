@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.2.6 - 2026-08-09（草稿）
+## v0.2.7 - 2026-08-10（草稿）
 
-> 本节记录当前功能分支的未发布目标，不代表 GitHub Release 已完成。PR/main/tag CI、annotated tag、GitHub Release/Latest、唯一公开资产回下载合同和正式 `v0.2.5 -> v0.2.6` 一键更新证据，待主任务最终闭环后按真实结果补充。
+> 本节记录当前功能分支的未发布目标，不代表 GitHub Release 已完成。PR/main/tag CI、annotated tag、GitHub Release/Latest、唯一公开资产回下载合同和正式 `v0.2.5 -> v0.2.7` 一键更新证据，待主任务最终闭环后按真实结果补充。`v0.2.6` annotated tag 在正式 Release 前被最终独立审查拦截，未创建 GitHub Release；修复不移动旧 tag，统一进入 `v0.2.7`。
 
 ### Added
 
@@ -16,10 +16,11 @@
 
 ### Security and boundaries
 
-- 诊断事件落盘前脱敏，导出时再次删除禁用字段、替换受管路径/身份字面值并扫描秘密形态和未知绝对路径。默认包不包含凭据、token、Authorization、聊天/会话正文、原始 JSONL/SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、用户名或稳定设备 ID。
+- 诊断事件落盘前脱敏，导出时再次删除禁用字段、替换受管路径/身份字面值并扫描秘密形态和未知绝对路径。自由文本中的 canonical 业务 UUID 固定脱敏，诊断结构化关联 ID 保留；正斜杠 UNC、设备路径、通用未知绝对路径和已知根边界均有双层回归。默认包不包含凭据、token、Authorization、聊天/会话正文、原始 JSONL/SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、用户名或稳定设备 ID。
 - `operations.jsonl` 的 schema、严格解析、原子整文件发布和检查点清理证据保持不变；诊断导出只读并生成去掉备份路径的相关子集。诊断轮转、导出和清除不取得 mutation guard，也不删除操作历史、备份、会话、配置或凭据。
 - Known Folder 解析或写入失败时先返回页面内导出错误；只有用户点击“改存应用诊断目录”才写固定备用目录，不会自动改存 APPDATA、桌面或其他位置。默认与备用导出都不覆盖原业务失败/成功终态。
 - health collector 只输出结构化摘要与计数，不输出进程命令行、完整配置/认证内容或 SQLite 数据；无法读取的 Windows 版本、route 状态、进程 inventory 或单库 schema 信息必须逐项 unavailable，不伪造空健康状态。
+- store 可按 session causal sequence 返回事件，但 status 和 retained-window selection 使用真实 `timestamp` 最小/最大值；operation overlap 先规范化 started/completed 边界，系统墙钟回拨时不会因数组首尾顺序漏选相关终态。
 - diagnostics named mutex 使用 Windows `Local\` 命名空间和词法规范化 root 哈希：同一登录会话/同一路径标识可协调，跨登录会话或同目录不同路径别名不保证共享锁；14 天窗口依赖系统墙钟，大幅回拨会影响保留判断。非 Windows 只提供进程内锁和非稳定 ID fallback，不属于当前正式交付目标。
 - exporter 在正常返回/错误 unwind 时尽力删除同目录 staging；若进程在最终发布前硬崩溃，Downloads 或固定备用目录仍可能留下 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`。“清除诊断日志”只删 event segments，不负责清理这些 staging 或已导出 ZIP。
 - panic hook 只能尽力保留进程仍有机会执行时的最小事件；访问冲突、强制结束、断电、硬卡死和其他来不及落盘的硬崩溃不在捕获保证内。`previousSessionUnclean` 只表示缺少 clean terminal，不能单独证明根因。
@@ -30,7 +31,7 @@
 - 必须在隔离 `APPDATA` / `CODEX_HOME` 中完成故障注入和最终 ZIP 外部检查，证明敏感字段、用户名/机器名、原始绝对路径和业务正文均未进入包；再用真实 packed `codex-switch.exe` 完成导出 UI/E2E 与 release contract。
 - 诊断后端收敛快照上，`cargo check --manifest-path src-tauri/Cargo.toml --lib` 已通过；定向命令 `cargo test --manifest-path src-tauri/Cargo.toml diagnostics:: -- --nocapture` 为 `51 passed; 0 failed`，diagnostics owned Rust 文件的 `rustfmt --check` 也通过。这些只证明该快照的 lib 编译/diagnostics 定向回归，最终组合工作树仍须重跑；它们不代表前端、完整 Rust 门禁、真实 EXE 或发布闭环。
 - 冻结 `commands.rs` 快照上，`cargo test --manifest-path src-tauri/Cargo.toml commands` 为 `60 passed; 0 failed`，`cargo check --manifest-path src-tauri/Cargo.toml --lib`、`cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`、`rustfmt --edition 2021 --check src-tauri/src/commands.rs` 与 scoped `git diff --check` 均通过；最终组合工作树仍须重跑完整门禁。
-- 当前不记录虚构的全量测试数、本地/CI 资产 hash、GitHub Release、Latest 或 updater 成功。只有独立 reviewer PASS、本地全门禁、PR/main/tag CI、唯一 tag-CI packed 资产、公开回下载一致性和正式 `v0.2.5 -> v0.2.6` updater smoke 均完成后，才能把本节从草稿改为发布记录。
+- 当前不记录虚构的全量测试数、本地/CI 资产 hash、GitHub Release、Latest 或 updater 成功。只有独立 reviewer PASS、本地全门禁、PR/main/tag CI、唯一 tag-CI packed 资产、公开回下载一致性和正式 `v0.2.5 -> v0.2.7` updater smoke 均完成后，才能把本节从草稿改为发布记录。
 
 ## v0.2.5 - 2026-08-01
 

@@ -27,7 +27,10 @@ use super::platform::{
     downloads_dir, is_diagnostic_archive_name, local_filename_timestamp, validate_downloads_dir,
     validate_export_file, DIAGNOSTIC_ARCHIVE_PREFIX,
 };
-use super::sanitize::contains_secret_shape;
+use super::sanitize::{
+    contains_absolute_path, contains_secret_shape, contains_uuid_like_id, redact_free_form_ids,
+    replace_known_path_root,
+};
 
 const README_NAME: &str = "README.txt";
 const MANIFEST_NAME: &str = "manifest.json";
@@ -453,6 +456,17 @@ fn sanitize_value(
     context: &RedactionContext,
     depth: usize,
 ) -> Result<(), String> {
+    sanitize_value_scoped(value, context, depth, true, true, false)
+}
+
+fn sanitize_value_scoped(
+    value: &mut Value,
+    context: &RedactionContext,
+    depth: usize,
+    allow_structured_id_fields: bool,
+    allow_selection_child: bool,
+    preserve_uuid: bool,
+) -> Result<(), String> {
     if depth > MAX_JSON_DEPTH {
         return Err("diagnostic data exceeds the nesting limit".to_string());
     }
@@ -462,8 +476,20 @@ fn sanitize_value(
                 return Err("diagnostic data contains too many fields".to_string());
             }
             object.retain(|key, _| !is_forbidden_key(key));
-            for value in object.values_mut() {
-                sanitize_value(value, context, depth + 1)?;
+            for (key, value) in object.iter_mut() {
+                let normalized = normalize_key(key);
+                let child_preserve_uuid =
+                    allow_structured_id_fields && is_structured_id_key(&normalized);
+                let child_allows_structured_ids =
+                    allow_selection_child && normalized == "selection";
+                sanitize_value_scoped(
+                    value,
+                    context,
+                    depth + 1,
+                    child_allows_structured_ids,
+                    false,
+                    child_preserve_uuid,
+                )?;
             }
         }
         Value::Array(array) => {
@@ -471,16 +497,16 @@ fn sanitize_value(
                 return Err("diagnostic data contains too many items".to_string());
             }
             for value in array {
-                sanitize_value(value, context, depth + 1)?;
+                sanitize_value_scoped(value, context, depth + 1, false, false, false)?;
             }
         }
-        Value::String(string) => *string = sanitize_string(string, context),
+        Value::String(string) => *string = sanitize_string(string, context, preserve_uuid),
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
     Ok(())
 }
 
-fn sanitize_string(value: &str, context: &RedactionContext) -> String {
+fn sanitize_string(value: &str, context: &RedactionContext, preserve_uuid: bool) -> String {
     let mut value = value.to_string();
     let mut roots = [
         context
@@ -501,13 +527,16 @@ fn sanitize_string(value: &str, context: &RedactionContext) -> String {
     .collect::<Vec<_>>();
     roots.sort_by_key(|right| std::cmp::Reverse(right.0.len()));
     for (root, replacement) in roots {
-        value = replace_ascii_case_insensitive(&value, &root, replacement);
-        value = replace_ascii_case_insensitive(&value, &root.replace('\\', "/"), replacement);
+        value = replace_known_path_root(&value, &root, replacement);
+        value = replace_known_path_root(&value, &root.replace('\\', "/"), replacement);
     }
     for literal in &context.forbidden_literals {
         if !literal.is_empty() {
             value = replace_forbidden_literal(&value, literal, "[REDACTED]");
         }
+    }
+    if !preserve_uuid {
+        value = redact_free_form_ids(&value);
     }
     if contains_secret_shape(&value) {
         return "[REDACTED]".to_string();
@@ -519,26 +548,6 @@ fn sanitize_string(value: &str, context: &RedactionContext) -> String {
         value = value.chars().take(MAX_STRING_CHARS).collect();
     }
     value
-}
-
-fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return value.to_string();
-    }
-    let needle_lower = needle.to_ascii_lowercase();
-    let mut result = String::with_capacity(value.len());
-    let mut remaining = value;
-    loop {
-        let lower = remaining.to_ascii_lowercase();
-        let Some(index) = lower.find(&needle_lower) else {
-            result.push_str(remaining);
-            break;
-        };
-        result.push_str(&remaining[..index]);
-        result.push_str(replacement);
-        remaining = &remaining[index + needle.len()..];
-    }
-    result
 }
 
 fn replace_forbidden_literal(value: &str, needle: &str, replacement: &str) -> String {
@@ -626,21 +635,11 @@ fn normalize_key(key: &str) -> String {
         .collect()
 }
 
-fn contains_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.windows(3).any(|window| {
-        window[0].is_ascii_alphabetic() && window[1] == b':' && matches!(window[2], b'\\' | b'/')
-    }) {
-        return true;
-    }
-    if value.contains("\\\\")
-        || value.starts_with("/home/")
-        || value.starts_with("/Users/")
-        || value.starts_with("/tmp/")
-    {
-        return true;
-    }
-    value.contains(" /home/") || value.contains(" /Users/") || value.contains(" /tmp/")
+fn is_structured_id_key(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "eventid" | "sessionid" | "attemptid" | "operationid"
+    )
 }
 
 fn scan_entry(name: &str, bytes: &[u8], context: &RedactionContext) -> Result<(), String> {
@@ -685,13 +684,27 @@ fn scan_entry(name: &str, bytes: &[u8], context: &RedactionContext) -> Result<()
         let value: Value = serde_json::from_slice(bytes)
             .map_err(|_| format!("diagnostic entry {name} contains invalid JSON"))?;
         scan_json_value(name, &value, context)?;
-    } else if contains_secret_shape(text) || contains_absolute_path(text) {
+    } else if contains_secret_shape(text)
+        || contains_uuid_like_id(text)
+        || contains_absolute_path(text)
+    {
         return Err(format!("diagnostic entry {name} contains forbidden text"));
     }
     Ok(())
 }
 
 fn scan_json_value(name: &str, value: &Value, context: &RedactionContext) -> Result<(), String> {
+    scan_json_value_scoped(name, value, context, true, true, false)
+}
+
+fn scan_json_value_scoped(
+    name: &str,
+    value: &Value,
+    context: &RedactionContext,
+    allow_structured_id_fields: bool,
+    allow_selection_child: bool,
+    preserve_uuid: bool,
+) -> Result<(), String> {
     match value {
         Value::Object(object) => {
             if object.keys().any(|key| is_forbidden_key(key)) {
@@ -699,13 +712,23 @@ fn scan_json_value(name: &str, value: &Value, context: &RedactionContext) -> Res
                     "diagnostic entry {name} contains a forbidden field"
                 ));
             }
-            for value in object.values() {
-                scan_json_value(name, value, context)?;
+            for (key, value) in object {
+                let normalized = normalize_key(key);
+                let child_preserve_uuid =
+                    allow_structured_id_fields && is_structured_id_key(&normalized);
+                scan_json_value_scoped(
+                    name,
+                    value,
+                    context,
+                    allow_selection_child && normalized == "selection",
+                    false,
+                    child_preserve_uuid,
+                )?;
             }
         }
         Value::Array(array) => {
             for value in array {
-                scan_json_value(name, value, context)?;
+                scan_json_value_scoped(name, value, context, false, false, false)?;
             }
         }
         Value::String(value) => {
@@ -731,7 +754,10 @@ fn scan_json_value(name: &str, value: &Value, context: &RedactionContext) -> Res
                     return Err(format!("diagnostic entry {name} contains a private path"));
                 }
             }
-            if contains_secret_shape(value) || contains_absolute_path(value) {
+            if contains_secret_shape(value)
+                || (!preserve_uuid && contains_uuid_like_id(value))
+                || contains_absolute_path(value)
+            {
                 return Err(format!("diagnostic entry {name} contains forbidden text"));
             }
         }
@@ -1017,9 +1043,11 @@ mod tests {
         io::{Read, Seek, SeekFrom, Write},
     };
 
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tempfile::tempdir;
     use zip::ZipArchive;
+
+    use crate::diagnostics::{DiagnosticSanitizer, SanitizerRoots};
 
     use super::{
         build_entries, export_to_directory_at, prepare_diagnostic_archive,
@@ -1033,7 +1061,7 @@ mod tests {
         ExportInputs {
             metadata: ExportMetadata {
                 schema_version: 1,
-                application_version: "0.2.6".to_string(),
+                application_version: "0.2.7".to_string(),
                 build_version: Some("test-build".to_string()),
                 exported_at: "2026-08-09T15:30:12+08:00".to_string(),
                 timezone_offset_minutes: 480,
@@ -1131,6 +1159,196 @@ mod tests {
                 ["credentialConfigured"],
             true
         );
+    }
+
+    #[test]
+    fn export_redacts_free_form_business_ids_but_preserves_structured_correlation_ids() {
+        let structured = "123e4567-e89b-12d3-a456-426614174000";
+        let expected = "123e4567-e89b-12d3-a456-426614174004";
+        let actual = "123e4567-e89b-12d3-a456-426614174005";
+        let mut value = inputs();
+        value.metadata.selection.operation_id = Some(structured.into());
+        value.diagnostics_jsonl = format!(
+            "{}\n",
+            json!({
+                "eventId": structured,
+                "sessionId": structured,
+                "attemptId": structured,
+                "operationId": structured,
+                "safeMessage": format!(
+                    "source session JSONL id changed from {expected} to {actual}"
+                ),
+                "safeContext": {
+                    "detail": format!("provider mismatch ({expected} != {actual})"),
+                    "operationId": expected,
+                    "selection": {"sessionId": actual}
+                }
+            })
+        )
+        .into_bytes();
+        value.operations_jsonl = format!("{}\n", json!({"operationId": structured})).into_bytes();
+
+        let entries = build_entries(&value).unwrap();
+        let diagnostic: Value = serde_json::from_slice(
+            entries[DIAGNOSTICS_NAME]
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostic["eventId"], structured);
+        assert_eq!(diagnostic["sessionId"], structured);
+        assert_eq!(diagnostic["attemptId"], structured);
+        assert_eq!(diagnostic["operationId"], structured);
+        assert!(diagnostic["safeMessage"]
+            .as_str()
+            .unwrap()
+            .contains("source session JSONL id changed from [REDACTED_ID] to [REDACTED_ID]"));
+        assert_eq!(diagnostic["safeContext"]["operationId"], "[REDACTED_ID]");
+        assert_eq!(
+            diagnostic["safeContext"]["selection"]["sessionId"],
+            "[REDACTED_ID]"
+        );
+        let manifest: Value = serde_json::from_slice(&entries[MANIFEST_NAME]).unwrap();
+        assert_eq!(manifest["selection"]["operationId"], structured);
+        for bytes in entries.values() {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains(expected), "{text}");
+            assert!(!text.contains(actual), "{text}");
+        }
+    }
+
+    #[test]
+    fn export_path_redaction_handles_forward_unc_and_final_scan_excludes_web_urls() {
+        let mut value = inputs();
+        value.diagnostics_jsonl = format!(
+            "{}\n",
+            json!({
+                "eventId": "event-1",
+                "safeMessage": "path mismatch //server/share/Alice/x",
+                "safeContext": {
+                    "device": "//?/C:/Users/Alice/private.txt",
+                    "similar": r"C:\Users\AliceOther\state.db",
+                    "similarSpace": r"C:\Users\Alice Other\private.txt",
+                    "similarComma": r"C:\Users\Alice,Other\private.txt",
+                    "url": "https://example.test/Users/Alice/docs"
+                }
+            })
+        )
+        .into_bytes();
+        let entries = build_entries(&value).unwrap();
+        let diagnostics = String::from_utf8_lossy(&entries[DIAGNOSTICS_NAME]);
+        for forbidden in [
+            "server",
+            "share",
+            "AliceOther",
+            "Alice Other",
+            "Alice,Other",
+            "private.txt",
+            "state.db",
+        ] {
+            assert!(!diagnostics.contains(forbidden), "{diagnostics}");
+        }
+        assert!(!diagnostics.contains("%USERPROFILE%Other"), "{diagnostics}");
+        assert!(diagnostics.contains("https://example.test/Users/Alice/docs"));
+
+        let context = RedactionContext::default();
+        for raw_path in [
+            "//server/share/Alice/x",
+            "//?/C:/Users/Alice/x",
+            r"D:\Other User\private.txt",
+            "//server/share/My Documents/private.txt",
+            r"D:\Other\a%b\secret.db",
+            r"D:\Other\[draft]\secret.db",
+            r"D:\Other\customer,2026.db",
+            r"D:\Other\customer;2026.db",
+            r"D:\Other\customer)2026.db",
+            r"D:\Other\O'Brien\file.db",
+            r"C:\Users\Alice Other\private.txt",
+            r"C:\Users\Alice,Other\private.txt",
+        ] {
+            let payload = serde_json::to_vec(&json!({"safeMessage": raw_path})).unwrap();
+            assert!(scan_entry(HEALTH_NAME, &payload, &context).is_err());
+        }
+        let raw_uuid = serde_json::to_vec(&json!({
+            "safeMessage": "mismatch 123e4567-e89b-12d3-a456-426614174099"
+        }))
+        .unwrap();
+        assert!(scan_entry(HEALTH_NAME, &raw_uuid, &context).is_err());
+        let nested_selection_uuid = serde_json::to_vec(&json!({
+            "safeContext": {
+                "selection": {
+                    "sessionId": "123e4567-e89b-12d3-a456-426614174099"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(scan_entry(HEALTH_NAME, &nested_selection_uuid, &context).is_err());
+        let structured_and_url = serde_json::to_vec(&json!({
+            "operationId": "123e4567-e89b-12d3-a456-426614174099",
+            "url": "https://example.test/Users/Alice/docs"
+        }))
+        .unwrap();
+        assert!(scan_entry(HEALTH_NAME, &structured_and_url, &context).is_ok());
+
+        let sanitizer = DiagnosticSanitizer::new(SanitizerRoots {
+            user_profile: Some(r"C:\Users\Alice".into()),
+            appdata: None,
+            codex_home: None,
+        });
+        let path_cases = [
+            r"D:\Other User\private.txt",
+            "//server/share/My Documents/private.txt",
+            r"D:\Other\a%b\secret.db",
+            r"D:\Other\[draft]\secret.db",
+            r"D:\Other\customer,2026.db",
+            r"D:\Other\customer;2026.db",
+            r"D:\Other\customer)2026.db",
+            r"D:\Other\O'Brien\file.db",
+            r"C:\Users\Alice Other\private.txt",
+            r"C:\Users\Alice,Other\private.txt",
+        ];
+        let mut pipeline = inputs();
+        pipeline.diagnostics_jsonl = path_cases
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let message = sanitizer
+                    .sanitize_text(&format!("open failed: {path} | retry-visible-{index}"));
+                assert!(message.contains(&format!("retry-visible-{index}")));
+                format!(
+                    "{}\n",
+                    json!({"eventId": format!("event-{index}"), "safeMessage": message})
+                )
+            })
+            .collect::<String>()
+            .into_bytes();
+        let entries = build_entries(&pipeline).unwrap();
+        let diagnostics = String::from_utf8_lossy(&entries[DIAGNOSTICS_NAME]);
+        for forbidden in [
+            "Other User",
+            "My Documents",
+            "private.txt",
+            "a%b",
+            "[draft]",
+            "customer,2026",
+            "customer;2026",
+            "customer)2026",
+            "O'Brien",
+            "Brien",
+            "file.db",
+            "Alice Other",
+            "Alice,Other",
+            "secret.db",
+        ] {
+            assert!(!diagnostics.contains(forbidden), "{diagnostics}");
+        }
+        for index in 0..path_cases.len() {
+            assert!(
+                diagnostics.contains(&format!("retry-visible-{index}")),
+                "{diagnostics}"
+            );
+        }
     }
 
     #[test]

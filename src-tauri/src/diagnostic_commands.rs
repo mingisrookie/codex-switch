@@ -207,14 +207,15 @@ fn diagnostic_status() -> Result<DiagnosticStatus, String> {
     };
     let status = runtime.store().status()?;
     let events = runtime.store().read_events()?;
+    let (oldest_event_at_ms, newest_event_at_ms) = event_timestamp_bounds(&events);
     Ok(DiagnosticStatus {
         available: true,
         event_count: events.len(),
         total_bytes: status.total_bytes,
         retention_days: DEFAULT_RETENTION.as_secs() / 86_400,
         max_bytes: DEFAULT_MAX_TOTAL_BYTES,
-        oldest_event_at_ms: events.first().map(|event| event.timestamp),
-        newest_event_at_ms: events.last().map(|event| event.timestamp),
+        oldest_event_at_ms,
+        newest_event_at_ms,
         warnings: Vec::new(),
     })
 }
@@ -375,11 +376,9 @@ fn select_events(
         });
     }
 
-    let from = events.first().map(|event| event.timestamp).unwrap_or(now);
-    let through = events
-        .last()
-        .map(|event| now.max(event.timestamp))
-        .unwrap_or(now);
+    let (oldest, newest) = event_timestamp_bounds(&events);
+    let from = oldest.unwrap_or(now);
+    let through = newest.map(|timestamp| now.max(timestamp)).unwrap_or(now);
     Ok(SelectedEvents {
         events,
         selection: ExportSelection {
@@ -391,6 +390,18 @@ fn select_events(
     })
 }
 
+fn event_timestamp_bounds(events: &[DiagnosticEvent]) -> (Option<u128>, Option<u128>) {
+    events
+        .iter()
+        .map(|event| event.timestamp)
+        .fold((None, None), |(oldest, newest), timestamp| {
+            (
+                Some(oldest.map_or(timestamp, |value: u128| value.min(timestamp))),
+                Some(newest.map_or(timestamp, |value: u128| value.max(timestamp))),
+            )
+        })
+}
+
 fn select_operations(
     records: Vec<OperationRecord>,
     selection: &ExportSelection,
@@ -398,9 +409,11 @@ fn select_operations(
     records
         .into_iter()
         .filter(|record| {
+            let record_from = record.started_at_ms.min(record.completed_at_ms);
+            let record_through = record.started_at_ms.max(record.completed_at_ms);
             selection.operation_id.as_deref() == Some(record.operation_id.as_str())
-                || (record.completed_at_ms >= selection.from_timestamp_ms
-                    && record.started_at_ms <= selection.through_timestamp_ms)
+                || (record_through >= selection.from_timestamp_ms
+                    && record_from <= selection.through_timestamp_ms)
         })
         .collect()
 }
@@ -768,16 +781,19 @@ mod tests {
 
     use crate::{
         diagnostics::{
-            export::{prepare_diagnostic_archive, ExportInputs, ExportMetadata, RedactionContext},
+            export::{
+                prepare_diagnostic_archive, ExportInputs, ExportMetadata,
+                PreparedDiagnosticArchive, RedactionContext,
+            },
             DiagnosticEvent, DiagnosticEventKind, DiagnosticLevel, DIAGNOSTIC_SCHEMA_VERSION,
         },
         operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus},
     };
 
     use super::{
-        destination_failure, encode_operations, preparation_failure, select_events,
-        select_operations, sqlite_schema_version, validate_frontend_input, ExportSelection,
-        ExportSelectionMode, FrontendDiagnosticInput, PreparedExportContext,
+        destination_failure, encode_operations, event_timestamp_bounds, preparation_failure,
+        select_events, select_operations, sqlite_schema_version, validate_frontend_input,
+        ExportSelection, ExportSelectionMode, FrontendDiagnosticInput, PreparedExportContext,
         PreparedExportRegistry, MAX_PREPARED_EXPORTS, PREPARED_EXPORT_TTL,
     };
 
@@ -802,17 +818,11 @@ mod tests {
         }
     }
 
-    fn prepared_context(retry_id: &str, created_at: Instant) -> PreparedExportContext {
-        let selection = ExportSelection {
-            mode: ExportSelectionMode::Operation,
-            operation_id: Some("operation-1".to_string()),
-            from_timestamp_ms: 1,
-            through_timestamp_ms: 2,
-        };
+    fn prepared_archive(selection: ExportSelection) -> PreparedDiagnosticArchive {
         let inputs = ExportInputs {
             metadata: ExportMetadata {
                 schema_version: DIAGNOSTIC_SCHEMA_VERSION,
-                application_version: "0.2.6".to_string(),
+                application_version: "0.2.7".to_string(),
                 build_version: None,
                 exported_at: "2026-08-09T15:30:12+08:00".to_string(),
                 timezone_offset_minutes: 480,
@@ -827,11 +837,34 @@ mod tests {
             operations_jsonl: b"{}\n".to_vec(),
             health_json: b"{}".to_vec(),
         };
+        prepare_diagnostic_archive(inputs).unwrap()
+    }
+
+    fn prepared_context(retry_id: &str, created_at: Instant) -> PreparedExportContext {
+        let selection = ExportSelection {
+            mode: ExportSelectionMode::Operation,
+            operation_id: Some("operation-1".to_string()),
+            from_timestamp_ms: 1,
+            through_timestamp_ms: 2,
+        };
         PreparedExportContext {
             retry_id: retry_id.to_string(),
             created_at,
             local_timestamp: "20260809-153012-004".to_string(),
-            archive: prepare_diagnostic_archive(inputs).unwrap(),
+            archive: prepared_archive(selection),
+        }
+    }
+
+    fn operation_record(id: &str, started_at_ms: u128, completed_at_ms: u128) -> OperationRecord {
+        OperationRecord {
+            operation_id: id.to_string(),
+            action: OperationAction::SyncSessions,
+            status: OperationStatus::Succeeded,
+            phase: OperationPhase::Complete,
+            started_at_ms,
+            completed_at_ms,
+            backup_dirs: Vec::new(),
+            counts: BTreeMap::new(),
         }
     }
 
@@ -891,6 +924,48 @@ mod tests {
                 now,
             )
             .is_none());
+    }
+
+    #[test]
+    fn status_timestamp_bounds_survive_wall_clock_regression() {
+        let events = vec![
+            event(900, "attempt-newer", None),
+            event(100, "attempt-regressed", None),
+            event(500, "attempt-middle", None),
+        ];
+
+        assert_eq!(event_timestamp_bounds(&events), (Some(100), Some(900)));
+        assert_eq!(event_timestamp_bounds(&[]), (None, None));
+    }
+
+    #[test]
+    fn retained_selection_uses_timestamp_extrema_and_survives_manifest_preparation() {
+        let events = vec![
+            event(900, "attempt-newer", None),
+            event(100, "attempt-regressed", None),
+            event(500, "attempt-middle", None),
+        ];
+        let selected_during_regression = select_events(events.clone(), None, 700).unwrap();
+        assert_eq!(selected_during_regression.selection.from_timestamp_ms, 100);
+        assert_eq!(
+            selected_during_regression.selection.through_timestamp_ms,
+            900
+        );
+
+        let selected_after_clock_advance = select_events(events, None, 1_100).unwrap();
+        assert_eq!(
+            selected_after_clock_advance.selection.from_timestamp_ms,
+            100
+        );
+        assert_eq!(
+            selected_after_clock_advance.selection.through_timestamp_ms,
+            1_100
+        );
+        let prepared = prepared_archive(selected_after_clock_advance.selection.clone());
+        assert_eq!(
+            prepared.selection(),
+            &selected_after_clock_advance.selection
+        );
     }
 
     #[test]
@@ -969,24 +1044,36 @@ mod tests {
     }
 
     #[test]
-    fn operation_selection_uses_time_window_without_paths() {
+    fn operation_selection_uses_true_overlap_window_even_when_clock_regresses() {
         let selection = ExportSelection {
             mode: ExportSelectionMode::RetainedWindow,
             operation_id: None,
             from_timestamp_ms: 10,
             through_timestamp_ms: 30,
         };
-        let records = vec![OperationRecord {
-            operation_id: "operation-1".to_string(),
-            action: OperationAction::SyncSessions,
-            status: OperationStatus::Succeeded,
-            phase: OperationPhase::Complete,
-            started_at_ms: 15,
-            completed_at_ms: 20,
-            backup_dirs: Vec::new(),
-            counts: BTreeMap::new(),
-        }];
-        assert_eq!(select_operations(records, &selection).len(), 1);
+        let records = vec![
+            operation_record("before", 1, 9),
+            operation_record("ends-at-start", 1, 10),
+            operation_record("encompasses", 5, 35),
+            operation_record("inside", 15, 20),
+            operation_record("starts-at-end", 30, 40),
+            operation_record("after", 31, 40),
+            operation_record("clock-regressed", 25, 8),
+        ];
+        let selected = select_operations(records, &selection)
+            .into_iter()
+            .map(|record| record.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            vec![
+                "ends-at-start",
+                "encompasses",
+                "inside",
+                "starts-at-end",
+                "clock-regressed",
+            ]
+        );
     }
 
     #[test]
