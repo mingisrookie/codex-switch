@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.2.7 - 2026-08-10（草稿）
+## v0.2.7 - 2026-08-10
 
-> 本节记录当前功能分支的未发布目标，不代表 GitHub Release 已完成。PR/main/tag CI、annotated tag、GitHub Release/Latest、唯一公开资产回下载合同和正式 `v0.2.5 -> v0.2.7` 一键更新证据，待主任务最终闭环后按真实结果补充。`v0.2.6` annotated tag 在正式 Release 前被最终独立审查拦截，未创建 GitHub Release；修复不移动旧 tag，统一进入 `v0.2.7`。
+> `v0.2.7` 已正式发布为 GitHub latest stable。`v0.2.6` annotated tag 在正式 Release 前被最终独立隐私审查拦截，未创建 GitHub Release/Latest；旧 tag 未移动，门禁修复统一进入 `v0.2.7`。
 
 ### Added
 
@@ -27,11 +27,11 @@
 
 ### Validation and release status
 
-- 发布前诊断专项门禁必须覆盖 schema/sanitizer/路径 tokenization、每段尾记录截断/dirty tail 封存、segment 创建时间轮转与 event timestamp 14 天精确过滤、10 MiB 容量、Windows root named mutex 并发、schema/reparse/clear 边界、`operations.jsonl` byte-exact 分离、生命周期/panic、health 的只读/逐项 unavailable、Known Folder 失败、用户显式备用目录、staging 正常清理/硬崩溃残余边界、文件名冲突/no-clobber、ZIP 五文件/hash/self-check，以及前端面板、失败导出、焦点恢复和 390px 可达性。
-- 必须在隔离 `APPDATA` / `CODEX_HOME` 中完成故障注入和最终 ZIP 外部检查，证明敏感字段、用户名/机器名、原始绝对路径和业务正文均未进入包；再用真实 packed `codex-switch.exe` 完成导出 UI/E2E 与 release contract。
-- 诊断后端收敛快照上，`cargo check --manifest-path src-tauri/Cargo.toml --lib` 已通过；定向命令 `cargo test --manifest-path src-tauri/Cargo.toml diagnostics:: -- --nocapture` 为 `51 passed; 0 failed`，diagnostics owned Rust 文件的 `rustfmt --check` 也通过。这些只证明该快照的 lib 编译/diagnostics 定向回归，最终组合工作树仍须重跑；它们不代表前端、完整 Rust 门禁、真实 EXE 或发布闭环。
-- 冻结 `commands.rs` 快照上，`cargo test --manifest-path src-tauri/Cargo.toml commands` 为 `60 passed; 0 failed`，`cargo check --manifest-path src-tauri/Cargo.toml --lib`、`cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`、`rustfmt --edition 2021 --check src-tauri/src/commands.rs` 与 scoped `git diff --check` 均通过；最终组合工作树仍须重跑完整门禁。
-- 当前不记录虚构的全量测试数、本地/CI 资产 hash、GitHub Release、Latest 或 updater 成功。只有独立 reviewer PASS、本地全门禁、PR/main/tag CI、唯一 tag-CI packed 资产、公开回下载一致性和正式 `v0.2.5 -> v0.2.7` updater smoke 均完成后，才能把本节从草稿改为发布记录。
+- 最终本地门禁通过：前端 `139 passed`，TypeScript typecheck 与 production build 通过；Rust `499 passed`、`4 ignored`，fmt、clippy `-D warnings`、完整测试和 release contract 通过。
+- 隔离诊断 E2E 覆盖失败关联、强杀重启、`previousSessionUnclean`、固定五文件 ZIP、外部 UUID/路径/秘密形态扫描、Downloads no-clobber/清理和 390×844 七项 UIA hit-test；独立复核结果为 PASS。
+- PR CI `31328121903` / `31328135186`、main CI `31328794302`、tag CI `31329458760` 全部通过；annotated tag `v0.2.7` 指向合并提交 `74832037710520e8ecb0d43c0bb163f32d46ca20`。
+- [GitHub Release v0.2.7](https://github.com/mingisrookie/codex-switch/releases/tag/v0.2.7) 为 latest stable、非 draft，唯一资产来自 tag CI：`2,411,008` bytes，SHA-256 `E8905135EAB0C5D76117BAA25770371E3D8BFDAF07495805463C96A823A5B78E`。公开回下载与 tag-CI artifact 完全一致，并再次通过 PE32+ x64、双版本、UPX 5.2.0 与两个 live GitHub Release 合同测试。
+- 正式 `v0.2.5 -> v0.2.7` 一键更新 smoke 通过：旧版同路径退出并自动替换/重启为公开资产，`CODEX_HOME`、SQLite Home、Relay runtime 和 mobile continuity 均 byte-exact，真实 WebView2 UDF 元数据不变（未读取内容），受保护 ChatGPT/Codex 进程身份不变，staging/install 残留为 `0`。
 
 ## v0.2.5 - 2026-08-01
 
