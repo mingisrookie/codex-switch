@@ -5,6 +5,8 @@ pub mod codex_paths;
 mod commands;
 pub mod config_patch;
 pub mod crypto;
+mod diagnostic_commands;
+pub mod diagnostics;
 pub mod file_ops;
 pub mod mobile_continuity;
 pub mod operation_log;
@@ -59,25 +61,64 @@ pub fn run() {
             commands::list_operation_records,
             commands::list_skills,
             commands::install_skill,
-            commands::save_skill_config
+            commands::save_skill_config,
+            diagnostic_commands::get_diagnostic_status,
+            diagnostic_commands::export_diagnostics,
+            diagnostic_commands::export_diagnostics_to_diagnostic_directory,
+            diagnostic_commands::open_diagnostic_export,
+            diagnostic_commands::open_diagnostic_log_directory,
+            diagnostic_commands::clear_diagnostic_logs,
+            diagnostic_commands::record_frontend_diagnostic
         ])
         .build(tauri::generate_context!())
         .expect("failed to build ChatGPT Switch");
     app.run(|app_handle, event| {
-        if matches!(&event, tauri::RunEvent::Ready)
-            && update_install::acknowledge_update_startup().is_err()
-        {
-            app_handle.exit(1);
-        }
+        let lifecycle = diagnostics::global_runtime().map(|runtime| runtime.lifecycle());
         match event {
-            tauri::RunEvent::ExitRequested { api, .. } if commands::mutation_blocks_shutdown() => {
-                api.prevent_exit();
+            tauri::RunEvent::Ready => {
+                if let Some(lifecycle) = lifecycle {
+                    let _ = lifecycle.mark_ready();
+                }
+                if update_install::acknowledge_update_startup().is_err() {
+                    if let Some(lifecycle) = lifecycle {
+                        let _ = lifecycle.record_startup_failure(
+                            "update.startup_ack_failed",
+                            "the updated application could not acknowledge startup",
+                        );
+                    }
+                    app_handle.exit(1);
+                }
+            }
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                let prevented = commands::mutation_blocks_shutdown();
+                if let Some(lifecycle) = lifecycle {
+                    let reason = if code.is_some() {
+                        "programmaticExit"
+                    } else {
+                        "userExit"
+                    };
+                    let _ = lifecycle.record_exit_requested(reason, prevented);
+                }
+                if prevented {
+                    api.prevent_exit();
+                }
             }
             tauri::RunEvent::WindowEvent {
                 event: tauri::WindowEvent::CloseRequested { api, .. },
                 ..
-            } if commands::mutation_blocks_shutdown() => {
-                api.prevent_close();
+            } => {
+                let prevented = commands::mutation_blocks_shutdown();
+                if let Some(lifecycle) = lifecycle {
+                    let _ = lifecycle.record_exit_requested("windowClose", prevented);
+                }
+                if prevented {
+                    api.prevent_close();
+                }
+            }
+            tauri::RunEvent::Exit => {
+                if let Some(lifecycle) = lifecycle {
+                    let _ = lifecycle.end_session("runEventExit", None);
+                }
             }
             _ => {}
         }

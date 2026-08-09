@@ -31,7 +31,11 @@ use crate::{
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
     },
-    mobile_continuity::{self, MobileContinuityStatus},
+    diagnostics::{
+        empty_context, global_runtime, DiagnosticEventInput, DiagnosticEventKind, DiagnosticLevel,
+        DiagnosticOperation, DiagnosticRecorder, DiagnosticTerminalStatus,
+    },
+    mobile_continuity::{self, MobileContinuityItemStatus, MobileContinuityStatus},
     operation_log::{
         operation_id, timestamp_millis, OperationAction, OperationLog, OperationPhase,
         OperationRecord, OperationStatus,
@@ -77,6 +81,9 @@ use crate::{
 
 static MUTATION_COORDINATOR: MutationCoordinator = MutationCoordinator::new();
 const MAX_LISTED_FULL_BACKUPS: usize = 256;
+const MUTATION_ERROR_ENVELOPE_PREFIX: &str = "__CHATGPT_SWITCH_MUTATION_ERROR_V1__";
+const MAX_MUTATION_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_MUTATION_CORRELATION_ID_BYTES: usize = 160;
 
 #[derive(Debug)]
 struct MutationCoordinator {
@@ -160,6 +167,409 @@ fn mutation_busy_error() -> String {
     "another ChatGPT Switch mutation is already in progress".to_string()
 }
 
+fn begin_command_diagnostic(action: &'static str) -> Option<DiagnosticOperation> {
+    global_runtime().map(|runtime| runtime.recorder().begin_operation("commands", action))
+}
+
+fn diagnostic_correlation_id(operation: Option<&DiagnosticOperation>) -> Option<String> {
+    operation.map(|operation| {
+        operation
+            .operation_id()
+            .unwrap_or_else(|| operation.attempt_id())
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationErrorEnvelope<'a> {
+    message: &'a str,
+    operation_id: &'a str,
+}
+
+fn correlate_mutation_result<T>(
+    result: Result<T, String>,
+    operation: Option<&DiagnosticOperation>,
+) -> Result<T, String> {
+    result.map_err(|message| {
+        let envelope = diagnostic_correlation_id(operation)
+            .and_then(|operation_id| encode_mutation_error(&message, &operation_id));
+        envelope.unwrap_or(message)
+    })
+}
+
+fn encode_mutation_error(message: &str, operation_id: &str) -> Option<String> {
+    if message.len() > MAX_MUTATION_ERROR_MESSAGE_BYTES
+        || !is_valid_mutation_correlation_id(operation_id)
+    {
+        return None;
+    }
+    let payload = serde_json::to_string(&MutationErrorEnvelope {
+        message,
+        operation_id,
+    })
+    .ok()?;
+    Some(format!("{MUTATION_ERROR_ENVELOPE_PREFIX}{payload}"))
+}
+
+fn is_valid_mutation_correlation_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=MAX_MUTATION_CORRELATION_ID_BYTES).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn record_diagnostic_phase(operation: Option<&DiagnosticOperation>, phase: &'static str) {
+    if let Some(operation) = operation.filter(|operation| !operation.is_terminal_recorded()) {
+        let _ = operation.phase(phase, empty_context());
+    }
+}
+
+fn record_diagnostic_branch(
+    operation: Option<&DiagnosticOperation>,
+    phase: &'static str,
+    error_code: &'static str,
+    safe_message: &str,
+) {
+    if let Some(operation) = operation.filter(|operation| !operation.is_terminal_recorded()) {
+        let _ = operation.branch(
+            DiagnosticLevel::Error,
+            Some(phase),
+            Some(error_code),
+            Some(safe_message),
+            empty_context(),
+        );
+    }
+}
+
+fn record_diagnostic_terminal(
+    operation: Option<&DiagnosticOperation>,
+    status: DiagnosticTerminalStatus,
+    phase: &'static str,
+    error_code: Option<&'static str>,
+    safe_message: Option<&str>,
+) {
+    if let Some(operation) = operation {
+        let _ = operation.terminal(
+            status,
+            Some(phase),
+            error_code,
+            safe_message,
+            empty_context(),
+        );
+    }
+}
+
+fn record_diagnostic_result<T>(
+    operation: Option<&DiagnosticOperation>,
+    result: &Result<T, String>,
+    success_phase: &'static str,
+    failure_phase: &'static str,
+    error_code: &'static str,
+) {
+    match result {
+        Ok(_) => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Succeeded,
+            success_phase,
+            None,
+            None,
+        ),
+        Err(error) => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Failed,
+            failure_phase,
+            Some(error_code),
+            Some(error),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_durable_command_result<T>(
+    operation: Option<&DiagnosticOperation>,
+    result: &Result<T, String>,
+    success_status: DiagnosticTerminalStatus,
+    success_phase: &'static str,
+    success_error_code: Option<&'static str>,
+    success_message: Option<&'static str>,
+    failure_phase: &'static str,
+    failure_error_code: &'static str,
+) {
+    match result {
+        Ok(_) => record_diagnostic_terminal(
+            operation,
+            success_status,
+            success_phase,
+            success_error_code,
+            success_message,
+        ),
+        Err(error) => {
+            let status = terminal_status(error);
+            record_diagnostic_terminal(
+                operation,
+                diagnostic_status_for_command_error(error),
+                if matches!(
+                    status,
+                    OperationStatus::RolledBack | OperationStatus::RollbackFailed
+                ) {
+                    "rollback"
+                } else {
+                    failure_phase
+                },
+                Some(failure_error_code),
+                Some(error),
+            );
+        }
+    }
+}
+
+fn mobile_publication_terminal(
+    status: &MobileContinuityStatus,
+    thread_id: &str,
+) -> DiagnosticTerminalStatus {
+    match status
+        .items
+        .iter()
+        .find(|item| item.thread_id == thread_id)
+        .map(|item| item.status)
+    {
+        Some(MobileContinuityItemStatus::RemotePublished) => DiagnosticTerminalStatus::Succeeded,
+        Some(
+            MobileContinuityItemStatus::Conflict
+            | MobileContinuityItemStatus::NeedsManual
+            | MobileContinuityItemStatus::Paused,
+        ) => DiagnosticTerminalStatus::Blocked,
+        Some(
+            MobileContinuityItemStatus::Queued
+            | MobileContinuityItemStatus::Publishing
+            | MobileContinuityItemStatus::Partial
+            | MobileContinuityItemStatus::Retrying,
+        )
+        | None => DiagnosticTerminalStatus::Partial,
+    }
+}
+
+fn diagnostic_status_for_command_error(error: &str) -> DiagnosticTerminalStatus {
+    let durable_status = terminal_status(error);
+    if matches!(
+        durable_status,
+        OperationStatus::RolledBack | OperationStatus::RollbackFailed
+    ) {
+        return diagnostic_terminal_status(durable_status);
+    }
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("already in progress")
+        || normalized.contains("requires explicit confirmation")
+        || normalized.contains("requires confirmation")
+        || normalized.contains("must be confirmed")
+        || normalized.contains("must be closed")
+        || normalized.contains("is still running")
+        || normalized.contains(" is required")
+        || normalized.contains(" is missing")
+        || normalized.contains(" is invalid")
+        || normalized.contains("invalid relay base url")
+        || normalized.contains("service url is not allowed")
+        || normalized.contains("must use https")
+        || normalized.contains("must end with /v1")
+        || normalized.contains("enter a new api key")
+        || error.contains("请先")
+        || error.contains("请确认")
+        || error.contains("不是 ChatGPT 账号登录态")
+    {
+        DiagnosticTerminalStatus::Blocked
+    } else {
+        DiagnosticTerminalStatus::Failed
+    }
+}
+
+fn record_chatgpt_launch_diagnostic(
+    operation: Option<&DiagnosticOperation>,
+    result: &Result<ChatGptLaunchReceipt, String>,
+) {
+    match result {
+        Ok(receipt)
+            if matches!(
+                receipt.status,
+                ChatGptLaunchStatus::Launched | ChatGptLaunchStatus::AlreadyRunning
+            ) =>
+        {
+            record_diagnostic_terminal(
+                operation,
+                DiagnosticTerminalStatus::Succeeded,
+                "complete",
+                None,
+                None,
+            )
+        }
+        Ok(receipt) if receipt.status == ChatGptLaunchStatus::Failed => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Failed,
+            "apply",
+            Some("commands.launch_chatgpt.failed"),
+            receipt.message.as_deref(),
+        ),
+        Ok(receipt) => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Blocked,
+            "apply",
+            Some("commands.launch_chatgpt.blocked"),
+            receipt.message.as_deref(),
+        ),
+        Err(error) => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Failed,
+            "apply",
+            Some("commands.launch_chatgpt.failed"),
+            Some(error),
+        ),
+    }
+}
+
+fn record_post_mutation_launch_issue(
+    operation: Option<&DiagnosticOperation>,
+    launch: &ChatGptLaunchReceipt,
+    failed_code: &'static str,
+    blocked_code: &'static str,
+) -> bool {
+    match launch.status {
+        ChatGptLaunchStatus::Launched | ChatGptLaunchStatus::AlreadyRunning => false,
+        ChatGptLaunchStatus::Failed => {
+            record_diagnostic_terminal(
+                operation,
+                DiagnosticTerminalStatus::Partial,
+                "launchingApp",
+                Some(failed_code),
+                launch.message.as_deref(),
+            );
+            true
+        }
+        ChatGptLaunchStatus::Blocked | ChatGptLaunchStatus::NotRequested => {
+            record_diagnostic_terminal(
+                operation,
+                DiagnosticTerminalStatus::Blocked,
+                "launchingApp",
+                Some(blocked_code),
+                launch.message.as_deref(),
+            );
+            true
+        }
+    }
+}
+
+fn record_runtime_switch_success_diagnostic(
+    operation: Option<&DiagnosticOperation>,
+    receipt: &RuntimeSwitchResult,
+) {
+    if record_post_mutation_launch_issue(
+        operation,
+        &receipt.chatgpt_launch,
+        "commands.switch_runtime.launch_failed",
+        "commands.switch_runtime.launch_blocked",
+    ) {
+        return;
+    }
+    match receipt.incremental_session_sync.status {
+        IncrementalSessionSyncStatus::Failed => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Partial,
+            "syncingIncrementalSessions",
+            Some("commands.switch_runtime.incremental_failed"),
+            Some("request route changed, but incremental session work failed"),
+        ),
+        IncrementalSessionSyncStatus::NeedsFullSync | IncrementalSessionSyncStatus::Deferred => {
+            record_diagnostic_terminal(
+                operation,
+                DiagnosticTerminalStatus::Partial,
+                "syncingIncrementalSessions",
+                Some("commands.switch_runtime.incremental_deferred"),
+                Some("request route changed, but session work requires a later manual action"),
+            )
+        }
+        IncrementalSessionSyncStatus::Skipped
+        | IncrementalSessionSyncStatus::Unchanged
+        | IncrementalSessionSyncStatus::Applied => record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        ),
+    }
+}
+
+fn record_session_sync_success_diagnostic(
+    operation: Option<&DiagnosticOperation>,
+    receipt: &SessionSyncReceipt,
+) {
+    if receipt.checkpoint_cleanup.failed_count > 0 {
+        record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Partial,
+            "complete",
+            Some("commands.sync_all_sessions.checkpoint_cleanup_partial"),
+            Some("session sync completed with incomplete checkpoint cleanup"),
+        );
+        return;
+    }
+    if !record_post_mutation_launch_issue(
+        operation,
+        &receipt.chatgpt_launch,
+        "commands.sync_all_sessions.launch_failed",
+        "commands.sync_all_sessions.launch_blocked",
+    ) {
+        record_diagnostic_terminal(
+            operation,
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        );
+    }
+}
+
+fn record_background_failure_to(
+    recorder: &DiagnosticRecorder,
+    action: &'static str,
+    error_code: &'static str,
+    error: &str,
+) {
+    let _ = recorder.record(
+        DiagnosticEventInput::new(
+            DiagnosticLevel::Error,
+            "commands",
+            DiagnosticEventKind::BackgroundFailure,
+        )
+        .with_action(action)
+        .with_phase("query")
+        .with_error(error_code, error),
+    );
+}
+
+fn record_background_result<T>(
+    action: &'static str,
+    error_code: &'static str,
+    result: &Result<T, String>,
+) {
+    let Some(runtime) = global_runtime() else {
+        return;
+    };
+    record_background_result_to(&runtime.recorder(), action, error_code, result);
+}
+
+fn record_background_result_to<T>(
+    recorder: &DiagnosticRecorder,
+    action: &'static str,
+    error_code: &'static str,
+    result: &Result<T, String>,
+) {
+    if let Err(error) = result {
+        record_background_failure_to(recorder, action, error_code, error);
+    }
+}
+
 pub(crate) fn mutation_blocks_shutdown() -> bool {
     MUTATION_COORDINATOR.blocks_shutdown()
 }
@@ -204,6 +614,8 @@ pub enum SessionSyncPhase {
 pub struct SessionSyncProgress {
     pub phase: SessionSyncPhase,
     pub timestamp_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -281,6 +693,8 @@ pub struct RuntimeSwitchProgress {
     pub phase: RuntimeSwitchPhase,
     pub timestamp_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RuntimeSwitchOutcome>,
@@ -304,15 +718,26 @@ pub fn get_app_status() -> AppStatus {
 
 #[tauri::command]
 pub async fn check_for_updates() -> Result<UpdateCheckResult, String> {
-    tauri::async_runtime::spawn_blocking(check_latest_release)
-        .await
-        .map_err(|_| "update check worker failed".to_string())?
+    let result = match tauri::async_runtime::spawn_blocking(check_latest_release).await {
+        Ok(result) => result,
+        Err(_) => Err("update check worker failed".to_string()),
+    };
+    record_background_result(
+        "checkForUpdates",
+        "commands.check_for_updates.failed",
+        &result,
+    );
+    result
 }
 
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceipt, String> {
-    let receipt = tauri::async_runtime::spawn_blocking(|| {
+    let diagnostic = begin_command_diagnostic("installUpdate");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         let mutation_guard = acquire_mutation_lock()?;
+        record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
         let result = install_latest_update();
         if result.is_ok() {
             mutation_guard.hold_until_process_exit();
@@ -320,7 +745,18 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceip
         result
     })
     .await
-    .map_err(|_| "update installer worker failed".to_string())??;
+    {
+        Ok(result) => result,
+        Err(_) => Err("update installer worker failed".to_string()),
+    };
+    record_diagnostic_result(
+        diagnostic.as_ref(),
+        &result,
+        "complete",
+        "apply",
+        "commands.install_update.failed",
+    );
+    let receipt = correlate_mutation_result(result, diagnostic.as_ref())?;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
         app.exit(0);
@@ -330,8 +766,36 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallReceip
 
 #[tauri::command]
 pub fn request_app_exit(app: tauri::AppHandle) -> Result<AppExitRequestResult, String> {
-    let lock_path = appdata_root()?.join("codex-switch").join("mutation.lock");
-    let scheduled = prepare_app_exit_at(&MUTATION_COORDINATOR, &lock_path)?;
+    let diagnostic = begin_command_diagnostic("requestAppExit");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let result = (|| {
+        let lock_path = appdata_root()?.join("codex-switch").join("mutation.lock");
+        prepare_app_exit_at(&MUTATION_COORDINATOR, &lock_path)
+    })();
+    match &result {
+        Ok(true) => record_diagnostic_terminal(
+            diagnostic.as_ref(),
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        ),
+        Ok(false) => record_diagnostic_terminal(
+            diagnostic.as_ref(),
+            DiagnosticTerminalStatus::Blocked,
+            "preflight",
+            Some("commands.request_app_exit.mutation_busy"),
+            Some("application exit is waiting for the active mutation"),
+        ),
+        Err(error) => record_diagnostic_terminal(
+            diagnostic.as_ref(),
+            DiagnosticTerminalStatus::Failed,
+            "preflight",
+            Some("commands.request_app_exit.failed"),
+            Some(error),
+        ),
+    }
+    let scheduled = correlate_mutation_result(result, diagnostic.as_ref())?;
     if scheduled {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
@@ -352,28 +816,42 @@ pub fn get_update_startup_notice() -> Option<UpdateStartupNotice> {
 
 #[tauri::command]
 pub fn scan_codex_home() -> Result<CodexHomeStatus, String> {
-    scan_home(&managed_codex_home()?)
+    let result = (|| scan_home(&managed_codex_home()?))();
+    record_background_result("scanCodexHome", "commands.scan_codex_home.failed", &result);
+    result
 }
 
 #[tauri::command]
 pub fn scan_sessions() -> Result<SessionInventory, String> {
-    scan_session_inventory(&managed_codex_home()?)
+    let result = (|| scan_session_inventory(&managed_codex_home()?))();
+    record_background_result("scanSessions", "commands.scan_sessions.failed", &result);
+    result
 }
 
 #[tauri::command]
 pub fn scan_managed_sessions() -> Result<ManagedSessionInventory, String> {
-    let shared_home = default_shared_sessions_root()?;
-    scan_managed_session_inventory(&managed_codex_home()?, &shared_home)
+    let result = (|| {
+        let shared_home = default_shared_sessions_root()?;
+        scan_managed_session_inventory(&managed_codex_home()?, &shared_home)
+    })();
+    record_background_result(
+        "scanManagedSessions",
+        "commands.scan_managed_sessions.failed",
+        &result,
+    );
+    result
 }
 
 #[tauri::command]
 pub fn list_runtimes() -> Result<Vec<RuntimeMetadata>, String> {
-    RuntimeStore::from_default_root()?.list_runtimes()
+    let result = (|| RuntimeStore::from_default_root()?.list_runtimes())();
+    record_background_result("listRuntimes", "commands.list_runtimes.failed", &result);
+    result
 }
 
 #[tauri::command]
 pub async fn get_mobile_continuity_status() -> Result<MobileContinuityStatus, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    let result = match tauri::async_runtime::spawn_blocking(|| {
         let _mutation_guard = acquire_mutation_lock()?;
         let current_home = managed_codex_home()?;
         let current_paths = resolve_user_codex_paths(&current_home)?;
@@ -383,15 +861,28 @@ pub async fn get_mobile_continuity_status() -> Result<MobileContinuityStatus, St
         )
     })
     .await
-    .map_err(|_| "mobile continuity status worker failed".to_string())?
+    {
+        Ok(result) => result,
+        Err(_) => Err("mobile continuity status worker failed".to_string()),
+    };
+    record_background_result(
+        "getMobileContinuityStatus",
+        "commands.get_mobile_continuity_status.failed",
+        &result,
+    );
+    result
 }
 
 #[tauri::command]
 pub async fn set_mobile_continuity_enabled(
     enabled: bool,
 ) -> Result<MobileContinuityStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let diagnostic = begin_command_diagnostic("setMobileContinuityEnabled");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
+        record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
         let current_home = managed_codex_home()?;
         let current_paths = resolve_user_codex_paths(&current_home)?;
         mobile_continuity::set_enabled(
@@ -401,13 +892,28 @@ pub async fn set_mobile_continuity_enabled(
         )
     })
     .await
-    .map_err(|_| "mobile continuity settings worker failed".to_string())?
+    {
+        Ok(result) => result,
+        Err(_) => Err("mobile continuity settings worker failed".to_string()),
+    };
+    record_diagnostic_result(
+        diagnostic.as_ref(),
+        &result,
+        "complete",
+        "apply",
+        "commands.set_mobile_continuity_enabled.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub async fn acknowledge_mobile_continuity_notice() -> Result<MobileContinuityStatus, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    let diagnostic = begin_command_diagnostic("acknowledgeMobileContinuityNotice");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
+        record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
         let current_home = managed_codex_home()?;
         let current_paths = resolve_user_codex_paths(&current_home)?;
         mobile_continuity::acknowledge_notice(
@@ -416,18 +922,37 @@ pub async fn acknowledge_mobile_continuity_notice() -> Result<MobileContinuitySt
         )
     })
     .await
-    .map_err(|_| "mobile continuity notice worker failed".to_string())?
+    {
+        Ok(result) => result,
+        Err(_) => Err("mobile continuity notice worker failed".to_string()),
+    };
+    record_diagnostic_result(
+        diagnostic.as_ref(),
+        &result,
+        "complete",
+        "apply",
+        "commands.acknowledge_mobile_continuity_notice.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub async fn publish_mobile_continuity_session(
     thread_id: String,
 ) -> Result<MobileContinuityStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _mutation_guard = acquire_mutation_lock()?;
-        let started_at_ms = timestamp_millis()?;
-        let operation_id = operation_id("mobile-continuity-manual")?;
+    let diagnostic = begin_command_diagnostic("publishMobileContinuitySession");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        let mut durable = None;
+        let mut publication_terminal = None;
+        let mut launch_terminal = None;
         let result = (|| {
+            let _mutation_guard = acquire_mutation_lock()?;
+            let started_at_ms = timestamp_millis()?;
+            let operation_id = operation_id("mobile-continuity-manual")?;
+            durable = Some((started_at_ms, operation_id));
+            record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
             let current_home = managed_codex_home()?;
             let runtime_status =
                 RuntimeStore::from_default_root()?.detect_active_runtime(&current_home)?;
@@ -449,9 +974,20 @@ pub async fn publish_mobile_continuity_session(
                 &current_paths,
                 &thread_id,
             );
+            if let Ok(status) = publication.as_ref() {
+                publication_terminal = Some(mobile_publication_terminal(status, &thread_id));
+            }
             let auth_after = fs::read(current_home.join("auth.json"))
                 .map_err(|error| format!("failed to verify official auth state: {error}"));
+            record_diagnostic_phase(worker_diagnostic.as_ref(), "launchingApp");
             let launch = ChatGptLaunchReceipt::from(launch_cached_chatgpt());
+            launch_terminal = match launch.status {
+                ChatGptLaunchStatus::Launched | ChatGptLaunchStatus::AlreadyRunning => None,
+                ChatGptLaunchStatus::Failed => Some(DiagnosticTerminalStatus::Partial),
+                ChatGptLaunchStatus::Blocked | ChatGptLaunchStatus::NotRequested => {
+                    Some(DiagnosticTerminalStatus::Blocked)
+                }
+            };
             if auth_after? != auth_snapshot {
                 return Err(
                     "official auth state changed unexpectedly; session publication stopped"
@@ -481,106 +1017,275 @@ pub async fn publish_mobile_continuity_session(
                 ])
             })
             .unwrap_or_default();
-        let _ = record_result(
-            &operation_id,
-            OperationAction::IncrementalSync,
-            started_at_ms,
-            &result,
-            &[],
-            counts,
-        );
+        let durable_recorded = durable
+            .as_ref()
+            .is_some_and(|(started_at_ms, operation_id)| {
+                record_result_with_diagnostic(
+                    operation_id,
+                    OperationAction::IncrementalSync,
+                    *started_at_ms,
+                    &result,
+                    &[],
+                    counts,
+                    worker_diagnostic.as_ref(),
+                )
+                .is_ok()
+            });
+        match (&result, publication_terminal, launch_terminal) {
+            (Ok(_), Some(DiagnosticTerminalStatus::Blocked), _)
+            | (Ok(_), _, Some(DiagnosticTerminalStatus::Blocked)) => {
+                record_diagnostic_terminal(
+                    worker_diagnostic.as_ref(),
+                    DiagnosticTerminalStatus::Blocked,
+                    "launchingApp",
+                    Some("commands.publish_mobile_continuity_session.blocked"),
+                    Some("session publication or application relaunch requires user action"),
+                );
+            }
+            (Ok(_), Some(DiagnosticTerminalStatus::Succeeded), None) if durable_recorded => {
+                record_diagnostic_terminal(
+                    worker_diagnostic.as_ref(),
+                    DiagnosticTerminalStatus::Succeeded,
+                    "complete",
+                    None,
+                    None,
+                );
+            }
+            (Ok(_), _, _) => record_diagnostic_terminal(
+                worker_diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Partial,
+                "complete",
+                Some("commands.publish_mobile_continuity_session.partial"),
+                Some("session publication completed with a partial or unaudited outcome"),
+            ),
+            (Err(error), Some(_), _) => record_diagnostic_terminal(
+                worker_diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Partial,
+                "launchingApp",
+                Some("commands.publish_mobile_continuity_session.post_mutation_failed"),
+                Some(error),
+            ),
+            (Err(_), None, _) => record_durable_command_result(
+                worker_diagnostic.as_ref(),
+                &result,
+                DiagnosticTerminalStatus::Succeeded,
+                "complete",
+                None,
+                None,
+                "apply",
+                "commands.publish_mobile_continuity_session.failed",
+            ),
+        }
         result
     })
     .await
-    .map_err(|_| "mobile continuity publication worker failed".to_string())?
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = "mobile continuity publication worker failed".to_string();
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.publish_mobile_continuity_session.worker_join_failed"),
+                Some(&error),
+            );
+            Err(error)
+        }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn scan_runtime_status() -> Result<RuntimeStatus, String> {
-    RuntimeStore::from_default_root()?.detect_active_runtime(&managed_codex_home()?)
+    let result =
+        (|| RuntimeStore::from_default_root()?.detect_active_runtime(&managed_codex_home()?))();
+    record_background_result(
+        "scanRuntimeStatus",
+        "commands.scan_runtime_status.failed",
+        &result,
+    );
+    result
 }
 
 #[tauri::command]
 pub fn import_plus_runtime(confirm_overwrite: bool) -> Result<RuntimeMetadata, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let id = operation_id("import-account")?;
+    let diagnostic = begin_command_diagnostic("importAccount");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let mut durable_recorded = false;
     let result = (|| {
-        ensure_codex_closed("saving the account slot")?;
-        RuntimeStore::from_default_root()?
-            .import_plus_from_home(&managed_codex_home()?, confirm_overwrite)
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let id = operation_id("import-account")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let result = (|| {
+            ensure_codex_closed("saving the account slot")?;
+            RuntimeStore::from_default_root()?
+                .import_plus_from_home(&managed_codex_home()?, confirm_overwrite)
+        })();
+        durable_recorded = record_result_with_diagnostic(
+            &id,
+            OperationAction::ImportAccount,
+            started,
+            &result,
+            &[],
+            BTreeMap::new(),
+            diagnostic.as_ref(),
+        )
+        .is_ok();
+        result
     })();
-    let _ = record_result(
-        &id,
-        OperationAction::ImportAccount,
-        started,
+    record_durable_command_result(
+        diagnostic.as_ref(),
         &result,
-        &[],
-        BTreeMap::new(),
+        if durable_recorded {
+            DiagnosticTerminalStatus::Succeeded
+        } else {
+            DiagnosticTerminalStatus::Partial
+        },
+        "complete",
+        (!durable_recorded).then_some("commands.import_account.operation_history_failed"),
+        (!durable_recorded).then_some("account import completed without durable operation history"),
+        "apply",
+        "commands.import_account.failed",
     );
-    result
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn upsert_relay_runtime(input: RelayRuntimeInput) -> Result<RuntimeMetadata, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let id = operation_id("save-relay")?;
-    let result =
-        (|| RuntimeStore::from_default_root()?.upsert_relay(input, &managed_codex_home()?))();
-    let _ = record_result(
-        &id,
-        OperationAction::SaveRelay,
-        started,
+    let diagnostic = begin_command_diagnostic("saveRelay");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let mut durable_recorded = false;
+    let result = (|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let id = operation_id("save-relay")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let result =
+            (|| RuntimeStore::from_default_root()?.upsert_relay(input, &managed_codex_home()?))();
+        durable_recorded = record_result_with_diagnostic(
+            &id,
+            OperationAction::SaveRelay,
+            started,
+            &result,
+            &[],
+            BTreeMap::new(),
+            diagnostic.as_ref(),
+        )
+        .is_ok();
+        result
+    })();
+    record_durable_command_result(
+        diagnostic.as_ref(),
         &result,
-        &[],
-        BTreeMap::new(),
+        if durable_recorded {
+            DiagnosticTerminalStatus::Succeeded
+        } else {
+            DiagnosticTerminalStatus::Partial
+        },
+        "complete",
+        (!durable_recorded).then_some("commands.save_relay.operation_history_failed"),
+        (!durable_recorded)
+            .then_some("relay settings were saved without durable operation history"),
+        "apply",
+        "commands.save_relay.failed",
     );
-    result
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn test_relay_connection() -> Result<RuntimeMetadata, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let id = operation_id("verify-relay")?;
+    let diagnostic = begin_command_diagnostic("verifyRelay");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let mut durable_recorded = false;
     let result = (|| {
-        let store = RuntimeStore::from_default_root()?;
-        let connection = store.load_relay_connection()?;
-        verify_relay(&connection.base_url, &connection.api_key)?;
-        store.mark_verified(RELAY_RUNTIME_ID)
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let id = operation_id("verify-relay")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "verify");
+        let result = (|| {
+            let store = RuntimeStore::from_default_root()?;
+            let connection = store.load_relay_connection()?;
+            verify_relay(&connection.base_url, &connection.api_key)?;
+            store.mark_verified(RELAY_RUNTIME_ID)
+        })();
+        durable_recorded = record_result_with_diagnostic(
+            &id,
+            OperationAction::VerifyRelay,
+            started,
+            &result,
+            &[],
+            BTreeMap::new(),
+            diagnostic.as_ref(),
+        )
+        .is_ok();
+        result
     })();
-    let _ = record_result(
-        &id,
-        OperationAction::VerifyRelay,
-        started,
+    record_durable_command_result(
+        diagnostic.as_ref(),
         &result,
-        &[],
-        BTreeMap::new(),
+        if durable_recorded {
+            DiagnosticTerminalStatus::Succeeded
+        } else {
+            DiagnosticTerminalStatus::Partial
+        },
+        "complete",
+        (!durable_recorded).then_some("commands.verify_relay.operation_history_failed"),
+        (!durable_recorded)
+            .then_some("relay verification completed without durable operation history"),
+        "verify",
+        "commands.verify_relay.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
+}
+
+#[tauri::command]
+pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    let result = list_processes();
+    record_background_result(
+        "listCodexProcesses",
+        "commands.list_codex_processes.failed",
+        &result,
     );
     result
 }
 
 #[tauri::command]
-pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    list_processes()
-}
-
-#[tauri::command]
 pub async fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
-    tauri::async_runtime::spawn_blocking(close_codex)
-        .await
-        .map_err(|_| "ChatGPT process close worker failed".to_string())?
+    let diagnostic = begin_command_diagnostic("closeCodexProcesses");
+    record_diagnostic_phase(diagnostic.as_ref(), "apply");
+    let result = match tauri::async_runtime::spawn_blocking(close_codex).await {
+        Ok(result) => result,
+        Err(_) => Err("ChatGPT process close worker failed".to_string()),
+    };
+    record_diagnostic_result(
+        diagnostic.as_ref(),
+        &result,
+        "complete",
+        "apply",
+        "commands.close_codex_processes.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub async fn launch_chatgpt() -> Result<ChatGptLaunchReceipt, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    let diagnostic = begin_command_diagnostic("launchChatgpt");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
+        record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
         Ok(ChatGptLaunchReceipt::from(launch_cached_chatgpt()))
     })
     .await
-    .map_err(|_| "ChatGPT launch worker failed".to_string())?
+    {
+        Ok(result) => result,
+        Err(_) => Err("ChatGPT launch worker failed".to_string()),
+    };
+    record_chatgpt_launch_diagnostic(diagnostic.as_ref(), &result);
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
@@ -589,37 +1294,63 @@ pub async fn switch_runtime(
     relay_preference: Option<RelaySwitchPreference>,
     on_progress: Channel<RuntimeSwitchProgress>,
 ) -> Result<RuntimeSwitchResult, String> {
+    let diagnostic = begin_command_diagnostic("switchRuntime");
+    record_diagnostic_phase(diagnostic.as_ref(), "waitingForMutationLock");
     let worker_progress = on_progress.clone();
-    match tauri::async_runtime::spawn_blocking(move || {
-        switch_runtime_blocking(runtime_id, relay_preference, worker_progress)
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        switch_runtime_blocking(
+            runtime_id,
+            relay_preference,
+            worker_progress,
+            worker_diagnostic,
+        )
     })
     .await
     {
         Ok(result) => result,
         Err(_) => {
             let error = "runtime switch worker failed".to_string();
-            emit_runtime_switch_failure(
+            emit_runtime_switch_failure_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
             );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.switch_runtime.worker_join"),
+                Some(&error),
+            );
             Err(error)
         }
-    }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 fn switch_runtime_blocking(
     runtime_id: String,
     relay_preference: Option<RelaySwitchPreference>,
     on_progress: Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<DiagnosticOperation>,
 ) -> Result<RuntimeSwitchResult, String> {
     let _mutation_guard = match acquire_mutation_lock() {
         Ok(guard) => guard,
         Err(error) => {
-            emit_runtime_switch_failure(
+            emit_runtime_switch_failure_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                diagnostic_status_for_command_error(&error),
+                "preflight",
+                Some("commands.switch_runtime.mutation_lock"),
+                Some(&error),
             );
             return Err(error);
         }
@@ -627,10 +1358,18 @@ fn switch_runtime_blocking(
     let started = match timestamp_millis() {
         Ok(started) => started,
         Err(error) => {
-            emit_runtime_switch_failure(
+            emit_runtime_switch_failure_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "preflight",
+                Some("commands.switch_runtime.timestamp"),
+                Some(&error),
             );
             return Err(error);
         }
@@ -638,10 +1377,18 @@ fn switch_runtime_blocking(
     let attempt_id = match operation_id("switch-runtime-attempt") {
         Ok(attempt_id) => attempt_id,
         Err(error) => {
-            emit_runtime_switch_failure(
+            emit_runtime_switch_failure_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "preflight",
+                Some("commands.switch_runtime.operation_id"),
+                Some(&error),
             );
             return Err(error);
         }
@@ -651,12 +1398,18 @@ fn switch_runtime_blocking(
     let target_is_account = runtime_id == PLUS_RUNTIME_ID;
     let mut relay_validation = RelayValidationStatus::NotApplicable;
     let mut launch_target_captured = false;
-    emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LoadingRuntime, None);
+    emit_runtime_switch_progress_diagnostic(
+        &on_progress,
+        diagnostic.as_ref(),
+        RuntimeSwitchPhase::LoadingRuntime,
+        None,
+    );
     let mut result = (|| {
         let store = RuntimeStore::from_default_root()?;
         let current_home = managed_codex_home()?;
-        emit_runtime_switch_progress(
+        emit_runtime_switch_progress_diagnostic(
             &on_progress,
+            diagnostic.as_ref(),
             RuntimeSwitchPhase::ValidatingOfficialAuth,
             None,
         );
@@ -673,8 +1426,9 @@ fn switch_runtime_blocking(
                     .ok_or_else(|| "请选择“验证连接后切换”或“直接切换”后再继续".to_string())?,
             };
             if preference == RelaySwitchPreference::Validate {
-                emit_runtime_switch_progress(
+                emit_runtime_switch_progress_diagnostic(
                     &on_progress,
+                    diagnostic.as_ref(),
                     RuntimeSwitchPhase::VerifyingRelay,
                     None,
                 );
@@ -699,7 +1453,14 @@ fn switch_runtime_blocking(
                     Ok(processes)
                 },
                 || close_codex().map(|_| ()),
-                |phase, message| emit_runtime_switch_progress(&on_progress, phase, message),
+                |phase, message| {
+                    emit_runtime_switch_progress_diagnostic(
+                        &on_progress,
+                        diagnostic.as_ref(),
+                        phase,
+                        message,
+                    )
+                },
             )?;
         } else {
             // A Relay no-op does not enter the process-close gate, so retain
@@ -713,7 +1474,14 @@ fn switch_runtime_blocking(
             &current_home,
             plan,
             &mut || ensure_codex_closed("switching request routes"),
-            &mut |phase| emit_runtime_switch_progress(&on_progress, phase, None),
+            &mut |phase| {
+                emit_runtime_switch_progress_diagnostic(
+                    &on_progress,
+                    diagnostic.as_ref(),
+                    phase,
+                    None,
+                )
+            },
         ) {
             Ok(receipt) => Ok(receipt),
             Err(failure) => {
@@ -753,9 +1521,35 @@ fn switch_runtime_blocking(
             BTreeMap::new(),
         ),
     };
-    emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::RecordingResult, None);
-    let terminal_record =
-        record_runtime_switch_result(id, started, &result, &[], counts, failure_outcome).ok();
+    emit_runtime_switch_progress_diagnostic(
+        &on_progress,
+        diagnostic.as_ref(),
+        RuntimeSwitchPhase::RecordingResult,
+        None,
+    );
+    let terminal_record = match record_runtime_switch_result_with_diagnostic(
+        id,
+        started,
+        &result,
+        &[],
+        counts,
+        failure_outcome,
+        diagnostic.as_ref(),
+    ) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            if let Some(diagnostic) = diagnostic.as_ref() {
+                let _ = diagnostic.branch(
+                    DiagnosticLevel::Error,
+                    Some("recordingResult"),
+                    Some("commands.switch_runtime.operation_log"),
+                    Some(&error),
+                    empty_context(),
+                );
+            }
+            None
+        }
+    };
     let terminal_recorded = terminal_record.is_some();
     let mut incremental_launch_allowed = true;
     if let Ok(receipt) = &mut result {
@@ -765,8 +1559,9 @@ fn switch_runtime_blocking(
             terminal_recorded,
             receipt.incremental_session_sync.status,
         ) {
-            emit_runtime_switch_progress(
+            emit_runtime_switch_progress_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 RuntimeSwitchPhase::SyncingIncrementalSessions,
                 None,
             );
@@ -779,7 +1574,12 @@ fn switch_runtime_blocking(
         }
         if successful_switch_requests_chatgpt_launch(receipt.changed) {
             if terminal_recorded && incremental_launch_allowed {
-                emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LaunchingApp, None);
+                emit_runtime_switch_progress_diagnostic(
+                    &on_progress,
+                    diagnostic.as_ref(),
+                    RuntimeSwitchPhase::LaunchingApp,
+                    None,
+                );
             }
             receipt.chatgpt_launch = if incremental_launch_allowed {
                 launch_chatgpt_after_durable_terminal(terminal_recorded, || {
@@ -801,7 +1601,12 @@ fn switch_runtime_blocking(
             RuntimeSwitchOutcome::FailedBeforeWrite | RuntimeSwitchOutcome::RolledBack
         )
     {
-        emit_runtime_switch_progress(&on_progress, RuntimeSwitchPhase::LaunchingApp, None);
+        emit_runtime_switch_progress_diagnostic(
+            &on_progress,
+            diagnostic.as_ref(),
+            RuntimeSwitchPhase::LaunchingApp,
+            None,
+        );
         let launch = ChatGptLaunchReceipt::from(launch_cached_chatgpt());
         if launch.status == ChatGptLaunchStatus::Failed {
             if let Err(message) = &mut result {
@@ -809,7 +1614,36 @@ fn switch_runtime_blocking(
             }
         }
     }
-    emit_runtime_switch_terminal(&on_progress, &result, failure_outcome);
+    emit_runtime_switch_terminal_diagnostic(
+        &on_progress,
+        diagnostic.as_ref(),
+        &result,
+        failure_outcome,
+    );
+    if diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| !diagnostic.is_terminal_recorded())
+    {
+        match &result {
+            Ok(receipt) if terminal_recorded => {
+                record_runtime_switch_success_diagnostic(diagnostic.as_ref(), receipt)
+            }
+            Ok(_) => record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Partial,
+                "recordingResult",
+                Some("commands.switch_runtime.operation_log"),
+                Some("request route changed, but the durable operation terminal was unavailable"),
+            ),
+            Err(error) => record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                runtime_switch_diagnostic_status(failure_outcome),
+                runtime_switch_diagnostic_terminal_phase(failure_outcome),
+                Some(runtime_switch_diagnostic_error_code(failure_outcome)),
+                Some(error),
+            ),
+        }
+    }
     result
 }
 
@@ -902,53 +1736,117 @@ where
     }
 }
 
-fn emit_runtime_switch_progress(
+fn emit_runtime_switch_progress_diagnostic(
     on_progress: &Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
     phase: RuntimeSwitchPhase,
     message: Option<String>,
 ) {
-    emit_runtime_switch_progress_event(on_progress, phase, message, None);
+    emit_runtime_switch_progress_event_diagnostic(on_progress, diagnostic, phase, message, None);
 }
 
-fn emit_runtime_switch_progress_event(
+fn emit_runtime_switch_progress_event_diagnostic(
     on_progress: &Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
     phase: RuntimeSwitchPhase,
     message: Option<String>,
     outcome: Option<RuntimeSwitchOutcome>,
 ) {
+    record_diagnostic_phase(diagnostic, runtime_switch_phase_name(phase));
     let _ = on_progress.send(RuntimeSwitchProgress {
         phase,
         timestamp_ms: timestamp_millis().unwrap_or_default(),
+        operation_id: diagnostic_correlation_id(diagnostic),
         message,
         outcome,
     });
 }
 
-fn emit_runtime_switch_failure(
+fn emit_runtime_switch_failure_diagnostic(
     on_progress: &Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
     error: &str,
     outcome: RuntimeSwitchOutcome,
 ) {
-    emit_runtime_switch_progress_event(
+    emit_runtime_switch_progress_event_diagnostic(
         on_progress,
+        diagnostic,
         RuntimeSwitchPhase::Failed,
         Some(error.to_string()),
         Some(outcome),
     );
 }
 
+#[cfg(test)]
 fn emit_runtime_switch_terminal<T>(
     on_progress: &Channel<RuntimeSwitchProgress>,
     result: &Result<T, String>,
     failure_outcome: RuntimeSwitchOutcome,
 ) {
+    emit_runtime_switch_terminal_diagnostic(on_progress, None, result, failure_outcome);
+}
+
+fn emit_runtime_switch_terminal_diagnostic<T>(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
+    result: &Result<T, String>,
+    failure_outcome: RuntimeSwitchOutcome,
+) {
     match result {
         Ok(_) => {
-            emit_runtime_switch_progress(on_progress, RuntimeSwitchPhase::Complete, None);
+            emit_runtime_switch_progress_diagnostic(
+                on_progress,
+                diagnostic,
+                RuntimeSwitchPhase::Complete,
+                None,
+            );
         }
         Err(error) => {
-            emit_runtime_switch_failure(on_progress, error, failure_outcome);
+            emit_runtime_switch_failure_diagnostic(on_progress, diagnostic, error, failure_outcome);
         }
+    }
+}
+
+fn runtime_switch_phase_name(phase: RuntimeSwitchPhase) -> &'static str {
+    match phase {
+        RuntimeSwitchPhase::LoadingRuntime => "loadingRuntime",
+        RuntimeSwitchPhase::ValidatingOfficialAuth => "validatingOfficialAuth",
+        RuntimeSwitchPhase::VerifyingRelay => "verifyingRelay",
+        RuntimeSwitchPhase::DetectingApp => "detectingApp",
+        RuntimeSwitchPhase::ClosingApp => "closingApp",
+        RuntimeSwitchPhase::PreparingRuntime => "preparingRuntime",
+        RuntimeSwitchPhase::RepairingAppState => "repairingAppState",
+        RuntimeSwitchPhase::ApplyingRuntime => "applyingRuntime",
+        RuntimeSwitchPhase::Verifying => "verifying",
+        RuntimeSwitchPhase::RecordingResult => "recordingResult",
+        RuntimeSwitchPhase::SyncingIncrementalSessions => "syncingIncrementalSessions",
+        RuntimeSwitchPhase::RollingBack => "rollingBack",
+        RuntimeSwitchPhase::LaunchingApp => "launchingApp",
+        RuntimeSwitchPhase::Complete => "complete",
+        RuntimeSwitchPhase::Failed => "failed",
+    }
+}
+
+fn runtime_switch_diagnostic_status(outcome: RuntimeSwitchOutcome) -> DiagnosticTerminalStatus {
+    match outcome {
+        RuntimeSwitchOutcome::FailedBeforeWrite => DiagnosticTerminalStatus::Failed,
+        RuntimeSwitchOutcome::RolledBack => DiagnosticTerminalStatus::RolledBack,
+        RuntimeSwitchOutcome::RollbackFailed => DiagnosticTerminalStatus::RollbackFailed,
+    }
+}
+
+fn runtime_switch_diagnostic_error_code(outcome: RuntimeSwitchOutcome) -> &'static str {
+    match outcome {
+        RuntimeSwitchOutcome::FailedBeforeWrite => "commands.switch_runtime.failed_before_write",
+        RuntimeSwitchOutcome::RolledBack => "commands.switch_runtime.rolled_back",
+        RuntimeSwitchOutcome::RollbackFailed => "commands.switch_runtime.rollback_failed",
+    }
+}
+
+fn runtime_switch_diagnostic_terminal_phase(outcome: RuntimeSwitchOutcome) -> &'static str {
+    match outcome {
+        RuntimeSwitchOutcome::FailedBeforeWrite => "preflight",
+        RuntimeSwitchOutcome::RolledBack | RuntimeSwitchOutcome::RollbackFailed => "rollback",
     }
 }
 
@@ -994,10 +1892,13 @@ fn run_incremental_session_sync_after_route(target_is_account: bool) -> Incremen
     if !target_is_account {
         return IncrementalSessionRun::safe(IncrementalSessionSyncReceipt::skipped(), None);
     }
+    let diagnostic = begin_command_diagnostic("incrementalSync");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let started_at_ms = timestamp_millis().unwrap_or_default();
     let operation_id = operation_id("mobile-continuity")
         .unwrap_or_else(|_| format!("mobile-continuity-{started_at_ms}"));
     let outcome = (|| {
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
         let current_home = managed_codex_home()?;
         let current_paths = resolve_user_codex_paths(&current_home)?;
         let state_path = default_mobile_continuity_state_path()?;
@@ -1023,13 +1924,30 @@ fn run_incremental_session_sync_after_route(target_is_account: bool) -> Incremen
                 duration_ms: clock.elapsed().as_millis(),
                 requires_full_sync: false,
             };
-            let _ = record_incremental_outcome(
+            let durable_recorded = record_incremental_outcome(
                 &operation_id,
                 started_at_ms,
                 &receipt,
                 OperationStatus::Succeeded,
                 OperationPhase::Complete,
                 &[],
+                diagnostic.as_ref(),
+                None,
+            )
+            .is_some();
+            let partial = preparation.partial_threads > 0
+                || receipt.status == IncrementalSessionSyncStatus::Deferred
+                || !durable_recorded;
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                if partial {
+                    DiagnosticTerminalStatus::Partial
+                } else {
+                    DiagnosticTerminalStatus::Succeeded
+                },
+                "complete",
+                partial.then_some("commands.incremental_sync.partial"),
+                partial.then_some("incremental session publication completed with deferred, partial, or unaudited work"),
             );
             let warning = (preparation.partial_threads > 0).then(|| {
                 format!(
@@ -1039,7 +1957,7 @@ fn run_incremental_session_sync_after_route(target_is_account: bool) -> Incremen
             });
             IncrementalSessionRun::safe(receipt, warning)
         }
-        Err(_) => {
+        Err(error) => {
             let receipt = IncrementalSessionSyncReceipt {
                 status: IncrementalSessionSyncStatus::Failed,
                 detected_threads: 0,
@@ -1055,6 +1973,15 @@ fn run_incremental_session_sync_after_route(target_is_account: bool) -> Incremen
                 OperationStatus::Failed,
                 OperationPhase::Apply,
                 &[],
+                diagnostic.as_ref(),
+                Some(&error),
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "apply",
+                Some("commands.incremental_sync.failed"),
+                Some(&error),
             );
             IncrementalSessionRun::safe(
                 receipt,
@@ -1069,6 +1996,7 @@ fn incremental_chatgpt_launch_allowed(status: OperationStatus) -> bool {
     status != OperationStatus::RollbackFailed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_incremental_outcome(
     operation_id: &str,
     started_at_ms: u128,
@@ -1076,9 +2004,11 @@ fn record_incremental_outcome(
     status: OperationStatus,
     phase: OperationPhase,
     backups: &[BackupManifest],
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
 ) -> Option<OperationRecord> {
     let projected_bytes = usize::try_from(receipt.projected_bytes).unwrap_or(usize::MAX);
-    append_operation_record_with_phase(
+    append_operation_record_with_phase_and_diagnostic(
         operation_id,
         OperationAction::IncrementalSync,
         status,
@@ -1094,6 +2024,8 @@ fn record_incremental_outcome(
             ),
             ("projectedBytes".to_string(), projected_bytes),
         ]),
+        diagnostic,
+        diagnostic_error,
     )
     .ok()
 }
@@ -1108,35 +2040,110 @@ fn incremental_terminal_warning() -> String {
 pub async fn sync_all_sessions(
     on_progress: Channel<SessionSyncProgress>,
 ) -> Result<SessionSyncReceipt, String> {
+    let diagnostic = begin_command_diagnostic("syncAllSessions");
+    record_diagnostic_phase(diagnostic.as_ref(), "waitingForMutationLock");
     let worker_progress = on_progress.clone();
-    match tauri::async_runtime::spawn_blocking(move || sync_all_sessions_blocking(worker_progress))
-        .await
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        sync_all_sessions_blocking(worker_progress, worker_diagnostic)
+    })
+    .await
     {
         Ok(result) => result,
         Err(_) => {
-            emit_session_sync_progress(
+            let error = "session sync worker failed".to_string();
+            emit_session_sync_progress_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 SessionSyncPhase::Failed,
-                Some("session sync worker failed".to_string()),
+                Some(error.clone()),
             );
-            Err("session sync worker failed".to_string())
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.sync_all_sessions.worker_join"),
+                Some(&error),
+            );
+            Err(error)
         }
-    }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 fn sync_all_sessions_blocking(
     on_progress: Channel<SessionSyncProgress>,
+    diagnostic: Option<DiagnosticOperation>,
 ) -> Result<SessionSyncReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let operation_id = operation_id("sync-sessions")?;
+    let _mutation_guard = match acquire_mutation_lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::Failed,
+                Some(error.clone()),
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                diagnostic_status_for_command_error(&error),
+                "preflight",
+                Some("commands.sync_all_sessions.mutation_lock"),
+                Some(&error),
+            );
+            return Err(error);
+        }
+    };
+    let started = match timestamp_millis() {
+        Ok(started) => started,
+        Err(error) => {
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::Failed,
+                Some(error.clone()),
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "preflight",
+                Some("commands.sync_all_sessions.timestamp"),
+                Some(&error),
+            );
+            return Err(error);
+        }
+    };
+    let operation_id = match operation_id("sync-sessions") {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::Failed,
+                Some(error.clone()),
+            );
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "preflight",
+                Some("commands.sync_all_sessions.operation_id"),
+                Some(&error),
+            );
+            return Err(error);
+        }
+    };
     let mut backups = Vec::new();
     let mut failure_status = None;
     let mut failure_phase = OperationPhase::Preflight;
     let mut checkpoint_root = None;
     let mut launch_target_captured = false;
     let mut process_gate_entered = false;
-    emit_session_sync_progress(&on_progress, SessionSyncPhase::Preparing, None);
+    emit_session_sync_progress_diagnostic(
+        &on_progress,
+        diagnostic.as_ref(),
+        SessionSyncPhase::Preparing,
+        None,
+    );
     let mut result = (|| {
         let backup_root = default_backup_root()?;
         checkpoint_root = Some(backup_root.clone());
@@ -1150,8 +2157,9 @@ fn sync_all_sessions_blocking(
             let _ = cache_chatgpt_launch_target();
         });
         if !processes.is_empty() {
-            emit_session_sync_progress(
+            emit_session_sync_progress_diagnostic(
                 &on_progress,
+                diagnostic.as_ref(),
                 SessionSyncPhase::ClosingApp,
                 Some(format!("Closing {} ChatGPT process(es)", processes.len())),
             );
@@ -1159,7 +2167,12 @@ fn sync_all_sessions_blocking(
         }
         ensure_codex_closed("completely syncing active sessions")?;
         process_gate_entered = true;
-        emit_session_sync_progress(&on_progress, SessionSyncPhase::BackingUp, None);
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            diagnostic.as_ref(),
+            SessionSyncPhase::BackingUp,
+            None,
+        );
         let current_backup = after_capacity_preflight(
             || {
                 preflight_backup_capacity_for_sources(
@@ -1205,7 +2218,12 @@ fn sync_all_sessions_blocking(
         ensure_codex_paths_unchanged("session sync", &current_home, &current_paths)?;
         ensure_codex_closed("completely syncing active sessions")?;
         failure_phase = OperationPhase::Apply;
-        emit_session_sync_progress(&on_progress, SessionSyncPhase::Reconciling, None);
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            diagnostic.as_ref(),
+            SessionSyncPhase::Reconciling,
+            None,
+        );
         match sync_home_with_shared_complete_with_paths(&current_paths, &shared_paths) {
             Ok(sync_result) => Ok(SessionSyncReceipt {
                 operation_id: operation_id.clone(),
@@ -1236,6 +2254,7 @@ fn sync_all_sessions_blocking(
             }
         }
     })();
+    let durable_terminal_recorded;
     match &mut result {
         Ok(receipt) => {
             if let (Ok(current_home), Ok(shared_home), Ok(index_path)) = (
@@ -1262,16 +2281,36 @@ fn sync_all_sessions_blocking(
                     .warnings
                     .push("完全同步已完成，但增量索引路径无法复核".to_string());
             }
-            emit_session_sync_progress(&on_progress, SessionSyncPhase::RecordingResult, None);
-            let terminal_record = record_success_result(
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::RecordingResult,
+                None,
+            );
+            let terminal_record = match record_success_result_with_diagnostic(
                 &operation_id,
                 OperationAction::SyncSessions,
                 started,
                 &backups,
                 sync_counts(&receipt.result),
-            )
-            .ok();
+                diagnostic.as_ref(),
+            ) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    if let Some(diagnostic) = diagnostic.as_ref() {
+                        let _ = diagnostic.branch(
+                            DiagnosticLevel::Error,
+                            Some("recordingResult"),
+                            Some("commands.sync_all_sessions.operation_log"),
+                            Some(&error),
+                            empty_context(),
+                        );
+                    }
+                    None
+                }
+            };
             let terminal_recorded = terminal_record.is_some();
+            durable_terminal_recorded = terminal_recorded;
             let cleanup = release_transient_checkpoints(
                 checkpoint_root.as_deref(),
                 terminal_record.as_ref(),
@@ -1306,17 +2345,49 @@ fn sync_all_sessions_blocking(
                         .push("会话槽位清理路径无法复核，旧槽位已保留".to_string()),
                 }
             }
-            emit_session_sync_progress(&on_progress, SessionSyncPhase::LaunchingApp, None);
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::LaunchingApp,
+                None,
+            );
             receipt.chatgpt_launch =
                 launch_chatgpt_after_durable_terminal(terminal_recorded, || {
                     ChatGptLaunchReceipt::from(launch_cached_chatgpt())
                 });
-            emit_session_sync_progress(&on_progress, SessionSyncPhase::Complete, None);
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::Complete,
+                None,
+            );
         }
         Err(error) => {
             let status = failure_status.unwrap_or_else(|| terminal_status(error));
-            let terminal_record =
-                record_sync_failure(&operation_id, status, failure_phase, started, &backups).ok();
+            let terminal_record = match record_sync_failure_with_diagnostic(
+                &operation_id,
+                status,
+                failure_phase,
+                started,
+                &backups,
+                diagnostic.as_ref(),
+                Some(error),
+            ) {
+                Ok(record) => Some(record),
+                Err(log_error) => {
+                    if let Some(diagnostic) = diagnostic.as_ref() {
+                        let _ = diagnostic.branch(
+                            DiagnosticLevel::Error,
+                            Some("recordingResult"),
+                            Some("commands.sync_all_sessions.operation_log"),
+                            Some(&log_error),
+                            empty_context(),
+                        );
+                    }
+                    None
+                }
+            };
+            durable_terminal_recorded = terminal_record.is_some();
             if !backups.is_empty()
                 && (failure_phase == OperationPhase::Backup
                     || status == OperationStatus::RolledBack)
@@ -1329,7 +2400,12 @@ fn sync_all_sessions_blocking(
                 append_warnings_to_error(error, &cleanup.warnings);
             }
             if process_gate_entered && status != OperationStatus::RollbackFailed {
-                emit_session_sync_progress(&on_progress, SessionSyncPhase::LaunchingApp, None);
+                emit_session_sync_progress_diagnostic(
+                    &on_progress,
+                    diagnostic.as_ref(),
+                    SessionSyncPhase::LaunchingApp,
+                    None,
+                );
                 let launch =
                     launch_chatgpt_after_durable_terminal(terminal_record.is_some(), || {
                         ChatGptLaunchReceipt::from(launch_cached_chatgpt())
@@ -1341,22 +2417,70 @@ fn sync_all_sessions_blocking(
                     );
                 }
             }
-            emit_session_sync_progress(&on_progress, SessionSyncPhase::Failed, Some(error.clone()));
+            emit_session_sync_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                SessionSyncPhase::Failed,
+                Some(error.clone()),
+            );
+        }
+    }
+    if diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| !diagnostic.is_terminal_recorded())
+    {
+        match &result {
+            Ok(receipt) if durable_terminal_recorded => {
+                record_session_sync_success_diagnostic(diagnostic.as_ref(), receipt)
+            }
+            Ok(_) => record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Partial,
+                "recordingResult",
+                Some("commands.sync_all_sessions.operation_log"),
+                Some("session sync completed, but the durable operation terminal was unavailable"),
+            ),
+            Err(error) => {
+                let status = failure_status.unwrap_or_else(|| terminal_status(error));
+                record_diagnostic_terminal(
+                    diagnostic.as_ref(),
+                    diagnostic_terminal_status(status),
+                    operation_phase_name(failure_phase),
+                    Some("commands.sync_all_sessions.failed"),
+                    Some(error),
+                )
+            }
         }
     }
     result
 }
 
-fn emit_session_sync_progress(
+fn emit_session_sync_progress_diagnostic(
     on_progress: &Channel<SessionSyncProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
     phase: SessionSyncPhase,
     message: Option<String>,
 ) {
+    record_diagnostic_phase(diagnostic, session_sync_phase_name(phase));
     let _ = on_progress.send(SessionSyncProgress {
         phase,
         timestamp_ms: timestamp_millis().unwrap_or_default(),
+        operation_id: diagnostic_correlation_id(diagnostic),
         message,
     });
+}
+
+fn session_sync_phase_name(phase: SessionSyncPhase) -> &'static str {
+    match phase {
+        SessionSyncPhase::Preparing => "preparing",
+        SessionSyncPhase::ClosingApp => "closingApp",
+        SessionSyncPhase::BackingUp => "backingUp",
+        SessionSyncPhase::Reconciling => "reconciling",
+        SessionSyncPhase::RecordingResult => "recordingResult",
+        SessionSyncPhase::LaunchingApp => "launchingApp",
+        SessionSyncPhase::Complete => "complete",
+        SessionSyncPhase::Failed => "failed",
+    }
 }
 
 #[tauri::command]
@@ -1364,77 +2488,132 @@ pub fn delete_managed_sessions(
     ids: Vec<String>,
     confirmed: bool,
 ) -> Result<SessionMutationReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let operation_id = operation_id("delete-sessions")?;
-    let mut failure_backups = Vec::new();
-    let mut checkpoint_root = None;
+    let diagnostic = begin_command_diagnostic("deleteSessions");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
-        let backup_root = default_backup_root()?;
-        checkpoint_root = Some(backup_root.clone());
-        let shared_home = default_shared_sessions_root()?;
-        let current_home = managed_codex_home()?;
-        match delete_sessions(
-            &current_home,
-            &shared_home,
-            &backup_root,
-            &ids,
-            confirmed,
-            || ensure_codex_closed("deleting sessions"),
-        ) {
-            Ok(result) => Ok(result),
-            Err(failure) => {
-                failure_backups = failure.backups;
-                Err(failure.message)
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let operation_id = operation_id("delete-sessions")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let mut failure_backups = Vec::new();
+        let mut checkpoint_root = None;
+        let result = (|| {
+            let backup_root = default_backup_root()?;
+            checkpoint_root = Some(backup_root.clone());
+            let shared_home = default_shared_sessions_root()?;
+            let current_home = managed_codex_home()?;
+            match delete_sessions(
+                &current_home,
+                &shared_home,
+                &backup_root,
+                &ids,
+                confirmed,
+                || ensure_codex_closed("deleting sessions"),
+            ) {
+                Ok(result) => Ok(result),
+                Err(failure) => {
+                    failure_backups = failure.backups;
+                    Err(failure.message)
+                }
             }
-        }
+        })();
+        finish_session_mutation(
+            operation_id,
+            OperationAction::DeleteSessions,
+            started,
+            result,
+            &failure_backups,
+            checkpoint_root.as_deref(),
+            diagnostic.as_ref(),
+        )
     })();
-    finish_session_mutation(
-        operation_id,
-        OperationAction::DeleteSessions,
-        started,
-        result,
-        &failure_backups,
-        checkpoint_root.as_deref(),
-    )
+    let partial = result.is_ok()
+        && diagnostic
+            .as_ref()
+            .is_some_and(|operation| operation.operation_id().is_none());
+    record_durable_command_result(
+        diagnostic.as_ref(),
+        &result,
+        if partial {
+            DiagnosticTerminalStatus::Partial
+        } else {
+            DiagnosticTerminalStatus::Succeeded
+        },
+        "complete",
+        partial.then_some("commands.delete_sessions.operation_history_failed"),
+        partial.then_some("session deletion completed without durable operation history"),
+        "apply",
+        "commands.delete_sessions.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn restore_sessions_visible(ids: Vec<String>) -> Result<SessionMutationReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let operation_id = operation_id("restore-visibility")?;
-    let mut failure_backups = Vec::new();
-    let mut checkpoint_root = None;
+    let diagnostic = begin_command_diagnostic("restoreVisibility");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
-        let backup_root = default_backup_root()?;
-        checkpoint_root = Some(backup_root.clone());
-        let current_home = managed_codex_home()?;
-        match restore_visible(&current_home, &backup_root, &ids, &operation_id, || {
-            ensure_codex_closed("restoring session visibility")
-        }) {
-            Ok(result) => Ok(result),
-            Err(failure) => {
-                failure_backups = failure.backups;
-                Err(failure.message)
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let operation_id = operation_id("restore-visibility")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let mut failure_backups = Vec::new();
+        let mut checkpoint_root = None;
+        let result = (|| {
+            let backup_root = default_backup_root()?;
+            checkpoint_root = Some(backup_root.clone());
+            let current_home = managed_codex_home()?;
+            match restore_visible(&current_home, &backup_root, &ids, &operation_id, || {
+                ensure_codex_closed("restoring session visibility")
+            }) {
+                Ok(result) => Ok(result),
+                Err(failure) => {
+                    failure_backups = failure.backups;
+                    Err(failure.message)
+                }
             }
-        }
+        })();
+        finish_session_mutation(
+            operation_id,
+            OperationAction::RestoreVisibility,
+            started,
+            result,
+            &failure_backups,
+            checkpoint_root.as_deref(),
+            diagnostic.as_ref(),
+        )
     })();
-    finish_session_mutation(
-        operation_id,
-        OperationAction::RestoreVisibility,
-        started,
-        result,
-        &failure_backups,
-        checkpoint_root.as_deref(),
-    )
+    let partial = result.as_ref().is_ok_and(|receipt| {
+        receipt.checkpoint_cleanup.failed_count > 0
+            || diagnostic
+                .as_ref()
+                .is_some_and(|operation| operation.operation_id().is_none())
+    });
+    record_durable_command_result(
+        diagnostic.as_ref(),
+        &result,
+        if partial {
+            DiagnosticTerminalStatus::Partial
+        } else {
+            DiagnosticTerminalStatus::Succeeded
+        },
+        "complete",
+        partial.then_some("commands.restore_visibility.partial"),
+        partial.then_some("session visibility was restored with incomplete checkpoint cleanup or operation history"),
+        "apply",
+        "commands.restore_visibility.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub async fn list_backups() -> Result<Vec<BackupSummary>, String> {
-    tauri::async_runtime::spawn_blocking(list_backups_blocking)
-        .await
-        .map_err(|_| "backup list worker failed".to_string())?
+    let result = match tauri::async_runtime::spawn_blocking(list_backups_blocking).await {
+        Ok(result) => result,
+        Err(_) => Err("backup list worker failed".to_string()),
+    };
+    record_background_result("listBackups", "commands.list_backups.failed", &result);
+    result
 }
 
 fn list_backups_blocking() -> Result<Vec<BackupSummary>, String> {
@@ -1452,9 +2631,17 @@ fn list_backups_at(backup_root: &Path) -> Result<Vec<BackupSummary>, String> {
 
 #[tauri::command]
 pub async fn inspect_checkpoint_storage() -> Result<CheckpointStorageStatus, String> {
-    tauri::async_runtime::spawn_blocking(inspect_checkpoint_storage_blocking)
-        .await
-        .map_err(|_| "checkpoint storage worker failed".to_string())?
+    let result =
+        match tauri::async_runtime::spawn_blocking(inspect_checkpoint_storage_blocking).await {
+            Ok(result) => result,
+            Err(_) => Err("checkpoint storage worker failed".to_string()),
+        };
+    record_background_result(
+        "inspectCheckpointStorage",
+        "commands.inspect_checkpoint_storage.failed",
+        &result,
+    );
+    result
 }
 
 fn inspect_checkpoint_storage_blocking() -> Result<CheckpointStorageStatus, String> {
@@ -1465,46 +2652,98 @@ fn inspect_checkpoint_storage_blocking() -> Result<CheckpointStorageStatus, Stri
 
 #[tauri::command]
 pub async fn cleanup_automatic_checkpoints() -> Result<CheckpointCleanupReceipt, String> {
-    tauri::async_runtime::spawn_blocking(cleanup_automatic_checkpoints_blocking)
-        .await
-        .map_err(|_| "checkpoint cleanup worker failed".to_string())?
+    let diagnostic = begin_command_diagnostic("cleanupCheckpoints");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        cleanup_automatic_checkpoints_blocking(worker_diagnostic.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = "checkpoint cleanup worker failed".to_string();
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.cleanup_checkpoints.worker_join_failed"),
+                Some(&error),
+            );
+            Err(error)
+        }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
-fn cleanup_automatic_checkpoints_blocking() -> Result<CheckpointCleanupReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let operation_id = operation_id("cleanup-checkpoints")?;
-    let log = operation_log()?;
-    let records = log.list_all_strict()?;
-    let summary = cleanup_checkpoint_storage(&default_backup_root()?, &records)?;
-    let mut receipt = CheckpointCleanupReceipt {
-        operation_id: operation_id.clone(),
-        attempted_count: summary.attempted_count,
-        failed_count: summary.failed_count,
-        reclaimed_count: summary.reclaimed_count,
-        reclaimed_bytes: summary.reclaimed_bytes,
-        retained_count: summary.retained_count,
-        warnings: summary.warnings,
-    };
-    let counts = checkpoint_cleanup_counts(&receipt);
-    let terminal = checkpoint_cleanup_terminal(&receipt);
-    if append_operation_record_to(
-        &log,
-        &operation_id,
-        OperationAction::CleanupCheckpoints,
-        terminal,
-        started,
-        &[],
-        counts,
-    )
-    .is_err()
-    {
-        receipt.warnings.push(
-            "checkpoint cleanup completed, but local operation history could not be written"
-                .to_string(),
-        );
-    }
-    Ok(receipt)
+fn cleanup_automatic_checkpoints_blocking(
+    diagnostic: Option<&DiagnosticOperation>,
+) -> Result<CheckpointCleanupReceipt, String> {
+    let mut durable_recorded = false;
+    let result = (|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        record_diagnostic_phase(diagnostic, "apply");
+        let started = timestamp_millis()?;
+        let operation_id = operation_id("cleanup-checkpoints")?;
+        let log = operation_log().inspect_err(|error| {
+            record_diagnostic_branch(
+                diagnostic,
+                "recordingResult",
+                "commands.operation_history.open_failed",
+                error,
+            );
+        })?;
+        let records = log.list_all_strict()?;
+        let summary = cleanup_checkpoint_storage(&default_backup_root()?, &records)?;
+        let mut receipt = CheckpointCleanupReceipt {
+            operation_id: operation_id.clone(),
+            attempted_count: summary.attempted_count,
+            failed_count: summary.failed_count,
+            reclaimed_count: summary.reclaimed_count,
+            reclaimed_bytes: summary.reclaimed_bytes,
+            retained_count: summary.retained_count,
+            warnings: summary.warnings,
+        };
+        let counts = checkpoint_cleanup_counts(&receipt);
+        let terminal = checkpoint_cleanup_terminal(&receipt);
+        durable_recorded = append_operation_record_receipt_to_with_diagnostic(
+            &log,
+            &operation_id,
+            OperationAction::CleanupCheckpoints,
+            terminal,
+            started,
+            &[],
+            counts,
+            diagnostic,
+            None,
+        )
+        .is_ok();
+        if !durable_recorded {
+            receipt.warnings.push(
+                "checkpoint cleanup completed, but local operation history could not be written"
+                    .to_string(),
+            );
+        }
+        Ok(receipt)
+    })();
+    let success_status = result
+        .as_ref()
+        .map(|receipt| checkpoint_cleanup_diagnostic_status(receipt, durable_recorded))
+        .unwrap_or(DiagnosticTerminalStatus::Succeeded);
+    let partial = success_status == DiagnosticTerminalStatus::Partial;
+    record_durable_command_result(
+        diagnostic,
+        &result,
+        success_status,
+        "complete",
+        partial.then_some("commands.cleanup_checkpoints.partial"),
+        partial.then_some(
+            "checkpoint cleanup completed with failed items or missing operation history",
+        ),
+        "apply",
+        "commands.cleanup_checkpoints.failed",
+    );
+    result
 }
 
 fn checkpoint_cleanup_counts(receipt: &CheckpointCleanupReceipt) -> BTreeMap<String, usize> {
@@ -1534,15 +2773,66 @@ fn checkpoint_cleanup_terminal(receipt: &CheckpointCleanupReceipt) -> OperationT
     }
 }
 
-#[tauri::command]
-pub async fn create_full_backup() -> Result<CreateFullBackupReceipt, String> {
-    tauri::async_runtime::spawn_blocking(create_full_backup_blocking)
-        .await
-        .map_err(|_| "full backup worker failed".to_string())?
+fn checkpoint_cleanup_diagnostic_status(
+    receipt: &CheckpointCleanupReceipt,
+    durable_recorded: bool,
+) -> DiagnosticTerminalStatus {
+    if receipt.failed_count > 0 || !durable_recorded {
+        DiagnosticTerminalStatus::Partial
+    } else {
+        DiagnosticTerminalStatus::Succeeded
+    }
 }
 
-fn create_full_backup_blocking() -> Result<CreateFullBackupReceipt, String> {
+#[tauri::command]
+pub async fn create_full_backup() -> Result<CreateFullBackupReceipt, String> {
+    let diagnostic = begin_command_diagnostic("createBackup");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        let result = create_full_backup_blocking(worker_diagnostic.as_ref());
+        let partial = result
+            .as_ref()
+            .is_ok_and(|receipt| !receipt.warnings.is_empty());
+        record_durable_command_result(
+            worker_diagnostic.as_ref(),
+            &result,
+            if partial {
+                DiagnosticTerminalStatus::Partial
+            } else {
+                DiagnosticTerminalStatus::Succeeded
+            },
+            "complete",
+            partial.then_some("commands.create_backup.operation_history_failed"),
+            partial.then_some("backup completed without durable operation history"),
+            "backup",
+            "commands.create_backup.failed",
+        );
+        result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = "full backup worker failed".to_string();
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.create_backup.worker_join_failed"),
+                Some(&error),
+            );
+            Err(error)
+        }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
+}
+
+fn create_full_backup_blocking(
+    diagnostic: Option<&DiagnosticOperation>,
+) -> Result<CreateFullBackupReceipt, String> {
     let _mutation_guard = acquire_mutation_lock()?;
+    record_diagnostic_phase(diagnostic, "backup");
     let started = timestamp_millis()?;
     let operation_id = operation_id("create-backup")?;
     let mut backups = Vec::new();
@@ -1610,7 +2900,7 @@ fn create_full_backup_blocking() -> Result<CreateFullBackupReceipt, String> {
     })();
     match &mut result {
         Ok(receipt) => {
-            receipt.warnings = record_success(
+            receipt.warnings = record_success_result_with_diagnostic(
                 &operation_id,
                 OperationAction::CreateBackup,
                 started,
@@ -1619,12 +2909,15 @@ fn create_full_backup_blocking() -> Result<CreateFullBackupReceipt, String> {
                     "backupFiles".to_string(),
                     backups.iter().map(|backup| backup.files.len()).sum(),
                 )]),
+                diagnostic,
             )
+            .err()
+            .map(|_| "操作已成功，但本地操作记录写入失败".to_string())
             .into_iter()
             .collect();
         }
         Err(error) => {
-            if append_operation_record_with_phase(
+            if append_operation_record_with_phase_and_diagnostic(
                 &operation_id,
                 OperationAction::CreateBackup,
                 terminal_status(error),
@@ -1632,6 +2925,8 @@ fn create_full_backup_blocking() -> Result<CreateFullBackupReceipt, String> {
                 started,
                 &backups,
                 BTreeMap::new(),
+                diagnostic,
+                Some(error),
             )
             .is_err()
             {
@@ -1647,26 +2942,90 @@ pub async fn delete_backup(
     backup_dir: PathBuf,
     confirmed: bool,
 ) -> Result<BackupDeleteReceipt, String> {
-    tauri::async_runtime::spawn_blocking(move || delete_backup_blocking(backup_dir, confirmed))
-        .await
-        .map_err(|_| "backup deletion worker failed".to_string())?
+    let diagnostic = begin_command_diagnostic("deleteBackup");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let worker_diagnostic = diagnostic.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        let result = delete_backup_blocking(backup_dir, confirmed, worker_diagnostic.as_ref());
+        let partial = result
+            .as_ref()
+            .is_ok_and(|receipt| !receipt.warnings.is_empty());
+        record_durable_command_result(
+            worker_diagnostic.as_ref(),
+            &result,
+            if partial {
+                DiagnosticTerminalStatus::Partial
+            } else {
+                DiagnosticTerminalStatus::Succeeded
+            },
+            "complete",
+            partial.then_some("commands.delete_backup.operation_history_failed"),
+            partial.then_some("backup deletion completed without durable operation history"),
+            "apply",
+            "commands.delete_backup.failed",
+        );
+        result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = "backup deletion worker failed".to_string();
+            record_diagnostic_terminal(
+                diagnostic.as_ref(),
+                DiagnosticTerminalStatus::Failed,
+                "workerJoin",
+                Some("commands.delete_backup.worker_join_failed"),
+                Some(&error),
+            );
+            Err(error)
+        }
+    };
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 fn delete_backup_blocking(
     backup_dir: PathBuf,
     confirmed: bool,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<BackupDeleteReceipt, String> {
     let _mutation_guard = acquire_mutation_lock()?;
+    record_diagnostic_phase(diagnostic, "apply");
     let backup_root = default_backup_root()?;
-    delete_backup_at(&backup_root, operation_log(), backup_dir, confirmed)
+    delete_backup_at_with_diagnostic(
+        &backup_root,
+        operation_log(),
+        backup_dir,
+        confirmed,
+        diagnostic,
+    )
 }
 
+#[cfg(test)]
 fn delete_backup_at(
     backup_root: &Path,
     log: Result<OperationLog, String>,
     backup_dir: PathBuf,
     confirmed: bool,
 ) -> Result<BackupDeleteReceipt, String> {
+    delete_backup_at_with_diagnostic(backup_root, log, backup_dir, confirmed, None)
+}
+
+fn delete_backup_at_with_diagnostic(
+    backup_root: &Path,
+    log: Result<OperationLog, String>,
+    backup_dir: PathBuf,
+    confirmed: bool,
+    diagnostic: Option<&DiagnosticOperation>,
+) -> Result<BackupDeleteReceipt, String> {
+    if let Err(error) = log.as_ref() {
+        record_diagnostic_branch(
+            diagnostic,
+            "recordingResult",
+            "commands.operation_history.open_failed",
+            error,
+        );
+    }
     let started_at_ms = timestamp_millis()?;
     let operation_id = operation_id("delete-backup")?;
     if !confirmed {
@@ -1679,6 +3038,8 @@ fn delete_backup_at(
                 started_at_ms,
                 Vec::new(),
                 BTreeMap::new(),
+                diagnostic,
+                Some("backup deletion requires explicit confirmation"),
             );
         }
         return Err("backup deletion requires explicit confirmation".to_string());
@@ -1706,6 +3067,8 @@ fn delete_backup_at(
                         started_at_ms,
                         vec![deleted.backup_dir.clone()],
                         counts,
+                        diagnostic,
+                        None,
                     )
                 })
                 .is_ok();
@@ -1730,6 +3093,8 @@ fn delete_backup_at(
                     started_at_ms,
                     Vec::new(),
                     BTreeMap::new(),
+                    diagnostic,
+                    Some(&error),
                 );
             }
             Err(error)
@@ -1737,6 +3102,7 @@ fn delete_backup_at(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_delete_backup_record(
     log: &OperationLog,
     operation_id: &str,
@@ -1745,8 +3111,10 @@ fn append_delete_backup_record(
     started_at_ms: u128,
     backup_dirs: Vec<PathBuf>,
     counts: BTreeMap<String, usize>,
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
 ) -> Result<(), String> {
-    log.append(&OperationRecord {
+    let record = OperationRecord {
         operation_id: operation_id.to_string(),
         action: OperationAction::DeleteBackup,
         status,
@@ -1755,134 +3123,174 @@ fn append_delete_backup_record(
         completed_at_ms: timestamp_millis()?,
         backup_dirs,
         counts,
-    })
+    };
+    append_durable_operation_record(log, &record, diagnostic, diagnostic_error)
 }
 
 #[tauri::command]
 pub fn restore_backup(backup_dir: String) -> Result<RestoreBackupReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started = timestamp_millis()?;
-    let operation_id = operation_id("restore-backup")?;
-    let mut backups = Vec::new();
-    let mut failure_status = None;
-    let mut failure_phase = OperationPhase::Preflight;
-    let mut result = (|| {
-        let backup_root = default_backup_root()?;
-        let selected = validate_backup_selection(&backup_root, Path::new(&backup_dir))?;
-        let manifest = verify_backup(&selected)?;
-        backups.push(manifest.clone());
-        let current_home = managed_codex_home()?;
-        let shared_home = default_shared_sessions_root()?;
-        let target_is_local = manifest.state_db_is_local;
-        let target = if manifest.source_root == current_home {
-            current_home
-        } else if manifest.source_root == shared_home {
-            shared_home
-        } else {
-            return Err("backup source is not one of the managed roots".to_string());
-        };
-        let target_paths = if target_is_local {
-            local_codex_paths(&target)
-        } else {
-            resolve_user_codex_paths(&target)?
-        };
-        let safety_backup = after_capacity_preflight(
-            || {
-                preflight_before_process_gate(
-                    || {
-                        preflight_backup_capacity_with_paths(
-                            &backup_root,
-                            &target,
-                            &target_paths,
-                            BackupScope::Full,
-                        )
-                        .map(|_| ())
-                    },
-                    || ensure_codex_closed("restoring a backup"),
-                )
-            },
-            || {
-                failure_phase = OperationPhase::Backup;
-                create_backup_with_paths(
-                    &target,
-                    &backup_root,
-                    "pre-restore-safety",
-                    target_paths.clone(),
-                )
-            },
-        )?;
-        backups.push(safety_backup.clone());
-        if !target_is_local {
+    let diagnostic = begin_command_diagnostic("restoreBackup");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
+    let result = (|| {
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started = timestamp_millis()?;
+        let operation_id = operation_id("restore-backup")?;
+        let mut backups = Vec::new();
+        let mut failure_status = None;
+        let mut failure_phase = OperationPhase::Preflight;
+        let mut result = (|| {
+            let backup_root = default_backup_root()?;
+            let selected = validate_backup_selection(&backup_root, Path::new(&backup_dir))?;
+            let manifest = verify_backup(&selected)?;
+            backups.push(manifest.clone());
+            let current_home = managed_codex_home()?;
+            let shared_home = default_shared_sessions_root()?;
+            let target_is_local = manifest.state_db_is_local;
+            let target = if manifest.source_root == current_home {
+                current_home
+            } else if manifest.source_root == shared_home {
+                shared_home
+            } else {
+                return Err("backup source is not one of the managed roots".to_string());
+            };
+            let target_paths = if target_is_local {
+                local_codex_paths(&target)
+            } else {
+                resolve_user_codex_paths(&target)?
+            };
+            let safety_backup = after_capacity_preflight(
+                || {
+                    preflight_before_process_gate(
+                        || {
+                            preflight_backup_capacity_with_paths(
+                                &backup_root,
+                                &target,
+                                &target_paths,
+                                BackupScope::Full,
+                            )
+                            .map(|_| ())
+                        },
+                        || ensure_codex_closed("restoring a backup"),
+                    )
+                },
+                || {
+                    failure_phase = OperationPhase::Backup;
+                    record_diagnostic_phase(diagnostic.as_ref(), "backup");
+                    create_backup_with_paths(
+                        &target,
+                        &backup_root,
+                        "pre-restore-safety",
+                        target_paths.clone(),
+                    )
+                },
+            )?;
+            backups.push(safety_backup.clone());
+            if !target_is_local {
+                failure_phase = OperationPhase::Preflight;
+                ensure_codex_paths_unchanged("backup restore", &target, &target_paths)?;
+            }
             failure_phase = OperationPhase::Preflight;
-            ensure_codex_paths_unchanged("backup restore", &target, &target_paths)?;
-        }
-        failure_phase = OperationPhase::Preflight;
-        ensure_codex_closed("restoring a backup")?;
-        failure_phase = OperationPhase::Apply;
-        match restore_backup_snapshot(&selected, &target) {
-            Ok(restore_result) => Ok(RestoreBackupReceipt {
-                operation_id: operation_id.clone(),
-                result: restore_result,
-                safety_backup: BackupReceiptSummary::from(&safety_backup),
-                rolled_back: false,
-                warnings: Vec::new(),
-            }),
-            Err(error) => {
-                failure_phase = OperationPhase::Rollback;
-                let rolled_back =
-                    restore_backup_snapshot(&safety_backup.backup_dir, &target).is_ok();
-                failure_status = Some(if rolled_back {
-                    OperationStatus::RolledBack
-                } else {
-                    OperationStatus::RollbackFailed
-                });
-                if rolled_back {
-                    Err(format!(
-                        "backup restore failed: {error}; restored the safety snapshot"
-                    ))
-                } else {
-                    Err(format!(
-                        "backup restore failed: {error}; safety rollback failed"
-                    ))
+            ensure_codex_closed("restoring a backup")?;
+            failure_phase = OperationPhase::Apply;
+            record_diagnostic_phase(diagnostic.as_ref(), "apply");
+            match restore_backup_snapshot(&selected, &target) {
+                Ok(restore_result) => Ok(RestoreBackupReceipt {
+                    operation_id: operation_id.clone(),
+                    result: restore_result,
+                    safety_backup: BackupReceiptSummary::from(&safety_backup),
+                    rolled_back: false,
+                    warnings: Vec::new(),
+                }),
+                Err(error) => {
+                    failure_phase = OperationPhase::Rollback;
+                    record_diagnostic_phase(diagnostic.as_ref(), "rollback");
+                    let rolled_back =
+                        restore_backup_snapshot(&safety_backup.backup_dir, &target).is_ok();
+                    failure_status = Some(if rolled_back {
+                        OperationStatus::RolledBack
+                    } else {
+                        OperationStatus::RollbackFailed
+                    });
+                    if rolled_back {
+                        Err(format!(
+                            "backup restore failed: {error}; restored the safety snapshot"
+                        ))
+                    } else {
+                        Err(format!(
+                            "backup restore failed: {error}; safety rollback failed"
+                        ))
+                    }
                 }
             }
+        })();
+        match &mut result {
+            Ok(receipt) => {
+                receipt.warnings = record_success_result_with_diagnostic(
+                    &operation_id,
+                    OperationAction::RestoreBackup,
+                    started,
+                    &backups,
+                    BTreeMap::from([("restoredFiles".to_string(), receipt.result.restored_files)]),
+                    diagnostic.as_ref(),
+                )
+                .err()
+                .map(|_| "操作已成功，但本地操作记录写入失败".to_string())
+                .into_iter()
+                .collect();
+            }
+            Err(error) => {
+                let _ = append_operation_record_with_phase_and_diagnostic(
+                    &operation_id,
+                    OperationAction::RestoreBackup,
+                    failure_status.unwrap_or_else(|| terminal_status(error)),
+                    failure_phase,
+                    started,
+                    &backups,
+                    BTreeMap::new(),
+                    diagnostic.as_ref(),
+                    Some(error),
+                );
+            }
         }
+        result
     })();
-    match &mut result {
-        Ok(receipt) => {
-            receipt.warnings = record_success(
-                &operation_id,
-                OperationAction::RestoreBackup,
-                started,
-                &backups,
-                BTreeMap::from([("restoredFiles".to_string(), receipt.result.restored_files)]),
-            )
-            .into_iter()
-            .collect();
-        }
-        Err(error) => {
-            let _ = append_operation_record_with_phase(
-                &operation_id,
-                OperationAction::RestoreBackup,
-                failure_status.unwrap_or_else(|| terminal_status(error)),
-                failure_phase,
-                started,
-                &backups,
-                BTreeMap::new(),
-            );
-        }
-    }
-    result
+    let partial = result
+        .as_ref()
+        .is_ok_and(|receipt| !receipt.result.verified || !receipt.warnings.is_empty());
+    record_durable_command_result(
+        diagnostic.as_ref(),
+        &result,
+        if partial {
+            DiagnosticTerminalStatus::Partial
+        } else {
+            DiagnosticTerminalStatus::Succeeded
+        },
+        "complete",
+        partial.then_some("commands.restore_backup.partial"),
+        partial
+            .then_some("backup restore completed without full verification or operation history"),
+        "apply",
+        "commands.restore_backup.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn list_operation_records(limit: Option<usize>) -> Result<Vec<OperationRecord>, String> {
-    operation_log()?.list(limit.unwrap_or(100).min(1_000))
+    let result = (|| operation_log()?.list(limit.unwrap_or(100).min(1_000)))();
+    record_background_result(
+        "listOperationRecords",
+        "commands.list_operation_records.failed",
+        &result,
+    );
+    result
 }
 
 #[tauri::command]
 pub fn list_skills() -> Result<Vec<SkillStatus>, String> {
-    list_skills_at(&skill_codex_home()?, &appdata_root()?)
+    let result = (|| list_skills_at(&skill_codex_home()?, &appdata_root()?))();
+    record_background_result("listSkills", "commands.list_skills.failed", &result);
+    result
 }
 
 #[tauri::command]
@@ -1890,41 +3298,91 @@ pub fn install_skill(
     skill_id: SkillId,
     confirm_replace: bool,
 ) -> Result<SkillMutationReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started_at_ms = timestamp_millis()?;
-    let attempt_id = operation_id("install-skill-attempt")?;
+    let diagnostic = begin_command_diagnostic("installSkill");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
-        ensure_codex_closed("installing or updating a skill")?;
-        install_skill_at(
-            &skill_codex_home()?,
-            &appdata_root()?,
-            skill_id,
-            confirm_replace,
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started_at_ms = timestamp_millis()?;
+        let attempt_id = operation_id("install-skill-attempt")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let result = (|| {
+            ensure_codex_closed("installing or updating a skill")?;
+            install_skill_at(
+                &skill_codex_home()?,
+                &appdata_root()?,
+                skill_id,
+                confirm_replace,
+            )
+        })();
+        finish_skill_operation(
+            attempt_id,
+            OperationAction::InstallSkill,
+            started_at_ms,
+            result,
+            diagnostic.as_ref(),
         )
     })();
-    finish_skill_operation(
-        attempt_id,
-        OperationAction::InstallSkill,
-        started_at_ms,
-        result,
-    )
+    let partial = result
+        .as_ref()
+        .is_ok_and(|receipt| !receipt.warnings.is_empty());
+    record_durable_command_result(
+        diagnostic.as_ref(),
+        &result,
+        if partial {
+            DiagnosticTerminalStatus::Partial
+        } else {
+            DiagnosticTerminalStatus::Succeeded
+        },
+        "complete",
+        partial.then_some("commands.install_skill.partial"),
+        partial
+            .then_some("skill installation completed with cleanup or operation-history warnings"),
+        "apply",
+        "commands.install_skill.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 #[tauri::command]
 pub fn save_skill_config(input: SkillConfigInput) -> Result<SkillMutationReceipt, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let started_at_ms = timestamp_millis()?;
-    let attempt_id = operation_id("configure-skill-attempt")?;
+    let diagnostic = begin_command_diagnostic("configureSkill");
+    record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
-        ensure_codex_closed("configuring a skill")?;
-        save_skill_config_at(&skill_codex_home()?, &appdata_root()?, input)
+        let _mutation_guard = acquire_mutation_lock()?;
+        let started_at_ms = timestamp_millis()?;
+        let attempt_id = operation_id("configure-skill-attempt")?;
+        record_diagnostic_phase(diagnostic.as_ref(), "apply");
+        let result = (|| {
+            ensure_codex_closed("configuring a skill")?;
+            save_skill_config_at(&skill_codex_home()?, &appdata_root()?, input)
+        })();
+        finish_skill_operation(
+            attempt_id,
+            OperationAction::ConfigureSkill,
+            started_at_ms,
+            result,
+            diagnostic.as_ref(),
+        )
     })();
-    finish_skill_operation(
-        attempt_id,
-        OperationAction::ConfigureSkill,
-        started_at_ms,
-        result,
-    )
+    let partial = result
+        .as_ref()
+        .is_ok_and(|receipt| !receipt.warnings.is_empty());
+    record_durable_command_result(
+        diagnostic.as_ref(),
+        &result,
+        if partial {
+            DiagnosticTerminalStatus::Partial
+        } else {
+            DiagnosticTerminalStatus::Succeeded
+        },
+        "complete",
+        partial.then_some("commands.configure_skill.partial"),
+        partial
+            .then_some("skill configuration completed with cleanup or operation-history warnings"),
+        "apply",
+        "commands.configure_skill.failed",
+    );
+    correlate_mutation_result(result, diagnostic.as_ref())
 }
 
 fn default_codex_home() -> PathBuf {
@@ -2218,8 +3676,9 @@ fn finish_session_mutation(
     result: Result<SessionMutationResult, String>,
     failure_backups: &[BackupManifest],
     checkpoint_root: Option<&Path>,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<SessionMutationReceipt, String> {
-    finish_session_mutation_with_log(
+    finish_session_mutation_with_log_and_diagnostic(
         operation_log(),
         operation_id,
         action,
@@ -2227,9 +3686,11 @@ fn finish_session_mutation(
         result,
         failure_backups,
         checkpoint_root,
+        diagnostic,
     )
 }
 
+#[cfg(test)]
 fn finish_session_mutation_with_log(
     log: Result<OperationLog, String>,
     operation_id: String,
@@ -2239,13 +3700,36 @@ fn finish_session_mutation_with_log(
     failure_backups: &[BackupManifest],
     checkpoint_root: Option<&Path>,
 ) -> Result<SessionMutationReceipt, String> {
+    finish_session_mutation_with_log_and_diagnostic(
+        log,
+        operation_id,
+        action,
+        started_at_ms,
+        result,
+        failure_backups,
+        checkpoint_root,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_session_mutation_with_log_and_diagnostic(
+    log: Result<OperationLog, String>,
+    operation_id: String,
+    action: OperationAction,
+    started_at_ms: u128,
+    result: Result<SessionMutationResult, String>,
+    failure_backups: &[BackupManifest],
+    checkpoint_root: Option<&Path>,
+    diagnostic: Option<&DiagnosticOperation>,
+) -> Result<SessionMutationReceipt, String> {
     match result {
         Ok(result) => {
             let terminal_record = log
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|log| {
-                    append_operation_record_receipt_to(
+                    append_operation_record_receipt_to_with_diagnostic(
                         log,
                         &operation_id,
                         action,
@@ -2256,6 +3740,8 @@ fn finish_session_mutation_with_log(
                         started_at_ms,
                         &result.backups,
                         mutation_counts(&result),
+                        diagnostic,
+                        None,
                     )
                 })
                 .ok();
@@ -2289,7 +3775,7 @@ fn finish_session_mutation_with_log(
         Err(error) => {
             let status = terminal_status(&error);
             if let Ok(log) = log {
-                let _ = append_operation_record_to(
+                let _ = append_operation_record_receipt_to_with_diagnostic(
                     &log,
                     &operation_id,
                     action,
@@ -2300,6 +3786,8 @@ fn finish_session_mutation_with_log(
                     started_at_ms,
                     failure_backups,
                     BTreeMap::new(),
+                    diagnostic,
+                    Some(&error),
                 );
             }
             Err(error)
@@ -2307,35 +3795,53 @@ fn finish_session_mutation_with_log(
     }
 }
 
-fn record_result<T>(
+#[allow(clippy::too_many_arguments)]
+fn record_result_with_diagnostic<T>(
     operation_id: &str,
     action: OperationAction,
     started_at_ms: u128,
     result: &Result<T, String>,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<(), String> {
-    let log = operation_log()?;
-    record_result_to_log(
+    let log = operation_log().inspect_err(|error| {
+        record_diagnostic_branch(
+            diagnostic,
+            "recordingResult",
+            "commands.operation_history.open_failed",
+            error,
+        );
+    })?;
+    let status = match result {
+        Ok(_) => OperationStatus::Succeeded,
+        Err(error) => terminal_status(error),
+    };
+    let phase = operation_phase(&action, &status);
+    append_operation_record_receipt_to_with_diagnostic(
         &log,
         operation_id,
         action,
+        OperationTerminal { status, phase },
         started_at_ms,
-        result,
         backups,
         counts,
+        diagnostic,
+        result.as_ref().err().map(String::as_str),
     )
+    .map(|_| ())
 }
 
-fn record_runtime_switch_result<T>(
+fn record_runtime_switch_result_with_diagnostic<T>(
     operation_id: &str,
     started_at_ms: u128,
     result: &Result<T, String>,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
     failure_outcome: RuntimeSwitchOutcome,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<OperationRecord, String> {
-    record_runtime_switch_result_to_log(
+    record_runtime_switch_result_to_log_with_diagnostic(
         &operation_log()?,
         operation_id,
         started_at_ms,
@@ -2343,9 +3849,11 @@ fn record_runtime_switch_result<T>(
         backups,
         counts,
         failure_outcome,
+        diagnostic,
     )
 }
 
+#[cfg(test)]
 fn record_runtime_switch_result_to_log<T>(
     log: &OperationLog,
     operation_id: &str,
@@ -2354,6 +3862,29 @@ fn record_runtime_switch_result_to_log<T>(
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
     failure_outcome: RuntimeSwitchOutcome,
+) -> Result<OperationRecord, String> {
+    record_runtime_switch_result_to_log_with_diagnostic(
+        log,
+        operation_id,
+        started_at_ms,
+        result,
+        backups,
+        counts,
+        failure_outcome,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_runtime_switch_result_to_log_with_diagnostic<T>(
+    log: &OperationLog,
+    operation_id: &str,
+    started_at_ms: u128,
+    result: &Result<T, String>,
+    backups: &[BackupManifest],
+    counts: BTreeMap<String, usize>,
+    failure_outcome: RuntimeSwitchOutcome,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<OperationRecord, String> {
     let terminal = match result {
         Ok(_) => OperationTerminal {
@@ -2379,7 +3910,7 @@ fn record_runtime_switch_result_to_log<T>(
             },
         },
     };
-    append_operation_record_receipt_to(
+    append_operation_record_receipt_to_with_diagnostic(
         log,
         operation_id,
         OperationAction::SwitchRuntime,
@@ -2387,26 +3918,34 @@ fn record_runtime_switch_result_to_log<T>(
         started_at_ms,
         backups,
         counts,
+        diagnostic,
+        result.as_ref().err().map(String::as_str),
     )
 }
 
-fn record_sync_failure(
+#[allow(clippy::too_many_arguments)]
+fn record_sync_failure_with_diagnostic(
     operation_id: &str,
     status: OperationStatus,
     phase: OperationPhase,
     started_at_ms: u128,
     backups: &[BackupManifest],
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
 ) -> Result<OperationRecord, String> {
-    record_sync_failure_to_log(
+    record_sync_failure_to_log_with_diagnostic(
         &operation_log()?,
         operation_id,
         status,
         phase,
         started_at_ms,
         backups,
+        diagnostic,
+        diagnostic_error,
     )
 }
 
+#[cfg(test)]
 fn record_sync_failure_to_log(
     log: &OperationLog,
     operation_id: &str,
@@ -2415,7 +3954,30 @@ fn record_sync_failure_to_log(
     started_at_ms: u128,
     backups: &[BackupManifest],
 ) -> Result<OperationRecord, String> {
-    append_operation_record_receipt_to(
+    record_sync_failure_to_log_with_diagnostic(
+        log,
+        operation_id,
+        status,
+        phase,
+        started_at_ms,
+        backups,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_sync_failure_to_log_with_diagnostic(
+    log: &OperationLog,
+    operation_id: &str,
+    status: OperationStatus,
+    phase: OperationPhase,
+    started_at_ms: u128,
+    backups: &[BackupManifest],
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
+) -> Result<OperationRecord, String> {
+    append_operation_record_receipt_to_with_diagnostic(
         log,
         operation_id,
         OperationAction::SyncSessions,
@@ -2423,9 +3985,12 @@ fn record_sync_failure_to_log(
         started_at_ms,
         backups,
         BTreeMap::new(),
+        diagnostic,
+        diagnostic_error,
     )
 }
 
+#[cfg(test)]
 fn record_result_to_log<T>(
     log: &OperationLog,
     operation_id: &str,
@@ -2440,7 +4005,7 @@ fn record_result_to_log<T>(
         Err(error) => terminal_status(error),
     };
     let phase = operation_phase(&action, &status);
-    append_operation_record_to(
+    append_operation_record_receipt_to_with_diagnostic(
         log,
         operation_id,
         action,
@@ -2448,69 +4013,56 @@ fn record_result_to_log<T>(
         started_at_ms,
         backups,
         counts,
+        None,
+        result.as_ref().err().map(String::as_str),
     )
+    .map(|_| ())
 }
 
-fn record_success(
+fn record_success_result_with_diagnostic(
     operation_id: &str,
     action: OperationAction,
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
-) -> Option<String> {
-    record_success_result(operation_id, action, started_at_ms, backups, counts)
-        .err()
-        .map(|_| "操作已成功，但本地操作记录写入失败".to_string())
-}
-
-fn record_success_result(
-    operation_id: &str,
-    action: OperationAction,
-    started_at_ms: u128,
-    backups: &[BackupManifest],
-    counts: BTreeMap<String, usize>,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<OperationRecord, String> {
-    append_operation_record(
+    let log = operation_log().inspect_err(|error| {
+        record_diagnostic_branch(
+            diagnostic,
+            "recordingResult",
+            "commands.operation_history.open_failed",
+            error,
+        );
+    })?;
+    append_operation_record_receipt_to_with_diagnostic(
+        &log,
         operation_id,
         action,
-        OperationStatus::Succeeded,
+        OperationTerminal {
+            status: OperationStatus::Succeeded,
+            phase: OperationPhase::Complete,
+        },
         started_at_ms,
         backups,
         counts,
+        diagnostic,
+        None,
     )
 }
 
 fn terminal_status(error: &str) -> OperationStatus {
     if error.contains("rollback failed") {
         OperationStatus::RollbackFailed
-    } else if error.contains("rolled back") {
+    } else if error.contains("rolled back") || error.contains("restored the safety snapshot") {
         OperationStatus::RolledBack
     } else {
         OperationStatus::Failed
     }
 }
 
-fn append_operation_record(
-    operation_id: &str,
-    action: OperationAction,
-    status: OperationStatus,
-    started_at_ms: u128,
-    backups: &[BackupManifest],
-    counts: BTreeMap<String, usize>,
-) -> Result<OperationRecord, String> {
-    let phase = operation_phase(&action, &status);
-    append_operation_record_with_phase(
-        operation_id,
-        action,
-        status,
-        phase,
-        started_at_ms,
-        backups,
-        counts,
-    )
-}
-
-fn append_operation_record_with_phase(
+#[allow(clippy::too_many_arguments)]
+fn append_operation_record_with_phase_and_diagnostic(
     operation_id: &str,
     action: OperationAction,
     status: OperationStatus,
@@ -2518,18 +4070,31 @@ fn append_operation_record_with_phase(
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
 ) -> Result<OperationRecord, String> {
-    append_operation_record_receipt_to(
-        &operation_log()?,
+    let log = operation_log().inspect_err(|error| {
+        record_diagnostic_branch(
+            diagnostic,
+            "recordingResult",
+            "commands.operation_history.open_failed",
+            error,
+        );
+    })?;
+    append_operation_record_receipt_to_with_diagnostic(
+        &log,
         operation_id,
         action,
         OperationTerminal { status, phase },
         started_at_ms,
         backups,
         counts,
+        diagnostic,
+        diagnostic_error,
     )
 }
 
+#[cfg(test)]
 fn append_operation_record_to(
     log: &OperationLog,
     operation_id: &str,
@@ -2551,6 +4116,7 @@ fn append_operation_record_to(
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn append_operation_record_receipt_to(
     log: &OperationLog,
     operation_id: &str,
@@ -2559,6 +4125,31 @@ fn append_operation_record_receipt_to(
     started_at_ms: u128,
     backups: &[BackupManifest],
     counts: BTreeMap<String, usize>,
+) -> Result<OperationRecord, String> {
+    append_operation_record_receipt_to_with_diagnostic(
+        log,
+        operation_id,
+        action,
+        terminal,
+        started_at_ms,
+        backups,
+        counts,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_operation_record_receipt_to_with_diagnostic(
+    log: &OperationLog,
+    operation_id: &str,
+    action: OperationAction,
+    terminal: OperationTerminal,
+    started_at_ms: u128,
+    backups: &[BackupManifest],
+    counts: BTreeMap<String, usize>,
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
 ) -> Result<OperationRecord, String> {
     let record = OperationRecord {
         operation_id: operation_id.to_string(),
@@ -2573,8 +4164,120 @@ fn append_operation_record_receipt_to(
             .collect(),
         counts,
     };
-    log.append(&record)?;
+    append_durable_operation_record(log, &record, diagnostic, diagnostic_error)?;
     Ok(record)
+}
+
+fn append_durable_operation_record(
+    log: &OperationLog,
+    record: &OperationRecord,
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
+) -> Result<(), String> {
+    log.append(record).inspect_err(|error| {
+        record_diagnostic_branch(
+            diagnostic,
+            "recordingResult",
+            "commands.operation_history.append_failed",
+            error,
+        );
+    })?;
+    mirror_durable_operation_record(record, diagnostic, diagnostic_error);
+    Ok(())
+}
+
+fn mirror_durable_operation_record(
+    record: &OperationRecord,
+    diagnostic: Option<&DiagnosticOperation>,
+    diagnostic_error: Option<&str>,
+) {
+    if let Some(diagnostic) = diagnostic {
+        let _ = diagnostic.bind_operation_id(record.operation_id.clone());
+    } else if let Some(runtime) = global_runtime() {
+        mirror_durable_operation_record_to(&runtime.recorder(), record, diagnostic_error);
+    }
+}
+
+fn mirror_durable_operation_record_to(
+    recorder: &DiagnosticRecorder,
+    record: &OperationRecord,
+    diagnostic_error: Option<&str>,
+) {
+    let diagnostic = recorder.begin_operation("commands", operation_action_name(record.action));
+    mirror_durable_operation_record_to_operation(&diagnostic, record, diagnostic_error);
+}
+
+fn mirror_durable_operation_record_to_operation(
+    diagnostic: &DiagnosticOperation,
+    record: &OperationRecord,
+    diagnostic_error: Option<&str>,
+) {
+    let _ = diagnostic.bind_operation_id(record.operation_id.clone());
+    let default_message = operation_status_message(record.status);
+    let _ = diagnostic.terminal(
+        diagnostic_terminal_status(record.status),
+        Some(operation_phase_name(record.phase)),
+        operation_status_error_code(record.status),
+        diagnostic_error.or(default_message),
+        empty_context(),
+    );
+}
+
+fn operation_action_name(action: OperationAction) -> &'static str {
+    match action {
+        OperationAction::ImportAccount => "importAccount",
+        OperationAction::SaveRelay => "saveRelay",
+        OperationAction::VerifyRelay => "verifyRelay",
+        OperationAction::SwitchRuntime => "switchRuntime",
+        OperationAction::IncrementalSync => "incrementalSync",
+        OperationAction::SyncSessions => "syncSessions",
+        OperationAction::DeleteSessions => "deleteSessions",
+        OperationAction::RestoreVisibility => "restoreVisibility",
+        OperationAction::CreateBackup => "createBackup",
+        OperationAction::DeleteBackup => "deleteBackup",
+        OperationAction::RestoreBackup => "restoreBackup",
+        OperationAction::CleanupCheckpoints => "cleanupCheckpoints",
+        OperationAction::InstallSkill => "installSkill",
+        OperationAction::ConfigureSkill => "configureSkill",
+    }
+}
+
+fn operation_phase_name(phase: OperationPhase) -> &'static str {
+    match phase {
+        OperationPhase::Preflight => "preflight",
+        OperationPhase::Backup => "backup",
+        OperationPhase::Apply => "apply",
+        OperationPhase::Verify => "verify",
+        OperationPhase::Complete => "complete",
+        OperationPhase::Rollback => "rollback",
+    }
+}
+
+fn diagnostic_terminal_status(status: OperationStatus) -> DiagnosticTerminalStatus {
+    match status {
+        OperationStatus::Succeeded => DiagnosticTerminalStatus::Succeeded,
+        OperationStatus::Failed => DiagnosticTerminalStatus::Failed,
+        OperationStatus::RolledBack => DiagnosticTerminalStatus::RolledBack,
+        OperationStatus::RollbackFailed => DiagnosticTerminalStatus::RollbackFailed,
+    }
+}
+
+fn operation_status_error_code(status: OperationStatus) -> Option<&'static str> {
+    match status {
+        OperationStatus::Succeeded => None,
+        OperationStatus::Failed => Some("operation.durable_terminal.failed"),
+        OperationStatus::RolledBack => Some("operation.durable_terminal.rolled_back"),
+        OperationStatus::RollbackFailed => Some("operation.durable_terminal.rollback_failed"),
+    }
+}
+
+fn operation_status_message(status: OperationStatus) -> Option<&'static str> {
+    match status {
+        OperationStatus::Succeeded => None,
+        OperationStatus::Failed => Some("operation reached a failed durable terminal"),
+        OperationStatus::RolledBack => Some("operation failed and was rolled back"),
+        OperationStatus::RollbackFailed => Some("operation failed and rollback did not complete"),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2599,6 +4302,7 @@ fn finish_skill_operation(
     action: OperationAction,
     started_at_ms: u128,
     result: Result<SkillMutationReceipt, String>,
+    diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<SkillMutationReceipt, String> {
     match result {
         Ok(mut receipt) => {
@@ -2612,7 +4316,17 @@ fn finish_skill_operation(
                 backup_dirs: receipt.backup_dir.clone().into_iter().collect(),
                 counts: BTreeMap::from([("skillsChanged".to_string(), 1)]),
             };
-            if operation_log().and_then(|log| log.append(&record)).is_err() {
+            let durable_result = operation_log()
+                .inspect_err(|error| {
+                    record_diagnostic_branch(
+                        diagnostic,
+                        "recordingResult",
+                        "commands.operation_history.open_failed",
+                        error,
+                    );
+                })
+                .and_then(|log| append_durable_operation_record(&log, &record, diagnostic, None));
+            if durable_result.is_err() {
                 receipt
                     .warnings
                     .push("操作已成功，但本地操作记录写入失败".to_string());
@@ -2628,8 +4342,16 @@ fn finish_skill_operation(
                 }
                 OperationStatus::Succeeded => OperationPhase::Complete,
             };
-            if let Ok(log) = operation_log() {
-                let _ = log.append(&OperationRecord {
+            let log = operation_log().inspect_err(|log_error| {
+                record_diagnostic_branch(
+                    diagnostic,
+                    "recordingResult",
+                    "commands.operation_history.open_failed",
+                    log_error,
+                );
+            });
+            if let Ok(log) = log {
+                let record = OperationRecord {
                     operation_id: attempt_id,
                     action,
                     status,
@@ -2638,7 +4360,8 @@ fn finish_skill_operation(
                     completed_at_ms: timestamp_millis()?,
                     backup_dirs: Vec::new(),
                     counts: BTreeMap::new(),
-                });
+                };
+                let _ = append_durable_operation_record(&log, &record, diagnostic, Some(&error));
             }
             Err(error)
         }
@@ -2665,7 +4388,16 @@ mod tests {
             create_state_checkpoint_with_paths, CheckpointRole,
         },
         codex_paths::resolve_user_codex_paths,
-        operation_log::{OperationAction, OperationLog, OperationPhase, OperationStatus},
+        diagnostics::{
+            DiagnosticEventKind, DiagnosticRecorder, DiagnosticSanitizer, DiagnosticStore,
+            DiagnosticTerminalStatus, SanitizerRoots,
+        },
+        mobile_continuity::{
+            MobileContinuityItem, MobileContinuityItemStatus, MobileContinuityStatus,
+        },
+        operation_log::{
+            OperationAction, OperationLog, OperationPhase, OperationRecord, OperationStatus,
+        },
         process_control::CodexProcess,
         session_incremental::IncrementalSessionSyncStatus,
         session_manager::SessionMutationResult,
@@ -2673,33 +4405,91 @@ mod tests {
 
     use super::{
         acquire_mutation_lock_at, after_capacity_preflight, append_operation_record_to,
-        capture_chatgpt_launch_target_once, checkpoint_cleanup_counts, checkpoint_cleanup_terminal,
+        capture_chatgpt_launch_target_once, checkpoint_cleanup_counts,
+        checkpoint_cleanup_diagnostic_status, checkpoint_cleanup_terminal,
         cleanup_automatic_checkpoints, close_codex_processes,
-        close_runtime_processes_with_progress, create_full_backup, default_codex_home_from_env,
-        delete_backup, delete_backup_at, emit_runtime_switch_terminal,
-        ensure_codex_closed_from_processes, ensure_codex_paths_unchanged,
+        close_runtime_processes_with_progress, correlate_mutation_result, create_full_backup,
+        default_codex_home_from_env, delete_backup, delete_backup_at,
+        diagnostic_status_for_command_error, diagnostic_terminal_status,
+        emit_runtime_switch_progress_diagnostic, emit_runtime_switch_terminal,
+        emit_runtime_switch_terminal_diagnostic, emit_session_sync_progress_diagnostic,
+        encode_mutation_error, ensure_codex_closed_from_processes, ensure_codex_paths_unchanged,
         failed_runtime_switch_checkpoints_are_releasable, finish_session_mutation_with_log,
         get_app_status, incremental_chatgpt_launch_allowed, inspect_checkpoint_storage,
         launch_chatgpt, launch_chatgpt_after_durable_terminal, list_backups, list_backups_at,
-        preflight_before_process_gate, prepare_app_exit_at, record_result_to_log,
-        record_runtime_switch_result_to_log, record_sync_failure_to_log,
+        mirror_durable_operation_record, mirror_durable_operation_record_to,
+        mobile_publication_terminal, preflight_before_process_gate, prepare_app_exit_at,
+        record_background_result_to, record_chatgpt_launch_diagnostic, record_diagnostic_terminal,
+        record_post_mutation_launch_issue, record_result_to_log,
+        record_runtime_switch_result_to_log, record_runtime_switch_result_to_log_with_diagnostic,
+        record_sync_failure_to_log, record_sync_failure_to_log_with_diagnostic,
         release_transient_checkpoints, should_run_legacy_incremental_after_route,
         successful_switch_requests_chatgpt_launch, switch_runtime, sync_all_sessions,
         validate_backup_selection, verify_relay_for_switch, BackupDeleteReceipt,
         BackupReceiptSummary, ChatGptLaunchReceipt, ChatGptLaunchStatus, CheckpointCleanupReceipt,
         CreateFullBackupReceipt, IncrementalSessionRun, MutationCoordinator, OperationTerminal,
         RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
-        SessionSyncProgress, MAX_LISTED_FULL_BACKUPS,
+        SessionSyncPhase, SessionSyncProgress, MAX_LISTED_FULL_BACKUPS,
+        MUTATION_ERROR_ENVELOPE_PREFIX,
     };
 
     #[cfg(windows)]
     use super::open_mutation_lock_file;
+
+    fn diagnostic_recorder(root: &std::path::Path) -> DiagnosticRecorder {
+        let store = DiagnosticStore::new(
+            root.join("diagnostics"),
+            "commands-test-session".to_string(),
+            DiagnosticSanitizer::new(SanitizerRoots::default()),
+        );
+        DiagnosticRecorder::new(store, "commands-test-session".to_string())
+    }
 
     #[test]
     fn app_status_does_not_report_the_retired_scaffold_phase() {
         assert_eq!(get_app_status().app_name, "ChatGPT Switch");
         assert_eq!(get_app_status().phase, "hardened-mvp");
         assert_eq!(get_app_status().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn mutation_error_envelope_preserves_message_and_prefers_durable_correlation() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let attempt = recorder.begin_operation("commands", "saveRelay");
+        let attempt_id = attempt.attempt_id();
+        let message = "relay save failed: original business message";
+
+        let encoded =
+            correlate_mutation_result::<()>(Err(message.to_string()), Some(&attempt)).unwrap_err();
+        let payload = encoded
+            .strip_prefix(MUTATION_ERROR_ENVELOPE_PREFIX)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["message"], message);
+        assert_eq!(value["operationId"], attempt_id);
+
+        let durable = recorder.begin_operation("commands", "installSkill");
+        assert!(durable.bind_operation_id("install-skill-attempt-1780000000000-42-1"));
+        let encoded =
+            correlate_mutation_result::<()>(Err(message.to_string()), Some(&durable)).unwrap_err();
+        let payload = encoded
+            .strip_prefix(MUTATION_ERROR_ENVELOPE_PREFIX)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["message"], message);
+        assert_eq!(
+            value["operationId"],
+            "install-skill-attempt-1780000000000-42-1"
+        );
+    }
+
+    #[test]
+    fn mutation_error_envelope_rejects_untrusted_correlation_shapes() {
+        assert!(encode_mutation_error("failed", "../outside").is_none());
+        assert!(encode_mutation_error("failed", "with space").is_none());
+        assert!(encode_mutation_error("failed", &"a".repeat(161)).is_none());
+        assert!(encode_mutation_error(&"x".repeat(16 * 1024 + 1), "attempt-safe").is_none());
     }
 
     #[test]
@@ -2721,6 +4511,14 @@ mod tests {
         assert_eq!(counts["failedCount"], 0);
         assert_eq!(terminal.status, OperationStatus::Succeeded);
         assert_eq!(terminal.phase, OperationPhase::Complete);
+        assert_eq!(
+            diagnostic_terminal_status(terminal.status),
+            DiagnosticTerminalStatus::Succeeded
+        );
+        assert_eq!(
+            checkpoint_cleanup_diagnostic_status(&receipt, true),
+            DiagnosticTerminalStatus::Succeeded
+        );
 
         receipt.failed_count = 1;
         receipt.reclaimed_count = 3;
@@ -2730,6 +4528,100 @@ mod tests {
         assert_eq!(counts["failedCount"], 1);
         assert_eq!(terminal.status, OperationStatus::Failed);
         assert_eq!(terminal.phase, OperationPhase::Apply);
+        assert_eq!(
+            diagnostic_terminal_status(terminal.status),
+            DiagnosticTerminalStatus::Failed
+        );
+        assert_eq!(
+            checkpoint_cleanup_diagnostic_status(&receipt, true),
+            DiagnosticTerminalStatus::Partial
+        );
+        assert_eq!(
+            checkpoint_cleanup_diagnostic_status(&receipt, false),
+            DiagnosticTerminalStatus::Partial
+        );
+    }
+
+    #[test]
+    fn manual_publication_terminal_uses_only_the_target_item() {
+        let mut status = MobileContinuityStatus {
+            enabled: true,
+            notice_pending: false,
+            initialized_at_ms: 1,
+            queued: 0,
+            publishing: 0,
+            remote_published: 1,
+            partial: 0,
+            conflict: 1,
+            needs_manual: 1,
+            items: vec![
+                MobileContinuityItem {
+                    thread_id: "historical-item".to_string(),
+                    status: MobileContinuityItemStatus::NeedsManual,
+                    attempts: 1,
+                    next_retry_at_ms: None,
+                    updated_at_ms: 1,
+                    failure_category: None,
+                    source_fingerprint: None,
+                },
+                MobileContinuityItem {
+                    thread_id: "target-item".to_string(),
+                    status: MobileContinuityItemStatus::RemotePublished,
+                    attempts: 1,
+                    next_retry_at_ms: None,
+                    updated_at_ms: 1,
+                    failure_category: None,
+                    source_fingerprint: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            mobile_publication_terminal(&status, "target-item"),
+            DiagnosticTerminalStatus::Succeeded
+        );
+        status.items[1].status = MobileContinuityItemStatus::Conflict;
+        assert_eq!(
+            mobile_publication_terminal(&status, "target-item"),
+            DiagnosticTerminalStatus::Blocked
+        );
+        status.items[1].status = MobileContinuityItemStatus::Partial;
+        assert_eq!(
+            mobile_publication_terminal(&status, "target-item"),
+            DiagnosticTerminalStatus::Partial
+        );
+        assert_eq!(
+            mobile_publication_terminal(&status, "missing-item"),
+            DiagnosticTerminalStatus::Partial
+        );
+    }
+
+    #[test]
+    fn user_preflight_gates_are_typed_as_blocked() {
+        assert_eq!(
+            diagnostic_status_for_command_error("backup deletion requires explicit confirmation"),
+            DiagnosticTerminalStatus::Blocked
+        );
+        assert_eq!(
+            diagnostic_status_for_command_error(
+                "another ChatGPT Switch mutation is already in progress"
+            ),
+            DiagnosticTerminalStatus::Blocked
+        );
+        assert_eq!(
+            diagnostic_status_for_command_error("API key is required for the first save"),
+            DiagnosticTerminalStatus::Blocked
+        );
+        assert_eq!(
+            diagnostic_status_for_command_error("disk write failed"),
+            DiagnosticTerminalStatus::Failed
+        );
+        assert_eq!(
+            diagnostic_status_for_command_error(
+                "backup restore failed: injected; restored the safety snapshot"
+            ),
+            DiagnosticTerminalStatus::RolledBack
+        );
     }
 
     #[test]
@@ -2831,6 +4723,85 @@ mod tests {
         }
 
         assert_future(launch_chatgpt());
+    }
+
+    #[test]
+    fn typed_ok_chatgpt_launch_failures_are_diagnostic_failures() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let failed = recorder.begin_operation("commands", "launchChatgpt");
+        let failed_result = Ok(ChatGptLaunchReceipt {
+            status: ChatGptLaunchStatus::Failed,
+            message: Some("Windows activation failed".to_string()),
+        });
+        record_chatgpt_launch_diagnostic(Some(&failed), &failed_result);
+
+        let blocked = recorder.begin_operation("commands", "launchChatgpt");
+        let blocked_result = Ok(ChatGptLaunchReceipt {
+            status: ChatGptLaunchStatus::Blocked,
+            message: Some("launch remained blocked".to_string()),
+        });
+        record_chatgpt_launch_diagnostic(Some(&blocked), &blocked_result);
+
+        let terminals = recorder
+            .store()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(
+            terminals[0].terminal_status,
+            Some(DiagnosticTerminalStatus::Failed)
+        );
+        assert_eq!(
+            terminals[1].terminal_status,
+            Some(DiagnosticTerminalStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn typed_ok_post_mutation_launch_failures_are_partial_or_blocked() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let failed = recorder.begin_operation("commands", "switchRuntime");
+        assert!(record_post_mutation_launch_issue(
+            Some(&failed),
+            &ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::Failed,
+                message: Some("Windows activation failed".to_string()),
+            },
+            "commands.switch_runtime.launch_failed",
+            "commands.switch_runtime.launch_blocked",
+        ));
+        let blocked = recorder.begin_operation("commands", "syncAllSessions");
+        assert!(record_post_mutation_launch_issue(
+            Some(&blocked),
+            &ChatGptLaunchReceipt {
+                status: ChatGptLaunchStatus::Blocked,
+                message: Some("launch remained blocked".to_string()),
+            },
+            "commands.sync_all_sessions.launch_failed",
+            "commands.sync_all_sessions.launch_blocked",
+        ));
+
+        let terminals = recorder
+            .store()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(
+            terminals[0].terminal_status,
+            Some(DiagnosticTerminalStatus::Partial)
+        );
+        assert_eq!(
+            terminals[1].terminal_status,
+            Some(DiagnosticTerminalStatus::Blocked)
+        );
     }
 
     #[test]
@@ -3215,6 +5186,390 @@ mod tests {
         assert!(events[1]["timestampMs"].as_u64().unwrap() > 0);
         assert_eq!(events[2]["outcome"], "rolledBack");
         assert_eq!(events[3]["outcome"], "rollbackFailed");
+    }
+
+    #[test]
+    fn runtime_switch_progress_carries_attempt_then_durable_correlation() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let diagnostic = recorder.begin_operation("commands", "switchRuntime");
+        let attempt_id = diagnostic.attempt_id();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let on_progress = Channel::<RuntimeSwitchProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("runtime switch progress must be JSON");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+
+        emit_runtime_switch_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            RuntimeSwitchPhase::LoadingRuntime,
+            None,
+        );
+        assert!(diagnostic.bind_operation_id("switch-runtime-durable"));
+        emit_runtime_switch_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            RuntimeSwitchPhase::Verifying,
+            None,
+        );
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(events[0]["operationId"], attempt_id);
+        assert_eq!(events[1]["operationId"], "switch-runtime-durable");
+        let diagnostics = recorder.store().read_events().unwrap();
+        let phases = diagnostics
+            .iter()
+            .filter(|event| event.event_kind == DiagnosticEventKind::OperationPhase)
+            .filter_map(|event| event.phase.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(phases, vec!["loadingRuntime", "verifying"]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_sync_progress_carries_attempt_then_durable_correlation() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let diagnostic = recorder.begin_operation("commands", "syncAllSessions");
+        let attempt_id = diagnostic.attempt_id();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let on_progress = Channel::<SessionSyncProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("session sync progress must be JSON");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            SessionSyncPhase::Preparing,
+            None,
+        );
+        assert!(diagnostic.bind_operation_id("sync-sessions-durable"));
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            SessionSyncPhase::BackingUp,
+            None,
+        );
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(events[0]["operationId"], attempt_id);
+        assert_eq!(events[1]["operationId"], "sync-sessions-durable");
+        let diagnostics = recorder.store().read_events().unwrap();
+        let phases = diagnostics
+            .iter()
+            .filter(|event| event.event_kind == DiagnosticEventKind::OperationPhase)
+            .filter_map(|event| event.phase.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(phases, vec!["preparing", "backingUp"]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_switch_log_append_failure_keeps_attempt_correlation() {
+        let temp = tempdir().unwrap();
+        let invalid_log_path = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let diagnostic = recorder.begin_operation("commands", "switchRuntime");
+        let attempt_id = diagnostic.attempt_id();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let captured = progress.clone();
+        let on_progress = Channel::<RuntimeSwitchProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("runtime switch progress must be JSON");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+        let business_result: Result<(), String> = Err("injected switch failure".to_string());
+
+        emit_runtime_switch_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            RuntimeSwitchPhase::RecordingResult,
+            None,
+        );
+        let append_result = record_runtime_switch_result_to_log_with_diagnostic(
+            &OperationLog::new(invalid_log_path.path().to_path_buf()),
+            "switch-runtime-not-durable",
+            1,
+            &business_result,
+            &[],
+            std::collections::BTreeMap::new(),
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+            Some(&diagnostic),
+        );
+        emit_runtime_switch_terminal_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            &business_result,
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+        );
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Failed,
+            "preflight",
+            Some("commands.switch_runtime.failed"),
+            business_result.as_ref().err().map(String::as_str),
+        );
+
+        assert!(append_result.is_err());
+        assert_eq!(business_result, Err("injected switch failure".to_string()));
+        assert_eq!(diagnostic.operation_id(), None);
+        assert!(diagnostic.is_terminal_recorded());
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert!(progress
+            .iter()
+            .all(|event| event["operationId"] == attempt_id));
+        let events = recorder.store().read_events().unwrap();
+        assert!(events.iter().all(|event| event.operation_id.is_none()));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_kind == DiagnosticEventKind::OperationBound));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_sync_log_append_failure_keeps_attempt_correlation() {
+        let temp = tempdir().unwrap();
+        let invalid_log_path = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let diagnostic = recorder.begin_operation("commands", "syncAllSessions");
+        let attempt_id = diagnostic.attempt_id();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let captured = progress.clone();
+        let on_progress = Channel::<SessionSyncProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("session sync progress must be JSON");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+        let business_result: Result<(), String> = Err("injected sync failure".to_string());
+
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            SessionSyncPhase::RecordingResult,
+            None,
+        );
+        let append_result = record_sync_failure_to_log_with_diagnostic(
+            &OperationLog::new(invalid_log_path.path().to_path_buf()),
+            "sync-sessions-not-durable",
+            OperationStatus::Failed,
+            OperationPhase::Apply,
+            1,
+            &[],
+            Some(&diagnostic),
+            business_result.as_ref().err().map(String::as_str),
+        );
+        emit_session_sync_progress_diagnostic(
+            &on_progress,
+            Some(&diagnostic),
+            SessionSyncPhase::Failed,
+            business_result.as_ref().err().cloned(),
+        );
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Failed,
+            "apply",
+            Some("commands.sync_all_sessions.failed"),
+            business_result.as_ref().err().map(String::as_str),
+        );
+
+        assert!(append_result.is_err());
+        assert_eq!(business_result, Err("injected sync failure".to_string()));
+        assert_eq!(diagnostic.operation_id(), None);
+        assert!(diagnostic.is_terminal_recorded());
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert!(progress
+            .iter()
+            .all(|event| event["operationId"] == attempt_id));
+        let events = recorder.store().read_events().unwrap();
+        assert!(events.iter().all(|event| event.operation_id.is_none()));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_kind == DiagnosticEventKind::OperationBound));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_operation_mirror_preserves_audit_schema_and_records_one_terminal() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let record = OperationRecord {
+            operation_id: "verify-relay-durable".to_string(),
+            action: OperationAction::VerifyRelay,
+            status: OperationStatus::Failed,
+            phase: OperationPhase::Verify,
+            started_at_ms: 10,
+            completed_at_ms: 20,
+            backup_dirs: Vec::new(),
+            counts: std::collections::BTreeMap::new(),
+        };
+        let serialized_before = serde_json::to_value(&record).unwrap();
+        let secret_error = "request failed with sk-1234567890abcdefghijklmnop";
+
+        mirror_durable_operation_record_to(&recorder, &record, Some(secret_error));
+
+        assert_eq!(serde_json::to_value(&record).unwrap(), serialized_before);
+        assert!(serialized_before.get("safeMessage").is_none());
+        let events = recorder.store().read_events().unwrap();
+        assert_eq!(events[0].event_kind, DiagnosticEventKind::OperationStarted);
+        assert_eq!(events[1].event_kind, DiagnosticEventKind::OperationBound);
+        assert_eq!(events[2].event_kind, DiagnosticEventKind::OperationTerminal);
+        assert_eq!(
+            events[2].operation_id.as_deref(),
+            Some("verify-relay-durable")
+        );
+        assert!(!events[2]
+            .safe_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sk-1234567890abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn live_durable_mirror_binds_without_duplicating_the_command_terminal() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let diagnostic = recorder.begin_operation("commands", "syncAllSessions");
+        let record = OperationRecord {
+            operation_id: "sync-sessions-durable".to_string(),
+            action: OperationAction::SyncSessions,
+            status: OperationStatus::Succeeded,
+            phase: OperationPhase::Complete,
+            started_at_ms: 10,
+            completed_at_ms: 20,
+            backup_dirs: Vec::new(),
+            counts: std::collections::BTreeMap::new(),
+        };
+
+        mirror_durable_operation_record(&record, Some(&diagnostic), None);
+        assert!(!diagnostic.is_terminal_recorded());
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        );
+        record_diagnostic_terminal(
+            Some(&diagnostic),
+            DiagnosticTerminalStatus::Succeeded,
+            "complete",
+            None,
+            None,
+        );
+
+        let events = recorder.store().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == DiagnosticEventKind::OperationTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn background_queries_record_only_failures_and_use_the_central_sanitizer() {
+        let temp = tempdir().unwrap();
+        let recorder = diagnostic_recorder(temp.path());
+        let success: Result<(), String> = Ok(());
+        record_background_result_to(
+            &recorder,
+            "scanRuntimeStatus",
+            "commands.scan_runtime_status.failed",
+            &success,
+        );
+        assert!(recorder.store().read_events().unwrap().is_empty());
+
+        let failure: Result<(), String> =
+            Err("failed with sk-1234567890abcdefghijklmnop".to_string());
+        record_background_result_to(
+            &recorder,
+            "scanRuntimeStatus",
+            "commands.scan_runtime_status.failed",
+            &failure,
+        );
+
+        let events = recorder.store().read_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, DiagnosticEventKind::BackgroundFailure);
+        assert!(!events[0]
+            .safe_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sk-1234567890abcdefghijklmnop"));
     }
 
     #[test]

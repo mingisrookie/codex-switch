@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { KeyRound, Save, X } from 'lucide-react';
+import { DiagnosticExportAction } from './DiagnosticPanel';
 import type { RelayRuntimeInput, RuntimeMetadata } from './types';
+
+type RelaySubmitFailure = { message: string; operationId?: string };
 
 type RelayRuntimeDialogProps = {
   runtime: RuntimeMetadata | null;
   fallbackModel: string;
   busy: boolean;
-  submitError: string | null;
+  submitError: RelaySubmitFailure | null;
   onCancel: () => void;
   onSave: (input: RelayRuntimeInput) => void | Promise<unknown>;
 };
@@ -80,9 +83,10 @@ export function RelayRuntimeDialog({ runtime, fallbackModel, busy, submitError, 
 
   const previewUrl = normalizePreviewUrl(baseUrl);
   const insecureRemote = previewUrl?.protocol === 'http:' && !isLoopbackHost(previewUrl.hostname);
-  const visibleError = insecureRemote
+  const localError = insecureRemote
     ? '远程中转站必须使用 HTTPS；HTTP 仅允许 localhost 或回环地址'
-    : error ?? submitError;
+    : error;
+  const visibleError = localError ?? submitError?.message ?? null;
 
   return (
       <section
@@ -125,6 +129,9 @@ export function RelayRuntimeDialog({ runtime, fallbackModel, busy, submitError, 
             />
           </label>
           {visibleError ? <p className="form-error" id="relay-config-error" role="alert">{visibleError}</p> : null}
+          {!localError && submitError?.operationId ? (
+            <DiagnosticExportAction operationId={submitError.operationId} />
+          ) : null}
           <p className="safe-note" id="relay-config-note">Key 仅提交给本机后端加密保存，不会回填到页面。</p>
           <div className="form-actions">
             <button type="button" className="ghost-button inline" onClick={cancel} disabled={busy}>

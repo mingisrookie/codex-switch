@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.6 - 2026-08-09（草稿）
+
+> 本节记录当前功能分支的未发布目标，不代表 GitHub Release 已完成。PR/main/tag CI、annotated tag、GitHub Release/Latest、唯一公开资产回下载合同和正式 `v0.2.5 -> v0.2.6` 一键更新证据，待主任务最终闭环后按真实结果补充。
+
+### Added
+
+- 新增独立于 durable `logs/operations.jsonl` 的诊断事件管线：所有用户主动 mutation 都在 lock/spawn/早退前从 command boundary 创建随机 attempt，记录 start/真实 phase/关键安全 branch/typed terminal；拿到 durable operation ID 后只绑定关联，等命令后置步骤完成再按 cleanup/mobile/launch/block/rollback 等真实语义封闭 terminal。operation ledger 持久化失败会记录安全 branch/typed 结果，但诊断始终 fail-open，不改变原业务返回。无 durable record 的 update/process/continuity/exit 也覆盖完整 lifecycle；普通后台成功刷新不写持久诊断，只有失败进入事件管线，前端未处理 `error` / `unhandledrejection` 只提交固定分类和安全文案。
+- 新增 `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 有界 store。事件在落盘前执行字段 allowlist、长度/深度/数量限制和集中 sanitizer；Windows 同一诊断根的 append/read/status/prune/clear 使用 root-scoped named mutex 跨进程协调，默认总量上限 10 MiB、单段 512 KiB。segment 按文件名中的创建时间轮转/prune，读取再按 event `timestamp` 精确过滤最近 14 天；容量可让实际窗口更短。dirty tail 会封存并换段，内部损坏、未知 schema、祖先 reparse 或非 regular segment fail closed；事件已 `sync_data` 后的 post-prune 失败不否定 durable append，也不改变应用启动或业务 mutation 结果。
+- 新增启动生命周期与 panic best-effort 记录：Windows session/attempt ID 使用 OS CSPRNG、`CoCreateGuid`、进程局部 fallback 的降级链；尽早写入带 PID/timestamp unit 和 best-effort process creation stamp 的 `sessionStarted`，在 Tauri Ready/正常 Exit 记录 `appReady` / `sessionEnded`，下一次启动在 PID + creation stamp 可用时排除仍存活实例和 PID reuse 后再判断 `previousSessionUnclean`。operation terminal 真正持久化后封闭关联状态，拒绝迟到 phase/branch/重复 terminal；release `panic = "abort"` 保持不变，不引入 watchdog 或崩溃恢复。
+- 顶部工具栏新增页面内“诊断与支持”面板，显示可用性、事件数、占用和保留上限，并提供“导出最近诊断”“打开日志目录”和只清理诊断事件的确认流程。已接入且具有真实关联 ID 的失败面可直接“导出本次诊断”；两个入口共用同一后端选择、脱敏与打包逻辑。
+- 新增固定五文件诊断 ZIP：`README.txt`、`manifest.json`、`diagnostics.jsonl`、脱敏后的 `operations.jsonl` 子集和 `health.json`。manifest 记录版本、时区化导出时间、选择窗口、脱敏策略、负载 bytes/SHA-256 与 unavailable/warning，并以 `timestampUnit = unixEpochMilliseconds` 明确事件 `timestamp` 的 Unix epoch 毫秒单位；ZIP 在发布前后执行 allowlist、hash 和敏感形态自检。
+- 默认导出使用 Windows `FOLDERID_Downloads` Known Folder 解析真实下载目录，以 `ChatGPT-Switch-Diagnostics-<local-timestamp>.zip` 保存。staging 与目标位于同一目录，最终使用 write-through、no-clobber 原子发布；同名时追加数字后缀且不覆盖旧包，成功后可打开所在位置。下载目录失败后，用户可显式重试或主动改存固定的 `%APPDATA%\codex-switch\diagnostic-exports`；不会静默 fallback，也不接受任意路径。
+- `health.json` 新增只读 best-effort collector：记录应用/平台、存储摘要、当前 route/auth mode 结构、受管 ChatGPT/独立 Codex 进程计数，以及四个受管 SQLite 的 present/readable/bytes/`schema_version`；采集失败逐项标记 unavailable。
+
+### Security and boundaries
+
+- 诊断事件落盘前脱敏，导出时再次删除禁用字段、替换受管路径/身份字面值并扫描秘密形态和未知绝对路径。默认包不包含凭据、token、Authorization、聊天/会话正文、原始 JSONL/SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、用户名或稳定设备 ID。
+- `operations.jsonl` 的 schema、严格解析、原子整文件发布和检查点清理证据保持不变；诊断导出只读并生成去掉备份路径的相关子集。诊断轮转、导出和清除不取得 mutation guard，也不删除操作历史、备份、会话、配置或凭据。
+- Known Folder 解析或写入失败时先返回页面内导出错误；只有用户点击“改存应用诊断目录”才写固定备用目录，不会自动改存 APPDATA、桌面或其他位置。默认与备用导出都不覆盖原业务失败/成功终态。
+- health collector 只输出结构化摘要与计数，不输出进程命令行、完整配置/认证内容或 SQLite 数据；无法读取的 Windows 版本、route 状态、进程 inventory 或单库 schema 信息必须逐项 unavailable，不伪造空健康状态。
+- diagnostics named mutex 使用 Windows `Local\` 命名空间和词法规范化 root 哈希：同一登录会话/同一路径标识可协调，跨登录会话或同目录不同路径别名不保证共享锁；14 天窗口依赖系统墙钟，大幅回拨会影响保留判断。非 Windows 只提供进程内锁和非稳定 ID fallback，不属于当前正式交付目标。
+- exporter 在正常返回/错误 unwind 时尽力删除同目录 staging；若进程在最终发布前硬崩溃，Downloads 或固定备用目录仍可能留下 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`。“清除诊断日志”只删 event segments，不负责清理这些 staging 或已导出 ZIP。
+- panic hook 只能尽力保留进程仍有机会执行时的最小事件；访问冲突、强制结束、断电、硬卡死和其他来不及落盘的硬崩溃不在捕获保证内。`previousSessionUnclean` 只表示缺少 clean terminal，不能单独证明根因。
+
+### Validation and release status
+
+- 发布前诊断专项门禁必须覆盖 schema/sanitizer/路径 tokenization、每段尾记录截断/dirty tail 封存、segment 创建时间轮转与 event timestamp 14 天精确过滤、10 MiB 容量、Windows root named mutex 并发、schema/reparse/clear 边界、`operations.jsonl` byte-exact 分离、生命周期/panic、health 的只读/逐项 unavailable、Known Folder 失败、用户显式备用目录、staging 正常清理/硬崩溃残余边界、文件名冲突/no-clobber、ZIP 五文件/hash/self-check，以及前端面板、失败导出、焦点恢复和 390px 可达性。
+- 必须在隔离 `APPDATA` / `CODEX_HOME` 中完成故障注入和最终 ZIP 外部检查，证明敏感字段、用户名/机器名、原始绝对路径和业务正文均未进入包；再用真实 packed `codex-switch.exe` 完成导出 UI/E2E 与 release contract。
+- 诊断后端收敛快照上，`cargo check --manifest-path src-tauri/Cargo.toml --lib` 已通过；定向命令 `cargo test --manifest-path src-tauri/Cargo.toml diagnostics:: -- --nocapture` 为 `51 passed; 0 failed`，diagnostics owned Rust 文件的 `rustfmt --check` 也通过。这些只证明该快照的 lib 编译/diagnostics 定向回归，最终组合工作树仍须重跑；它们不代表前端、完整 Rust 门禁、真实 EXE 或发布闭环。
+- 冻结 `commands.rs` 快照上，`cargo test --manifest-path src-tauri/Cargo.toml commands` 为 `60 passed; 0 failed`，`cargo check --manifest-path src-tauri/Cargo.toml --lib`、`cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`、`rustfmt --edition 2021 --check src-tauri/src/commands.rs` 与 scoped `git diff --check` 均通过；最终组合工作树仍须重跑完整门禁。
+- 当前不记录虚构的全量测试数、本地/CI 资产 hash、GitHub Release、Latest 或 updater 成功。只有独立 reviewer PASS、本地全门禁、PR/main/tag CI、唯一 tag-CI packed 资产、公开回下载一致性和正式 `v0.2.5 -> v0.2.6` updater smoke 均完成后，才能把本节从草稿改为发布记录。
+
 ## v0.2.5 - 2026-08-01
 
 ### Fixed

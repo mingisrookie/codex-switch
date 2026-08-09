@@ -67,6 +67,24 @@ where
     result
 }
 
+pub fn atomic_publish_new(source: &Path, target: &Path) -> Result<bool, String> {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| "atomic publish source must have a parent directory".to_string())?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| "atomic publish target must have a parent directory".to_string())?;
+    if source_parent != target_parent {
+        return Err("atomic publish paths must share a parent directory".to_string());
+    }
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("failed to inspect atomic publish source: {error}"))?;
+    if !source_metadata.file_type().is_file() {
+        return Err("atomic publish source must be a regular file".to_string());
+    }
+    publish_new_path(source, target)
+}
+
 pub fn atomic_rewrite<F>(path: &Path, writer: F) -> Result<(), String>
 where
     F: FnOnce(&mut File) -> Result<(), String>,
@@ -213,13 +231,60 @@ fn replace_path(source: &Path, target: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to atomically replace file: {error}"))
 }
 
+#[cfg(windows)]
+fn publish_new_path(source: &Path, target: &Path) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let (source, target) = windows_api_paths(source, target)?;
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let ok = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(80 | 183)) {
+        Ok(false)
+    } else {
+        Err(format!("failed to atomically publish new file: {error}"))
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_new_path(source: &Path, target: &Path) -> Result<bool, String> {
+    match fs::hard_link(source, target) {
+        Ok(()) => {
+            fs::remove_file(source)
+                .map_err(|error| format!("failed to remove published staging file: {error}"))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(format!("failed to atomically publish new file: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use std::io::Write;
 
-    use super::{atomic_create, atomic_write, walk_jsonl_files};
+    use super::{atomic_create, atomic_publish_new, atomic_write, walk_jsonl_files};
 
     #[test]
     fn jsonl_walk_propagates_directory_errors() {
@@ -245,6 +310,35 @@ mod tests {
 
         assert!(!created);
         assert_eq!(std::fs::read(&target).unwrap(), b"live");
+    }
+
+    #[test]
+    fn atomic_publish_new_moves_a_staged_file_without_replacement() {
+        let temp = tempdir().unwrap();
+        let staged = temp.path().join(".diagnostics.tmp");
+        let target = temp.path().join("diagnostics.zip");
+        std::fs::write(&staged, b"complete archive").unwrap();
+
+        assert!(atomic_publish_new(&staged, &target).unwrap());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete archive");
+
+        let second = temp.path().join(".diagnostics-second.tmp");
+        std::fs::write(&second, b"must not replace").unwrap();
+        assert!(!atomic_publish_new(&second, &target).unwrap());
+        assert!(second.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete archive");
+    }
+
+    #[test]
+    fn atomic_publish_new_rejects_cross_directory_sources() {
+        let temp = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let staged = temp.path().join(".diagnostics.tmp");
+        std::fs::write(&staged, b"complete archive").unwrap();
+
+        assert!(atomic_publish_new(&staged, &other.path().join("diagnostics.zip")).is_err());
+        assert!(staged.exists());
     }
 
     #[cfg(windows)]

@@ -15,6 +15,7 @@ import {
   listSkills as defaultListSkills,
   saveSkillConfig as defaultSaveSkillConfig,
 } from './api';
+import { DiagnosticExportAction } from './DiagnosticPanel';
 import { OperationResultPanel, type OperationView } from './OperationResultPanel';
 import type {
   DomainState,
@@ -34,6 +35,7 @@ type SkillsManagementPageProps = {
   installSkill?: (skillId: SkillId, confirmReplace: boolean) => Promise<SkillMutationReceipt>;
   saveSkillConfig?: (input: SkillConfigInput) => Promise<SkillMutationReceipt>;
 };
+type SkillFailureView = { message: string; operationId?: string };
 
 export function SkillsManagementPage({
   active,
@@ -45,10 +47,10 @@ export function SkillsManagementPage({
   saveSkillConfig = defaultSaveSkillConfig,
 }: SkillsManagementPageProps) {
   const [state, setState] = useState<DomainState<SkillStatus[]>>({ status: 'loading' });
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<SkillFailureView | null>(null);
   const [receipt, setReceipt] = useState<OperationView | null>(null);
   const [configuring, setConfiguring] = useState<SkillStatus | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<SkillFailureView | null>(null);
   const [pendingInstall, setPendingInstall] = useState<SkillId | null>(null);
   const loaded = useRef(false);
   const requestId = useRef(0);
@@ -93,7 +95,7 @@ export function SkillsManagementPage({
 
   function refreshInBackground(successMessage: string) {
     void refreshSkills(false).then((ok) => {
-      if (!ok) setError(`${successMessage}，但状态刷新失败`);
+      if (!ok) setError({ message: `${successMessage}，但状态刷新失败` });
     });
   }
 
@@ -126,7 +128,7 @@ export function SkillsManagementPage({
       if (replacing) closePendingInstall();
       refreshInBackground('技能安装已成功');
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(failureView(reason));
       void refreshSkills(false).catch(() => undefined);
     } finally {
       onBusyChange(null);
@@ -157,7 +159,7 @@ export function SkillsManagementPage({
       refreshInBackground('技能配置已保存');
       return true;
     } catch (reason) {
-      setConfigError(errorMessage(reason));
+      setConfigError(failureView(reason));
       return false;
     } finally {
       onBusyChange(null);
@@ -178,7 +180,12 @@ export function SkillsManagementPage({
         </button>
       </section>
 
-      {error ? <p className="error-banner" role="alert">{error}</p> : null}
+      {error ? (
+        <section className="error-banner operation-error-banner">
+          <span role="alert">{error.message}</span>
+          {error.operationId ? <DiagnosticExportAction operationId={error.operationId} /> : null}
+        </section>
+      ) : null}
       {receipt ? <OperationResultPanel result={receipt} /> : null}
 
       {state.status === 'loading' ? <p className="domain-placeholder" role="status">正在扫描技能...</p> : null}
@@ -280,7 +287,7 @@ function SkillConfigPanel({
 }: {
   skill: SkillStatus;
   busy: boolean;
-  submitError: string | null;
+  submitError: SkillFailureView | null;
   onCancel: () => void;
   onSave: (input: SkillConfigInput) => Promise<boolean>;
 }) {
@@ -324,7 +331,7 @@ function SkillConfigPanel({
     if (saved) setApiKey('');
   }
 
-  const visibleError = localError ?? submitError;
+  const visibleError = localError ?? submitError?.message ?? null;
   return (
     <section
       className="inline-config-panel skill-config-panel"
@@ -355,6 +362,9 @@ function SkillConfigPanel({
           />
         </label>
         {visibleError ? <p className="form-error" id="skill-config-error" role="alert">{visibleError}</p> : null}
+        {!localError && submitError?.operationId ? (
+          <DiagnosticExportAction operationId={submitError.operationId} />
+        ) : null}
         <p className="safe-note" id="skill-config-note">Key 不会回填或显示；保存成功或取消后立即清空本页输入。</p>
         <div className="form-actions">
           <button type="button" className="ghost-button inline" onClick={cancel} disabled={busy}>
@@ -423,5 +433,23 @@ function isLoopbackHost(hostname: string) {
 }
 
 function errorMessage(reason: unknown) {
-  return reason instanceof Error ? reason.message : String(reason);
+  if (reason instanceof Error) return reason.message;
+  if (reason && typeof reason === 'object' && 'message' in reason) {
+    const message = (reason as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+  }
+  return String(reason);
+}
+
+function failureView(reason: unknown): SkillFailureView {
+  return {
+    message: errorMessage(reason),
+    operationId: operationIdFromError(reason),
+  };
+}
+
+function operationIdFromError(reason: unknown) {
+  if (!reason || typeof reason !== 'object' || !('operationId' in reason)) return undefined;
+  const operationId = (reason as { operationId?: unknown }).operationId;
+  return typeof operationId === 'string' && operationId.trim() ? operationId : undefined;
 }

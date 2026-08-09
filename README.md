@@ -6,7 +6,7 @@
 
 保存当前账号配置；配置一个 OpenAI-compatible API 中转站；live `auth.json` 始终保留官方 ChatGPT 登录。切入 Relay 时使用隔离 SQLite 会话视图，历史会话继续可见；切回 Account 前把本轮新 Relay 会话有界发布到 Account 视图，未收口时保留 Relay 而不是让会话暂时消失。旧历史不会被自动上传，可按单个会话或手动“完全同步”处理。切换由单一应用内 task overlay 展示不超过 7 个真实步骤及耗时，成功后受控重新打开 ChatGPT。
 
-[快速使用](#快速使用) · [下载 Release](https://github.com/mingisrookie/codex-switch/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](#安全说明) · [开发](#开发)
+[快速使用](#快速使用) · [诊断与支持](#9-诊断与支持) · [下载 Release](https://github.com/mingisrookie/codex-switch/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](#安全说明) · [开发](#开发)
 
 ![release](https://img.shields.io/github/v/release/mingisrookie/codex-switch?display_name=tag&label=release&color=087f75)
 ![license](https://img.shields.io/badge/license-MIT-16a34a)
@@ -25,7 +25,7 @@
 
 ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步、可管理。公开 UI 和窗口标题使用 ChatGPT Switch；仓库名、`.codex`、`CODEX_HOME` 和 `plus` 等标识继续保留兼容命名。GitHub Release 资产仍必须唯一命名为 `codex-switch.exe`，因为 v0.1.9 updater 固定校验该资产名，不能改成 `chatgpt-switch.exe`。
 
-> 当前源码目标版本为 `v0.2.5`；正式可下载资产及校验结果以 GitHub Releases 的 latest stable 为准。
+> 当前源码目标版本为 `v0.2.6`；正式可下载资产及校验结果仍以 GitHub Releases 的 latest stable 为准。`v0.2.6` 的 PR/main/tag CI、GitHub Release/Latest、公开回下载 hash/版本合同和 `v0.2.5 -> v0.2.6` 一键更新证据，必须等本次发布最终闭环后再补，当前文档不把源码或本地候选写成已发布。
 
 ## 开发过程
 
@@ -44,6 +44,7 @@ ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 
 - 配置一个 API 中转站：填写 Base URL、模型名和 API Key；Key 不回填，留空可保留同一 origin 的已保存 Key，并可独立验证连接。保存失败时页面内表单保留本次 Key 方便重试，保存成功或取消后销毁输入值；origin 改变时必须输入新 Key。首次切换或地址/凭据变化后，页面询问“验证连接后切换”还是“直接切换”，并记住选择。
 - 在独立“技能”页安装固定来源的 `newapi-image2-client` 和 `grok-search`；Skill 按页面懒加载，不会让技能扫描故障污染运行态 Dashboard。
 - Image2 与 Grok 分别填写自己的服务 URL 和 API Key；Key 使用当前 Windows 用户的 DPAPI 加密，Skill、非敏感配置、UI、回执和日志中都不保存明文。
+- 顶部工具栏提供固定“诊断”入口；所有用户主动 mutation 都从 command boundary 建立 attempt，记录真实 phase/关键安全 branch/typed terminal，并在 durable operation ID 可用时关联。失败面拿到真实 operation/attempt ID 时可直接“导出本次诊断”，没有 ID 时导出保留窗口内的最近诊断。诊断事件写入独立有界存储，导出前自动再次脱敏并生成一个 ZIP，不改变原操作结果，也不修改用于备份清理证明的 `operations.jsonl`。
 - 分开显示“已保存”“当前运行”“最近验证”；live `auth.json` 只需保持官方 `chatgpt` 登录态，请求路由字段必须精确匹配。官方 token 正常刷新不会把当前态误判为失配。
 - 切换基于 live `config.toml` 应用最小请求路由 patch，只修改模型/service tier/provider/受管 `sqlite_home` 绑定，不覆盖 `model_instructions_file`、MCP、项目和其他全局设置。切换到 Relay 时把已用 DPAPI 保存的 Key 投影为受管 provider 的 `experimental_bearer_token`，同时写入 `requires_openai_auth = true` 保持 Desktop 官方账户识别，并写入 `supports_websockets = true` 允许 Responses WebSocket；切回账号态会删除整个受管 `openai_custom` provider 表和其中的明文 token，并恢复原 Account SQLite home。
 - 点击切换后只显示一个页面内 task overlay；后端原始 phase/timestamp 全部保留，UI 聚合为“准备、验证 Relay、关闭 ChatGPT、应用请求端、验证并记录、增量会话、启动 ChatGPT”最多 7 步。请求路由 mutation 不进入会话全量扫描/同步、容量规划、checkpoint 或 provider GC；`auth.json` 从 preflight 到后置验证必须 byte-exact 不变。只有 `config.toml` 写入后的失败会回滚原始配置，官方登录态始终不参与回滚写入。
@@ -242,6 +243,33 @@ Apply 失败会使用两份 `StateOnly` 检查点恢复 current/shared 数据库
 
 2026-07-26 的受控页面清理已把真实备份根从 `21` 个目录、`6,327,089,609` bytes 降到 `17` 个目录、`2,693,977,957` bytes：计划中的 `4/4` 个检查点均删除，回收 `3,633,111,652` bytes，紧邻操作的 C 盘空闲空间测得增加 `3,637,547,008` bytes。首次执行使用的是修复前候选 UI，它把安全保留 warning 误标为“部分完成”，并留下历史 Failed 日志；该历史不改写。现有 `attemptedCount` / `failedCount` 语义和前后端回归已修复此问题；发布闭环后的最终 cleanup 为 `0 attempted / 0 failed / Succeeded / Complete`，剩余 `17` 项继续保留且不会自动删除。
 
+### 9. 诊断与支持
+
+`v0.2.6` 源码新增独立的支持诊断层。它和 `%APPDATA%\codex-switch\logs\operations.jsonl` 是两套不同合同：
+
+- `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 保存已经结构化、限长并脱敏的诊断事件。Windows 上，同一登录会话内、使用同一规范化诊断根的 append/read/status/prune/clear 通过 root-scoped named mutex 跨进程协调，但不取得业务 mutation guard；command/lifecycle recorder 和 panic 路径拿不到锁都会立即放弃，低层管理 API 才使用有界等待。读取时每个 segment 只容忍最后一条未写完整的尾记录，发现 dirty tail 后不会继续追加旧段；内部损坏或不兼容 schema 会明确失败。诊断写入、轮转或清理仍是 best-effort，不会阻止启动、改变 mutation 终态或触发业务回滚；事件已经 `sync_data` 成功后，后置 prune 失败也不会把这次 durable append 误报成失败。
+- `logs\operations.jsonl` 仍是严格、durable 的终态审计账本和检查点清理证据。诊断导出只读它并生成去掉备份路径等敏感字段的相关子集；诊断面板的轮转、导出和“清除诊断日志”都不会删除、截断或改写该账本。
+
+使用方式：
+
+1. 点击顶部工具栏的“诊断”，可以查看诊断是否可用、事件数量、占用和保留上限，并执行“导出最近诊断”“打开日志目录”或页面内确认的“清除诊断日志”。清除只处理受管诊断事件，不处理操作历史、备份、会话、配置、凭据、已经导出的 ZIP 或导出中断遗留的同目录 staging 文件。
+2. 请求端切换、同步、备份/恢复、Skill、更新等用户主动 mutation 都进入统一诊断生命周期。后端在 Tauri rejection 中用固定、严格校验的错误信封携带真实 durable operation ID，尚未绑定时携带本次 attempt ID；前端统一解包但兼容既有裸字符串错误，不会猜测“最近一次操作”。失败面只有拿到真实关联 ID 时才显示“导出本次诊断”，并选择该 attempt 的完整事件及操作开始前 10 分钟上下文；没有 ID 时只提供“导出最近诊断”。
+3. 默认导出使用 Windows Known Folder API 解析真实“下载”目录，不假定 `%USERPROFILE%\Downloads`。文件名为 `ChatGPT-Switch-Diagnostics-<本地时间>.zip`；同名时追加数字后缀，绝不覆盖旧包。ZIP 先在受控内存中完成固定五文件、逐项 hash、脱敏扫描和自检，再在目标目录写入同目录 staging，通过 Windows write-through、no-clobber 原子发布。只有目标解析/发布失败才返回有界、短期有效的 opaque retry ID；“重试下载目录”和用户主动点击的“改存应用诊断目录”复用同一份 prepared bytes/hash/selection，不重新采集日志。后者固定写入 `%APPDATA%\codex-switch\diagnostic-exports`，不会静默 fallback，也不接受任意文件路径；采集/准备失败不会伪装成下载目录失败。
+
+诊断 ZIP 固定只含 5 个文件：
+
+- `README.txt`：包用途、隐私边界和文件说明。
+- `manifest.json`：schema/应用与构建版本、导出时间和时区偏移、平台/架构、选择窗口、脱敏策略版本、每个负载文件的 bytes/SHA-256，以及明确的 unavailable/warning；`timestampUnit` 固定为 `unixEpochMilliseconds`，说明事件 `timestamp` 是 Unix epoch 毫秒。manifest 不递归记录自身 hash。
+- `diagnostics.jsonl`：已按 operation/attempt、action、真实 phase、typed terminal/error code 关联的脱敏诊断事件。
+- `operations.jsonl`：相关 durable 操作终态的脱敏子集，不包含原账本中的备份路径。
+- `health.json`：只读健康摘要；包含应用版本、OS/架构与 best-effort Windows 版本、APPDATA/CODEX_HOME 和诊断存储摘要、当前 route/auth mode 结构、受管 ChatGPT/独立 Codex 进程计数，以及四个受管 SQLite 的 present/readable/bytes/只读 `schema_version`。任一 collector 失败时逐项标记 unavailable，不伪造成健康或空数据；它不读取进程命令行，也不执行写入式修复。
+
+事件在落盘前先经过字段 allowlist、深度/数量/长度限制和集中 sanitizer；导出层还会执行更严格的禁用字段删除、身份/路径/秘密形态扫描和 ZIP 自检。默认包不包含 API Key、token、Authorization、cookie、凭据、聊天/会话正文、原始 session JSONL、SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、Windows 用户名或稳定设备 ID。已知受管根替换为 `%CODEX_HOME%` / `%APPDATA%` / `%USERPROFILE%`，其他绝对路径不会原样导出。即使已脱敏，也建议只把生成的单个 ZIP 私下发给维护者，不要上传整个 `%APPDATA%\codex-switch`。
+
+本地诊断 store 默认只读取/导出 `timestamp` 位于最近 **14 天**事件窗口内的记录，同时把同一诊断根的 segment 总量限制为 **10 MiB**；单个 segment 达到 512 KiB、创建时间超出窗口或尾部不完整时轮转。年龄清理只有在逐条验证一个 clean segment 的全部事件都已过期后才删除整段，不能因文件名较旧而误删窗口内的新事件；容量上限仍可淘汰结构有效、尾部完整的最旧段，因此实际可用窗口可能短于 14 天。dirty tail、内部损坏或未知 schema 不会被 prune 掩盖。窗口依赖 Windows 系统墙钟，人为大幅回拨会影响判断；不同登录会话或指向同目录的不同路径别名也不保证共享同一个 named mutex。
+
+应用会尽早记录随机、仅本次启动有效的 `sessionStarted`；Windows session/attempt ID 优先来自 OS CSPRNG，失败时依次使用 `CoCreateGuid` 和不可稳定关联的进程局部 fallback。`sessionStarted` 带 PID、timestamp unit，并在系统允许时尽力带 process creation stamp，Tauri Ready/正常退出记录 `appReady` / `sessionEnded`；下次启动在 PID + creation stamp 可用时先排除仍在运行的另一个实例和 PID reuse，再对缺少 clean terminal 的上一 session 记录 `previousSessionUnclean`。Rust panic hook 和前端 `error` / `unhandledrejection` 只写最小、限长、脱敏的 best-effort 事件，release 的 `panic = "abort"` 保持不变：它不恢复 panic、不增加 watchdog，也不承诺捕获来不及执行落盘代码的访问冲突、强制结束、断电、硬卡死或其他硬崩溃。硬崩溃若发生在 ZIP 最终发布前，还可能在 Downloads 或固定备用目录留下 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`；正常错误会尽力删除，但“清除诊断日志”不会处理该文件。`previousSessionUnclean` 只能证明缺少干净终态，不能单独证明具体崩溃原因。
+
 ## 文件位置
 
 ChatGPT Switch 默认操作当前用户的 Codex Home。解析顺序：
@@ -267,6 +295,8 @@ C:\Users\<你>\.codex
 - `mobile-continuity-v1.json` 手机连续性 cutover 与持久队列；只保存 thread ID、source fingerprint、typed 状态、重试元数据和脱敏失败分类
 - `session-sync-state-v1.json` 仅供既有手动完全同步维护 current/shared 对账基线，不再进入普通请求端切换
 - 脱敏操作记录
+- 最近 14 天事件窗口 / 10 MiB 总量上限的脱敏诊断事件；默认导出的诊断 ZIP 位于 Windows Known Folder 解析的“下载”目录，不保存在 APPDATA 日志根
+- 用户在下载目录导出失败后主动选择的备用诊断 ZIP：`%APPDATA%\codex-switch\diagnostic-exports`；不属于 diagnostics event retention，也不会被“清除诊断日志”删除
 - Image2 / Grok 的非敏感配置与 DPAPI 加密凭据
 
 Codex 会话存储说明：
@@ -286,6 +316,8 @@ Codex 会话存储说明：
 %APPDATA%\codex-switch\shared-sessions
 %APPDATA%\codex-switch\backups
 %APPDATA%\codex-switch\logs\operations.jsonl
+%APPDATA%\codex-switch\logs\diagnostics
+%APPDATA%\codex-switch\diagnostic-exports  # 仅在用户主动改存时创建/使用
 %APPDATA%\codex-switch\skills\image2
 %APPDATA%\codex-switch\skills\grok-search
 ```
@@ -314,7 +346,7 @@ Codex 会话存储说明：
 - 关闭态 mutation 会在入口和最后写入前复检受管 ChatGPT 与独立 `codex.exe` CLI；只关闭受管 ChatGPT 进程树，独立 CLI 只作为 fail-closed 阻断信号。自动重启只使用关闭前从受管根捕获并在启动后重新验证的 AppUserModelID，不按 PATH 或任意 EXE 路径执行。
 - 需要整文件替换的配置、备份、可写 index 与 `operations.jsonl` 先生成同目录完整临时文件并同步，再用 Windows `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` 原子替换。`operations.jsonl` 业务语义 append-only，但每次会锁内严格解析旧文件、拒绝损坏历史和重复 operation ID，再原子发布完整新文件；失败时旧日志 byte-exact。会话 JSONL 的 Create/Import/provider successor 使用同目录完整临时文件 + hard-link no-clobber，生产路径绝不覆盖已有 JSONL；任何策略允许的 SQLite 引用切换都只能发生在完整新文件与 provenance marker 发布后。
 - 后端用进程内 try-lock + Windows 独占 `%APPDATA%\codex-switch\mutation.lock` 文件句柄串行化保存、验证、切换、同步、删除、恢复、一键更新安装和应用退出；同一进程或第二个 ChatGPT Switch 进程已有写操作时，新操作会立即拒绝。普通退出只有取得同一锁并把它保留到进程终止后才执行；繁忙时前端排队重试。更新进入退出阶段后锁同样保持到父进程终止，前端同时双向禁用其他 mutation。
-- 操作记录只保存 action、阶段、终态、操作 ID、备份目录和计数，不保存凭据、请求正文或自由文本错误。
+- `operations.jsonl` 只保存 action、阶段、终态、操作 ID、备份目录和计数，不保存凭据、请求正文或自由文本错误；它是严格的 durable 终态账本。独立 diagnostics store 只保存先脱敏的支持事件，导出时再次脱敏和扫描；诊断失败不会覆盖、伪造或削弱原 mutation 终态。
 - 会话管理里的删除是硬删除；工具会先备份并支持失败补偿，同时清理四个受管 SQLite 中可识别的 thread 关联。操作前仍需在页面内确认选择范围。
 - 自更新 staging 名来自 Windows CSPRNG；目录创建时按当前 token 是否 elevated 应用受限 DACL，并持有目录句柄。helper 以持久化阶段 journal、目标/备份 hash 和 Tauri Ready ACK 决定继续、完成或回滚；elevated 无参数启动不会从 `%TEMP%` 自动发现并执行恢复计划。
 - 本机 Microsoft Defender 的 Product/Feature 处于 disabled 状态，相关命令无法形成“扫描通过”证据；Release 的 hash、合同、`upx -t` 和真实更新验证不应被误述为 Defender 扫描结果。
@@ -348,6 +380,8 @@ npm run check:release
 ```powershell
 .\scripts\pack-windows-release.ps1 -UpxPath "C:\path\to\upx.exe"
 ```
+
+`v0.2.6` 还必须在隔离 `APPDATA` / `CODEX_HOME` 下完成诊断写入、跨进程 root lock、dirty tail 封存、事件时间 14 天/10 MiB segment 轮转、operation 分离、health 只读/逐项 unavailable、ZIP 五文件/hash/敏感扫描、Known Folder/显式备用目录/no-clobber、前端失败导出和真实 packed EXE 导出验证；随后才进入 PR/main/tag CI、GitHub Release/Latest、公开回下载一致性与正式 `v0.2.5 -> v0.2.6` updater smoke。上述发布证据当前待主任务最终闭环，不得从本 README 的目标说明推断已经完成。
 
 ## License
 

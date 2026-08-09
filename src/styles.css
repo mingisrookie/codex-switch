@@ -366,6 +366,7 @@ span.section-icon svg {
 .error-banner,
 .update-banner,
 .operation-result,
+.diagnostic-panel,
 .inline-confirmation {
   width: min(100%, 1500px);
   margin: 14px auto 0;
@@ -493,11 +494,192 @@ span.section-icon svg {
   font-family: Consolas, monospace;
 }
 
+.operation-result > .diagnostic-export-action {
+  grid-column: 1 / -1;
+}
+
+.diagnostic-panel {
+  padding: 18px 20px;
+  border: 1px solid var(--line-strong);
+  border-left: 4px solid var(--teal);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.diagnostic-panel-heading,
+.diagnostic-panel-actions,
+.diagnostic-privacy-note,
+.diagnostic-status-message,
+.diagnostic-export-receipt,
+.diagnostic-clear-confirmation {
+  display: flex;
+  align-items: center;
+}
+
+.diagnostic-panel-heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostic-panel-heading h2 {
+  margin-top: 2px;
+  font-size: 20px;
+}
+
+.diagnostic-privacy-note {
+  gap: 6px;
+  margin-top: 10px;
+  color: var(--teal-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.diagnostic-privacy-note svg {
+  width: 16px;
+  height: 16px;
+}
+
+.diagnostic-status-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.diagnostic-status-grid > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid var(--line);
+}
+
+.diagnostic-status-grid > div:last-child {
+  border-right: 0;
+}
+
+.diagnostic-status-grid dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.diagnostic-status-grid dd {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.diagnostic-status-message {
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 48px;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostic-status-message.error,
+.diagnostic-clear-confirmation {
+  justify-content: space-between;
+}
+
+.diagnostic-status-warning,
+.diagnostic-action-error {
+  margin-top: 10px;
+  color: #762121;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-panel-actions {
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.diagnostic-export-action {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.diagnostic-export-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diagnostic-export-receipt {
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #a8cfc9;
+  border-radius: 5px;
+  background: rgba(220, 240, 235, 0.58);
+  color: var(--teal-text);
+  font-size: 11px;
+}
+
+.diagnostic-export-path {
+  min-width: 0;
+  flex: 1 1 260px;
+  font-family: Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-panel-actions > .diagnostic-export-action {
+  flex: 1 1 360px;
+}
+
+.diagnostic-clear-confirmation {
+  gap: 16px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid #e2c17d;
+  border-left: 4px solid var(--amber);
+  border-radius: 5px;
+  background: var(--amber-soft);
+}
+
+.diagnostic-clear-confirmation h3 {
+  margin-top: 2px;
+  font-size: 16px;
+}
+
+.diagnostic-clear-confirmation > div > p:last-child {
+  margin-top: 4px;
+  color: var(--amber-text);
+  font-size: 12px;
+}
+
+.diagnostic-clear-confirmation .form-actions {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+.switch-task-body > .diagnostic-export-action,
+.skill-config-panel .diagnostic-export-action,
+.checkpoint-cleanup-flow .diagnostic-export-action {
+  margin-top: 12px;
+}
+
 .runtime-page,
 .session-management-page,
 .skills-page {
   width: min(100%, 1440px);
   margin: 0 auto;
+}
+
+.operation-error-banner {
+  justify-content: space-between;
+}
+
+.operation-error-banner > span {
+  flex: 1 1 280px;
 }
 
 .runtime-intro,
@@ -2319,6 +2501,18 @@ span.section-icon svg {
     grid-template-columns: 1fr;
   }
 
+  .diagnostic-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .diagnostic-status-grid > div:nth-child(3n) {
+    border-right: 0;
+  }
+
+  .diagnostic-status-grid > div:nth-child(-n + 3) {
+    border-bottom: 1px solid var(--line);
+  }
+
   .session-manager-grid {
     grid-template-columns: 1fr;
   }
@@ -2359,6 +2553,48 @@ span.section-icon svg {
 
   .topbar-actions {
     gap: 5px;
+  }
+
+  .diagnostic-panel {
+    padding: 14px;
+  }
+
+  .diagnostic-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .diagnostic-status-grid > div,
+  .diagnostic-status-grid > div:nth-child(3n) {
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .diagnostic-status-grid > div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .diagnostic-status-grid > div:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .diagnostic-panel-actions,
+  .diagnostic-clear-confirmation,
+  .operation-error-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .diagnostic-panel-actions,
+  .diagnostic-panel-actions button,
+  .diagnostic-export-buttons,
+  .diagnostic-export-buttons > button,
+  .diagnostic-clear-confirmation .form-actions,
+  .diagnostic-clear-confirmation .form-actions button {
+    width: 100%;
+  }
+
+  .diagnostic-clear-confirmation .form-actions {
+    display: grid;
   }
 
   .runtime-intro h1 {

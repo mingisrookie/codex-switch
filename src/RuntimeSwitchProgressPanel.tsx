@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import { DiagnosticExportAction } from './DiagnosticPanel';
 import type {
   RuntimeKind,
   RuntimeSwitchPhase,
@@ -34,6 +35,7 @@ export type RuntimeSwitchFlow = {
   result?: RuntimeSwitchResult;
   launchRetrying?: boolean;
   refreshError?: string;
+  operationId?: string;
 };
 
 type Step = {
@@ -345,6 +347,10 @@ export function RuntimeSwitchProgressPanel({
             </p>
           )}
 
+          {flow.status === 'failed' && flow.operationId ? (
+            <DiagnosticExportAction operationId={flow.operationId} />
+          ) : null}
+
           {flow.refreshError ? (
             <p className="switch-refresh-warning" role="alert">
               切换已结束，但运行态刷新失败：{flow.refreshError}
@@ -405,6 +411,10 @@ function SwitchSuccessResult({
           {launch.message ? <small>{launch.message}</small> : null}
         </div>
       </section>
+
+      {launchProblem ? (
+        <DiagnosticExportAction operationId={result.operationId} />
+      ) : null}
 
       <dl className="switch-receipt" aria-label="切换回执">
         <div><dt>操作 ID</dt><dd>{result.operationId}</dd></div>

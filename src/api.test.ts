@@ -18,12 +18,17 @@ import {
   checkForUpdates,
   cleanupAutomaticCheckpoints,
   createFullBackup,
+  clearDiagnosticLogs,
   deleteBackup,
   deleteManagedSessions,
   getAppStatus,
+  getDiagnosticStatus,
   getMobileContinuityStatus,
   getUpdateStartupNotice,
   importPlusRuntime,
+  exportDiagnostics,
+  normalizeDiagnosticExportFailure,
+  retryDiagnosticExport,
   installUpdate,
   installSkill,
   launchChatgpt,
@@ -32,13 +37,18 @@ import {
   loadDashboard,
   loadRuntimeDashboard,
   loadSessionDashboard,
+  openDiagnosticExport,
+  openDiagnosticLogDirectory,
   requestAppExit,
+  recordFrontendDiagnostic,
   acknowledgeMobileContinuityNotice,
   publishMobileContinuitySession,
   setMobileContinuityEnabled,
   saveSkillConfig,
   switchRuntime,
   syncAllSessions,
+  upsertRelayRuntime,
+  verifyRelayRuntime,
 } from './api';
 import type { BackupSummary } from './types';
 
@@ -50,6 +60,117 @@ describe('dashboard API', () => {
 
     await expect(requestAppExit()).resolves.toEqual({ scheduled: true });
     expect(invoke).toHaveBeenCalledWith('request_app_exit');
+  });
+
+  it('recovers correlated mutation failures without changing the business message', async () => {
+    const relayFailure = {
+      message: 'relay validation failed: original message',
+      operationId: 'verify-relay-1780000000000-42-1',
+    };
+    invoke.mockRejectedValueOnce(
+      `__CHATGPT_SWITCH_MUTATION_ERROR_V1__${JSON.stringify(relayFailure)}`,
+    );
+
+    await expect(verifyRelayRuntime()).rejects.toEqual(relayFailure);
+    expect(invoke).toHaveBeenCalledWith('test_relay_connection');
+
+    const skillFailure = {
+      message: 'skill install failed unchanged',
+      operationId: 'install-skill-attempt-1780000000000-42-2',
+    };
+    invoke.mockRejectedValueOnce(
+      `__CHATGPT_SWITCH_MUTATION_ERROR_V1__${JSON.stringify(skillFailure)}`,
+    );
+
+    await expect(installSkill('image2', false)).rejects.toEqual(skillFailure);
+    expect(invoke).toHaveBeenLastCalledWith('install_skill', {
+      skillId: 'image2',
+      confirmReplace: false,
+    });
+  });
+
+  it('preserves bare and malformed mutation rejection strings for compatibility', async () => {
+    const legacy = 'legacy backend failure';
+    invoke.mockRejectedValueOnce(legacy);
+    await expect(upsertRelayRuntime({
+      baseUrl: 'https://relay.example.com/v1',
+      model: 'example-model',
+      apiKey: 'placeholder-key',
+    })).rejects.toBe(legacy);
+
+    const malformed = `__CHATGPT_SWITCH_MUTATION_ERROR_V1__${JSON.stringify({
+      message: 'must not be trusted as correlated',
+      operationId: '../outside',
+    })}`;
+    invoke.mockRejectedValueOnce(malformed);
+    await expect(installUpdate()).rejects.toBe(malformed);
+  });
+
+  it('uses typed diagnostic commands without exposing arbitrary paths or raw errors', async () => {
+    invoke.mockResolvedValue(undefined);
+
+    await getDiagnosticStatus();
+    await exportDiagnostics();
+    await exportDiagnostics('sync-1');
+    await retryDiagnosticExport('diagnostic-export-context-aabbccddeeff00112233445566778899', 'downloads');
+    await retryDiagnosticExport(
+      'diagnostic-export-context-aabbccddeeff00112233445566778899',
+      'diagnosticDirectory',
+    );
+    await openDiagnosticExport('export-1');
+    await openDiagnosticLogDirectory();
+    await clearDiagnosticLogs();
+    await recordFrontendDiagnostic({
+      level: 'error',
+      component: 'frontend',
+      eventKind: 'unhandledError',
+      errorCode: 'frontend.unhandled_error',
+      safeMessage: '前端发生未处理异常',
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_diagnostic_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'export_diagnostics', {});
+    expect(invoke).toHaveBeenNthCalledWith(3, 'export_diagnostics', { operationId: 'sync-1' });
+    expect(invoke).toHaveBeenNthCalledWith(4, 'export_diagnostics', {
+      retryId: 'diagnostic-export-context-aabbccddeeff00112233445566778899',
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, 'export_diagnostics_to_diagnostic_directory', {
+      retryId: 'diagnostic-export-context-aabbccddeeff00112233445566778899',
+    });
+    expect(invoke).toHaveBeenNthCalledWith(6, 'open_diagnostic_export', { exportId: 'export-1' });
+    expect(invoke).toHaveBeenNthCalledWith(7, 'open_diagnostic_log_directory');
+    expect(invoke).toHaveBeenNthCalledWith(8, 'clear_diagnostic_logs');
+    expect(invoke).toHaveBeenNthCalledWith(9, 'record_frontend_diagnostic', {
+      input: {
+        level: 'error',
+        component: 'frontend',
+        eventKind: 'unhandledError',
+        errorCode: 'frontend.unhandled_error',
+        safeMessage: '前端发生未处理异常',
+      },
+    });
+  });
+
+  it('preserves only a valid typed destination retry context', async () => {
+    const failure = {
+      kind: 'destination',
+      message: 'Downloads is unavailable',
+      retryId: 'diagnostic-export-context-aabbccddeeff00112233445566778899',
+    };
+    invoke.mockRejectedValueOnce(failure);
+
+    await expect(exportDiagnostics('switch-1')).rejects.toEqual(failure);
+    expect(normalizeDiagnosticExportFailure({
+      ...failure,
+      retryId: 'C:\\Users\\alice\\Downloads',
+    })).toEqual({
+      kind: 'preparation',
+      message: '诊断导出请求失败',
+    });
+    expect(normalizeDiagnosticExportFailure(new Error('worker failed'))).toEqual({
+      kind: 'preparation',
+      message: 'worker failed',
+    });
   });
 
   it('uses fixed mobile-continuity commands and passes only typed settings or thread ids', async () => {
