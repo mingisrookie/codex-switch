@@ -499,7 +499,7 @@ fn sanitize_string(value: &str, context: &RedactionContext) -> String {
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    roots.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    roots.sort_by_key(|right| std::cmp::Reverse(right.0.len()));
     for (root, replacement) in roots {
         value = replace_ascii_case_insensitive(&value, &root, replacement);
         value = replace_ascii_case_insensitive(&value, &root.replace('\\', "/"), replacement);

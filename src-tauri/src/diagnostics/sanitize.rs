@@ -90,7 +90,7 @@ impl DiagnosticSanitizer {
             roots.user_profile.clone(),
             "%USERPROFILE%",
         );
-        path_replacements.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        path_replacements.sort_by_key(|right| std::cmp::Reverse(right.0.len()));
         path_replacements.dedup_by(|left, right| left.0.eq_ignore_ascii_case(&right.0));
 
         let mut identity_replacements = Vec::new();
