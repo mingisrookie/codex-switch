@@ -25,7 +25,7 @@
 
 ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步、可管理。公开 UI 和窗口标题使用 ChatGPT Switch；仓库名、`.codex`、`CODEX_HOME` 和 `plus` 等标识继续保留兼容命名。GitHub Release 资产仍必须唯一命名为 `codex-switch.exe`，因为 v0.1.9 updater 固定校验该资产名，不能改成 `chatgpt-switch.exe`。
 
-> 当前源码目标版本为 `v0.2.7`；正式可下载资产及校验结果仍以 GitHub Releases 的 latest stable 为准。`v0.2.7` 的 PR/main/tag CI、GitHub Release/Latest、公开回下载 hash/版本合同和 `v0.2.5 -> v0.2.7` 一键更新证据，必须等本次发布最终闭环后再补，当前文档不把源码或本地候选写成已发布。
+> 当前正式版本为 [`v0.2.7`](https://github.com/mingisrookie/codex-switch/releases/tag/v0.2.7)，是 GitHub Releases 的 latest stable、非 draft。annotated tag `v0.2.7` 指向合并提交 `74832037710520e8ecb0d43c0bb163f32d46ca20`；唯一公开资产 `codex-switch.exe` 为 `2,411,008` bytes、SHA-256 `E8905135EAB0C5D76117BAA25770371E3D8BFDAF07495805463C96A823A5B78E`，公开回下载与 tag-CI artifact 完全一致，正式 `v0.2.5 -> v0.2.7` 一键更新 smoke 已通过。
 
 ## 开发过程
 
@@ -245,7 +245,7 @@ Apply 失败会使用两份 `StateOnly` 检查点恢复 current/shared 数据库
 
 ### 9. 诊断与支持
 
-`v0.2.7` 源码新增独立的支持诊断层。它和 `%APPDATA%\codex-switch\logs\operations.jsonl` 是两套不同合同：
+`v0.2.7` 新增独立的支持诊断层。它和 `%APPDATA%\codex-switch\logs\operations.jsonl` 是两套不同合同：
 
 - `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 保存已经结构化、限长并脱敏的诊断事件。Windows 上，同一登录会话内、使用同一规范化诊断根的 append/read/status/prune/clear 通过 root-scoped named mutex 跨进程协调，但不取得业务 mutation guard；command/lifecycle recorder 和 panic 路径拿不到锁都会立即放弃，低层管理 API 才使用有界等待。读取时每个 segment 只容忍最后一条未写完整的尾记录，发现 dirty tail 后不会继续追加旧段；内部损坏或不兼容 schema 会明确失败。诊断写入、轮转或清理仍是 best-effort，不会阻止启动、改变 mutation 终态或触发业务回滚；事件已经 `sync_data` 成功后，后置 prune 失败也不会把这次 durable append 误报成失败。
 - `logs\operations.jsonl` 仍是严格、durable 的终态审计账本和检查点清理证据。诊断导出只读它并生成去掉备份路径等敏感字段的相关子集；诊断面板的轮转、导出和“清除诊断日志”都不会删除、截断或改写该账本。
@@ -381,7 +381,7 @@ npm run check:release
 .\scripts\pack-windows-release.ps1 -UpxPath "C:\path\to\upx.exe"
 ```
 
-`v0.2.7` 还必须在隔离 `APPDATA` / `CODEX_HOME` 下完成诊断写入、跨进程 root lock、dirty tail 封存、事件时间 14 天/10 MiB segment 轮转、operation 分离、health 只读/逐项 unavailable、ZIP 五文件/hash/敏感扫描、Known Folder/显式备用目录/no-clobber、前端失败导出和真实 packed EXE 导出验证；随后才进入 PR/main/tag CI、GitHub Release/Latest、公开回下载一致性与正式 `v0.2.5 -> v0.2.7` updater smoke。上述发布证据当前待主任务最终闭环，不得从本 README 的目标说明推断已经完成。
+`v0.2.7` 已在隔离 `APPDATA` / `CODEX_HOME` 下完成诊断故障注入、跨进程 root lock、dirty tail 封存、事件时间窗口/容量、operation 分离、health 降级、ZIP 固定五文件/hash/敏感扫描、Known Folder/显式备用目录/no-clobber，以及 390×844 真实 packed EXE 导出 UI/E2E。PR CI `31328121903` / `31328135186`、main CI `31328794302`、tag CI `31329458760` 全部通过；Release 使用唯一 tag-CI packed artifact，公开回下载 bytes/hash/PE/双版本/UPX 合同一致，两个 live GitHub Release 合同测试和正式 `v0.2.5 -> v0.2.7` updater smoke 均通过。
 
 ## License
 
