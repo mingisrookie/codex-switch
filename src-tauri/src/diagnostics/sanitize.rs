@@ -12,6 +12,7 @@ const MAX_ARRAY_ITEMS: usize = 32;
 const MAX_RAW_TEXT_BYTES: usize = 16 * 1024;
 const MAX_AUTH_SEPARATOR_BYTES: usize = 64;
 const REDACTED_SECRET: &str = "[REDACTED_SECRET]";
+const REDACTED_ID: &str = "[REDACTED_ID]";
 const REDACTED_IDENTITY: &str = "[REDACTED_IDENTITY]";
 const REDACTED_PATH: &str = "[REDACTED_PATH]";
 const REDACTED_URL: &str = "[REDACTED_URL]";
@@ -188,19 +189,20 @@ impl DiagnosticSanitizer {
             output.push_str(" [TRUNCATED]");
         }
         for (root, token) in &self.path_replacements {
-            output = replace_ascii_case_insensitive(&output, root, token);
+            output = replace_known_path_root(&output, root, token);
             let alternate = root.replace('\\', "/");
             if alternate != *root {
-                output = replace_ascii_case_insensitive(&output, &alternate, token);
+                output = replace_known_path_root(&output, &alternate, token);
             }
         }
+        output = redact_urls(output);
+        output = redact_unknown_paths(output);
         for identity in &self.identity_replacements {
             output = replace_identity_literal(&output, identity);
         }
+        output = redact_free_form_ids(&output);
         output = redact_assignments(output);
         output = redact_embedded_secrets(output);
-        output = redact_urls(output);
-        output = redact_unknown_paths(output);
         truncate_utf8(&output, limit)
     }
 
@@ -326,7 +328,7 @@ fn bounded_prefix(value: &str, limit: usize) -> (&str, bool) {
     (&value[..end], true)
 }
 
-fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+pub(super) fn replace_known_path_root(value: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() || value.len() < needle.len() {
         return value.to_string();
     }
@@ -336,10 +338,14 @@ fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) 
     let mut cursor = 0;
     let mut index = 0;
     while index + target.len() <= source.len() {
-        if source[index..index + target.len()].eq_ignore_ascii_case(target) {
+        let end = index + target.len();
+        if source[index..end].eq_ignore_ascii_case(target)
+            && is_path_root_start_boundary(source.get(index.wrapping_sub(1)).copied())
+            && is_path_root_boundary(source.get(end).copied())
+        {
             output.push_str(&value[cursor..index]);
             output.push_str(replacement);
-            index += target.len();
+            index = end;
             cursor = index;
         } else {
             index += 1;
@@ -347,6 +353,20 @@ fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) 
     }
     output.push_str(&value[cursor..]);
     output
+}
+
+fn is_path_root_start_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| {
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'"' | b'\'' | b'(' | b'[' | b'{' | b',' | b';' | b'=' | b':'
+            )
+    })
+}
+
+fn is_path_root_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| matches!(byte, b'\\' | b'/'))
 }
 
 fn replace_identity_literal(value: &str, identity: &str) -> String {
@@ -383,6 +403,7 @@ fn replace_identity_literal(value: &str, identity: &str) -> String {
 fn protected_placeholder_len(value: &str, index: usize) -> Option<usize> {
     [
         REDACTED_SECRET,
+        REDACTED_ID,
         REDACTED_IDENTITY,
         REDACTED_PATH,
         REDACTED_URL,
@@ -403,6 +424,57 @@ fn protected_placeholder_len(value: &str, index: usize) -> Option<usize> {
 
 fn is_identity_boundary(byte: Option<u8>) -> bool {
     byte.is_none_or(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-'))
+}
+
+pub(super) fn redact_free_form_ids(value: &str) -> String {
+    let (bounded, was_truncated) = bounded_prefix(value, MAX_RAW_TEXT_BYTES);
+    let mut output = String::with_capacity(bounded.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < bounded.len() {
+        if let Some(end) = uuid_like_id_end_at(bounded.as_bytes(), index) {
+            output.push_str(&bounded[cursor..index]);
+            output.push_str(REDACTED_ID);
+            cursor = end;
+            index = end;
+            continue;
+        }
+        index += bounded[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+    output.push_str(&bounded[cursor..]);
+    if was_truncated {
+        output.push_str(" [TRUNCATED]");
+    }
+    output
+}
+
+fn uuid_like_id_end_at(bytes: &[u8], index: usize) -> Option<usize> {
+    const UUID_BYTES: usize = 36;
+    let candidate = bytes.get(index..index.checked_add(UUID_BYTES)?)?;
+    for (offset, byte) in candidate.iter().enumerate() {
+        let valid = if matches!(offset, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        };
+        if !valid {
+            return None;
+        }
+    }
+    Some(index + UUID_BYTES)
+}
+
+pub(super) fn contains_uuid_like_id(value: &str) -> bool {
+    if value.len() > MAX_RAW_TEXT_BYTES {
+        return true;
+    }
+    value
+        .char_indices()
+        .any(|(index, _)| uuid_like_id_end_at(value.as_bytes(), index).is_some())
 }
 
 fn redact_assignments(value: String) -> String {
@@ -713,36 +785,109 @@ fn redact_urls(mut value: String) -> String {
     }
 }
 
-fn redact_unknown_paths(mut value: String) -> String {
-    loop {
-        let bytes = value.as_bytes();
-        let start = value.char_indices().map(|(index, _)| index).find(|index| {
-            let index = *index;
-            let windows_drive = index + 2 < bytes.len()
-                && bytes[index].is_ascii_alphabetic()
-                && bytes[index + 1] == b':'
-                && matches!(bytes[index + 2], b'\\' | b'/');
-            let unc = index + 1 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'\\';
-            let unix_home = value[index..].starts_with("/Users/")
-                || value[index..].starts_with("/home/")
-                || value[index..].starts_with("/tmp/");
-            windows_drive || unc || unix_home
-        });
-        let Some(start) = start else {
-            return value;
-        };
-        let end = value[start..]
-            .char_indices()
-            .find(|(_, character)| {
-                matches!(
-                    character,
-                    '\r' | '\n' | '"' | '\'' | '<' | '>' | '|' | ',' | ';' | '%' | '['
-                )
-            })
-            .map(|(index, _)| start + index)
-            .unwrap_or(value.len());
-        value.replace_range(start..end, REDACTED_PATH);
+fn redact_unknown_paths(value: String) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < value.len() {
+        if let Some(end) = absolute_path_end_at(&value, index) {
+            output.push_str(&value[cursor..index]);
+            output.push_str(REDACTED_PATH);
+            cursor = end;
+            index = end;
+            continue;
+        }
+        index += value[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
     }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn absolute_path_end_at(value: &str, index: usize) -> Option<usize> {
+    if is_inside_web_url(value, index) || is_part_of_web_url_scheme(value, index) {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let windows_drive = index + 2 < bytes.len()
+        && bytes[index].is_ascii_alphabetic()
+        && bytes[index + 1] == b':'
+        && matches!(bytes[index + 2], b'\\' | b'/');
+    let unc = index + 1 < bytes.len()
+        && matches!(
+            (bytes[index], bytes[index + 1]),
+            (b'\\', b'\\') | (b'/', b'/')
+        );
+    let unix_home = value[index..].starts_with("/Users/")
+        || value[index..].starts_with("/home/")
+        || value[index..].starts_with("/tmp/");
+    if !(windows_drive || unc || unix_home) {
+        return None;
+    }
+    if let Some(quote) = value[..index]
+        .chars()
+        .next_back()
+        .filter(|character| matches!(character, '"' | '\''))
+    {
+        return Some(find_unescaped_quote(value, index, quote).unwrap_or(value.len()));
+    }
+    Some(
+        value[index..]
+            .char_indices()
+            .skip(1)
+            .find(|(_, character)| matches!(character, '\r' | '\n' | '\t' | '"' | '<' | '>' | '|'))
+            .map(|(relative, _)| index + relative)
+            .unwrap_or(value.len()),
+    )
+}
+
+fn is_part_of_web_url_scheme(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    ["https://", "http://", "wss://", "ws://"]
+        .iter()
+        .any(|scheme| {
+            let earliest = index.saturating_sub(scheme.len());
+            (earliest..=index).any(|start| {
+                starts_with_ascii_case_insensitive(bytes, start, scheme.as_bytes())
+                    && index < start + scheme.len()
+            })
+        })
+}
+
+fn is_inside_web_url(value: &str, index: usize) -> bool {
+    let token_start = value[..index]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+        })
+        .map(|(offset, character)| offset + character.len_utf8())
+        .unwrap_or(0);
+    let prefix = &value[token_start..index];
+    ["https://", "http://", "wss://", "ws://"]
+        .iter()
+        .any(|scheme| {
+            prefix
+                .as_bytes()
+                .windows(scheme.len())
+                .any(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
+        })
+}
+
+pub(super) fn contains_absolute_path(value: &str) -> bool {
+    if value.len() > MAX_RAW_TEXT_BYTES {
+        return true;
+    }
+    value
+        .char_indices()
+        .any(|(index, _)| absolute_path_end_at(value, index).is_some())
 }
 
 fn truncate_utf8(value: &str, limit: usize) -> String {
@@ -768,8 +913,8 @@ mod tests {
     };
 
     use super::{
-        contains_secret_shape, DiagnosticSanitizer, SanitizerRoots, MAX_CONTEXT_FIELDS,
-        MAX_RAW_TEXT_BYTES,
+        contains_absolute_path, contains_secret_shape, contains_uuid_like_id, DiagnosticSanitizer,
+        SanitizerRoots, MAX_CONTEXT_FIELDS, MAX_RAW_TEXT_BYTES,
     };
 
     fn sanitizer() -> DiagnosticSanitizer {
@@ -805,7 +950,7 @@ mod tests {
     fn redacts_credentials_urls_and_unknown_paths_before_persistence() {
         let sanitizer = sanitizer();
         let output = sanitizer.sanitize_text(
-            r"api_key=sk-secret; Authorization: Bearer abcdef; https://user:pass@example.test/v1 C:\OtherUser\private.txt D:\Codex Home\state.db",
+            r"api_key=sk-secret; Authorization: Bearer abcdef; https://user:pass@example.test/v1 C:\OtherUser\private.txt | D:\Codex Home\state.db",
         );
 
         assert!(!output.contains("sk-secret"), "{output}");
@@ -1034,6 +1179,133 @@ mod tests {
         assert_eq!(once, twice);
         assert!(once.contains("切换失败"), "{once}");
         assert!(once.contains("请重试"), "{once}");
+    }
+
+    #[test]
+    fn free_form_uuid_like_business_ids_are_redacted_but_structured_ids_remain() {
+        let mut raw = event();
+        raw.event_id = "123e4567-e89b-12d3-a456-426614174000".into();
+        raw.session_id = "123e4567-e89b-12d3-a456-426614174001".into();
+        raw.attempt_id = Some("123e4567-e89b-12d3-a456-426614174002".into());
+        raw.operation_id = Some("123e4567-e89b-12d3-a456-426614174003".into());
+        let expected = "123e4567-e89b-12d3-a456-426614174004";
+        let actual = "123e4567-e89b-12d3-a456-426614174005";
+        raw.safe_message = Some(format!(
+            "source session JSONL id changed from {expected} to {actual}"
+        ));
+        raw.safe_context.insert(
+            "detail".into(),
+            Value::String(format!("provider mismatch ({expected} != {actual})")),
+        );
+        raw.safe_context.insert(
+            "nested".into(),
+            json!({"items": [expected, {"sessionId": actual}]}),
+        );
+
+        let safe = sanitizer().sanitize_event(&raw);
+        assert_eq!(safe.event_id, raw.event_id);
+        assert_eq!(safe.session_id, raw.session_id);
+        assert_eq!(safe.attempt_id, raw.attempt_id);
+        assert_eq!(safe.operation_id, raw.operation_id);
+        let message = safe.safe_message.unwrap();
+        assert!(message.contains("source session JSONL id changed from"));
+        assert_eq!(message.matches("[REDACTED_ID]").count(), 2);
+        let detail = safe.safe_context["detail"].as_str().unwrap();
+        assert!(detail.contains("provider mismatch"));
+        assert_eq!(detail.matches("[REDACTED_ID]").count(), 2);
+        assert!(!message.contains(expected));
+        assert!(!detail.contains(actual));
+        let nested = serde_json::to_string(&safe.safe_context["nested"]).unwrap();
+        assert!(!nested.contains(expected), "{nested}");
+        assert!(!nested.contains(actual), "{nested}");
+        assert_eq!(nested.matches("[REDACTED_ID]").count(), 2);
+        assert_eq!(sanitizer().sanitize_text(&message), message);
+        assert!(contains_uuid_like_id(expected));
+        assert!(!contains_uuid_like_id(&message));
+    }
+
+    #[test]
+    fn forward_unc_device_paths_and_unknown_roots_are_redacted_without_url_false_positives() {
+        let sanitizer = sanitizer();
+        let input = concat!(
+            "失败路径 //server/share/Alice/x | ",
+            "设备路径 //?/C:/Users/Alice/private.txt | ",
+            "相似用户 C:\\Users\\AliceOther\\state.db | ",
+            "合法链接 https://example.test/Users/Alice/docs 和 wss://example.test/socket"
+        );
+        let once = sanitizer.sanitize_text(input);
+        let twice = sanitizer.sanitize_text(&once);
+
+        assert_eq!(once, twice);
+        for forbidden in ["server", "share", "AliceOther", "private.txt", "state.db"] {
+            assert!(!once.contains(forbidden), "{once}");
+        }
+        assert!(!once.contains("%USERPROFILE%Other"), "{once}");
+        assert!(once.contains("[REDACTED_PATH]"), "{once}");
+        assert!(once.contains("[REDACTED_URL]"), "{once}");
+
+        for path in [
+            "//server/share/Alice/x",
+            "//?/C:/Users/Alice/x",
+            r"\\server\share\Alice\x",
+            r"C:\Other\state.db",
+            "/home/alice/state.db",
+        ] {
+            assert!(contains_absolute_path(path), "{path}");
+        }
+        for url in [
+            "https://example.test/Users/Alice/docs",
+            "http://example.test/home/alice",
+            "wss://example.test/socket",
+            "ws://example.test/tmp/cache",
+        ] {
+            assert!(!contains_absolute_path(url), "{url}");
+        }
+
+        for path in [
+            r"D:\Other User\private.txt",
+            "//server/share/My Documents/private.txt",
+            r"D:\Other\a%b\secret.db",
+            r"D:\Other\[draft]\secret.db",
+            r"D:\Other\customer,2026.db",
+            r"D:\Other\customer;2026.db",
+            r"D:\Other\customer)2026.db",
+            r"D:\Other\O'Brien\file.db",
+            r"C:\Users\Alice Other\private.txt",
+            r"C:\Users\Alice,Other\private.txt",
+        ] {
+            let input = format!("open failed: {path} | retry remains visible");
+            let output = sanitizer.sanitize_text(&input);
+            assert!(!output.contains(path), "{output}");
+            assert!(!output.contains("private.txt"), "{output}");
+            assert!(!output.contains("secret.db"), "{output}");
+            assert!(!output.contains("customer"), "{output}");
+            assert!(!output.contains("Brien"), "{output}");
+            assert!(!output.contains("file.db"), "{output}");
+            assert!(output.contains("retry remains visible"), "{output}");
+            assert_eq!(sanitizer.sanitize_text(&output), output);
+        }
+
+        let quoted = sanitizer.sanitize_text(
+            r#"open failed: "D:\Other User\[draft],2026);a%b\private.txt" | retry visible"#,
+        );
+        assert!(!quoted.contains("Other User"), "{quoted}");
+        assert!(!quoted.contains("private.txt"), "{quoted}");
+        assert!(quoted.contains("retry visible"), "{quoted}");
+
+        let exact_root = sanitizer.sanitize_text(r"C:\Users\Alice");
+        let root_child = sanitizer.sanitize_text(r"C:\Users\Alice\child.txt");
+        assert_eq!(exact_root, "%USERPROFILE%");
+        assert_eq!(root_child, r"%USERPROFILE%\child.txt");
+        for collision in [
+            r"C:\Users\Alice Other\private.txt",
+            r"C:\Users\Alice,Other\private.txt",
+        ] {
+            let output = sanitizer.sanitize_text(&format!("failed: {collision} | retry"));
+            assert!(output.starts_with("failed: [REDACTED_PATH]"), "{output}");
+            assert!(output.contains("retry"), "{output}");
+            assert!(!output.contains("%USERPROFILE%"));
+        }
     }
 
     #[test]

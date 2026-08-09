@@ -25,7 +25,7 @@
 
 ChatGPT Switch 是一个 Windows 桌面工具，用来在 **ChatGPT 账号态** 和 **一个 OpenAI-compatible API 中转站态** 之间安全切换，同时保持本地会话可同步、可管理。公开 UI 和窗口标题使用 ChatGPT Switch；仓库名、`.codex`、`CODEX_HOME` 和 `plus` 等标识继续保留兼容命名。GitHub Release 资产仍必须唯一命名为 `codex-switch.exe`，因为 v0.1.9 updater 固定校验该资产名，不能改成 `chatgpt-switch.exe`。
 
-> 当前源码目标版本为 `v0.2.6`；正式可下载资产及校验结果仍以 GitHub Releases 的 latest stable 为准。`v0.2.6` 的 PR/main/tag CI、GitHub Release/Latest、公开回下载 hash/版本合同和 `v0.2.5 -> v0.2.6` 一键更新证据，必须等本次发布最终闭环后再补，当前文档不把源码或本地候选写成已发布。
+> 当前源码目标版本为 `v0.2.7`；正式可下载资产及校验结果仍以 GitHub Releases 的 latest stable 为准。`v0.2.7` 的 PR/main/tag CI、GitHub Release/Latest、公开回下载 hash/版本合同和 `v0.2.5 -> v0.2.7` 一键更新证据，必须等本次发布最终闭环后再补，当前文档不把源码或本地候选写成已发布。
 
 ## 开发过程
 
@@ -245,7 +245,7 @@ Apply 失败会使用两份 `StateOnly` 检查点恢复 current/shared 数据库
 
 ### 9. 诊断与支持
 
-`v0.2.6` 源码新增独立的支持诊断层。它和 `%APPDATA%\codex-switch\logs\operations.jsonl` 是两套不同合同：
+`v0.2.7` 源码新增独立的支持诊断层。它和 `%APPDATA%\codex-switch\logs\operations.jsonl` 是两套不同合同：
 
 - `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 保存已经结构化、限长并脱敏的诊断事件。Windows 上，同一登录会话内、使用同一规范化诊断根的 append/read/status/prune/clear 通过 root-scoped named mutex 跨进程协调，但不取得业务 mutation guard；command/lifecycle recorder 和 panic 路径拿不到锁都会立即放弃，低层管理 API 才使用有界等待。读取时每个 segment 只容忍最后一条未写完整的尾记录，发现 dirty tail 后不会继续追加旧段；内部损坏或不兼容 schema 会明确失败。诊断写入、轮转或清理仍是 best-effort，不会阻止启动、改变 mutation 终态或触发业务回滚；事件已经 `sync_data` 成功后，后置 prune 失败也不会把这次 durable append 误报成失败。
 - `logs\operations.jsonl` 仍是严格、durable 的终态审计账本和检查点清理证据。诊断导出只读它并生成去掉备份路径等敏感字段的相关子集；诊断面板的轮转、导出和“清除诊断日志”都不会删除、截断或改写该账本。
@@ -264,9 +264,9 @@ Apply 失败会使用两份 `StateOnly` 检查点恢复 current/shared 数据库
 - `operations.jsonl`：相关 durable 操作终态的脱敏子集，不包含原账本中的备份路径。
 - `health.json`：只读健康摘要；包含应用版本、OS/架构与 best-effort Windows 版本、APPDATA/CODEX_HOME 和诊断存储摘要、当前 route/auth mode 结构、受管 ChatGPT/独立 Codex 进程计数，以及四个受管 SQLite 的 present/readable/bytes/只读 `schema_version`。任一 collector 失败时逐项标记 unavailable，不伪造成健康或空数据；它不读取进程命令行，也不执行写入式修复。
 
-事件在落盘前先经过字段 allowlist、深度/数量/长度限制和集中 sanitizer；导出层还会执行更严格的禁用字段删除、身份/路径/秘密形态扫描和 ZIP 自检。默认包不包含 API Key、token、Authorization、cookie、凭据、聊天/会话正文、原始 session JSONL、SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、Windows 用户名或稳定设备 ID。已知受管根替换为 `%CODEX_HOME%` / `%APPDATA%` / `%USERPROFILE%`，其他绝对路径不会原样导出。即使已脱敏，也建议只把生成的单个 ZIP 私下发给维护者，不要上传整个 `%APPDATA%\codex-switch`。
+事件在落盘前先经过字段 allowlist、深度/数量/长度限制和集中 sanitizer；导出层还会执行更严格的禁用字段删除、身份/路径/秘密形态扫描和 ZIP 自检。自由文本中的业务 session/thread UUID 会固定脱敏，诊断自身随机 session/event/attempt/operation 关联字段仍保留。默认包不包含 API Key、token、Authorization、cookie、凭据、聊天/会话正文、原始 session JSONL、SQLite、`auth.json`、完整 `config.toml`、请求/响应正文、全量环境变量、进程命令行、Windows WER、机器名、Windows 用户名或稳定设备 ID。已知受管根只在完整路径边界上映射为 `%CODEX_HOME%` / `%APPDATA%` / `%USERPROFILE%`；盘符、反斜杠/正斜杠 UNC、设备路径和其他未知绝对路径都不会原样导出，带 scheme 的 URL 仍按 URL 规则处理。即使已脱敏，也建议只把生成的单个 ZIP 私下发给维护者，不要上传整个 `%APPDATA%\codex-switch`。
 
-本地诊断 store 默认只读取/导出 `timestamp` 位于最近 **14 天**事件窗口内的记录，同时把同一诊断根的 segment 总量限制为 **10 MiB**；单个 segment 达到 512 KiB、创建时间超出窗口或尾部不完整时轮转。年龄清理只有在逐条验证一个 clean segment 的全部事件都已过期后才删除整段，不能因文件名较旧而误删窗口内的新事件；容量上限仍可淘汰结构有效、尾部完整的最旧段，因此实际可用窗口可能短于 14 天。dirty tail、内部损坏或未知 schema 不会被 prune 掩盖。窗口依赖 Windows 系统墙钟，人为大幅回拨会影响判断；不同登录会话或指向同目录的不同路径别名也不保证共享同一个 named mutex。
+本地诊断 store 默认只读取/导出 `timestamp` 位于最近 **14 天**事件窗口内的记录，同时把同一诊断根的 segment 总量限制为 **10 MiB**；单个 segment 达到 512 KiB、创建时间超出窗口或尾部不完整时轮转。年龄清理只有在逐条验证一个 clean segment 的全部事件都已过期后才删除整段，不能因文件名较旧而误删窗口内的新事件；容量上限仍可淘汰结构有效、尾部完整的最旧段，因此实际可用窗口可能短于 14 天。dirty tail、内部损坏或未知 schema 不会被 prune 掩盖。事件读取仍按 session causal sequence 展示，但状态和 retained-window manifest 使用事件 `timestamp` 的真实最小/最大值，操作子集也按规范化时间区间求交，避免系统墙钟回拨漏掉相关记录。窗口依赖 Windows 系统墙钟，人为大幅回拨仍会影响 14 天判断；不同登录会话或指向同目录的不同路径别名也不保证共享同一个 named mutex。
 
 应用会尽早记录随机、仅本次启动有效的 `sessionStarted`；Windows session/attempt ID 优先来自 OS CSPRNG，失败时依次使用 `CoCreateGuid` 和不可稳定关联的进程局部 fallback。`sessionStarted` 带 PID、timestamp unit，并在系统允许时尽力带 process creation stamp，Tauri Ready/正常退出记录 `appReady` / `sessionEnded`；下次启动在 PID + creation stamp 可用时先排除仍在运行的另一个实例和 PID reuse，再对缺少 clean terminal 的上一 session 记录 `previousSessionUnclean`。Rust panic hook 和前端 `error` / `unhandledrejection` 只写最小、限长、脱敏的 best-effort 事件，release 的 `panic = "abort"` 保持不变：它不恢复 panic、不增加 watchdog，也不承诺捕获来不及执行落盘代码的访问冲突、强制结束、断电、硬卡死或其他硬崩溃。硬崩溃若发生在 ZIP 最终发布前，还可能在 Downloads 或固定备用目录留下 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`；正常错误会尽力删除，但“清除诊断日志”不会处理该文件。`previousSessionUnclean` 只能证明缺少干净终态，不能单独证明具体崩溃原因。
 
@@ -381,7 +381,7 @@ npm run check:release
 .\scripts\pack-windows-release.ps1 -UpxPath "C:\path\to\upx.exe"
 ```
 
-`v0.2.6` 还必须在隔离 `APPDATA` / `CODEX_HOME` 下完成诊断写入、跨进程 root lock、dirty tail 封存、事件时间 14 天/10 MiB segment 轮转、operation 分离、health 只读/逐项 unavailable、ZIP 五文件/hash/敏感扫描、Known Folder/显式备用目录/no-clobber、前端失败导出和真实 packed EXE 导出验证；随后才进入 PR/main/tag CI、GitHub Release/Latest、公开回下载一致性与正式 `v0.2.5 -> v0.2.6` updater smoke。上述发布证据当前待主任务最终闭环，不得从本 README 的目标说明推断已经完成。
+`v0.2.7` 还必须在隔离 `APPDATA` / `CODEX_HOME` 下完成诊断写入、跨进程 root lock、dirty tail 封存、事件时间 14 天/10 MiB segment 轮转、operation 分离、health 只读/逐项 unavailable、ZIP 五文件/hash/敏感扫描、Known Folder/显式备用目录/no-clobber、前端失败导出和真实 packed EXE 导出验证；随后才进入 PR/main/tag CI、GitHub Release/Latest、公开回下载一致性与正式 `v0.2.5 -> v0.2.7` updater smoke。上述发布证据当前待主任务最终闭环，不得从本 README 的目标说明推断已经完成。
 
 ## License
 
