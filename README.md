@@ -1,16 +1,38 @@
-# ChatGPT Switch
+<div align="center">
 
-在 **Windows** 上，一键在 **ChatGPT 官方模式** 和 **API 模式**之间切换。API 模式使用你自己配置的 OpenAI-compatible API（也常被称为 API 中转站）。
+<h1>ChatGPT Switch</h1>
 
-无需反复退出官方 ChatGPT 登录，也无需手工修改本地配置。ChatGPT Switch 会协助关闭 ChatGPT Desktop、切换请求配置、检查结果并重新打开应用；还提供本机会话管理、完整备份、诊断导出和应用内更新。
+<hr />
 
-[下载最新版](https://github.com/mingisrookie/codex-switch/releases/latest) · [快速开始](#快速开始) · [安全与数据](#安全与数据) · [问题反馈](https://github.com/mingisrookie/codex-switch/issues)
+<p><strong>在 Windows 上，一键在 ChatGPT 官方模式和 OpenAI-compatible API 模式之间切换。</strong></p>
+
+<p>无需反复退出官方 ChatGPT 登录，也无需手工修改本地配置；支持本机会话管理、完整备份、脱敏诊断和应用内更新。</p>
+
+<p>
+  <a href="#快速开始">快速开始</a> ·
+  <a href="https://github.com/mingisrookie/codex-switch/releases/latest">下载最新版</a> ·
+  <a href="docs/USER_GUIDE.md">使用指南</a> ·
+  <a href="docs/SECURITY.md">安全与数据</a> ·
+  <a href="https://github.com/mingisrookie/codex-switch/issues">问题反馈</a>
+</p>
+
+<p>
+  <img alt="release" src="https://img.shields.io/github/v/release/mingisrookie/codex-switch?display_name=tag&amp;label=release&amp;color=087f75" />
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-16a34a" />
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20x64-2563eb" />
+  <img alt="desktop" src="https://img.shields.io/badge/desktop-Tauri%202-24c8db" />
+</p>
+
+</div>
+
+## 这是什么
+
+ChatGPT Switch 是一个 Windows 桌面工具，用于在 ChatGPT 官方模式和你自行配置的 OpenAI-compatible API 模式之间切换。
 
 > **先知道这些：**
 > - ChatGPT Switch **不是 API 中转服务**，不会提供 ChatGPT 账号、API Key、模型额度或第三方接口。
 > - 当前只支持 **Windows x64**；你需要自行安装并登录 ChatGPT Desktop。
 > - 这是独立开源项目，**不是 OpenAI 官方产品**，与 OpenAI 没有隶属或授权关系。
-
 ## 下载最新版
 
 1. 打开 [GitHub Releases](https://github.com/mingisrookie/codex-switch/releases/latest)。
