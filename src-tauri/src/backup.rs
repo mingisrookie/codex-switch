@@ -3307,14 +3307,13 @@ fn validate_backup_restore_journal(journal: &BackupRestoreJournal) -> Result<(),
             }
         }
         BackupRestoreOperationPhase::CommittedCleanupComplete
-        | BackupRestoreOperationPhase::RolledBackCleanupComplete => {
+        | BackupRestoreOperationPhase::RolledBackCleanupComplete
             if journal
                 .mutation_states
                 .iter()
-                .any(|state| state.phase != BackupRestoreMutationPhase::Cleaned)
-            {
-                return Err("completed backup restore cleanup has retained artifacts".to_string());
-            }
+                .any(|state| state.phase != BackupRestoreMutationPhase::Cleaned) =>
+        {
+            return Err("completed backup restore cleanup has retained artifacts".to_string());
         }
         _ => {}
     }

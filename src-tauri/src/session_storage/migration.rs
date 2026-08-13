@@ -1241,7 +1241,7 @@ fn snapshot_database_digests(
             }
         }
     }
-    digests.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+    digests.sort_by_key(|digest| path_key(&digest.0));
     Ok(digests)
 }
 

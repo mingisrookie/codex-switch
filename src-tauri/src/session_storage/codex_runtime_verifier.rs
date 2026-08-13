@@ -1200,12 +1200,13 @@ fn verify_persisted_probe_tool(
                     call_seen = true;
                 }
             }
-            Some("function_call_output") if call_seen => {
-                if payload.get("output").is_some_and(|output| {
-                    value_contains_string_fragment(output, expected_output_token)
-                }) {
-                    output_seen = true;
-                }
+            Some("function_call_output")
+                if call_seen
+                    && payload.get("output").is_some_and(|output| {
+                        value_contains_string_fragment(output, expected_output_token)
+                    }) =>
+            {
+                output_seen = true;
             }
             _ => {}
         }
