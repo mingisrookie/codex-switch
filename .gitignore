@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+/target/
 src-tauri/gen/
 release/
 *.log
@@ -22,3 +23,8 @@ docs/superpowers/
 .agents/
 .codex/
 .trellis/
+.dxm/runs/
+
+# DXM:START
+.dxm/
+# DXM:END

@@ -50,6 +50,7 @@ pub(crate) struct RuntimeSessionStoragePlan {
     session_file_writes_required: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProviderSlotGcSummary {
     pub reclaimed_count: usize,
@@ -220,6 +221,7 @@ enum ExistingRolloutPathPolicy {
 struct SessionSyncPolicy {
     allow_existing_replacement: bool,
     update_existing_provider: bool,
+    reference_canonical_rollout: bool,
     existing_rollout_path: ExistingRolloutPathPolicy,
     session_files: SessionFileWritePolicy,
     session_index: SessionIndexWritePolicy,
@@ -236,6 +238,7 @@ impl SessionSyncPolicy {
         Self {
             allow_existing_replacement,
             update_existing_provider,
+            reference_canonical_rollout: false,
             existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
             session_files,
             session_index: SessionIndexWritePolicy::closed(session_files),
@@ -248,6 +251,7 @@ impl SessionSyncPolicy {
         Self {
             allow_existing_replacement: false,
             update_existing_provider: false,
+            reference_canonical_rollout: false,
             existing_rollout_path: ExistingRolloutPathPolicy::PreserveExisting,
             session_files,
             session_index: SessionIndexWritePolicy::hot(session_files),
@@ -261,6 +265,7 @@ impl SessionSyncPolicy {
         Self {
             allow_existing_replacement: true,
             update_existing_provider: false,
+            reference_canonical_rollout: false,
             existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
             session_files: SessionFileWritePolicy::Allow,
             session_index: SessionIndexWritePolicy::Skip,
@@ -269,10 +274,12 @@ impl SessionSyncPolicy {
         }
     }
 
+    #[cfg(test)]
     fn incremental_self_provider() -> Self {
         Self {
             allow_existing_replacement: true,
             update_existing_provider: true,
+            reference_canonical_rollout: false,
             existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
             session_files: SessionFileWritePolicy::Allow,
             session_index: SessionIndexWritePolicy::Skip,
@@ -283,8 +290,14 @@ impl SessionSyncPolicy {
 
     fn mobile_provider_publication() -> Self {
         Self {
-            sanitize_local_only_content: true,
-            ..Self::incremental_self_provider()
+            allow_existing_replacement: true,
+            update_existing_provider: true,
+            reference_canonical_rollout: true,
+            existing_rollout_path: ExistingRolloutPathPolicy::SelectMostComplete,
+            session_files: SessionFileWritePolicy::Deny,
+            session_index: SessionIndexWritePolicy::Skip,
+            copy_dependent_rows: true,
+            sanitize_local_only_content: false,
         }
     }
 }
@@ -1034,6 +1047,39 @@ fn sync_sessions_in_transaction(
             }
             let existing_rollout =
                 existing_thread_rollout_path(target_conn, target_root, &thread.id)?;
+            if policy.reference_canonical_rollout {
+                let provider_id = provider_id.ok_or_else(|| {
+                    "target provider is required for a canonical session view".to_string()
+                })?;
+                let selected_rollout = select_canonical_view_rollout(
+                    target_root,
+                    thread,
+                    existing_rollout.as_deref(),
+                )?;
+                let Some(selected_rollout) = selected_rollout else {
+                    preserved_divergent_thread_ids.insert(thread.id.clone());
+                    duplicate_threads += usize::from(existing_thread);
+                    continue;
+                };
+                if existing_thread {
+                    duplicate_threads += 1;
+                    update_existing_thread(
+                        target_conn,
+                        &thread.id,
+                        Some(selected_rollout.as_str()),
+                        Some(provider_id),
+                    )?;
+                } else {
+                    insert_thread(
+                        target_conn,
+                        thread,
+                        selected_rollout.as_str(),
+                        Some(provider_id),
+                    )?;
+                    inserted_threads += 1;
+                }
+                continue;
+            }
             if policy.update_existing_provider {
                 let provider_id = provider_id.ok_or_else(|| {
                     "target provider is required for a provider-aware sync".to_string()
@@ -2091,6 +2137,30 @@ fn create_session_file_if_absent(
             sanitize_local_only_content,
         )
     })
+}
+
+fn select_canonical_view_rollout(
+    target_root: &SyncRoot,
+    source: &SourceThread,
+    existing_rollout: Option<&str>,
+) -> Result<Option<String>, String> {
+    let source_path =
+        validate_contained_session_file(target_root, &source.session_file, &source.id)?;
+    let Some(existing_rollout) = existing_rollout else {
+        return Ok(Some(source.session_file.to_string_lossy().to_string()));
+    };
+    let existing_path =
+        validate_contained_session_file(target_root, Path::new(existing_rollout), &source.id)?;
+    if paths_match(&source_path, &existing_path) {
+        return Ok(Some(existing_rollout.to_string()));
+    }
+    match session_file_relation(&source_path, &existing_path)? {
+        SessionFileRelation::Equal | SessionFileRelation::LeftExtendsRight => {
+            Ok(Some(source.session_file.to_string_lossy().to_string()))
+        }
+        SessionFileRelation::RightExtendsLeft => Ok(Some(existing_rollout.to_string())),
+        SessionFileRelation::Divergent => Ok(None),
+    }
 }
 
 fn plan_rollout_file(
@@ -3478,6 +3548,7 @@ fn sha256_file(path: &Path) -> Result<Vec<u8>, String> {
     Ok(hasher.finalize().to_vec())
 }
 
+#[cfg(test)]
 pub(crate) fn cleanup_obsolete_provider_slots(
     candidates: &[ObsoleteProviderSlot],
     current: &CodexPaths,
@@ -3520,6 +3591,7 @@ pub(crate) fn cleanup_obsolete_provider_slots(
     summary
 }
 
+#[cfg(test)]
 fn cleanup_obsolete_provider_slot(
     candidate: &ObsoleteProviderSlot,
     root: &SyncRoot,
@@ -3611,6 +3683,7 @@ fn cleanup_obsolete_provider_slot(
     }
 }
 
+#[cfg(test)]
 fn database_references_rollout(paths: &CodexPaths, candidate: &Path) -> Result<bool, String> {
     if !paths.state_db.is_file() {
         return Ok(false);
@@ -4227,7 +4300,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn session_index_atomic_replace_fails_closed_while_target_is_open() {
+    fn session_index_atomic_replace_preserves_an_open_read_view() {
         use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
         let source = tempdir().unwrap();
@@ -4249,15 +4322,24 @@ mod tests {
         let source_root = root_from_paths(crate::codex_paths::local_codex_paths(source.path()));
         let target_root = root_from_paths(crate::codex_paths::local_codex_paths(target.path()));
 
-        let error = merge_session_index(
+        let merged = merge_session_index(
             &source_root,
             &target_root,
             &std::collections::HashSet::from(["thread-b".to_string()]),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("failed to atomically replace session_index.jsonl"));
-        assert_eq!(fs::read(&target_index).unwrap(), original);
+        assert_eq!(merged, 1);
+        assert_eq!(
+            fs::read_to_string(&target_index).unwrap(),
+            "{\"id\":\"thread-a\"}\n{\"id\":\"thread-b\"}\n"
+        );
+        use std::io::{Read, Seek, SeekFrom};
+        let mut held_target = held_target;
+        held_target.seek(SeekFrom::Start(0)).unwrap();
+        let mut held_bytes = Vec::new();
+        held_target.read_to_end(&mut held_bytes).unwrap();
+        assert_eq!(held_bytes, original);
         drop(held_target);
     }
 

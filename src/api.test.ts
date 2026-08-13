@@ -20,13 +20,22 @@ import {
   createFullBackup,
   clearDiagnosticLogs,
   deleteBackup,
-  deleteManagedSessions,
+  createSessionStorageMigrationBackup,
+  createSessionStorageInvestigationTask,
   getAppStatus,
   getDiagnosticStatus,
   getMobileContinuityStatus,
+  getSessionStorageStatus,
+  getSessionStorageControlState,
   getUpdateStartupNotice,
   importPlusRuntime,
   exportDiagnostics,
+  exportSessionStorageDowngrade,
+  importSessionStorageDowngrade,
+  reconcileSessionStorageLegacyBackups,
+  listSessionStoragePendingRecovery,
+  deferSessionStoragePendingRecovery,
+  restoreSessionStoragePendingRecovery,
   normalizeDiagnosticExportFailure,
   retryDiagnosticExport,
   installUpdate,
@@ -37,18 +46,28 @@ import {
   loadDashboard,
   loadRuntimeDashboard,
   loadSessionDashboard,
+  listSessionStorageConflicts,
+  openSessionStorageInvestigationTask,
+  resolveSessionStorageConflict,
   openDiagnosticExport,
   openDiagnosticLogDirectory,
   requestAppExit,
   recordFrontendDiagnostic,
   acknowledgeMobileContinuityNotice,
+  applySessionStorageMigration,
+  cancelSessionStorageMigration,
   publishMobileContinuitySession,
+  preflightSessionStorageMigration,
+  prepareSessionStorageMigration,
+  runSessionStorageOfflineGc,
   setMobileContinuityEnabled,
+  setSessionStorageAutomaticCleanup,
   saveSkillConfig,
+  scanSessionStorage,
   switchRuntime,
-  syncAllSessions,
+  mergeAndRepairSessions,
   upsertRelayRuntime,
-  verifyRelayRuntime,
+  verifySessionStorageMigrationBackup,
 } from './api';
 import type { BackupSummary } from './types';
 
@@ -64,15 +83,25 @@ describe('dashboard API', () => {
 
   it('recovers correlated mutation failures without changing the business message', async () => {
     const relayFailure = {
-      message: 'relay validation failed: original message',
-      operationId: 'verify-relay-1780000000000-42-1',
+      message: 'relay save failed: original message',
+      operationId: 'save-relay-1780000000000-42-1',
     };
     invoke.mockRejectedValueOnce(
       `__CHATGPT_SWITCH_MUTATION_ERROR_V1__${JSON.stringify(relayFailure)}`,
     );
 
-    await expect(verifyRelayRuntime()).rejects.toEqual(relayFailure);
-    expect(invoke).toHaveBeenCalledWith('test_relay_connection');
+    await expect(upsertRelayRuntime({
+      baseUrl: 'https://relay.example.com/v1',
+      model: 'example-model',
+      apiKey: 'placeholder-key',
+    })).rejects.toEqual(relayFailure);
+    expect(invoke).toHaveBeenCalledWith('upsert_relay_runtime', {
+      input: {
+        baseUrl: 'https://relay.example.com/v1',
+        model: 'example-model',
+        apiKey: 'placeholder-key',
+      },
+    });
 
     const skillFailure = {
       message: 'skill install failed unchanged',
@@ -199,6 +228,7 @@ describe('dashboard API', () => {
       const values: Record<string, unknown> = {
         scan_codex_home: { root: 'C:\\Users\\alice\\.codex' },
         scan_sessions: { threadCount: 4, sessionJsonlCount: 3 },
+        get_session_storage_status: null,
         list_runtimes: [],
         scan_runtime_status: {
           activeRuntimeId: null,
@@ -230,17 +260,19 @@ describe('dashboard API', () => {
       status: 'error',
       error: 'managed scan failed',
     });
+    expect(dashboard.sessionStorage).toMatchObject({ status: 'ready', data: null });
     expect(dashboard.runtimes).toMatchObject({ status: 'ready', data: [] });
     expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
     expect(dashboard.backups).toMatchObject({ status: 'ready', data: [] });
     expect(dashboard.backupStorage).toMatchObject({ status: 'ready' });
     expect(dashboard.operations).toMatchObject({ status: 'ready', data: [] });
-    expect(invoke).toHaveBeenCalledTimes(8);
+    expect(invoke).toHaveBeenCalledTimes(9);
     expect(invoke).toHaveBeenCalledWith('list_operation_records', { limit: 20 });
   });
 
   it('refreshes runtime-facing domains without scanning sessions', async () => {
     invoke.mockImplementation((command: string) => Promise.resolve({
+      get_session_storage_status: null,
       list_runtimes: [],
       scan_runtime_status: {
         activeRuntimeId: 'relay',
@@ -255,7 +287,8 @@ describe('dashboard API', () => {
     const dashboard = await loadRuntimeDashboard();
 
     expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
-    expect(invoke).toHaveBeenCalledTimes(4);
+    expect(dashboard.sessionStorage).toMatchObject({ status: 'ready', data: null });
+    expect(invoke).toHaveBeenCalledTimes(5);
     expect(invoke).not.toHaveBeenCalledWith('scan_sessions');
     expect(invoke).not.toHaveBeenCalledWith('scan_managed_sessions');
     expect(invoke).not.toHaveBeenCalledWith('list_backups');
@@ -265,14 +298,200 @@ describe('dashboard API', () => {
     invoke.mockImplementation((command: string) => Promise.resolve({
       scan_sessions: { threadCount: 4, sessionJsonlCount: 3 },
       scan_managed_sessions: { totalCount: 4, archivedCount: 0, sessions: [] },
+      get_session_storage_status: null,
     }[command]));
 
     const dashboard = await loadSessionDashboard();
 
     expect(dashboard.sessions).toMatchObject({ status: 'ready' });
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(dashboard.sessionStorage).toMatchObject({ status: 'ready', data: null });
+    expect(invoke).toHaveBeenCalledTimes(3);
     expect(invoke).not.toHaveBeenCalledWith('list_backups');
     expect(invoke).not.toHaveBeenCalledWith('list_runtimes');
+  });
+
+  it('uses separate typed commands for the cached status and explicit shadow scan', async () => {
+    invoke.mockResolvedValue(null);
+
+    await getSessionStorageStatus();
+    await scanSessionStorage();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_session_storage_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'scan_session_storage');
+  });
+
+  it('creates and opens only backend-owned sanitized investigation tasks', async () => {
+    invoke.mockResolvedValue(undefined);
+
+    await createSessionStorageInvestigationTask();
+    await openSessionStorageInvestigationTask('codex-investigation-1-safe');
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'create_session_storage_investigation_task');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'open_session_storage_investigation_task', {
+      taskId: 'codex-investigation-1-safe',
+    });
+  });
+
+  it('loads canonical storage control state and persists the automatic cleanup setting', async () => {
+    invoke.mockResolvedValue({ canonicalReady: true, automaticCleanupEnabled: false });
+
+    await getSessionStorageControlState();
+    await setSessionStorageAutomaticCleanup(false);
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_session_storage_control_state');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'set_session_storage_automatic_cleanup', {
+      enabled: false,
+    });
+  });
+
+  it('passes the selected local backup directory to migration preflight', async () => {
+    invoke.mockResolvedValue({ readyForBackup: false });
+
+    await preflightSessionStorageMigration('E:\\codex-switch-backups');
+
+    expect(invoke).toHaveBeenCalledWith('preflight_session_storage_migration', {
+      backupDestination: 'E:\\codex-switch-backups',
+    });
+  });
+
+  it('binds migration backup creation to the durable operation ID', async () => {
+    invoke.mockResolvedValue({ status: 'integrityVerified' });
+
+    await createSessionStorageMigrationBackup('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('create_session_storage_migration_backup', {
+      operationId: 'session-migration-1',
+    });
+  });
+
+  it('binds native migration backup verification to the durable operation ID', async () => {
+    invoke.mockResolvedValue({ status: 'runtimeVerified' });
+
+    await verifySessionStorageMigrationBackup('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('verify_session_storage_migration_backup', {
+      operationId: 'session-migration-1',
+    });
+  });
+
+  it('binds migration apply planning to the durable operation ID', async () => {
+    invoke.mockResolvedValue({ preparedSessionCount: 2 });
+
+    await prepareSessionStorageMigration('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('prepare_session_storage_migration', {
+      operationId: 'session-migration-1',
+    });
+  });
+
+  it('binds migration apply to the durable operation ID', async () => {
+    invoke.mockResolvedValue({ validated: true });
+
+    await applySessionStorageMigration('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('apply_session_storage_migration', {
+      operationId: 'session-migration-1',
+    });
+  });
+
+  it('binds precommit migration cancellation to the durable operation ID', async () => {
+    invoke.mockResolvedValue({ stagingDiscarded: true });
+
+    await cancelSessionStorageMigration('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('cancel_session_storage_migration', {
+      operationId: 'session-migration-1',
+    });
+  });
+
+  it('binds offline cleanup to the committed migration backup', async () => {
+    invoke.mockResolvedValue({ validated: true, deletedCount: 1 });
+
+    await runSessionStorageOfflineGc('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('run_session_storage_offline_gc', {
+      migrationOperationId: 'session-migration-1',
+    });
+  });
+
+  it('binds an explicit v0.2 export to migration, exact version, and isolated destination', async () => {
+    invoke.mockResolvedValue({ structurallyVerified: true });
+
+    await exportSessionStorageDowngrade(
+      'session-migration-1',
+      'v0.2.7',
+      'E:\\codex-switch-downgrade',
+    );
+
+    expect(invoke).toHaveBeenCalledWith('export_session_storage_downgrade', {
+      migrationOperationId: 'session-migration-1',
+      targetVersion: 'v0.2.7',
+      destinationRoot: 'E:\\codex-switch-downgrade',
+    });
+  });
+
+  it('binds downgrade re-upgrade import to its migration and isolated package', async () => {
+    invoke.mockResolvedValue({ validated: true });
+
+    await importSessionStorageDowngrade(
+      'session-migration-1',
+      'E:\\codex-switch-downgrade-v0.2.7',
+    );
+
+    expect(invoke).toHaveBeenCalledWith('import_session_storage_downgrade', {
+      migrationOperationId: 'session-migration-1',
+      packageDir: 'E:\\codex-switch-downgrade-v0.2.7',
+    });
+  });
+
+  it('binds legacy backup reconciliation and pending recovery actions to the committed migration', async () => {
+    invoke.mockResolvedValue({ entries: [] });
+
+    await reconcileSessionStorageLegacyBackups('session-migration-1');
+    await listSessionStoragePendingRecovery('session-migration-1');
+    await deferSessionStoragePendingRecovery('session-migration-1', 'entry-1');
+    await restoreSessionStoragePendingRecovery('session-migration-1', 'entry-2');
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'reconcile_session_storage_legacy_backups', {
+      migrationOperationId: 'session-migration-1',
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'list_session_storage_pending_recovery', {
+      migrationOperationId: 'session-migration-1',
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'defer_session_storage_pending_recovery', {
+      migrationOperationId: 'session-migration-1',
+      entryId: 'entry-1',
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, 'restore_session_storage_pending_recovery', {
+      migrationOperationId: 'session-migration-1',
+      entryId: 'entry-2',
+    });
+  });
+
+  it('lists conflict summaries by committed migration operation ID', async () => {
+    invoke.mockResolvedValue({ migrationOperationId: 'session-migration-1', conflicts: [] });
+
+    await listSessionStorageConflicts('session-migration-1');
+
+    expect(invoke).toHaveBeenCalledWith('list_session_storage_conflicts', {
+      migrationOperationId: 'session-migration-1',
+    });
+  });
+
+  it('submits an explicit conflict action without exposing session content', async () => {
+    invoke.mockResolvedValue({ status: 'deferred', validated: true });
+
+    await resolveSessionStorageConflict(
+      'session-migration-1',
+      `conflict-${'a'.repeat(64)}`,
+      'defer',
+    );
+
+    expect(invoke).toHaveBeenCalledWith('resolve_session_storage_conflict', {
+      migrationOperationId: 'session-migration-1',
+      conflictId: `conflict-${'a'.repeat(64)}`,
+      action: 'defer',
+    });
   });
 
   it('loads expensive backup verification only through its explicit loader', async () => {
@@ -354,17 +573,6 @@ describe('dashboard API', () => {
     expect(invoke).toHaveBeenNthCalledWith(2, 'check_for_updates');
     expect(invoke).toHaveBeenNthCalledWith(3, 'install_update');
     expect(invoke).toHaveBeenNthCalledWith(4, 'get_update_startup_notice');
-  });
-
-  it('passes the hard-delete confirmation under the backend confirmed field', async () => {
-    invoke.mockResolvedValue({ selectedCount: 1 });
-
-    await deleteManagedSessions(['thread-a'], true);
-
-    expect(invoke).toHaveBeenCalledWith('delete_managed_sessions', {
-      ids: ['thread-a'],
-      confirmed: true,
-    });
   });
 
   it('uses the fixed command for a typed full backup receipt', async () => {
@@ -473,7 +681,7 @@ describe('dashboard API', () => {
     invoke.mockResolvedValue({ changed: true });
     const events: string[] = [];
 
-    await switchRuntime('relay', (event) => events.push(event.phase), 'direct');
+    await switchRuntime('relay', (event) => events.push(event.phase));
 
     const payload = invoke.mock.calls[0][1] as {
       runtimeId: string;
@@ -481,7 +689,7 @@ describe('dashboard API', () => {
     };
     expect(invoke).toHaveBeenCalledWith('switch_runtime', {
       runtimeId: 'relay',
-      relayPreference: 'direct',
+      relayPreference: null,
       onProgress: expect.any(Channel),
     });
     payload.onProgress.onmessage({ phase: 'detectingApp' });
@@ -492,12 +700,12 @@ describe('dashboard API', () => {
     invoke.mockResolvedValue({ operationId: 'sync-1' });
     const phases: string[] = [];
 
-    await syncAllSessions((event) => phases.push(event.phase));
+    await mergeAndRepairSessions((event) => phases.push(event.phase));
 
     const payload = invoke.mock.calls[0][1] as {
       onProgress: { onmessage: (event: { phase: string; timestampMs: number }) => void };
     };
-    expect(invoke).toHaveBeenCalledWith('sync_all_sessions', {
+    expect(invoke).toHaveBeenCalledWith('merge_and_repair_sessions', {
       onProgress: expect.any(Channel),
     });
     payload.onProgress.onmessage({ phase: 'reconciling', timestampMs: 10 });

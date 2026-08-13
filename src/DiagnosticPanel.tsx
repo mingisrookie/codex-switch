@@ -316,7 +316,7 @@ export function DiagnosticPanel({ onClose, onBusyChange }: DiagnosticPanelProps)
           <div><dt>状态</dt><dd>{status?.available ? '可用' : '暂不可用'}</dd></div>
           <div><dt>事件</dt><dd>{status?.eventCount ?? 0}</dd></div>
           <div><dt>占用</dt><dd>{formatBytes(status?.totalBytes ?? 0)}</dd></div>
-          <div><dt>保留</dt><dd>{status?.retentionDays ?? 14} 天 / {formatBytes(status?.maxBytes ?? 0)}</dd></div>
+          <div><dt>保留</dt><dd>{status?.retentionDays ?? 7} 天 / {formatBytes(status?.maxBytes ?? 0)}</dd></div>
           <div><dt>最早记录</dt><dd>{formatTime(status?.oldestEventAtMs ?? null)}</dd></div>
           <div><dt>最近记录</dt><dd>{formatTime(status?.newestEventAtMs ?? null)}</dd></div>
         </dl>

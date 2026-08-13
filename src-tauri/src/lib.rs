@@ -3,6 +3,11 @@ mod chat_process_state;
 pub mod codex_home;
 pub mod codex_paths;
 mod commands;
+#[cfg(feature = "runtime-evidence")]
+pub use commands::{
+    run_automatic_gc_safe_window_evidence_at, AutomaticGcSafeWindowEvidence,
+    AutomaticGcSafeWindowObservation,
+};
 pub mod config_patch;
 pub mod crypto;
 mod diagnostic_commands;
@@ -11,7 +16,6 @@ pub mod file_ops;
 pub mod mobile_continuity;
 pub mod operation_log;
 pub mod process_control;
-pub mod relay_verify;
 mod request_route_switcher;
 mod runtime_session_view;
 pub mod runtime_store;
@@ -20,6 +24,7 @@ pub mod runtime_switcher;
 pub mod session_incremental;
 pub mod session_manager;
 pub mod session_scan;
+pub mod session_storage;
 pub mod session_sync;
 pub mod skill_manager;
 pub mod update_check;
@@ -36,6 +41,27 @@ pub fn run() {
             commands::scan_codex_home,
             commands::scan_sessions,
             commands::scan_managed_sessions,
+            commands::get_session_storage_status,
+            commands::get_session_storage_control_state,
+            commands::create_session_storage_investigation_task,
+            commands::open_session_storage_investigation_task,
+            commands::set_session_storage_automatic_cleanup,
+            commands::scan_session_storage,
+            commands::list_session_storage_conflicts,
+            commands::resolve_session_storage_conflict,
+            commands::preflight_session_storage_migration,
+            commands::create_session_storage_migration_backup,
+            commands::verify_session_storage_migration_backup,
+            commands::prepare_session_storage_migration,
+            commands::cancel_session_storage_migration,
+            commands::apply_session_storage_migration,
+            commands::run_session_storage_offline_gc,
+            commands::export_session_storage_downgrade,
+            commands::import_session_storage_downgrade,
+            commands::reconcile_session_storage_legacy_backups,
+            commands::list_session_storage_pending_recovery,
+            commands::defer_session_storage_pending_recovery,
+            commands::restore_session_storage_pending_recovery,
             commands::list_runtimes,
             commands::get_mobile_continuity_status,
             commands::set_mobile_continuity_enabled,
@@ -44,13 +70,11 @@ pub fn run() {
             commands::scan_runtime_status,
             commands::import_plus_runtime,
             commands::upsert_relay_runtime,
-            commands::test_relay_connection,
             commands::list_codex_processes,
             commands::close_codex_processes,
             commands::launch_chatgpt,
             commands::switch_runtime,
-            commands::sync_all_sessions,
-            commands::delete_managed_sessions,
+            commands::merge_and_repair_sessions,
             commands::restore_sessions_visible,
             commands::list_backups,
             commands::inspect_checkpoint_storage,
@@ -87,6 +111,8 @@ pub fn run() {
                         );
                     }
                     app_handle.exit(1);
+                } else {
+                    commands::schedule_session_storage_startup_recovery();
                 }
             }
             tauri::RunEvent::ExitRequested { code, api, .. } => {

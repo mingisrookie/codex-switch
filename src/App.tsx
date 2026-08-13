@@ -31,7 +31,6 @@ import {
   closeCodexProcesses,
   createFullBackup,
   deleteBackup,
-  deleteManagedSessions,
   importPlusRuntime,
   getAppStatus as defaultGetAppStatus,
   getMobileContinuityStatus,
@@ -49,11 +48,11 @@ import {
   recordFrontendDiagnostic,
   restoreBackup,
   restoreSessionsVisible,
+  scanSessionStorage as defaultScanSessionStorage,
   switchRuntime,
   setMobileContinuityEnabled,
-  syncAllSessions,
+  mergeAndRepairSessions,
   upsertRelayRuntime,
-  verifyRelayRuntime,
 } from './api';
 import { OperationResultPanel, type OperationView } from './OperationResultPanel';
 import { DiagnosticExportAction, DiagnosticPanel } from './DiagnosticPanel';
@@ -63,6 +62,7 @@ import {
   type RuntimeSwitchFlow,
 } from './RuntimeSwitchProgressPanel';
 import { SessionManagementPage } from './SessionManagementPage';
+import { SessionStorageManagementPage } from './SessionStorageManagementPage';
 import { SkillsManagementPage } from './SkillsManagementPage';
 import type {
   AppExitRequestResult,
@@ -74,7 +74,6 @@ import type {
   DomainState,
   MobileContinuityStatus,
   RelayRuntimeInput,
-  RelaySwitchPreference,
   RuntimeKind,
   RuntimeMetadata,
   RuntimeStatus,
@@ -84,6 +83,7 @@ import type {
   SessionDashboardData,
   OperationRecord,
   SessionMutationResult,
+  ShadowScanReport,
   SessionSyncProgress,
   SessionSyncResult,
   UpdateCheckResult,
@@ -94,6 +94,7 @@ type AppProps = {
   loadRuntimeDashboard?: () => Promise<RuntimeDashboardData>;
   loadSessionDashboard?: () => Promise<SessionDashboardData>;
   loadBackupDashboard?: () => Promise<BackupDashboardData>;
+  scanSessionStorage?: () => Promise<ShadowScanReport>;
   registerCloseGuard?: RegisterCloseGuard;
   requestExit?: () => Promise<AppExitRequestResult>;
 };
@@ -136,6 +137,7 @@ function App({
   loadRuntimeDashboard = defaultLoadRuntimeDashboard,
   loadSessionDashboard = defaultLoadSessionDashboard,
   loadBackupDashboard = defaultLoadBackupDashboard,
+  scanSessionStorage = defaultScanSessionStorage,
   registerCloseGuard = defaultRegisterCloseGuard,
   requestExit = defaultRequestAppExit,
 }: AppProps) {
@@ -147,21 +149,18 @@ function App({
   const [diagnosticPanelOpen, setDiagnosticPanelOpen] = useState(false);
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [relaySubmitError, setRelaySubmitError] = useState<OperationFailureView | null>(null);
-  const [relaySwitchPrompt, setRelaySwitchPrompt] = useState<{
-    label: string;
-    trigger: HTMLElement | null;
-  } | null>(null);
   const [mobileContinuity, setMobileContinuity] = useState<MobileContinuityStatus | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [switchFlow, setSwitchFlow] = useState<RuntimeSwitchFlow | null>(null);
   const [sessionsStale, setSessionsStale] = useState(() => loadDashboard === undefined);
   const [backupsStale, setBackupsStale] = useState(() => loadDashboard === undefined);
   const [backupLoading, setBackupLoading] = useState(false);
+  const [storageScanning, setStorageScanning] = useState(false);
   const [runtimeRefreshPending, setRuntimeRefreshPending] = useState(false);
   const [checkpointCleanupFlow, setCheckpointCleanupFlow] =
     useState<CheckpointCleanupFlow | null>(null);
   const [sessionRevision, setSessionRevision] = useState(0);
-  const [activePage, setActivePage] = useState<'runtime' | 'sessions' | 'skills'>('runtime');
+  const [activePage, setActivePage] = useState<'runtime' | 'sessions' | 'storage' | 'skills'>('runtime');
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -191,6 +190,7 @@ function App({
   const startupCheckStarted = useRef(false);
   const updateCheckInFlight = useRef(false);
   const exclusiveActionInFlight = useRef(false);
+  const childActionInFlight = useRef(false);
   const closeRequestInFlight = useRef(false);
   const exitScheduled = useRef(false);
   const continuitySyncActive = switchFlow?.status === 'running'
@@ -201,7 +201,7 @@ function App({
   continuityCloseChoiceRef.current = continuityCloseChoice;
 
   const attemptAppExit = useCallback(async () => {
-    if (exclusiveActionInFlight.current) {
+    if (exclusiveActionInFlight.current || childActionInFlight.current) {
       setClosePending(true);
       return;
     }
@@ -260,7 +260,7 @@ function App({
       .then(setMobileContinuity)
       .catch((reason: unknown) => {
         setError({
-          message: `手机连续性已暂停：${errorMessage(reason)}。旧会话不会自动上传，请使用手动同步处理。`,
+          message: `Relay 会话视图状态读取失败：${errorMessage(reason)}。请求端切换不会恢复旧 provider 正文复制。`,
         });
       });
   }, []);
@@ -380,6 +380,7 @@ function App({
   const codexHome = readyData(data.codexHome);
   const sessions = readyData(data.sessions);
   const managedSessions = readyData(data.managedSessions);
+  const sessionStorage = readyData(data.sessionStorage);
   const runtimes = readyData(data.runtimes);
   const runtimeStatus = readyData(data.runtimeStatus);
   const plusRuntime = useMemo(() => runtimes?.find((runtime) => runtime.kind === 'plus') ?? null, [runtimes]);
@@ -389,16 +390,23 @@ function App({
     && data.runtimes.status === 'ready';
   const canConfigureRelay = data.runtimes.status === 'ready'
     && (data.codexHome.status !== 'ready' || data.codexHome.data.configToml.exists);
-  const canVerifyRelay = data.runtimes.status === 'ready' && Boolean(relayRuntime);
   const canSwitchRuntime = data.runtimes.status === 'ready'
     && closeGuardStatus === 'ready'
     && !runtimeRefreshPending;
   const canSync = !sessionsStale
     && data.sessions.status === 'ready'
-    && data.managedSessions.status === 'ready';
+    && data.managedSessions.status === 'ready'
+    && Boolean(sessionStorage)
+    && sessionStorage?.migrationRequired === false
+    && sessionStorage.status !== 'reviewRequired';
   const canMutateSessions = data.managedSessions.status === 'ready';
   const canRestoreBackup = !backupsStale && data.backups.status === 'ready';
   const exclusiveBusy = busy !== null || updateInstalling;
+
+  function handleChildBusyChange(label: string | null) {
+    childActionInFlight.current = label !== null;
+    setBusy(label);
+  }
   const threadCount = sessionsStale
     ? '待刷新'
     : sessions ? numberFormat.format(sessions.threadCount) : statusLabel(data.sessions);
@@ -448,6 +456,24 @@ function App({
     if (requestId === sessionRequestId.current) {
       setData((current) => ({ ...current, ...next }));
       setSessionsStale(false);
+    }
+  }
+
+  async function handleSessionStorageScan() {
+    if (storageScanning) return;
+    setStorageScanning(true);
+    setError(null);
+    try {
+      const report = await scanSessionStorage();
+      setData((current) => ({
+        ...current,
+        sessionStorage: { status: 'ready', data: report },
+      }));
+    } catch (reason) {
+      const failure = operationFailure(reason);
+      setError({ ...failure, message: `会话存储扫描失败：${failure.message}` });
+    } finally {
+      setStorageScanning(false);
     }
   }
 
@@ -641,33 +667,12 @@ function App({
     if (saved) setRelayEditorOpen(false);
   }
 
-  async function handleVerifyRelay() {
-    await runAction('验证中转站', verifyRelayRuntime, (runtime) => ({
-      label: '中转站连接验证', metrics: [`验证时间：${formatTime(runtime.lastVerifiedAtMs)}`],
-    }), undefined, 'runtime');
-  }
-
   async function handleSwitch(
     runtimeId: RuntimeKind,
     label: string,
     trigger?: HTMLElement,
-    requestedRelayPreference?: RelaySwitchPreference,
   ) {
     if (!canSwitchRuntime || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
-    let relayPreference = requestedRelayPreference;
-    if (runtimeId === 'relay' && relayPreference === undefined) {
-      relayPreference = relayRuntime?.relaySwitchPreference ?? undefined;
-      if (relayPreference === undefined) {
-        setRelaySwitchPrompt({
-          label,
-          trigger: trigger ?? (
-            document.activeElement instanceof HTMLElement ? document.activeElement : null
-          ),
-        });
-        return;
-      }
-    }
-    setRelaySwitchPrompt(null);
     switchTrigger.current = trigger ?? (
       document.activeElement instanceof HTMLElement ? document.activeElement : null
     );
@@ -706,9 +711,7 @@ function App({
           };
         });
       };
-      const result: RuntimeSwitchResult = runtimeId === 'relay'
-        ? await switchRuntime(runtimeId, onProgress, relayPreference ?? null)
-        : await switchRuntime(runtimeId, onProgress);
+      const result: RuntimeSwitchResult = await switchRuntime(runtimeId, onProgress);
       if (attemptId !== switchAttemptId.current) return;
       if (result.incrementalSessionSync.status === 'applied') {
         markSessionsStale();
@@ -802,11 +805,11 @@ function App({
   async function handleMobileContinuityToggle() {
     if (!mobileContinuity || exclusiveBusy) return;
     await runAction(
-      mobileContinuity.enabled ? '关闭手机连续性' : '开启手机连续性',
+      mobileContinuity.enabled ? '关闭显式加入视图' : '开启显式加入视图',
       () => setMobileContinuityEnabled(!mobileContinuity.enabled),
       (status) => ({
-        label: status.enabled ? '手机连续性已开启' : '手机连续性已关闭',
-        metrics: ['只影响升级后新建的 Relay 会话'],
+        label: status.enabled ? '显式加入视图已开启' : '显式加入视图已关闭',
+        metrics: ['只更新数据库引用，不复制会话正文'],
       }),
       undefined,
       'none',
@@ -825,13 +828,13 @@ function App({
 
   async function handlePublishMobileContinuitySession(threadId: string) {
     const status = await runAction(
-      '发布单个会话',
+      '加入 Account 视图',
       () => publishMobileContinuitySession(threadId),
       (next) => ({
-        label: '会话已提交到手机同步',
+        label: '会话已加入 Account 视图',
         metrics: [
-          `本机 Remote：${next.remotePublished}`,
-          `部分可见：${next.partial}`,
+          `Account 视图：${next.remotePublished}`,
+          `兼容状态：${next.partial}`,
         ],
       }),
       undefined,
@@ -871,10 +874,10 @@ function App({
   async function performSyncSessions() {
     const progressEvents: SessionSyncProgress[] = [];
     await runAction(
-      '完全同步',
+      '会话合并与修复',
       async () => {
         try {
-          return await syncAllSessions((event) => {
+          return await mergeAndRepairSessions((event) => {
             progressEvents.push(event);
             setBusy(sessionSyncProgressLabel(event));
           });
@@ -887,14 +890,6 @@ function App({
       },
       (result) => syncReceipt(result, progressEvents),
     );
-  }
-
-  async function handleDeleteSessions(ids: string[], confirmed: boolean) {
-    const result = await runAction('删除会话', async () => {
-      await ensureChatGptClosed('会话删除');
-      return deleteManagedSessions(ids, confirmed);
-    }, mutationReceipt('会话删除完成'));
-    return result !== null;
   }
 
   async function handleRestoreSessionsVisible(ids: string[]) {
@@ -1055,9 +1050,10 @@ function App({
           <span><strong>CHATGPT SWITCH</strong><small>LOCAL CONTROL SURFACE</small></span>
         </div>
         <nav className="topbar-tabs" aria-label="主导航">
-          <button aria-current={activePage === 'runtime' ? 'page' : undefined} className={`topbar-tab ${activePage === 'runtime' ? 'active' : ''}`} onClick={() => setActivePage('runtime')}><Zap aria-hidden="true" />运行态</button>
-          <button aria-current={activePage === 'sessions' ? 'page' : undefined} className={`topbar-tab ${activePage === 'sessions' ? 'active' : ''}`} onClick={() => setActivePage('sessions')}><MessagesSquare aria-hidden="true" />会话</button>
-          <button aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}><Wrench aria-hidden="true" />技能</button>
+          <button disabled={exclusiveBusy} aria-current={activePage === 'runtime' ? 'page' : undefined} className={`topbar-tab ${activePage === 'runtime' ? 'active' : ''}`} onClick={() => setActivePage('runtime')}><Zap aria-hidden="true" />运行态</button>
+          <button disabled={exclusiveBusy} aria-current={activePage === 'sessions' ? 'page' : undefined} className={`topbar-tab ${activePage === 'sessions' ? 'active' : ''}`} onClick={() => setActivePage('sessions')}><MessagesSquare aria-hidden="true" />会话</button>
+          <button disabled={exclusiveBusy} aria-current={activePage === 'storage' ? 'page' : undefined} className={`topbar-tab ${activePage === 'storage' ? 'active' : ''}`} onClick={() => setActivePage('storage')}><Database aria-hidden="true" />存储</button>
+          <button disabled={exclusiveBusy} aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}><Wrench aria-hidden="true" />技能</button>
         </nav>
         <div className="topbar-actions">
           <span className="topbar-version" aria-live="polite">{versionStatus}</span>
@@ -1171,7 +1167,7 @@ function App({
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
               <p className="runtime-intro-lede">
             保持 ChatGPT 官方登录态不变，只切换请求端。新建 Relay 会话可在切回 Account
-            后发布到本机 Remote；每一步都展示真实耗时，完成后自动回到 ChatGPT。
+            后提升到 Account 数据库视图；每一步都展示真实耗时，完成后自动回到 ChatGPT。
               </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
@@ -1215,87 +1211,18 @@ function App({
               onPrimary={() => { setRelaySubmitError(null); setRelayEditorOpen(true); }} primaryAction="配置中转站"
               onSwitch={(trigger) => void handleSwitch('relay', '切换中转站', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'relay') ? '当前为中转站' : runtimeStatus?.activeRuntimeId === 'relay' ? '重新应用中转站' : '切换到中转站'}
-              onVerify={() => void handleVerifyRelay()}
               primaryDisabled={exclusiveBusy || !canConfigureRelay}
-              verifyDisabled={exclusiveBusy || !canVerifyRelay}
               switchDisabled={exclusiveBusy || !canSwitchRuntime || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
             />
           </section>
 
-          {relaySwitchPrompt ? (
-            <section className="home-setup-notice relay-switch-choice" aria-label="选择中转站切换方式">
-              <ShieldCheck aria-hidden="true" />
-              <div>
-                <p className="eyebrow">RELAY CHECK</p>
-                <h2>切换前是否验证中转站连接？</h2>
-                <p>只验证地址、网络和鉴权，不检查模型。你的选择会保留到地址或凭据变化。</p>
-              </div>
-              <div className="relay-switch-choice-actions">
-                <button
-                  className="primary-button"
-                  onClick={() => void handleSwitch(
-                    'relay',
-                    relaySwitchPrompt.label,
-                    relaySwitchPrompt.trigger ?? undefined,
-                    'validate',
-                  )}
-                  disabled={exclusiveBusy}
-                >
-                  验证连接后切换
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => void handleSwitch(
-                    'relay',
-                    relaySwitchPrompt.label,
-                    relaySwitchPrompt.trigger ?? undefined,
-                    'direct',
-                  )}
-                  disabled={exclusiveBusy}
-                >
-                  直接切换
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => setRelaySwitchPrompt(null)}
-                  disabled={exclusiveBusy}
-                >
-                  取消
-                </button>
-              </div>
-            </section>
-          ) : null}
-
-          {isExactRuntime(runtimeStatus, 'relay')
-            && relayRuntime?.relaySwitchPreference === 'direct' ? (
-              <section className="home-setup-notice relay-direct-notice" aria-label="中转站未验证">
-                <CircleAlert aria-hidden="true" />
-                <div>
-                  <p className="eyebrow">RELAY UNVERIFIED</p>
-                  <h2>当前中转站未验证</h2>
-                  <p>请求端已直接切换；如果无法使用，可安全返回 OpenAI 官方请求端。</p>
-                </div>
-                <button
-                  className="primary-button"
-                  onClick={(event) => void handleSwitch(
-                    'plus',
-                    '返回 ChatGPT 账号',
-                    event.currentTarget,
-                  )}
-                  disabled={exclusiveBusy || !plusRuntime}
-                >
-                  一键返回 Account
-                </button>
-              </section>
-            ) : null}
-
           {mobileContinuity?.noticePending ? (
-            <section className="home-setup-notice mobile-continuity-notice" aria-label="手机连续性已开启">
+            <section className="home-setup-notice mobile-continuity-notice" aria-label="Relay 会话视图已启用">
               <MessagesSquare aria-hidden="true" />
               <div>
-                <p className="eyebrow">MOBILE CONTINUITY</p>
-                <h2>升级后新建的 Relay 会话会在切回 Account 时自动发布</h2>
-                <p>发布在本机安全关闭窗口内完成；旧会话继续由你手动同步。</p>
+                <p className="eyebrow">CANONICAL VIEW</p>
+                <h2>Relay 与 Account 共用 canonical 会话正文</h2>
+                <p>切回 Account 时只提升 SQLite 视图，不复制或改写 JSONL。</p>
               </div>
               <button
                 className="ghost-button"
@@ -1316,38 +1243,44 @@ function App({
           ) : null}
 
           <section className="runtime-operations" aria-label="数据与恢复">
-            <aside className="detail-panel session-panel mobile-continuity-panel" aria-label="手机连续性">
+            <SessionStoragePanel
+              state={data.sessionStorage}
+              scanning={storageScanning}
+              onScan={() => void handleSessionStorageScan()}
+            />
+            <aside className="detail-panel session-panel mobile-continuity-panel" aria-label="Relay 会话视图">
               <div className="card-title-row">
                 <MessagesSquare className="section-icon" aria-hidden="true" />
-                <div><p className="eyebrow">REMOTE PUBLICATION</p><h2>手机连续性</h2></div>
+                <div><p className="eyebrow">CANONICAL VIEW</p><h2>Relay 会话视图</h2></div>
               </div>
               {mobileContinuity ? (
                 <>
                   <div className="continuity-stats">
-                    <strong>{mobileContinuity.queued + mobileContinuity.publishing}<span>待发布</span></strong>
-                    <strong>{mobileContinuity.remotePublished}<span>本机 Remote</span></strong>
-                    <strong>{mobileContinuity.partial}<span>部分可见</span></strong>
+                    <strong>{mobileContinuity.queued + mobileContinuity.publishing}<span>待加入视图</span></strong>
+                    <strong>{mobileContinuity.remotePublished}<span>Account 视图</span></strong>
+                    <strong>{mobileContinuity.partial}<span>兼容状态</span></strong>
                     <strong>{mobileContinuity.conflict + mobileContinuity.needsManual}<span>需处理</span></strong>
                   </div>
                   <p className="continuity-copy">
                     {mobileContinuity.enabled
-                      ? '已开启：只自动处理本版本启用后新建的 Relay 会话。'
-                      : '已关闭：不会领取新的自动发布任务，已有状态不会删除。'}
+                      ? '已开启：显式加入 Account 视图时只更新数据库引用。'
+                      : '已关闭：保留已有状态，不会恢复旧 provider 正文复制。'}
                   </p>
                   <button
                     className="ghost-button full"
                     onClick={() => void handleMobileContinuityToggle()}
                     disabled={exclusiveBusy}
                   >
-                    {mobileContinuity.enabled ? '关闭自动发布' : '开启自动发布'}
+                    {mobileContinuity.enabled ? '关闭显式加入' : '开启显式加入'}
                   </button>
                 </>
               ) : <p className="continuity-copy">连续性状态读取中…</p>}
             </aside>
-            <aside className="detail-panel session-panel" aria-label="会话同步">
-              <div className="card-title-row"><Database className="section-icon" aria-hidden="true" /><div><p className="eyebrow">SESSION POOL</p><h2>完全同步</h2></div></div>
+            <aside className="detail-panel session-panel" aria-label="会话合并与修复">
+              <div className="card-title-row"><Database className="section-icon" aria-hidden="true" /><div><p className="eyebrow">CANONICAL MERGE</p><h2>会话合并与修复</h2></div></div>
               <div className="sync-stats"><strong>{threadCount}<span>threads</span></strong><strong>{jsonlCount}<span>JSONL</span></strong></div>
-              <button className="primary-button full" onClick={handleSyncSessions} disabled={exclusiveBusy || !canSync}><RefreshCw className="button-icon" aria-hidden="true" />完全同步</button>
+              <p className="continuity-copy">{sessionStorage?.migrationRequired === false ? '仅合并缺失、相同或完整延续的会话。' : '完成 v0.3 前台迁移后可用；旧完全同步已停用。'}</p>
+              <button className="primary-button full" onClick={handleSyncSessions} disabled={exclusiveBusy || !canSync}><RefreshCw className="button-icon" aria-hidden="true" />会话合并与修复</button>
             </aside>
             <SafetyPanel data={data} sessionsStale={sessionsStale} backupsStale={backupsStale} />
             <BackupRecoveryPanel
@@ -1379,7 +1312,7 @@ function App({
         <SessionManagementPage
           inventory={managedSessions} busy={exclusiveBusy}
           syncDisabled={!canSync} mutationDisabled={!canMutateSessions}
-          onSync={() => void handleSyncSessions()} onDelete={handleDeleteSessions}
+          onSync={() => void handleSyncSessions()}
           onRestoreVisible={handleRestoreSessionsVisible}
           mobileContinuity={mobileContinuity}
           onPublishMobile={(threadId) => handlePublishMobileContinuitySession(threadId)}
@@ -1387,10 +1320,22 @@ function App({
         />
       ) : activePage === 'sessions' ? <DomainPlaceholder state={data.managedSessions} /> : null}
 
+      <SessionStorageManagementPage
+        active={activePage === 'storage'}
+        initialReport={sessionStorage ?? null}
+        onReportChange={(report) => {
+          setData((current) => ({
+            ...current,
+            sessionStorage: { status: 'ready', data: report },
+          }));
+        }}
+        onBusyChange={handleChildBusyChange}
+      />
+
       <SkillsManagementPage
         active={activePage === 'skills'}
         busy={exclusiveBusy}
-        onBusyChange={setBusy}
+        onBusyChange={handleChildBusyChange}
         ensureCodexClosed={ensureChatGptClosed}
       />
     </main>
@@ -1468,10 +1413,10 @@ function InlineConfirmation({
     detail = '当前账号态会先归档，再写入新的加密快照。';
     confirmLabel = '确认覆盖';
   } else if (pending.kind === 'syncSessions') {
-    title = '完全同步活跃会话';
-    detail = '确认后会安全关闭 ChatGPT，一次性对账两边活跃会话，完成后自动重新打开。归档会话不会被改动。';
-    metrics = ['不执行重复 dry-run', '完整扫描与切换耗时分离'];
-    confirmLabel = '开始完全同步';
+    title = '会话合并与修复';
+    detail = '确认后会安全关闭 ChatGPT，只处理缺失、相同或完整延续的会话，并修复 canonical 数据库视图。';
+    metrics = ['不生成 provider 正文副本', '冲突默认不覆盖'];
+    confirmLabel = '开始合并与修复';
   } else if (pending.kind === 'restoreBackup') {
     title = '恢复已验证备份';
     detail = `来源：${pending.backup.sourceRoot}`;
@@ -1511,15 +1456,15 @@ function InlineConfirmation({
 
 function RuntimeCard({
   title, kind, description, runtime, runtimeStatus, baseUrlFallback, primaryAction, switchAction,
-  runtimeDomainStatus, runtimeStatusDomainStatus, onPrimary, onSwitch, onVerify,
-  primaryDisabled, verifyDisabled = false, switchDisabled,
+  runtimeDomainStatus, runtimeStatusDomainStatus, onPrimary, onSwitch,
+  primaryDisabled, switchDisabled,
 }: {
   title: string; kind: RuntimeKind; description: string; runtime: RuntimeMetadata | null;
   runtimeStatus: RuntimeStatus | null; baseUrlFallback: string; primaryAction: string; switchAction: string;
   runtimeDomainStatus: DomainState<RuntimeMetadata[]>['status'];
   runtimeStatusDomainStatus: DomainState<RuntimeStatus>['status'];
-  onPrimary: () => void; onSwitch: (trigger?: HTMLElement) => void; onVerify?: () => void;
-  primaryDisabled: boolean; verifyDisabled?: boolean; switchDisabled: boolean;
+  onPrimary: () => void; onSwitch: (trigger?: HTMLElement) => void;
+  primaryDisabled: boolean; switchDisabled: boolean;
 }) {
   const savedState = runtimeDomainStatus === 'ready'
     ? runtime ? '已保存' : '未保存'
@@ -1529,9 +1474,6 @@ function RuntimeCard({
     : !runtimeStatus ? '未检测到' : runtimeStatus.activeRuntimeId === kind
     ? runtimeStatus.confidence === 'exact' ? '当前运行' : '模式匹配'
     : '非当前';
-  const verifiedState = runtimeDomainStatus === 'ready'
-    ? runtime?.lastVerifiedAtMs ? '已验证' : '未验证'
-    : domainStatusText(runtimeDomainStatus);
   const runtimeDetailUnavailable = runtimeDomainStatus !== 'ready';
   const RuntimeIcon = kind === 'plus' ? UserRound : KeyRound;
   return (
@@ -1544,16 +1486,13 @@ function RuntimeCard({
       <div className="runtime-state-grid">
         <span className={stateClass(savedState)}>{savedState}</span>
         <span className={stateClass(activeState)}>{activeState}</span>
-        <span className={stateClass(verifiedState)}>{verifiedState}</span>
       </div>
       <dl className="meta-list">
         <div><dt>Base URL</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : runtime?.baseUrl ?? baseUrlFallback}</dd></div>
         <div><dt>模型</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : runtime?.model ?? '跟随当前 ChatGPT 配置'}</dd></div>
-        <div><dt>最近验证</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : runtime?.lastVerifiedAtMs ? formatTime(runtime.lastVerifiedAtMs) : '暂无验证记录'}</dd></div>
       </dl>
       <div className="runtime-actions">
         <button className="ghost-button inline" onClick={onPrimary} disabled={primaryDisabled}>{kind === 'plus' ? <Save className="button-icon" aria-hidden="true" /> : <Settings2 className="button-icon" aria-hidden="true" />}{primaryAction}</button>
-        {onVerify ? <button className="ghost-button inline" onClick={onVerify} disabled={verifyDisabled || !runtime}><ShieldCheck className="button-icon" aria-hidden="true" />验证连接</button> : null}
         <button className="switch-button" onClick={(event) => onSwitch(event?.currentTarget)} disabled={switchDisabled}><ArrowLeftRight className="button-icon" aria-hidden="true" />{switchAction}</button>
       </div>
       <p className="runtime-switch-note"><Power aria-hidden="true" />任务执行器会安全关闭，并在成功后自动打开 ChatGPT</p>
@@ -1574,6 +1513,7 @@ function SafetyPanel({
   const status = readyData(data.runtimeStatus);
   const backups = readyData(data.backups);
   const latestBackup = backups?.[0];
+  const storageReport = readyData(data.sessionStorage);
   const homeFilesReady = Boolean(home?.authJson.exists && home.configToml.exists && home.stateDb.exists);
   const homeState = data.codexHome.status === 'ready' ? homeFilesReady ? '完整' : '缺失' : statusLabel(data.codexHome);
   const backupState = backupsStale
@@ -1600,8 +1540,90 @@ function SafetyPanel({
         state={sessionsStale || data.sessions.status === 'loading' ? 'pending' : data.sessions.status === 'error' ? 'error' : 'ok'}
         label={`会话索引：${sessionsStale ? '待刷新' : statusLabel(data.sessions)}`}
       />
+      <SafetyLine
+        state={data.sessionStorage.status === 'loading'
+          ? 'pending'
+          : data.sessionStorage.status === 'error'
+          ? 'error'
+          : storageReport?.status === 'reviewRequired'
+          ? 'warning'
+          : storageReport
+          ? 'ok'
+          : 'warning'}
+        label={`会话存储：${storageReport ? storageScanStatusLabel(storageReport.status) : data.sessionStorage.status === 'ready' ? '尚未扫描' : statusLabel(data.sessionStorage)}`}
+      />
     </aside>
   );
+}
+
+function SessionStoragePanel({
+  state,
+  scanning,
+  onScan,
+}: {
+  state: DomainState<ShadowScanReport | null>;
+  scanning: boolean;
+  onScan: () => void;
+}) {
+  const report = readyData(state);
+  const issues = report?.issues.reduce((total, issue) => total + issue.count, 0) ?? 0;
+  return (
+    <aside className="detail-panel session-panel" aria-label="会话存储状态">
+      <div className="card-title-row">
+        <Database className="section-icon" aria-hidden="true" />
+        <div><p className="eyebrow">SHADOW SCAN</p><h2>会话存储</h2></div>
+      </div>
+      {state.status === 'loading' ? (
+        <p className="continuity-copy">正在读取最近一次扫描结果…</p>
+      ) : state.status === 'error' ? (
+        <p className="continuity-copy">{state.error}</p>
+      ) : report ? (
+        <>
+          <div className="sync-stats">
+            <strong>{report.summary.logicalSessionCount}<span>逻辑会话</span></strong>
+            <strong>{report.summary.canonicalCandidateCount}<span>候选主版本</span></strong>
+            <strong>{report.summary.highConfidenceCopyCount}<span>高置信副本</span></strong>
+            <strong>{report.summary.conflictSessionCount}<span>需复核</span></strong>
+          </div>
+          <p className="continuity-copy">
+            {storageScanStatusLabel(report.status)} · 潜在可释放 {formatBytes(report.summary.potentialReclaimBytes)}
+            {issues > 0 ? ` · ${issues} 项检查提示` : ''}
+          </p>
+          <p className="continuity-copy">
+            回合来源已解析 {report.summary.resolvedTurnProvenanceCount}/{report.summary.turnContextCount}
+            {report.summary.historicalUnknownTurnCount > 0
+              ? ` · ${report.summary.historicalUnknownTurnCount} 个迁移前回合来源未知`
+              : ''}
+            {report.summary.incompleteTurnProvenanceCount > 0
+              ? ` · ${report.summary.incompleteTurnProvenanceCount} 个来源记录不完整`
+              : ''}
+          </p>
+          <p className="runtime-switch-note">
+            <ShieldCheck aria-hidden="true" />
+            在线仅扫描，不删除；最近扫描 {formatTime(report.generatedAtMs)}
+          </p>
+        </>
+      ) : (
+        <p className="continuity-copy">尚未执行 v0.3 Shadow 扫描；扫描只生成脱敏分类报告。</p>
+      )}
+      <button className="ghost-button full" onClick={onScan} disabled={scanning}>
+        {scanning
+          ? <LoaderCircle className="button-icon spin" aria-hidden="true" />
+          : <RefreshCw className="button-icon" aria-hidden="true" />}
+        {scanning ? '扫描中' : '扫描会话存储'}
+      </button>
+    </aside>
+  );
+}
+
+function storageScanStatusLabel(status: ShadowScanReport['status']) {
+  const labels: Record<ShadowScanReport['status'], string> = {
+    noSessions: '未检测到会话',
+    canonicalReady: 'Canonical 存储已就绪',
+    migrationAvailable: '检测到旧版存储，建议迁移',
+    reviewRequired: '发现冲突或异常，需先复核',
+  };
+  return labels[status];
 }
 
 function BackupRecoveryPanel({
@@ -1888,7 +1910,7 @@ function operationActionLabel(action: OperationRecord['action']) {
   const labels: Record<OperationRecord['action'], string> = {
     importAccount: '保存账号态', saveRelay: '保存中转站', verifyRelay: '验证中转站',
     switchRuntime: '切换运行态', incrementalSync: '增量会话同步',
-    syncSessions: '完全同步会话', deleteSessions: '删除会话',
+    syncSessions: '会话合并与修复', deleteSessions: '删除会话',
     restoreVisibility: '恢复会话可见', restoreBackup: '恢复备份', createBackup: '创建完整备份',
     deleteBackup: '删除恢复点', cleanupCheckpoints: '清理自动检查点',
     installSkill: '安装技能', configureSkill: '配置技能',
@@ -1906,6 +1928,7 @@ function operationStatusLabel(status: OperationRecord['status']) {
 function dashboardErrors(data: DashboardData) {
   const domains: Array<[string, DomainState<unknown>]> = [
     ['ChatGPT 本机数据', data.codexHome], ['会话扫描', data.sessions], ['会话管理', data.managedSessions],
+    ['会话存储', data.sessionStorage],
     ['运行态列表', data.runtimes], ['当前运行态', data.runtimeStatus], ['备份列表', data.backups],
     ['操作历史', data.operations],
   ];
@@ -1923,7 +1946,7 @@ function syncReceipt(
   const sessionNetBytes = result.persistentSessionBytesAdded
     - result.persistentSessionBytesReclaimed;
   return {
-    label: '完全同步完成',
+    label: '会话合并与修复完成',
     operationId: result.operationId,
     backupCount: cleanupComplete ? 0 : backups.length,
     backupPaths: cleanupComplete ? [] : backups.map((backup) => backup.backupDir),
@@ -1968,21 +1991,21 @@ function sessionSyncTimingMetrics(events: SessionSyncProgress[]) {
     event.phase === 'complete' || event.phase === 'failed'
   ));
   if (first && terminal) {
-    timings.push(`完全同步总耗时：${(Math.max(0, terminal.timestampMs - first.timestampMs) / 1000).toFixed(1)}s`);
+    timings.push(`合并与修复总耗时：${(Math.max(0, terminal.timestampMs - first.timestampMs) / 1000).toFixed(1)}s`);
   }
   return timings;
 }
 
 function sessionSyncProgressLabel(event: SessionSyncProgress) {
   const labels: Record<SessionSyncProgress['phase'], string> = {
-    preparing: '完全同步：准备',
-    closingApp: '完全同步：关闭 ChatGPT',
-    backingUp: '完全同步：创建安全检查点',
-    reconciling: '完全同步：对账活跃会话',
-    recordingResult: '完全同步：记录结果',
-    launchingApp: '完全同步：重新打开 ChatGPT',
-    complete: '完全同步：完成',
-    failed: '完全同步：失败',
+    preparing: '合并与修复：准备',
+    closingApp: '合并与修复：关闭 ChatGPT',
+    backingUp: '合并与修复：创建安全检查点',
+    reconciling: '合并与修复：对账会话',
+    recordingResult: '合并与修复：记录结果',
+    launchingApp: '合并与修复：重新打开 ChatGPT',
+    complete: '合并与修复：完成',
+    failed: '合并与修复：失败',
   };
   return labels[event.phase];
 }

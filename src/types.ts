@@ -48,6 +48,451 @@ export type SessionInventory = {
   sessionFiles: SessionFileRecord[];
 };
 
+export type StorageScanStatus =
+  | 'noSessions'
+  | 'canonicalReady'
+  | 'migrationAvailable'
+  | 'reviewRequired';
+
+export type ShadowScanIssueCode =
+  | 'databaseDiscoveryFailed'
+  | 'databaseSnapshotFailed'
+  | 'databaseRowMissingRolloutPath'
+  | 'sessionDiscoveryFailed'
+  | 'sessionParseFailed'
+  | 'invalidProviderMarker'
+  | 'missingRuntimeReference'
+  | 'mismatchedRuntimeReference'
+  | 'divergentSession'
+  | 'onlineSnapshotNotAtomic'
+  | 'reportPersistenceFailed'
+  | 'hashCacheInvalid'
+  | 'hashCachePersistenceFailed'
+  | 'turnProvenanceInvalid'
+  | 'storageStateInvalid';
+
+export type RelationCounts = {
+  equal: number;
+  equalExceptProvider: number;
+  prefix: number;
+  divergent: number;
+  unknown: number;
+};
+
+export type ShadowScanSummary = {
+  schemaVersion: number;
+  onlineScanOnly: boolean;
+  nonAtomicAcrossDatabases: boolean;
+  logicalSessionCount: number;
+  canonicalCandidateCount: number;
+  duplicatedSessionCount: number;
+  conflictSessionCount: number;
+  highConfidenceCopyCount: number;
+  sessionFileCount: number;
+  sessionBytes: number;
+  potentialReclaimBytes: number;
+  markerFileCount: number;
+  runtimeDatabaseCount: number;
+  backupDatabaseCount: number;
+  runtimeReferenceCount: number;
+  missingRuntimeReferenceCount: number;
+  mismatchedRuntimeReferenceCount: number;
+  cacheHitCount: number;
+  cacheMissCount: number;
+  stableFileCount: number;
+  turnContextCount: number;
+  resolvedTurnProvenanceCount: number;
+  historicalUnknownTurnCount: number;
+  incompleteTurnProvenanceCount: number;
+  relationCounts: RelationCounts;
+};
+
+export type ShadowScanReport = {
+  schemaVersion: number;
+  scanId: string;
+  generatedAtMs: number;
+  status: StorageScanStatus;
+  migrationRequired: boolean;
+  deletionEnabled: boolean;
+  summary: ShadowScanSummary;
+  issues: Array<{ code: ShadowScanIssueCode; count: number }>;
+};
+
+export type SessionStorageControlState = {
+  schemaVersion: number;
+  canonicalReady: boolean;
+  migrationOperationId?: string;
+  migrationPreparedAtMs?: number;
+  automaticCleanupEnabled: boolean;
+  onlineDeletionEnabled: boolean;
+  reclaimedBytes: number;
+};
+
+export type SessionStorageInvestigationReceipt = {
+  taskId: string;
+  issueCount: number;
+  databaseCount: number;
+  displayPath: string;
+  taskSha256: string;
+};
+
+export type SessionRelation =
+  | 'equal'
+  | 'equalExceptProvider'
+  | 'leftPrefix'
+  | 'rightPrefix'
+  | 'divergent'
+  | 'unknown';
+
+export type SessionDatabaseRole =
+  | 'canonicalAccount'
+  | 'accountView'
+  | 'relay'
+  | 'shared'
+  | 'legacyOrRelocated'
+  | 'backup'
+  | 'recoveryPackage'
+  | 'downgradeExport'
+  | 'unknownRuntime';
+
+export type SessionMarkerStatus = 'absent' | 'valid' | 'invalid';
+
+export type FileOrigin =
+  | 'canonicalHome'
+  | 'shared'
+  | 'referencedExternal'
+  | 'backupInventory'
+  | 'conflictRecycle'
+  | 'recoveryPackage'
+  | 'downgradeExport'
+  | 'temporaryAdapter'
+  | 'unknown';
+
+export type MigrationSafetyBlocker =
+  | 'inventoryChanged'
+  | 'databaseDiscoveryFailed'
+  | 'databaseSnapshotFailed'
+  | 'sessionDiscoveryFailed'
+  | 'backupDestinationUnsafe'
+  | 'insufficientBackupSpace'
+  | 'canonicalTargetCollision';
+
+export type MigrationSessionAction =
+  | 'keepCanonical'
+  | 'copyToCanonical'
+  | 'replaceCanonicalWithExtension'
+  | 'conflict';
+
+export type MigrationDuplicatePlan = {
+  path: string;
+  bytes: number;
+  sha256: string;
+  relationToRetained: SessionRelation;
+  markerStatus: SessionMarkerStatus;
+};
+
+export type MigrationSessionPlan = {
+  threadId: string;
+  action: MigrationSessionAction;
+  retainedPath: string;
+  canonicalPath: string;
+  retainedBytes: number;
+  retainedSha256: string;
+  retainedMessageCount: number;
+  lastValidMessageAt?: string;
+  duplicates: MigrationDuplicatePlan[];
+};
+
+export type MigrationConflictPlan = {
+  threadId: string;
+  currentPath: string;
+  candidatePath: string;
+  canonicalPath: string;
+  currentSha256?: string;
+  candidateSha256: string;
+  currentOrigin: FileOrigin;
+  candidateOrigin: FileOrigin;
+  currentMarkerStatus: SessionMarkerStatus;
+  candidateMarkerStatus: SessionMarkerStatus;
+  currentMessageCount: number;
+  candidateMessageCount: number;
+  currentLastMessageAt?: string;
+  candidateLastMessageAt?: string;
+  currentProvider?: string | null;
+  candidateProvider?: string | null;
+  relation: SessionRelation;
+  defaultOverwrite: boolean;
+};
+
+export type MigrationDatabasePlan = {
+  databaseId: string;
+  path: string;
+  role: SessionDatabaseRole;
+  referenceCount: number;
+};
+
+export type CanonicalMigrationPlan = {
+  schemaVersion: number;
+  operationId: string;
+  generatedAtMs: number;
+  canonicalRoot: string;
+  inventoryFingerprint: string;
+  sessions: MigrationSessionPlan[];
+  conflicts: MigrationConflictPlan[];
+  databases: MigrationDatabasePlan[];
+  unclassifiedFileCount: number;
+  invalidMarkerCount: number;
+  missingRuntimeReferenceCount: number;
+  mismatchedRuntimeReferenceCount: number;
+};
+
+export type MigrationPreflightReport = {
+  schemaVersion: number;
+  operationId: string;
+  generatedAtMs: number;
+  canonicalSessionCount: number;
+  sessionFileCount: number;
+  providerCopyCount: number;
+  conflictCount: number;
+  anomalyCount: number;
+  estimatedReclaimBytes: number;
+  backupSourceBytes: number;
+  requiredBackupBytes: number;
+  availableBackupBytes: number;
+  backupDestination: string;
+  blockers: MigrationSafetyBlocker[];
+  readyForBackup: boolean;
+  plan: CanonicalMigrationPlan;
+};
+
+export type MigrationBackupStatus =
+  | 'integrityVerified'
+  | 'isolatedRestoreVerified'
+  | 'runtimeVerified';
+
+export type MigrationBackupEntryKind =
+  | 'session'
+  | 'sessionIndex'
+  | 'database'
+  | 'storageMetadata';
+
+export type MigrationBackupEntry = {
+  sourcePath: string;
+  payloadRelativePath: string;
+  kind: MigrationBackupEntryKind;
+  bytes: number;
+  sha256: string;
+  logicalThreadId?: string;
+};
+
+export type MigrationBackupManifest = {
+  schemaVersion: number;
+  operationId: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  backupDir: string;
+  status: MigrationBackupStatus;
+  entries: MigrationBackupEntry[];
+  isolatedRestoreVerifiedAtMs?: number;
+  runtimeVerification?: {
+    expectedSessionCount: number;
+    listedSessionCount: number;
+    resumedSessionCount: number;
+    toolSessionCount: number;
+    toolRoundTripVerified: boolean;
+    verifiedAtMs: number;
+  };
+};
+
+export type MigrationPreparationReceipt = {
+  operationId: string;
+  preparedSessionCount: number;
+  preparedDatabaseCount: number;
+  conflictCount: number;
+  preparedBytes: number;
+};
+
+export type MigrationCancellationReceipt = {
+  operationId: string;
+  backupRetained: boolean;
+  stagingDiscarded: boolean;
+};
+
+export type MigrationApplyReceipt = {
+  operationId: string;
+  canonicalCreatedCount: number;
+  canonicalReplacedCount: number;
+  databaseViewCount: number;
+  conflictCount: number;
+  validated: boolean;
+  runtimeVerification?: {
+    expectedSessionCount: number;
+    listedSessionCount: number;
+    resumedSessionCount: number;
+    toolSessionCount: number;
+    toolRoundTripVerified: boolean;
+    verifiedAtMs: number;
+  };
+};
+
+export type OfflineGcReceipt = {
+  operationId: string;
+  candidateCount: number;
+  deletedCount: number;
+  reclaimedBytes: number;
+  validated: boolean;
+};
+
+export type DowngradeCompatibilityBand = 'a' | 'b' | 'c';
+
+export type DowngradeTargetContract = {
+  version: string;
+  band: DowngradeCompatibilityBand;
+  runtimeBundleRequired: boolean;
+  incrementalIndexRequired: boolean;
+  relaySessionViewSupported: boolean;
+  mobileContinuityRequired: boolean;
+};
+
+export type DowngradeExportReceipt = {
+  operationId: string;
+  target: DowngradeTargetContract;
+  packageDir: string;
+  logicalSessionCount: number;
+  sessionFileCount: number;
+  conflictBranchCount: number;
+  recoveryPayloadCount: number;
+  packageBytes: number;
+  containsCredentials: boolean;
+  structurallyVerified: boolean;
+  nativeRuntimeVerified: boolean;
+  targetRuntimeVerificationRequired: boolean;
+};
+
+export type RestoreImportReceipt = {
+  operationId: string;
+  packageOperationId: string;
+  targetVersion: string;
+  packageDir: string;
+  scannedSessionCount: number;
+  unchangedSessionCount: number;
+  currentAheadSessionCount: number;
+  importedNewSessionCount: number;
+  importedExtensionCount: number;
+  conflictCount: number;
+  unclassifiedRecoveryCount: number;
+  unclassifiedRecoveryBytes: number;
+  unclassifiedRecoveryPaths: string[];
+  anomalyCount: number;
+  databaseViewCount: number;
+  importedBytes: number;
+  recoveryExpiresAtMs: number;
+  validated: boolean;
+  runtimeVerification?: {
+    expectedSessionCount: number;
+    listedSessionCount: number;
+    resumedSessionCount: number;
+    toolSessionCount: number;
+    toolRoundTripVerified: boolean;
+    verifiedAtMs: number;
+  };
+};
+
+export type PendingRecoveryRelation =
+  | 'missingFromCanonical'
+  | 'extendsCanonical'
+  | 'divergent'
+  | 'unknown';
+
+export type PendingRecoveryStatus = 'pending' | 'restored' | 'deferred';
+
+export type PendingRecoverySummary = {
+  entryId: string;
+  threadId: string;
+  relation: PendingRecoveryRelation;
+  status: PendingRecoveryStatus;
+  sourceBackupId: string;
+  sourceBackupCreatedAtMs: number;
+  candidateMessageCount: number;
+  currentMessageCount: number;
+  candidateAddedMessageCount: number;
+  currentAddedMessageCount: number;
+  candidateLastMessageAt?: string;
+  currentLastMessageAt?: string;
+  candidateProvider?: string;
+  currentProvider?: string;
+  payloadBytes: number;
+  expiresAtMs: number;
+  restoreAllowed: boolean;
+};
+
+export type PendingRecoveryList = {
+  migrationOperationId: string;
+  entries: PendingRecoverySummary[];
+  expiredPackageCount: number;
+  invalidPackageCount: number;
+};
+
+export type LegacyBackupReconciliationReceipt = {
+  operationId: string;
+  migrationOperationId: string;
+  scannedBackupCount: number;
+  deletedBackupCount: number;
+  retainedBackupCount: number;
+  unreadableBackupCount: number;
+  pendingRecoveryCount: number;
+  conflictCount: number;
+  reclaimedBytes: number;
+  validated: boolean;
+};
+
+export type ConflictVersion = 'current' | 'candidate';
+
+export type SessionConflictSummary = {
+  conflictId: string;
+  deferred: boolean;
+  currentMessageCount: number;
+  candidateMessageCount: number;
+  currentAddedMessageCount: number;
+  candidateAddedMessageCount: number;
+  currentLastMessageAt?: string;
+  candidateLastMessageAt?: string;
+  currentProvider?: string;
+  candidateProvider?: string;
+  currentOrigin: FileOrigin;
+  candidateOrigin: FileOrigin;
+  relation: SessionRelation;
+  newerVersion?: ConflictVersion;
+  defaultOverwrite: boolean;
+};
+
+export type SessionConflictList = {
+  migrationOperationId: string;
+  conflicts: SessionConflictSummary[];
+};
+
+export type ConflictResolutionAction = 'defer' | 'useNewer';
+
+export type ConflictResolutionReceipt = {
+  operationId?: string;
+  migrationOperationId: string;
+  conflictId: string;
+  status: 'deferred' | 'resolved';
+  chosenVersion?: ConflictVersion;
+  canonicalUpdated: boolean;
+  databaseViewCount: number;
+  recoveryExpiresAtMs?: number;
+  runtimeVerification?: {
+    expectedSessionCount: number;
+    listedSessionCount: number;
+    resumedSessionCount: number;
+    toolSessionCount: number;
+    toolRoundTripVerified: boolean;
+    verifiedAtMs: number;
+  };
+  validated: boolean;
+};
+
 export type DomainState<T> =
   | { status: 'loading' }
   | { status: 'ready'; data: T }
@@ -57,6 +502,7 @@ export type DashboardData = {
   codexHome: DomainState<CodexHomeStatus>;
   sessions: DomainState<SessionInventory>;
   managedSessions: DomainState<ManagedSessionInventory>;
+  sessionStorage: DomainState<ShadowScanReport | null>;
   runtimes: DomainState<RuntimeMetadata[]>;
   runtimeStatus: DomainState<RuntimeStatus>;
   backups: DomainState<BackupSummary[]>;
@@ -66,12 +512,12 @@ export type DashboardData = {
 
 export type RuntimeDashboardData = Pick<
   DashboardData,
-  'codexHome' | 'runtimes' | 'runtimeStatus' | 'operations'
+  'codexHome' | 'sessionStorage' | 'runtimes' | 'runtimeStatus' | 'operations'
 >;
 
 export type SessionDashboardData = Pick<
   DashboardData,
-  'sessions' | 'managedSessions'
+  'sessions' | 'managedSessions' | 'sessionStorage'
 >;
 
 export type BackupDashboardData = Pick<DashboardData, 'backups' | 'backupStorage' | 'operations'>;
@@ -454,6 +900,10 @@ export type RuntimeSwitchResult = {
   runtime: RuntimeMetadata;
   warnings?: string[];
   incrementalSessionSync: IncrementalSessionSyncReceipt;
+  routeProvenance: {
+    status: 'pending' | 'recorded' | 'unchanged' | 'failed';
+    message?: string | null;
+  };
   relayValidation: 'notApplicable' | 'verified' | 'skipped';
   chatProcessStateRepaired: boolean;
   chatgptLaunch: ChatGptLaunchResult;

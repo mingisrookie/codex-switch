@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.3.0 - 2026-08-13
+
+> 本版本只有在精确旧版运行时、最终真实库只读预检、完整质量门、tag-CI、公开资产回下载、updater 首跳与回滚全部闭环后才构成正式发布。
+
+### Canonical 会话存储
+
+- 新增统一 `SessionReferenceGraph`，覆盖 OpenAI 主目录、Account、Relay、Shared、legacy/relocated 与备份库存；逐文件记录逻辑 thread、全部数据库引用、canonical/provider-slot 来源、写入状态、大小/hash 和与保留版本的 Equal / EqualExceptProvider / Prefix / Divergent / Unknown 关系。备份引用不再被误当成运行时保留证明。
+- 新增语义 JSONL 解析和回合 provenance：按有效消息序列、工具调用/结果关系和内容 hash 判定，不使用 Switch 文件名时间、mtime、大小或 provider 字段单独决定新旧。非法 JSONL、工具链断裂、顺序变化、真实双尾或无法判断的历史都 fail closed。
+- Account、Relay 与 Shared 改为数据库视图和请求路由；canonical 就绪后继续同一逻辑 threadId，不再按 provider 永久物化完整正文。每轮实际 provider/model/account 来源由 route epoch/provenance 记录，不改写首轮来源伪装 provider。
+- 删除旧“完全同步”语义，改为“会话合并与修复”：只处理缺失、完全相同、仅 provider 元数据不同、严格完整延续和数据库视图/canonical 路径修复。本地合并与 Relay 发布保持独立流程。
+- 新增合并冲突清单与原子主版本切换。真实分叉默认“不覆盖”；候选时间可靠时才提供较新版本提示。显式覆盖后的旧主版本进入 7 天冲突回收，到期仍需重新证明零引用后才能删除。
+- v0.3 生产版移除会话 hard-delete command 与 UI 永久删除入口；旧 v0.2.x hard-delete 实现仅作为 test fixture 保留，不能从日常命令到达。恢复点显式删除和经全局引用证明的 provider 副本 GC 不等同于删除逻辑会话。
+
+### 迁移、备份、GC 与降级
+
+- 新增一次性前台迁移状态机：只读 Preflight → 完整备份 → 真实 Codex 隔离恢复验证 → 原子计划 → Apply/Validate/Commit；取消、失败和启动恢复均由持久操作账本驱动。未迁移时普通账号切换继续可用，但合并修复、历史清理和离线 GC 禁用。
+- 迁移要求所有 Codex writer 退出、SQLite/WAL 一致快照、容量与稳定性预检。完整备份由用户选择位置、未加密且不上传；必须在隔离目录恢复，并由真实 Codex 运行时验证列表、读取和恢复后才标记 `runtimeVerified`。
+- 新增 fail-closed 安全窗口 GC：在线阶段固定只扫描，成功切换、迁移、冲突处理、待恢复导入和会话合并只合并排队新 Shadow。自动清理开启时，只有迁移已提交、scan identity 新鲜、零未完成操作且实时确认全部 writer 关闭，后台才调用与手工入口相同的离线执行器；窗口未形成时零删除并等待后续安全触发校准。候选仍必须同时具有有效 Switch marker、确定 canonical peer、Equal/Prefix、连续两次未变化、全部运行时数据库零引用且无活动句柄/写入。
+- 新增旧备份整理与“待恢复会话”：重复内容删除、主库缺失会话提取待用户决定、完整延续允许恢复、真实分叉进入冲突；无法读取或验证的旧备份不会写入 canonical。诊断事件、已终结操作/迁移审计、恢复包及其 manifest、冲突回收均按 7 天隐私生命周期管理；未终结或仍被恢复载荷引用的账本先保留。自动清理开关只控制 provider 副本 GC，关闭后继续扫描/报告，也不暂停这些隐私 TTL。
+- 新增 v0.2.0–v0.2.7 显式隔离降级导出和再次升级导入。旧版只使用自描述隔离存储，canonical 保持不动；相同/完整延续自动合并，旧版期间新增会话导入，分叉走统一冲突流程。v0.2.x 数据库/索引保存包内绝对路径，因此 UI 与包内 README 明确要求直接选择最终目录，生成后不移动；换盘必须从 canonical 重新生成。
+- 新增本地“交给 Codex 排查”任务生成：只包含问题分类、脱敏路径、schema/version、引用/完整性摘要和只读检查建议，不包含会话正文。
+
+### UI、隐私与发布工程
+
+- 按产品决策移除独立中转站连接验证、切换前 `/models` 探测及 Validate/Direct 选择；切换不再因外部网络探测阻塞，仍保留本地 URL、凭据、官方登录态和写后请求路由校验。历史 `verifyRelay` 日志/枚举字段仅保留为旧数据兼容，不再有生产命令入口。
+- 顶部新增“存储”页，集中展示存储状态、canonical 会话、安全副本、冲突、已回收字节和安全窗口状态；提供迁移进度、冲突、待恢复、自动清理、本地排查和降级导出入口。在线始终只扫描；日常安全扫描/离线清理不弹窗，阻断问题才提示。
+- 会话存储日志和回执只记录脱敏路径、阶段、大小/hash、引用数、删除/保留计数与失败分类；禁止用户消息、模型回复、工具输出、Prompt、附件、凭据和冲突正文。无云端遥测或远程功能开关。
+- Tauri 关闭默认 runtime Brotli asset feature，仅保留 `wry` 与 Windows `common-controls-v6`；Release staging 使用固定官方 UPX 5.2.0 `--ultra-brute --lzma`，raw 不原地修改，packed 仍受 3,000,000 bytes、PE32+ x64、双版本、release contract 和 `upx -t` 硬门约束。
+- Windows-only 网络客户端改用系统 Schannel（`reqwest` `native-tls`），保留 HTTPS、超时、重定向白名单和证书校验边界，同时避免在单文件 EXE 中静态携带第二套 TLS 实现。
+
+### 发布验证边界
+
+- 任何旧的测试输出、runtime/UI 截图、raw/packed hash 或本地证据都不能继承到变化后的工作树；所有质量门必须针对精确发布工作树重新执行并绑定源输入。
+- 真实主库只允许只读 preflight；迁移、回滚、离线 GC 和故障注入只在本机隔离副本执行，不能以历史样本或静态检查替代运行态结果。
+- v0.2.0–v0.2.7 旧版运行时和 updater live gate 必须验证精确旧版 EXE 的 list/resume/continue/graceful close、公开资产更新成功与替换锁回滚。
+- 独立审查、tag-CI、公开 Release 回下载和 updater 成功/回滚是本版本发布记录的一部分；任一门失败即不得把对应资产声明为稳定 Latest。
+
 ## v0.2.7 - 2026-08-10
 
 > `v0.2.7` 已正式发布为 GitHub latest stable。`v0.2.6` annotated tag 在正式 Release 前被最终独立隐私审查拦截，未创建 GitHub Release/Latest；旧 tag 未移动，门禁修复统一进入 `v0.2.7`。
@@ -7,7 +44,7 @@
 ### Added
 
 - 新增独立于 durable `logs/operations.jsonl` 的诊断事件管线：所有用户主动 mutation 都在 lock/spawn/早退前从 command boundary 创建随机 attempt，记录 start/真实 phase/关键安全 branch/typed terminal；拿到 durable operation ID 后只绑定关联，等命令后置步骤完成再按 cleanup/mobile/launch/block/rollback 等真实语义封闭 terminal。operation ledger 持久化失败会记录安全 branch/typed 结果，但诊断始终 fail-open，不改变原业务返回。无 durable record 的 update/process/continuity/exit 也覆盖完整 lifecycle；普通后台成功刷新不写持久诊断，只有失败进入事件管线，前端未处理 `error` / `unhandledrejection` 只提交固定分类和安全文案。
-- 新增 `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 有界 store。事件在落盘前执行字段 allowlist、长度/深度/数量限制和集中 sanitizer；Windows 同一诊断根的 append/read/status/prune/clear 使用 root-scoped named mutex 跨进程协调，默认总量上限 10 MiB、单段 512 KiB。segment 按文件名中的创建时间轮转/prune，读取再按 event `timestamp` 精确过滤最近 14 天；容量可让实际窗口更短。dirty tail 会封存并换段，内部损坏、未知 schema、祖先 reparse 或非 regular segment fail closed；事件已 `sync_data` 后的 post-prune 失败不否定 durable append，也不改变应用启动或业务 mutation 结果。
+- 新增 `%APPDATA%\codex-switch\logs\diagnostics\events-*.jsonl` 有界 store。事件在落盘前执行字段 allowlist、长度/深度/数量限制和集中 sanitizer；Windows 同一诊断根的 append/read/status/prune/clear 使用 root-scoped named mutex 跨进程协调，默认总量上限 10 MiB、单段 512 KiB。segment 按文件名中的创建时间轮转/prune，读取再按 event `timestamp` 精确过滤最近 7 天；容量可让实际窗口更短。dirty tail 会封存并换段，内部损坏、未知 schema、祖先 reparse 或非 regular segment fail closed；事件已 `sync_data` 后的 post-prune 失败不否定 durable append，也不改变应用启动或业务 mutation 结果。
 - 新增启动生命周期与 panic best-effort 记录：Windows session/attempt ID 使用 OS CSPRNG、`CoCreateGuid`、进程局部 fallback 的降级链；尽早写入带 PID/timestamp unit 和 best-effort process creation stamp 的 `sessionStarted`，在 Tauri Ready/正常 Exit 记录 `appReady` / `sessionEnded`，下一次启动在 PID + creation stamp 可用时排除仍存活实例和 PID reuse 后再判断 `previousSessionUnclean`。operation terminal 真正持久化后封闭关联状态，拒绝迟到 phase/branch/重复 terminal；release `panic = "abort"` 保持不变，不引入 watchdog 或崩溃恢复。
 - 顶部工具栏新增页面内“诊断与支持”面板，显示可用性、事件数、占用和保留上限，并提供“导出最近诊断”“打开日志目录”和只清理诊断事件的确认流程。已接入且具有真实关联 ID 的失败面可直接“导出本次诊断”；两个入口共用同一后端选择、脱敏与打包逻辑。
 - 新增固定五文件诊断 ZIP：`README.txt`、`manifest.json`、`diagnostics.jsonl`、脱敏后的 `operations.jsonl` 子集和 `health.json`。manifest 记录版本、时区化导出时间、选择窗口、脱敏策略、负载 bytes/SHA-256 与 unavailable/warning，并以 `timestampUnit = unixEpochMilliseconds` 明确事件 `timestamp` 的 Unix epoch 毫秒单位；ZIP 在发布前后执行 allowlist、hash 和敏感形态自检。
@@ -21,7 +58,7 @@
 - Known Folder 解析或写入失败时先返回页面内导出错误；只有用户点击“改存应用诊断目录”才写固定备用目录，不会自动改存 APPDATA、桌面或其他位置。默认与备用导出都不覆盖原业务失败/成功终态。
 - health collector 只输出结构化摘要与计数，不输出进程命令行、完整配置/认证内容或 SQLite 数据；无法读取的 Windows 版本、route 状态、进程 inventory 或单库 schema 信息必须逐项 unavailable，不伪造空健康状态。
 - store 可按 session causal sequence 返回事件，但 status 和 retained-window selection 使用真实 `timestamp` 最小/最大值；operation overlap 先规范化 started/completed 边界，系统墙钟回拨时不会因数组首尾顺序漏选相关终态。
-- diagnostics named mutex 使用 Windows `Local\` 命名空间和词法规范化 root 哈希：同一登录会话/同一路径标识可协调，跨登录会话或同目录不同路径别名不保证共享锁；14 天窗口依赖系统墙钟，大幅回拨会影响保留判断。非 Windows 只提供进程内锁和非稳定 ID fallback，不属于当前正式交付目标。
+- diagnostics named mutex 使用 Windows `Local\` 命名空间和词法规范化 root 哈希：同一登录会话/同一路径标识可协调，跨登录会话或同目录不同路径别名不保证共享锁；7 天窗口依赖系统墙钟，大幅回拨会影响保留判断。非 Windows 只提供进程内锁和非稳定 ID fallback，不属于当前正式交付目标。
 - exporter 在正常返回/错误 unwind 时尽力删除同目录 staging；若进程在最终发布前硬崩溃，Downloads 或固定备用目录仍可能留下 `.chatgpt-switch-diagnostics.<pid>.<sequence>.tmp`。“清除诊断日志”只删 event segments，不负责清理这些 staging 或已导出 ZIP。
 - panic hook 只能尽力保留进程仍有机会执行时的最小事件；访问冲突、强制结束、断电、硬卡死和其他来不及落盘的硬崩溃不在捕获保证内。`previousSessionUnclean` 只表示缺少 clean terminal，不能单独证明根因。
 

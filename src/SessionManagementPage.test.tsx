@@ -41,7 +41,6 @@ function inventory(sessions: ManagedSessionRecord[]): ManagedSessionInventory {
 
 function renderPage(
   sessions: ManagedSessionRecord[],
-  onDelete = vi.fn(),
   onRestoreVisible = vi.fn(),
 ) {
   return render(
@@ -51,7 +50,6 @@ function renderPage(
       syncDisabled={false}
       mutationDisabled={false}
       onSync={vi.fn()}
-      onDelete={onDelete}
       onRestoreVisible={onRestoreVisible}
     />,
   );
@@ -84,7 +82,7 @@ describe('SessionManagementPage', () => {
     expect(within(region).getByRole('table', { name: '会话列表' })).toBeTruthy();
   });
 
-  it('offers legacy relay sessions a manual Remote publication action and renders typed status', () => {
+  it('offers legacy relay sessions an Account view action and renders typed status', () => {
     const onPublishMobile = vi.fn();
     render(
       <SessionManagementPage
@@ -93,7 +91,6 @@ describe('SessionManagementPage', () => {
         syncDisabled={false}
         mutationDisabled={false}
         onSync={vi.fn()}
-        onDelete={vi.fn()}
         onRestoreVisible={vi.fn()}
         mobileContinuity={{
           enabled: true,
@@ -122,7 +119,7 @@ describe('SessionManagementPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '同步此会话' }));
 
     expect(onPublishMobile).toHaveBeenCalledWith('thread-02');
-    expect(screen.getByText('本机 Remote')).toBeTruthy();
+    expect(screen.getByText('Account 视图')).toBeTruthy();
   });
 
   it('keeps selections across pages and exposes the partial-page indeterminate state', () => {
@@ -150,7 +147,6 @@ describe('SessionManagementPage', () => {
         syncDisabled={false}
         mutationDisabled={false}
         onSync={vi.fn()}
-        onDelete={vi.fn()}
         onRestoreVisible={vi.fn()}
       />,
     );
@@ -158,94 +154,12 @@ describe('SessionManagementPage', () => {
     await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
   });
 
-  it('focuses inline delete confirmation and restores the trigger on cancel', async () => {
-    const onDelete = vi.fn();
-    renderPage([
-      session(1, {
-        archived: true,
-        archivedAt: 1000,
-        current: null,
-        scope: 'shared',
-      }),
-    ], onDelete);
-
-    fireEvent.click(screen.getByLabelText(/^选择 thread-01/));
-    const trigger = screen.getByRole('button', { name: '删除所选' });
-    fireEvent.click(trigger);
-
-    expect(screen.queryByRole('dialog')).toBeNull();
-    const heading = screen.getByRole('heading', { name: '确认硬删除 1 个会话' });
-    await waitFor(() => expect(document.activeElement).toBe(heading));
-    expect(onDelete).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
-
-    expect(screen.queryByRole('heading', { name: '确认硬删除 1 个会话' })).toBeNull();
-    await waitFor(() => expect(document.activeElement).toBe(trigger));
-    expect(screen.getByText('已选：1')).toBeTruthy();
-    expect(onDelete).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
-    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
-    expect(onDelete).toHaveBeenCalledWith(['thread-01'], true);
-  });
-
-  it('clears successfully deleted selections after the mutation resolves', async () => {
-    const onDelete = vi.fn().mockResolvedValue(true);
-    renderPage([session(1)], onDelete);
-
-    fireEvent.click(screen.getByLabelText(/^选择 thread-01/));
-    const trigger = screen.getByRole('button', { name: '删除所选' });
-    fireEvent.click(trigger);
-    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
-
-    await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
-    expect(screen.queryByRole('heading', { name: '确认硬删除 1 个会话' })).toBeNull();
-    expect((trigger as HTMLButtonElement).disabled).toBe(true);
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: '0 个' })));
-  });
-
-  it('uses the native disabled state when no sessions are selected', () => {
+  it('does not expose the retired hard-delete action', () => {
     renderPage([session(1)]);
-
-    const trigger = screen.getByRole('button', { name: '删除所选' }) as HTMLButtonElement;
-    expect(trigger.disabled).toBe(true);
-  });
-
-  it('keeps the inline delete state and selection when deletion fails', async () => {
-    const onDelete = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
-    renderPage([session(1)], onDelete);
-
     fireEvent.click(screen.getByLabelText(/^选择 thread-01/));
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
-    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
 
-    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
-    expect(screen.getByText('已选：1')).toBeTruthy();
-    expect(screen.getByRole('heading', { name: '确认硬删除 1 个会话' })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
-    await waitFor(() => expect(screen.getByText('已选：0')).toBeTruthy());
-  });
-
-  it('focuses the heading before typed confirmation when deleting more than 10 sessions', async () => {
-    const onDelete = vi.fn();
-    renderPage(Array.from({ length: 11 }, (_, index) => session(index + 1)), onDelete);
-
-    fireEvent.click(screen.getByLabelText('全选本页'));
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
-    const heading = screen.getByRole('heading', { name: '确认硬删除 11 个会话' });
-    await waitFor(() => expect(document.activeElement).toBe(heading));
-    const confirmButton = screen.getByRole('button', { name: '确认删除' }) as HTMLButtonElement;
-    expect(confirmButton.disabled).toBe(true);
-    expect(screen.queryByRole('dialog')).toBeNull();
-    expect(onDelete).not.toHaveBeenCalled();
-
-    fireEvent.change(screen.getByLabelText('批量删除确认'), { target: { value: '错误' } });
-    expect(confirmButton.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText('批量删除确认'), { target: { value: '删除 11' } });
-    expect(confirmButton.disabled).toBe(false);
-    fireEvent.click(confirmButton);
-    expect(onDelete).toHaveBeenCalledWith(expect.arrayContaining(['thread-01', 'thread-11']), true);
+    expect(screen.queryByRole('button', { name: /删除|硬删除/ })).toBeNull();
+    expect(screen.getByText(/v0\.3 不提供直接硬删除/)).toBeTruthy();
   });
 
   it('restores only archived sessions that still exist in the current home', () => {
@@ -258,7 +172,7 @@ describe('SessionManagementPage', () => {
       }),
       session(2, { archived: true, archivedAt: 2000, current: null, scope: 'shared' }),
       session(3),
-    ], vi.fn(), onRestore);
+    ], onRestore);
 
     fireEvent.click(screen.getByLabelText('全选本页'));
     fireEvent.click(screen.getByRole('button', { name: '恢复可见' }));
@@ -294,7 +208,6 @@ describe('SessionManagementPage', () => {
         syncDisabled={false}
         mutationDisabled={false}
         onSync={vi.fn()}
-        onDelete={vi.fn()}
         onRestoreVisible={vi.fn()}
       />,
     );

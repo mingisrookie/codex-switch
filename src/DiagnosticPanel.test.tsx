@@ -21,7 +21,7 @@ const status = {
   available: true,
   eventCount: 12,
   totalBytes: 4096,
-  retentionDays: 14,
+  retentionDays: 7,
   maxBytes: 10 * 1024 * 1024,
   oldestEventAtMs: 100,
   newestEventAtMs: 200,

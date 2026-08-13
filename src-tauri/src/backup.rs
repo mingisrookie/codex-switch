@@ -1,41 +1,66 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(windows)]
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
+#[cfg(all(test, windows))]
 use std::os::windows::fs::OpenOptionsExt;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+
+#[cfg(test)]
+use crate::{
+    chat_process_state::validate_snapshot_bytes as validate_chat_process_state_bytes,
+    file_ops::atomic_rewrite,
+};
 
 use rusqlite::{Connection, OpenFlags, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use toml_edit::DocumentMut;
 
 use crate::{
     chat_process_state::{
         backup_source as chat_process_state_backup_source,
         existing_restore_target as existing_chat_process_state_restore_target,
         read_snapshot as read_chat_process_state_snapshot,
-        restore_target as chat_process_state_restore_target,
-        validate_snapshot_bytes as validate_chat_process_state_bytes,
-        CHAT_PROCESS_STATE_RELATIVE_PATH,
+        restore_target as chat_process_state_restore_target, CHAT_PROCESS_STATE_RELATIVE_PATH,
     },
     codex_paths::{
-        local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
+        codex_paths_with_sqlite_home, local_codex_paths, resolve_user_codex_paths,
+        validate_absolute_root, CodexPaths,
     },
     crypto::{protect, unprotect},
-    file_ops::{atomic_rewrite, atomic_write, walk_jsonl_files},
+    file_ops::{atomic_write, walk_jsonl_files},
     operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus},
+    session_storage::write_barrier::{
+        parent_directory_identity_at_path, recover_handle_create, recover_handle_delete,
+        recover_handle_replace, stage_handle_delete, stage_handle_hardlink_create,
+        HandleCreateIdentityBindings, HandleCreatePaths, HandleCreateRecoveryDecision,
+        HandleDeleteIdentityBindings, HandleDeletePaths, HandleDeleteRecoveryDecision,
+        HandleReplaceIdentityBindings, HandleReplacePaths, HandleReplaceRecoveryDecision,
+        RegularFileIdentity, ResolvedHandleCreate, ResolvedHandleDelete, ResolvedHandleReplace,
+        WriteExclusionGuard,
+    },
 };
 
 static BACKUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCOPED_BACKUP_MANIFEST_VERSION: u32 = 3;
 const BACKUP_MANIFEST_VERSION: u32 = 4;
+const BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const BACKUP_RESTORE_OPERATION_DIRECTORY: &str = "backup-restore-operations";
+const BACKUP_RESTORE_JOURNAL_FILE: &str = "journal.dpapi";
+const BACKUP_RESTORE_JOURNAL_MAGIC: &[u8] = b"CSBRESTORE1\0";
+const BACKUP_RESTORE_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+const BACKUP_RESTORE_MAX_CIPHERTEXT_BYTES: u64 = BACKUP_RESTORE_MAX_JOURNAL_BYTES * 2 + 64 * 1024;
+const BACKUP_RESTORE_MAX_OPERATION_ID_BYTES: usize = 160;
 
 const BACKUP_FILE_OVERHEAD_BYTES: u64 = 64 * 1024;
 const MANIFEST_BASE_OVERHEAD_BYTES: u64 = 1024 * 1024;
@@ -1057,6 +1082,308 @@ pub fn delete_verified_full_backup(
     Ok(DeleteBackupResult {
         backup_dir: initial.backup_dir,
         reclaimed_bytes: initial.reclaimed_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BackupRestoreRecoveryReceipt {
+    pub discovered_operation_count: usize,
+    pub rolled_back_operation_count: usize,
+    pub committed_cleanup_count: usize,
+    pub already_terminal_count: usize,
+    pub blocked_operation_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum BackupRestoreMutationKind {
+    Create,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum BackupRestoreOperationPhase {
+    Planned,
+    Applying,
+    Validating,
+    Committing,
+    Committed,
+    RollingBack,
+    RolledBack,
+    CommittedCleanupComplete,
+    RolledBackCleanupComplete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum BackupRestoreMutationPhase {
+    Planned,
+    WitnessCreating,
+    WitnessReady,
+    Preparing,
+    Prepared,
+    Publishing,
+    Published,
+    CommittedWithRecovery,
+    RollbackPreparing,
+    RollbackPrepared,
+    RolledBack,
+    Cleaned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestoreArtifactPaths {
+    original_witness_path: PathBuf,
+    replacement_witness_path: PathBuf,
+    staging_path: PathBuf,
+    recovery_path: PathBuf,
+    rollback_tombstone_path: PathBuf,
+}
+
+impl BackupRestoreArtifactPaths {
+    fn replace_paths(&self, target_path: &Path) -> Result<HandleReplacePaths, String> {
+        HandleReplacePaths::from_persisted_plan(
+            target_path.to_path_buf(),
+            self.recovery_path.clone(),
+            self.staging_path.clone(),
+            self.rollback_tombstone_path.clone(),
+        )
+    }
+
+    fn create_paths(&self, target_path: &Path) -> Result<HandleCreatePaths, String> {
+        HandleCreatePaths::from_persisted_plan(
+            target_path.to_path_buf(),
+            self.staging_path.clone(),
+            self.rollback_tombstone_path.clone(),
+        )
+    }
+
+    fn delete_paths(&self, target_path: &Path) -> Result<HandleDeletePaths, String> {
+        HandleDeletePaths::from_persisted_plan(
+            target_path.to_path_buf(),
+            self.recovery_path.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestoreMutationPlan {
+    kind: BackupRestoreMutationKind,
+    logical_path: PathBuf,
+    target_path: PathBuf,
+    original_sha256: Option<String>,
+    replacement_sha256: Option<String>,
+    artifacts: BackupRestoreArtifactPaths,
+    sqlite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestoreMutationState {
+    phase: BackupRestoreMutationPhase,
+    parent_identity: Option<RegularFileIdentity>,
+    original_identity: Option<RegularFileIdentity>,
+    replacement_identity: Option<RegularFileIdentity>,
+}
+
+impl BackupRestoreMutationState {
+    fn replace_bindings(&self) -> Result<HandleReplaceIdentityBindings, String> {
+        Ok(HandleReplaceIdentityBindings {
+            parent_identity: self
+                .parent_identity
+                .ok_or_else(|| "backup restore parent identity is missing".to_string())?,
+            original_identity: self
+                .original_identity
+                .ok_or_else(|| "backup restore original identity is missing".to_string())?,
+            replacement_identity: self
+                .replacement_identity
+                .ok_or_else(|| "backup restore replacement identity is missing".to_string())?,
+        })
+    }
+
+    fn create_bindings(&self) -> Result<HandleCreateIdentityBindings, String> {
+        Ok(HandleCreateIdentityBindings {
+            parent_identity: self
+                .parent_identity
+                .ok_or_else(|| "backup restore parent identity is missing".to_string())?,
+            created_identity: self
+                .replacement_identity
+                .ok_or_else(|| "backup restore replacement identity is missing".to_string())?,
+        })
+    }
+
+    fn delete_bindings(&self) -> Result<HandleDeleteIdentityBindings, String> {
+        Ok(HandleDeleteIdentityBindings {
+            parent_identity: self
+                .parent_identity
+                .ok_or_else(|| "backup restore parent identity is missing".to_string())?,
+            deleted_identity: self
+                .original_identity
+                .ok_or_else(|| "backup restore original identity is missing".to_string())?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestorePlan {
+    operation_id: String,
+    created_at_ms: u128,
+    backup_dir: PathBuf,
+    backup_manifest_sha256: String,
+    target_root: PathBuf,
+    allowed_roots: Vec<PathBuf>,
+    restored_file_count: usize,
+    mutations: Vec<BackupRestoreMutationPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestoreJournal {
+    schema_version: u32,
+    revision: u64,
+    updated_at_ms: u128,
+    phase: BackupRestoreOperationPhase,
+    plan_integrity_sha256: String,
+    plan: BackupRestorePlan,
+    mutation_states: Vec<BackupRestoreMutationState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRestoreJournalEnvelope {
+    journal: BackupRestoreJournal,
+    integrity_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct BackupRestorePreparedPlan {
+    manifest: BackupManifest,
+    journal: BackupRestoreJournal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CorruptManagedBackupSnapshot {
+    pub manifest: BackupManifest,
+    pub tree_sha256: String,
+    pub reclaimed_bytes: u64,
+}
+
+pub(crate) fn verified_full_backup_reclaim_bytes(
+    destination_root: &Path,
+    backup_dir: &Path,
+) -> Result<u64, String> {
+    Ok(verify_managed_full_backup(destination_root, backup_dir)?.reclaimed_bytes)
+}
+
+pub(crate) fn inspect_corrupt_managed_full_backup(
+    destination_root: &Path,
+    backup_dir: &Path,
+) -> Result<CorruptManagedBackupSnapshot, String> {
+    let destination_root = validate_absolute_root(destination_root, "backup destination root")?;
+    let backup_dir = validate_absolute_root(backup_dir, "backup directory")?;
+    let root = fs::canonicalize(&destination_root)
+        .map_err(|_| "failed to resolve backup destination root".to_string())?;
+    let directory = fs::canonicalize(&backup_dir)
+        .map_err(|_| "failed to resolve corrupt backup directory".to_string())?;
+    if directory.parent() != Some(root.as_path()) {
+        return Err("corrupt backup directory is outside the managed root".to_string());
+    }
+    let manifest = read_backup_manifest(&directory)?;
+    if manifest.backup_dir != backup_dir
+        || fs::canonicalize(&manifest.backup_dir)
+            .map_err(|_| "failed to resolve corrupt backup manifest directory".to_string())?
+            != directory
+        || !managed_backup_directory_name_matches(&directory, &manifest)
+    {
+        return Err("corrupt backup identity is not managed".to_string());
+    }
+    if verify_backup(&directory).is_ok() {
+        return Err("backup is still fully verifiable".to_string());
+    }
+
+    let mut allowed_files = BTreeSet::from([backup_path_key(&directory.join("manifest.json"))]);
+    let mut allowed_directories = BTreeSet::from([backup_path_key(&directory)]);
+    for file in &manifest.files {
+        validate_relative_path(&file.relative_path)?;
+        let expected = encrypted_payload_path(&manifest.backup_dir, &file.relative_path)?;
+        if file.backup_path != expected {
+            return Err("corrupt backup payload path is not managed".to_string());
+        }
+        let relative = expected
+            .strip_prefix(&manifest.backup_dir)
+            .map_err(|_| "corrupt backup payload escaped its directory".to_string())?;
+        let managed_path = directory.join(relative);
+        allowed_files.insert(backup_path_key(&managed_path));
+        let mut parent = managed_path.parent();
+        while let Some(path) = parent {
+            if !path.starts_with(&directory) {
+                break;
+            }
+            allowed_directories.insert(backup_path_key(path));
+            if path == directory {
+                break;
+            }
+            parent = path.parent();
+        }
+    }
+
+    let mut observed_files = Vec::new();
+    let mut pending = vec![directory.clone()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)
+            .map_err(|_| "corrupt backup directory is unreadable".to_string())?
+        {
+            let entry = entry.map_err(|_| "corrupt backup entry is unreadable".to_string())?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|_| "corrupt backup entry is unreadable".to_string())?;
+            if backup_metadata_is_link_or_reparse(&metadata) {
+                return Err("corrupt backup contains a link".to_string());
+            }
+            let key = backup_path_key(&entry.path());
+            if metadata.is_dir() {
+                if !allowed_directories.contains(&key) {
+                    return Err("corrupt backup contains an undeclared directory".to_string());
+                }
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                if !allowed_files.contains(&key) {
+                    return Err("corrupt backup contains an undeclared file".to_string());
+                }
+                observed_files.push((key, metadata.len(), sha256_file(&entry.path())?));
+            } else {
+                return Err("corrupt backup contains an unsupported entry".to_string());
+            }
+        }
+    }
+    if !observed_files
+        .iter()
+        .any(|(path, _, _)| path == &backup_path_key(&directory.join("manifest.json")))
+    {
+        return Err("corrupt backup manifest disappeared".to_string());
+    }
+    observed_files.sort_by(|left, right| left.0.cmp(&right.0));
+    let reclaimed_bytes = observed_files.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.1)
+            .ok_or_else(|| "corrupt backup size overflowed".to_string())
+    })?;
+    let tree_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&observed_files)
+                .map_err(|_| "failed to encode corrupt backup inventory".to_string())?
+        )
+    );
+    Ok(CorruptManagedBackupSnapshot {
+        manifest,
+        tree_sha256,
+        reclaimed_bytes,
     })
 }
 
@@ -2105,6 +2432,66 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, String> {
     Ok(manifest)
 }
 
+/// Extracts one payload from an already managed backup without interpreting the
+/// backed-up config or resolving its historical SQLite root. This is used by
+/// the v0.3 legacy-backup inventory so an old `sqlite_home` value can never
+/// redirect an isolated inspection into a live profile.
+#[cfg(test)]
+pub(crate) fn extract_verified_backup_file(
+    backup_dir: &Path,
+    relative_path: &Path,
+    target: &Path,
+) -> Result<(u64, String), String> {
+    validate_absolute_root(backup_dir, "backup directory")?;
+    if !target.is_absolute() {
+        return Err("backup extraction target must be absolute".to_string());
+    }
+    validate_relative_path(relative_path)?;
+    let manifest = verify_backup(backup_dir)?;
+    extract_backup_manifest_file(&manifest, relative_path, target)
+}
+
+pub(crate) fn extract_backup_manifest_file(
+    manifest: &BackupManifest,
+    relative_path: &Path,
+    target: &Path,
+) -> Result<(u64, String), String> {
+    if !manifest.backup_dir.is_absolute() || !target.is_absolute() {
+        return Err("backup extraction paths must be absolute".to_string());
+    }
+    validate_relative_path(relative_path)?;
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == relative_path)
+        .ok_or_else(|| "backup payload is not declared by the manifest".to_string())?;
+    let encrypted_before = fs::read(&file.backup_path)
+        .map_err(|_| "backup payload is unavailable during extraction".to_string())?;
+    if encrypted_before.len() as u64 != file.bytes
+        || format!("{:x}", Sha256::digest(&encrypted_before)) != file.sha256
+    {
+        return Err("backup payload changed before extraction".to_string());
+    }
+    let plaintext = unprotect(&encrypted_before)
+        .map_err(|_| "backup payload could not be decrypted for isolated inspection".to_string())?;
+    atomic_write(target, &plaintext)
+        .map_err(|_| "failed to write isolated backup payload".to_string())?;
+    let encrypted_after = fs::read(&file.backup_path)
+        .map_err(|_| "backup payload is unavailable after extraction".to_string())?;
+    if encrypted_after != encrypted_before {
+        return Err("backup payload changed during extraction".to_string());
+    }
+    let bytes = u64::try_from(plaintext.len())
+        .map_err(|_| "isolated backup payload size overflowed".to_string())?;
+    let sha256 = format!("{:x}", Sha256::digest(&plaintext));
+    let written =
+        fs::read(target).map_err(|_| "isolated backup payload is unavailable".to_string())?;
+    if written.len() as u64 != bytes || format!("{:x}", Sha256::digest(&written)) != sha256 {
+        return Err("isolated backup payload verification failed".to_string());
+    }
+    Ok((bytes, sha256))
+}
+
 #[cfg(test)]
 pub(crate) fn load_process_state_checkpoint(
     manifest: &BackupManifest,
@@ -2271,6 +2658,2554 @@ fn manifest_scope(manifest: &BackupManifest) -> BackupScope {
     }
 }
 
+fn prepare_backup_restore_plan(
+    backup_dir: &Path,
+    target_home: &Path,
+    operation_id: &str,
+) -> Result<BackupRestorePreparedPlan, String> {
+    let backup_dir = validate_absolute_root(backup_dir, "backup directory")?;
+    let target_home = validate_absolute_root(target_home, "restore target root")?;
+    validate_backup_restore_operation_id(operation_id)?;
+    ensure_roots_disjoint(
+        &backup_dir,
+        "backup directory",
+        &target_home,
+        "restore target root",
+    )?;
+    let manifest = verify_backup(&backup_dir)?;
+    let backup_metadata = fs::symlink_metadata(&backup_dir)
+        .map_err(|_| "backup restore directory is unavailable".to_string())?;
+    let manifest_metadata = fs::symlink_metadata(backup_dir.join("manifest.json"))
+        .map_err(|_| "backup restore manifest is unavailable".to_string())?;
+    if !backup_metadata.is_dir()
+        || backup_metadata_is_link_or_reparse(&backup_metadata)
+        || !manifest_metadata.is_file()
+        || backup_metadata_is_link_or_reparse(&manifest_metadata)
+    {
+        return Err("backup restore directory is unsafe".to_string());
+    }
+    if manifest.backup_dir != backup_dir
+        || fs::canonicalize(&manifest.backup_dir)
+            .map_err(|_| "backup restore directory is unavailable".to_string())?
+            != fs::canonicalize(&backup_dir)
+                .map_err(|_| "backup restore directory is unavailable".to_string())?
+        || manifest.source_root != target_home
+    {
+        return Err("backup restore target does not match the backed-up root".to_string());
+    }
+    let (_, backup_manifest_sha256) = backup_restore_existing_file_digest(
+        &backup_dir.join("manifest.json"),
+        "backup restore manifest",
+    )?;
+
+    let old_paths = if manifest.state_db_is_local {
+        local_codex_paths(&target_home)
+    } else {
+        resolve_user_codex_paths(&target_home)?
+    };
+    let new_paths = resolve_backed_up_codex_paths(&manifest, &target_home, &old_paths)?;
+    for root in [&old_paths.sqlite_home, &new_paths.sqlite_home] {
+        ensure_roots_disjoint(
+            &backup_dir,
+            "backup directory",
+            root,
+            "backup restore SQLite root",
+        )?;
+    }
+
+    let mut allowed_roots = vec![target_home.clone()];
+    for root in [&old_paths.sqlite_home, &new_paths.sqlite_home] {
+        if !allowed_roots
+            .iter()
+            .any(|candidate| backup_restore_path_key(candidate) == backup_restore_path_key(root))
+        {
+            allowed_roots.push(root.clone());
+        }
+    }
+    allowed_roots.sort_by_key(|path| backup_restore_path_key(path));
+    for root in &allowed_roots {
+        validate_backup_restore_allowed_root(root)?;
+    }
+
+    let mut planned = BTreeMap::<String, BackupRestoreMutationPlan>::new();
+    if manifest.root_existed {
+        for file in &manifest.files {
+            let target = restore_target(&new_paths, &target_home, &file.relative_path)?;
+            validate_backup_restore_target_ancestry(&allowed_roots, &target)?;
+            let plaintext = read_verified_backup_plaintext(&manifest, file)?;
+            let replacement_sha256 = format!("{:x}", Sha256::digest(&plaintext));
+            let expected_sqlite =
+                sqlite_restore_target(&new_paths, file.relative_path.to_string_lossy().as_ref())
+                    .is_some();
+            if expected_sqlite {
+                validate_sqlite_snapshot_header(&plaintext)?;
+            }
+            let existing = backup_restore_optional_file_digest(&target, "backup restore target")?;
+            let kind = if existing.is_some() {
+                BackupRestoreMutationKind::Replace
+            } else {
+                BackupRestoreMutationKind::Create
+            };
+            insert_backup_restore_mutation(
+                &mut planned,
+                operation_id,
+                BackupRestoreMutationPlan {
+                    kind,
+                    logical_path: file.relative_path.clone(),
+                    target_path: target,
+                    original_sha256: existing.map(|(_, sha256)| sha256),
+                    replacement_sha256: Some(replacement_sha256),
+                    artifacts: BackupRestoreArtifactPaths {
+                        original_witness_path: PathBuf::new(),
+                        replacement_witness_path: PathBuf::new(),
+                        staging_path: PathBuf::new(),
+                        recovery_path: PathBuf::new(),
+                        rollback_tombstone_path: PathBuf::new(),
+                    },
+                    sqlite: expected_sqlite,
+                },
+            )?;
+        }
+    }
+
+    collect_backup_restore_deletions(
+        &manifest,
+        &target_home,
+        &old_paths,
+        &new_paths,
+        &allowed_roots,
+        operation_id,
+        &mut planned,
+    )?;
+    let mutations = planned.into_values().collect::<Vec<_>>();
+    let created_at_ms = timestamp_millis()?;
+    let plan = BackupRestorePlan {
+        operation_id: operation_id.to_string(),
+        created_at_ms,
+        backup_dir: backup_dir.clone(),
+        backup_manifest_sha256,
+        target_root: target_home,
+        allowed_roots,
+        restored_file_count: manifest.files.len(),
+        mutations,
+    };
+    let journal = new_backup_restore_journal(plan)?;
+    Ok(BackupRestorePreparedPlan { manifest, journal })
+}
+
+fn insert_backup_restore_mutation(
+    planned: &mut BTreeMap<String, BackupRestoreMutationPlan>,
+    operation_id: &str,
+    mut mutation: BackupRestoreMutationPlan,
+) -> Result<(), String> {
+    mutation.artifacts = build_backup_restore_artifact_paths(operation_id, &mutation.target_path)?;
+    let key = backup_restore_path_key(&mutation.target_path);
+    match planned.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(mutation);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().replacement_sha256.is_some()
+                && mutation.replacement_sha256.is_none() =>
+        {
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().kind == BackupRestoreMutationKind::Delete
+                && mutation.kind == BackupRestoreMutationKind::Delete
+                && entry.get().original_sha256 == mutation.original_sha256 =>
+        {
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {
+            Err("backup restore plan contains conflicting target actions".to_string())
+        }
+    }
+}
+
+fn collect_backup_restore_deletions(
+    manifest: &BackupManifest,
+    target_home: &Path,
+    old_paths: &CodexPaths,
+    new_paths: &CodexPaths,
+    allowed_roots: &[PathBuf],
+    operation_id: &str,
+    planned: &mut BTreeMap<String, BackupRestoreMutationPlan>,
+) -> Result<(), String> {
+    let scope = manifest_scope(manifest);
+    let desired = manifest
+        .files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<HashSet<_>>();
+    let mut candidates = Vec::<(PathBuf, PathBuf, bool)>::new();
+    if scope.tracks_runtime_files() {
+        for relative in [Path::new("auth.json"), Path::new("config.toml")] {
+            if !desired.contains(relative) {
+                candidates.push((
+                    PathBuf::from(format!("absent/{}", relative.display())),
+                    target_home.join(relative),
+                    false,
+                ));
+            }
+        }
+    }
+    if manifest.tracked_process_state
+        && !desired.contains(Path::new(CHAT_PROCESS_STATE_RELATIVE_PATH))
+    {
+        if let Some(target) = existing_chat_process_state_restore_target(target_home)? {
+            candidates.push((
+                PathBuf::from(format!("absent/{CHAT_PROCESS_STATE_RELATIVE_PATH}")),
+                target,
+                false,
+            ));
+        }
+    }
+    if scope.tracks_sessions() && !desired.contains(Path::new("session_index.jsonl")) {
+        candidates.push((
+            PathBuf::from("absent/session_index.jsonl"),
+            new_paths.session_index.clone(),
+            false,
+        ));
+    }
+
+    for (relative, new_database) in managed_sqlite_paths(new_paths) {
+        if !manifest_tracks_database(manifest, relative) {
+            continue;
+        }
+        let old_database = sqlite_restore_target(old_paths, relative)
+            .expect("managed SQLite relative paths must be routable");
+        let database_is_desired = desired.contains(Path::new(relative));
+        if !database_is_desired {
+            candidates.push((
+                PathBuf::from(format!("absent/{relative}")),
+                new_database.to_path_buf(),
+                true,
+            ));
+        }
+        if old_database != new_database {
+            candidates.push((
+                PathBuf::from(format!("previous-sqlite/{relative}")),
+                old_database.to_path_buf(),
+                true,
+            ));
+        }
+        for database in [new_database, old_database] {
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = PathBuf::from(format!("{}{suffix}", database.to_string_lossy()));
+                candidates.push((
+                    PathBuf::from(format!(
+                        "sqlite-sidecars/{}/{}{}",
+                        backup_restore_root_digest(
+                            database.parent().unwrap_or_else(|| Path::new("."))
+                        ),
+                        relative,
+                        suffix
+                    )),
+                    sidecar,
+                    true,
+                ));
+            }
+        }
+    }
+
+    if scope.tracks_sessions() && manifest.complete_sessions {
+        let expected = manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.relative_path.starts_with(Path::new("sessions"))
+                    || file
+                        .relative_path
+                        .starts_with(Path::new("archived_sessions"))
+            })
+            .map(|file| target_home.join(&file.relative_path))
+            .map(|path| backup_restore_path_key(&path))
+            .collect::<HashSet<_>>();
+        for (directory, tracked) in [
+            (&new_paths.sessions_dir, true),
+            (
+                &new_paths.archived_sessions_dir,
+                scope.tracks_archived_sessions(),
+            ),
+        ] {
+            if !tracked || !directory.is_dir() {
+                continue;
+            }
+            for path in walk_jsonl_files(directory)? {
+                if !expected.contains(&backup_restore_path_key(&path)) {
+                    let relative = path
+                        .strip_prefix(target_home)
+                        .map_err(|_| "backup restore session escaped its root".to_string())?;
+                    candidates.push((
+                        PathBuf::from(format!("extra/{}", relative.display())),
+                        path,
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    for (logical_path, target_path, sqlite) in candidates {
+        validate_backup_restore_target_ancestry(allowed_roots, &target_path)?;
+        let Some((_, original_sha256)) =
+            backup_restore_optional_file_digest(&target_path, "backup restore deletion target")?
+        else {
+            continue;
+        };
+        insert_backup_restore_mutation(
+            planned,
+            operation_id,
+            BackupRestoreMutationPlan {
+                kind: BackupRestoreMutationKind::Delete,
+                logical_path,
+                target_path,
+                original_sha256: Some(original_sha256),
+                replacement_sha256: None,
+                artifacts: BackupRestoreArtifactPaths {
+                    original_witness_path: PathBuf::new(),
+                    replacement_witness_path: PathBuf::new(),
+                    staging_path: PathBuf::new(),
+                    recovery_path: PathBuf::new(),
+                    rollback_tombstone_path: PathBuf::new(),
+                },
+                sqlite,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_backed_up_codex_paths(
+    manifest: &BackupManifest,
+    target_home: &Path,
+    current_paths: &CodexPaths,
+) -> Result<CodexPaths, String> {
+    if manifest.state_db_is_local {
+        return Ok(local_codex_paths(target_home));
+    }
+    let configured_sqlite_home = match manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == Path::new("config.toml"))
+    {
+        Some(file) => {
+            let plaintext = read_verified_backup_plaintext(manifest, file)?;
+            let text = std::str::from_utf8(&plaintext)
+                .map_err(|_| "backed-up config.toml is not UTF-8".to_string())?;
+            let document = DocumentMut::from_str(text)
+                .map_err(|_| "backed-up config.toml is invalid".to_string())?;
+            match document.get("sqlite_home") {
+                Some(value) => {
+                    let raw = value
+                        .as_str()
+                        .ok_or_else(|| {
+                            "backed-up config.toml sqlite_home must be a string".to_string()
+                        })?
+                        .trim();
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(validate_absolute_root(
+                            &PathBuf::from(raw),
+                            "backed-up config.toml sqlite_home",
+                        )?)
+                    }
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+    let mut declared_sqlite_roots = manifest
+        .files
+        .iter()
+        .filter(|file| {
+            file.relative_path
+                .to_str()
+                .is_some_and(|relative| MANAGED_DATABASES.contains(&relative))
+        })
+        .map(|file| {
+            file.source
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "backed-up SQLite payload has no parent".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    declared_sqlite_roots.sort_by_key(|path| backup_restore_path_key(path));
+    declared_sqlite_roots
+        .dedup_by(|left, right| backup_restore_path_key(left) == backup_restore_path_key(right));
+    if declared_sqlite_roots.len() > 1 {
+        return Err("backed-up SQLite payloads disagree on their storage root".to_string());
+    }
+    if let (Some(configured), Some(source)) = (
+        configured_sqlite_home.as_ref(),
+        declared_sqlite_roots.first(),
+    ) {
+        if backup_restore_path_key(configured) != backup_restore_path_key(source) {
+            return Err("backed-up config and SQLite payload roots disagree".to_string());
+        }
+    }
+    let sqlite_home = configured_sqlite_home
+        .or_else(|| {
+            (current_paths.sqlite_home != target_home).then(|| current_paths.sqlite_home.clone())
+        })
+        .ok_or_else(|| "external backup SQLite root cannot be proven".to_string())?;
+    codex_paths_with_sqlite_home(target_home, &sqlite_home)
+}
+
+fn read_verified_backup_plaintext(
+    manifest: &BackupManifest,
+    file: &BackupFile,
+) -> Result<Vec<u8>, String> {
+    let expected = encrypted_payload_path(&manifest.backup_dir, &file.relative_path)?;
+    if file.backup_path != expected || !file.encrypted {
+        return Err("backup restore payload identity is invalid".to_string());
+    }
+    let metadata = fs::symlink_metadata(&file.backup_path)
+        .map_err(|_| "backup restore payload is unavailable".to_string())?;
+    if !metadata.is_file() || backup_metadata_is_link_or_reparse(&metadata) {
+        return Err("backup restore payload is unsafe".to_string());
+    }
+    let encrypted_before = fs::read(&file.backup_path)
+        .map_err(|_| "backup restore payload is unavailable".to_string())?;
+    if encrypted_before.len() as u64 != file.bytes
+        || format!("{:x}", Sha256::digest(&encrypted_before)) != file.sha256
+    {
+        return Err("backup restore payload changed before staging".to_string());
+    }
+    let plaintext = unprotect(&encrypted_before)
+        .map_err(|_| "backup restore payload is unreadable".to_string())?;
+    let encrypted_after = fs::read(&file.backup_path)
+        .map_err(|_| "backup restore payload is unavailable".to_string())?;
+    if encrypted_after != encrypted_before {
+        return Err("backup restore payload changed during staging".to_string());
+    }
+    Ok(plaintext)
+}
+
+fn validate_sqlite_snapshot_header(bytes: &[u8]) -> Result<(), String> {
+    const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+    if bytes.len() < 100 || !bytes.starts_with(SQLITE_HEADER) {
+        return Err("backed-up SQLite payload header is invalid".to_string());
+    }
+    let encoded_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if encoded_page_size == 1 {
+        65_536_usize
+    } else {
+        usize::from(encoded_page_size)
+    };
+    if !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+        || !bytes.len().is_multiple_of(page_size)
+    {
+        return Err("backed-up SQLite payload page layout is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn backup_restore_optional_file_digest(
+    path: &Path,
+    label: &str,
+) -> Result<Option<(u64, String)>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || backup_metadata_is_link_or_reparse(&metadata) {
+                return Err(format!("{label} is not a regular file"));
+            }
+            backup_restore_existing_file_digest(path, label).map(Some)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(format!("{label} is unavailable")),
+    }
+}
+
+fn backup_restore_existing_file_digest(path: &Path, label: &str) -> Result<(u64, String), String> {
+    let before = fs::symlink_metadata(path).map_err(|_| format!("{label} is unavailable"))?;
+    if !before.is_file() || backup_metadata_is_link_or_reparse(&before) {
+        return Err(format!("{label} is not a regular file"));
+    }
+    let sha256 = sha256_file(path)?;
+    let after = fs::symlink_metadata(path).map_err(|_| format!("{label} is unavailable"))?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || backup_restore_metadata_identity(path, &before)
+            != backup_restore_metadata_identity(path, &after)
+    {
+        return Err(format!("{label} changed during inspection"));
+    }
+    Ok((before.len(), sha256))
+}
+
+#[cfg(windows)]
+fn backup_restore_metadata_identity(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> (Option<(u32, u64)>, u32, u64) {
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+    };
+    let identity = fs::File::open(path).ok().and_then(|file| {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        let ok =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+        (ok != 0).then_some((
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        ))
+    });
+    (
+        identity,
+        metadata.file_attributes(),
+        metadata.last_write_time(),
+    )
+}
+
+#[cfg(unix)]
+fn backup_restore_metadata_identity(_path: &Path, metadata: &fs::Metadata) -> (u64, u64, u32, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.ctime(),
+    )
+}
+
+#[cfg(not(any(windows, unix)))]
+fn backup_restore_metadata_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> (u64, Option<SystemTime>) {
+    (metadata.len(), metadata.modified().ok())
+}
+
+fn backup_restore_root_digest(path: &Path) -> String {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(backup_restore_path_key(path).as_bytes())
+    );
+    digest[..16].to_string()
+}
+
+fn build_backup_restore_artifact_paths(
+    operation_id: &str,
+    target_path: &Path,
+) -> Result<BackupRestoreArtifactPaths, String> {
+    validate_backup_restore_operation_id(operation_id)?;
+    validate_absolute_root(
+        target_path
+            .parent()
+            .ok_or_else(|| "backup restore target has no parent".to_string())?,
+        "backup restore target parent",
+    )?;
+    let target_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "backup restore target name is invalid".to_string())?;
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "codex-switch-backup-restore-artifact-v1\0{operation_id}\0{}",
+                backup_restore_path_key(target_path)
+            )
+            .as_bytes()
+        )
+    );
+    let prefix = format!(
+        ".{target_name}.codex-switch-backup-restore-{}",
+        &digest[..32]
+    );
+    let parent = target_path
+        .parent()
+        .expect("validated backup restore targets have a parent");
+    Ok(BackupRestoreArtifactPaths {
+        original_witness_path: parent.join(format!("{prefix}.original")),
+        replacement_witness_path: parent.join(format!("{prefix}.replacement")),
+        staging_path: parent.join(format!("{prefix}.staging")),
+        recovery_path: parent.join(format!("{prefix}.recovery")),
+        rollback_tombstone_path: parent.join(format!("{prefix}.tombstone")),
+    })
+}
+
+fn new_backup_restore_journal(plan: BackupRestorePlan) -> Result<BackupRestoreJournal, String> {
+    validate_backup_restore_plan(&plan)?;
+    let mutation_states = plan
+        .mutations
+        .iter()
+        .map(|_| BackupRestoreMutationState {
+            phase: BackupRestoreMutationPhase::Planned,
+            parent_identity: None,
+            original_identity: None,
+            replacement_identity: None,
+        })
+        .collect::<Vec<_>>();
+    let journal = BackupRestoreJournal {
+        schema_version: BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION,
+        revision: 0,
+        updated_at_ms: plan.created_at_ms,
+        phase: BackupRestoreOperationPhase::Planned,
+        plan_integrity_sha256: backup_restore_plan_digest(&plan)?,
+        plan,
+        mutation_states,
+    };
+    validate_backup_restore_journal(&journal)?;
+    Ok(journal)
+}
+
+fn validate_backup_restore_journal(journal: &BackupRestoreJournal) -> Result<(), String> {
+    if journal.schema_version != BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION {
+        return Err("backup restore journal version is unsupported".to_string());
+    }
+    validate_backup_restore_plan(&journal.plan)?;
+    if journal.plan_integrity_sha256 != backup_restore_plan_digest(&journal.plan)? {
+        return Err("backup restore plan integrity check failed".to_string());
+    }
+    if journal.updated_at_ms < journal.plan.created_at_ms {
+        return Err("backup restore journal timestamp moved backwards".to_string());
+    }
+    if journal.mutation_states.len() != journal.plan.mutations.len() {
+        return Err("backup restore journal mutation state is incomplete".to_string());
+    }
+    if journal.phase == BackupRestoreOperationPhase::Planned
+        && (journal.revision != 0
+            || journal
+                .mutation_states
+                .iter()
+                .any(|state| state.phase != BackupRestoreMutationPhase::Planned))
+    {
+        return Err("backup restore planned journal contains applied state".to_string());
+    }
+    for (mutation, state) in journal.plan.mutations.iter().zip(&journal.mutation_states) {
+        validate_backup_restore_mutation_state(mutation, state)?;
+    }
+    match journal.phase {
+        BackupRestoreOperationPhase::Committed => {
+            if journal.mutation_states.iter().any(|state| {
+                !matches!(
+                    state.phase,
+                    BackupRestoreMutationPhase::CommittedWithRecovery
+                        | BackupRestoreMutationPhase::Cleaned
+                )
+            }) {
+                return Err("committed backup restore has unfinished mutations".to_string());
+            }
+        }
+        BackupRestoreOperationPhase::RolledBack => {
+            if journal.mutation_states.iter().any(|state| {
+                !matches!(
+                    state.phase,
+                    BackupRestoreMutationPhase::RolledBack | BackupRestoreMutationPhase::Cleaned
+                )
+            }) {
+                return Err("rolled back backup restore has unfinished mutations".to_string());
+            }
+        }
+        BackupRestoreOperationPhase::CommittedCleanupComplete
+        | BackupRestoreOperationPhase::RolledBackCleanupComplete => {
+            if journal
+                .mutation_states
+                .iter()
+                .any(|state| state.phase != BackupRestoreMutationPhase::Cleaned)
+            {
+                return Err("completed backup restore cleanup has retained artifacts".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_plan(plan: &BackupRestorePlan) -> Result<(), String> {
+    validate_backup_restore_operation_id(&plan.operation_id)?;
+    if plan.created_at_ms == 0 {
+        return Err("backup restore plan timestamp is invalid".to_string());
+    }
+    let backup_dir = validate_absolute_root(&plan.backup_dir, "backup restore backup directory")?;
+    let target_root = validate_absolute_root(&plan.target_root, "backup restore target root")?;
+    validate_backup_restore_sha256(&plan.backup_manifest_sha256)?;
+    if plan.allowed_roots.is_empty() {
+        return Err("backup restore plan has no allowed roots".to_string());
+    }
+    let mut allowed_root_keys = BTreeSet::new();
+    for root in &plan.allowed_roots {
+        let root = validate_absolute_root(root, "backup restore allowed root")?;
+        validate_backup_restore_allowed_root(&root)?;
+        if !allowed_root_keys.insert(backup_restore_path_key(&root)) {
+            return Err("backup restore plan contains a duplicate allowed root".to_string());
+        }
+        ensure_roots_disjoint(
+            &backup_dir,
+            "backup restore backup directory",
+            &root,
+            "backup restore allowed root",
+        )?;
+    }
+    if !allowed_root_keys.contains(&backup_restore_path_key(&target_root)) {
+        return Err("backup restore target root is not allowed".to_string());
+    }
+    let mut target_keys = BTreeSet::new();
+    let mut reserved_keys = BTreeSet::new();
+    for mutation in &plan.mutations {
+        validate_relative_path(&mutation.logical_path)?;
+        validate_absolute_root(
+            mutation
+                .target_path
+                .parent()
+                .ok_or_else(|| "backup restore mutation target has no parent".to_string())?,
+            "backup restore mutation parent",
+        )?;
+        if mutation.target_path.file_name().is_none()
+            || !plan
+                .allowed_roots
+                .iter()
+                .any(|root| mutation.target_path != *root && mutation.target_path.starts_with(root))
+        {
+            return Err("backup restore mutation escaped its allowed roots".to_string());
+        }
+        let target_key = backup_restore_path_key(&mutation.target_path);
+        if !target_keys.insert(target_key.clone()) || !reserved_keys.insert(target_key) {
+            return Err("backup restore plan contains a duplicate target".to_string());
+        }
+        let expected =
+            build_backup_restore_artifact_paths(&plan.operation_id, &mutation.target_path)?;
+        if mutation.artifacts != expected {
+            return Err("backup restore artifact paths are not deterministic".to_string());
+        }
+        for artifact in [
+            &mutation.artifacts.original_witness_path,
+            &mutation.artifacts.replacement_witness_path,
+            &mutation.artifacts.staging_path,
+            &mutation.artifacts.recovery_path,
+            &mutation.artifacts.rollback_tombstone_path,
+        ] {
+            let key = backup_restore_path_key(artifact);
+            if !reserved_keys.insert(key) {
+                return Err("backup restore plan contains a duplicate artifact".to_string());
+            }
+        }
+        match mutation.kind {
+            BackupRestoreMutationKind::Create => {
+                if mutation.original_sha256.is_some() || mutation.replacement_sha256.is_none() {
+                    return Err("backup restore create mutation hashes are invalid".to_string());
+                }
+            }
+            BackupRestoreMutationKind::Replace => {
+                if mutation.original_sha256.is_none() || mutation.replacement_sha256.is_none() {
+                    return Err("backup restore replace mutation hashes are invalid".to_string());
+                }
+            }
+            BackupRestoreMutationKind::Delete => {
+                if mutation.original_sha256.is_none() || mutation.replacement_sha256.is_some() {
+                    return Err("backup restore delete mutation hashes are invalid".to_string());
+                }
+            }
+        }
+        if let Some(sha256) = &mutation.original_sha256 {
+            validate_backup_restore_sha256(sha256)?;
+        }
+        if let Some(sha256) = &mutation.replacement_sha256 {
+            validate_backup_restore_sha256(sha256)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_mutation_state(
+    mutation: &BackupRestoreMutationPlan,
+    state: &BackupRestoreMutationState,
+) -> Result<(), String> {
+    if state.phase == BackupRestoreMutationPhase::Planned
+        && (state.parent_identity.is_some()
+            || state.original_identity.is_some()
+            || state.replacement_identity.is_some())
+    {
+        return Err("planned backup restore mutation contains file identity".to_string());
+    }
+    if mutation.original_sha256.is_none() && state.original_identity.is_some() {
+        return Err("backup restore mutation has an unexpected original identity".to_string());
+    }
+    if mutation.replacement_sha256.is_none() && state.replacement_identity.is_some() {
+        return Err("backup restore mutation has an unexpected replacement identity".to_string());
+    }
+    if !matches!(
+        state.phase,
+        BackupRestoreMutationPhase::Planned
+            | BackupRestoreMutationPhase::WitnessCreating
+            | BackupRestoreMutationPhase::RollbackPreparing
+    ) {
+        if state.parent_identity.is_none() {
+            return Err("backup restore mutation parent identity is missing".to_string());
+        }
+        if mutation.original_sha256.is_some() && state.original_identity.is_none() {
+            return Err("backup restore mutation original identity is missing".to_string());
+        }
+        if mutation.replacement_sha256.is_some() && state.replacement_identity.is_none() {
+            return Err("backup restore mutation replacement identity is missing".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_operation_transition(
+    current: BackupRestoreOperationPhase,
+    next: BackupRestoreOperationPhase,
+) -> Result<(), String> {
+    let allowed = current == next
+        || matches!(
+            (current, next),
+            (
+                BackupRestoreOperationPhase::Planned,
+                BackupRestoreOperationPhase::Applying | BackupRestoreOperationPhase::RollingBack
+            ) | (
+                BackupRestoreOperationPhase::Applying,
+                BackupRestoreOperationPhase::Validating | BackupRestoreOperationPhase::RollingBack
+            ) | (
+                BackupRestoreOperationPhase::Validating,
+                BackupRestoreOperationPhase::Committing | BackupRestoreOperationPhase::RollingBack
+            ) | (
+                BackupRestoreOperationPhase::Committing,
+                BackupRestoreOperationPhase::Committed | BackupRestoreOperationPhase::RollingBack
+            ) | (
+                BackupRestoreOperationPhase::Committed,
+                BackupRestoreOperationPhase::CommittedCleanupComplete
+            ) | (
+                BackupRestoreOperationPhase::RollingBack,
+                BackupRestoreOperationPhase::RolledBack
+            ) | (
+                BackupRestoreOperationPhase::RolledBack,
+                BackupRestoreOperationPhase::RolledBackCleanupComplete
+            )
+        );
+    if allowed {
+        Ok(())
+    } else {
+        Err("backup restore journal phase transition is invalid".to_string())
+    }
+}
+
+fn validate_backup_restore_mutation_transition(
+    current: BackupRestoreMutationPhase,
+    next: BackupRestoreMutationPhase,
+) -> Result<(), String> {
+    let allowed = current == next
+        || matches!(
+            (current, next),
+            (
+                BackupRestoreMutationPhase::Planned,
+                BackupRestoreMutationPhase::WitnessCreating
+                    | BackupRestoreMutationPhase::RollbackPreparing
+                    | BackupRestoreMutationPhase::Cleaned
+            ) | (
+                BackupRestoreMutationPhase::WitnessCreating,
+                BackupRestoreMutationPhase::WitnessReady
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::WitnessReady,
+                BackupRestoreMutationPhase::Preparing
+                    | BackupRestoreMutationPhase::Publishing
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::Preparing,
+                BackupRestoreMutationPhase::Prepared
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::Prepared,
+                BackupRestoreMutationPhase::Publishing
+                    | BackupRestoreMutationPhase::CommittedWithRecovery
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::Publishing,
+                BackupRestoreMutationPhase::Published
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::Published,
+                BackupRestoreMutationPhase::CommittedWithRecovery
+                    | BackupRestoreMutationPhase::RollbackPreparing
+            ) | (
+                BackupRestoreMutationPhase::CommittedWithRecovery,
+                BackupRestoreMutationPhase::RollbackPreparing | BackupRestoreMutationPhase::Cleaned
+            ) | (
+                BackupRestoreMutationPhase::RollbackPreparing,
+                BackupRestoreMutationPhase::RollbackPrepared
+                    | BackupRestoreMutationPhase::RolledBack
+            ) | (
+                BackupRestoreMutationPhase::RollbackPrepared,
+                BackupRestoreMutationPhase::RolledBack
+            ) | (
+                BackupRestoreMutationPhase::RolledBack,
+                BackupRestoreMutationPhase::Cleaned
+            )
+        );
+    if allowed {
+        Ok(())
+    } else {
+        Err("backup restore mutation phase transition is invalid".to_string())
+    }
+}
+
+fn validate_backup_restore_journal_update(
+    current: &BackupRestoreJournal,
+    next: &BackupRestoreJournal,
+) -> Result<(), String> {
+    validate_backup_restore_journal(current)?;
+    validate_backup_restore_journal(next)?;
+    if (matches!(
+        current.phase,
+        BackupRestoreOperationPhase::CommittedCleanupComplete
+            | BackupRestoreOperationPhase::RolledBackCleanupComplete
+    ) && current.phase != next.phase)
+        || (current.phase == BackupRestoreOperationPhase::Committed
+            && !matches!(
+                next.phase,
+                BackupRestoreOperationPhase::Committed
+                    | BackupRestoreOperationPhase::CommittedCleanupComplete
+            ))
+        || (current.phase == BackupRestoreOperationPhase::RolledBack
+            && !matches!(
+                next.phase,
+                BackupRestoreOperationPhase::RolledBack
+                    | BackupRestoreOperationPhase::RolledBackCleanupComplete
+            ))
+    {
+        return Err("terminal backup restore journal cannot change outcome".to_string());
+    }
+    if next.schema_version != current.schema_version
+        || next.plan != current.plan
+        || next.plan_integrity_sha256 != current.plan_integrity_sha256
+        || next.revision != current.revision.saturating_add(1)
+        || next.updated_at_ms < current.updated_at_ms
+        || next.mutation_states.len() != current.mutation_states.len()
+    {
+        return Err("backup restore journal immutable identity changed".to_string());
+    }
+    validate_backup_restore_operation_transition(current.phase, next.phase)?;
+    for (current, next) in current.mutation_states.iter().zip(&next.mutation_states) {
+        validate_backup_restore_mutation_transition(current.phase, next.phase)?;
+        if current.original_identity.is_some()
+            && current.original_identity != next.original_identity
+            || current.parent_identity.is_some() && current.parent_identity != next.parent_identity
+            || current.replacement_identity.is_some()
+                && current.replacement_identity != next.replacement_identity
+        {
+            return Err("backup restore mutation identity changed".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn create_backup_restore_journal(
+    data_root: &Path,
+    journal: &BackupRestoreJournal,
+) -> Result<PathBuf, String> {
+    validate_backup_restore_journal(journal)?;
+    if journal.revision != 0 || journal.phase != BackupRestoreOperationPhase::Planned {
+        return Err("backup restore journal must begin in the planned phase".to_string());
+    }
+    let operations_root = ensure_backup_restore_operations_root(data_root)?;
+    let operation_root = operations_root.join(&journal.plan.operation_id);
+    match fs::symlink_metadata(&operation_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("backup restore operation already exists".to_string()),
+        Err(_) => return Err("backup restore operation inventory is unavailable".to_string()),
+    }
+    let pending_root = operations_root.join(format!(
+        ".pending-{}-{}-{}",
+        journal.plan.operation_id,
+        std::process::id(),
+        journal.plan.created_at_ms
+    ));
+    match fs::create_dir(&pending_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err("backup restore pending operation already exists".to_string())
+        }
+        Err(_) => return Err("failed to create pending backup restore operation".to_string()),
+    }
+    let pending_journal_path = pending_root.join(BACKUP_RESTORE_JOURNAL_FILE);
+    let bytes = encode_backup_restore_journal(journal)?;
+    let publish = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending_journal_path)
+            .map_err(|_| "failed to create backup restore journal".to_string())?;
+        file.write_all(&bytes)
+            .map_err(|_| "failed to write backup restore journal".to_string())?;
+        file.sync_all()
+            .map_err(|_| "failed to flush backup restore journal".to_string())?;
+        drop(file);
+        let persisted = fs::read(&pending_journal_path)
+            .map_err(|_| "backup restore journal is unavailable".to_string())?;
+        if decode_backup_restore_journal_bytes(&persisted)?
+            != decode_backup_restore_journal_bytes(&bytes)?
+        {
+            return Err("backup restore journal verification failed".to_string());
+        }
+        backup_restore_publish_directory(&pending_root, &operation_root)
+    })();
+    if let Err(error) = publish {
+        let _ = fs::remove_file(&pending_journal_path);
+        let _ = fs::remove_dir(&pending_root);
+        return Err(error);
+    }
+    let journal_path = operation_root.join(BACKUP_RESTORE_JOURNAL_FILE);
+    let persisted = load_backup_restore_journal(data_root, &journal.plan.operation_id)?;
+    if persisted != *journal {
+        return Err("backup restore journal verification failed".to_string());
+    }
+    Ok(journal_path)
+}
+
+#[cfg(windows)]
+fn backup_restore_publish_directory(source: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source = fs::canonicalize(source)
+        .map_err(|_| "pending backup restore operation is unavailable".to_string())?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| "backup restore operation has no parent".to_string())?;
+    let target_parent = fs::canonicalize(target_parent)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| "backup restore operation name is invalid".to_string())?;
+    let target = target_parent.join(target_name);
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let ok = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        Err("failed to publish backup restore operation".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn backup_restore_publish_directory(source: &Path, target: &Path) -> Result<(), String> {
+    fs::rename(source, target).map_err(|_| "failed to publish backup restore operation".to_string())
+}
+
+fn persist_backup_restore_journal(
+    data_root: &Path,
+    current: &BackupRestoreJournal,
+    next: &BackupRestoreJournal,
+) -> Result<BackupRestoreJournal, String> {
+    validate_backup_restore_journal_update(current, next)?;
+    let persisted = load_backup_restore_journal(data_root, &current.plan.operation_id)?;
+    if persisted != *current {
+        return Err("backup restore journal changed concurrently".to_string());
+    }
+    let journal_path = backup_restore_journal_path(data_root, &current.plan.operation_id)?;
+    atomic_write(&journal_path, &encode_backup_restore_journal(next)?)?;
+    let persisted = load_backup_restore_journal(data_root, &current.plan.operation_id)?;
+    if persisted != *next {
+        return Err("backup restore journal verification failed".to_string());
+    }
+    Ok(persisted)
+}
+
+fn transition_backup_restore_operation(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+    phase: BackupRestoreOperationPhase,
+) -> Result<(), String> {
+    let current = journal.clone();
+    let mut next = current.clone();
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "backup restore journal revision overflowed".to_string())?;
+    next.updated_at_ms = timestamp_millis()?.max(current.updated_at_ms);
+    next.phase = phase;
+    *journal = persist_backup_restore_journal(data_root, &current, &next)?;
+    Ok(())
+}
+
+fn transition_backup_restore_mutation(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+    index: usize,
+    phase: BackupRestoreMutationPhase,
+    parent_identity: Option<RegularFileIdentity>,
+    original_identity: Option<RegularFileIdentity>,
+    replacement_identity: Option<RegularFileIdentity>,
+) -> Result<(), String> {
+    let current = journal.clone();
+    let mut next = current.clone();
+    let state = next
+        .mutation_states
+        .get_mut(index)
+        .ok_or_else(|| "backup restore mutation index is invalid".to_string())?;
+    state.phase = phase;
+    if parent_identity.is_some() {
+        state.parent_identity = parent_identity;
+    }
+    if original_identity.is_some() {
+        state.original_identity = original_identity;
+    }
+    if replacement_identity.is_some() {
+        state.replacement_identity = replacement_identity;
+    }
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "backup restore journal revision overflowed".to_string())?;
+    next.updated_at_ms = timestamp_millis()?.max(current.updated_at_ms);
+    *journal = persist_backup_restore_journal(data_root, &current, &next)?;
+    Ok(())
+}
+
+fn stage_backup_restore_witnesses(
+    data_root: &Path,
+    manifest: &BackupManifest,
+    journal: &mut BackupRestoreJournal,
+) -> Result<(), String> {
+    if journal.phase == BackupRestoreOperationPhase::Planned {
+        transition_backup_restore_operation(
+            data_root,
+            journal,
+            BackupRestoreOperationPhase::Applying,
+        )?;
+    }
+    if journal.phase != BackupRestoreOperationPhase::Applying {
+        return Err("backup restore journal is not ready for staging".to_string());
+    }
+    let verified = verify_backup(&journal.plan.backup_dir)?;
+    if verified != *manifest
+        || backup_restore_existing_file_digest(
+            &journal.plan.backup_dir.join("manifest.json"),
+            "backup restore manifest",
+        )?
+        .1 != journal.plan.backup_manifest_sha256
+    {
+        return Err("backup restore source changed before staging".to_string());
+    }
+
+    for index in 0..journal.plan.mutations.len() {
+        if journal.mutation_states[index].phase != BackupRestoreMutationPhase::Planned {
+            return Err("backup restore mutation was already staged".to_string());
+        }
+        let mutation = journal.plan.mutations[index].clone();
+        transition_backup_restore_mutation(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::WitnessCreating,
+            None,
+            None,
+            None,
+        )?;
+        for artifact in [
+            &mutation.artifacts.original_witness_path,
+            &mutation.artifacts.replacement_witness_path,
+            &mutation.artifacts.staging_path,
+            &mutation.artifacts.recovery_path,
+            &mutation.artifacts.rollback_tombstone_path,
+        ] {
+            match fs::symlink_metadata(artifact) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(
+                        "backup restore operation artifact appeared before staging".to_string()
+                    )
+                }
+                Err(_) => {
+                    return Err(
+                        "backup restore operation artifact is unavailable before staging"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        ensure_backup_restore_target_parent(&journal.plan, &mutation.target_path)?;
+
+        let original_identity = if let Some(expected) = mutation.original_sha256.as_deref() {
+            let (_, actual) = backup_restore_existing_file_digest(
+                &mutation.target_path,
+                "backup restore target",
+            )?;
+            if actual != expected {
+                return Err("backup restore target changed after planning".to_string());
+            }
+            create_backup_restore_hardlink(
+                &mutation.target_path,
+                &mutation.artifacts.original_witness_path,
+            )?;
+            if !backup_restore_same_file_identity(
+                &mutation.target_path,
+                &mutation.artifacts.original_witness_path,
+            )? {
+                return Err("backup restore original witness identity is invalid".to_string());
+            }
+            Some(backup_restore_file_identity(&mutation.target_path)?)
+        } else {
+            if backup_restore_optional_file_digest(
+                &mutation.target_path,
+                "backup restore create target",
+            )?
+            .is_some()
+            {
+                return Err("backup restore create target appeared after planning".to_string());
+            }
+            None
+        };
+
+        let replacement_identity = if let Some(expected) = mutation.replacement_sha256.as_deref() {
+            let backup_file = manifest
+                .files
+                .iter()
+                .find(|file| file.relative_path == mutation.logical_path)
+                .ok_or_else(|| "backup restore replacement payload is not declared".to_string())?;
+            let plaintext = read_verified_backup_plaintext(manifest, backup_file)?;
+            if format!("{:x}", Sha256::digest(&plaintext)) != expected {
+                return Err("backup restore replacement bytes changed".to_string());
+            }
+            let mut target = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&mutation.artifacts.replacement_witness_path)
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::AlreadyExists => {
+                        "backup restore replacement witness appeared concurrently".to_string()
+                    }
+                    _ => "failed to create backup restore replacement witness".to_string(),
+                })?;
+            target
+                .write_all(&plaintext)
+                .map_err(|_| "failed to write backup restore replacement witness".to_string())?;
+            target
+                .sync_all()
+                .map_err(|_| "failed to flush backup restore replacement witness".to_string())?;
+            drop(target);
+            if backup_restore_existing_file_digest(
+                &mutation.artifacts.replacement_witness_path,
+                "backup restore replacement witness",
+            )?
+            .1 != expected
+            {
+                return Err("backup restore replacement witness verification failed".to_string());
+            }
+            if mutation.sqlite {
+                quick_check_sqlite(
+                    &mutation.artifacts.replacement_witness_path,
+                    "staged backup restore SQLite",
+                )?;
+            }
+            Some(backup_restore_file_identity(
+                &mutation.artifacts.replacement_witness_path,
+            )?)
+        } else {
+            None
+        };
+        transition_backup_restore_mutation(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::WitnessReady,
+            Some(parent_directory_identity_at_path(&mutation.target_path)?),
+            original_identity,
+            replacement_identity,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_backup_restore_target_parent(
+    plan: &BackupRestorePlan,
+    target_path: &Path,
+) -> Result<(), String> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| "backup restore target has no parent".to_string())?;
+    let root = plan
+        .allowed_roots
+        .iter()
+        .filter(|root| parent.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .ok_or_else(|| "backup restore target parent escaped its allowed roots".to_string())?;
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|_| "backup restore allowed root is unavailable".to_string())?;
+    if !root_metadata.is_dir() || backup_metadata_is_link_or_reparse(&root_metadata) {
+        return Err("backup restore allowed root is unsafe".to_string());
+    }
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| "backup restore target parent escaped its allowed root".to_string())?;
+    let mut current = fs::canonicalize(root)
+        .map_err(|_| "backup restore allowed root is unavailable".to_string())?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err("backup restore target parent is invalid".to_string());
+        };
+        current.push(component);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err("failed to create backup restore target parent".to_string()),
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_| "backup restore target parent is unavailable".to_string())?;
+        if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+            return Err("backup restore target parent is unsafe".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_allowed_root(root: &Path) -> Result<(), String> {
+    validate_absolute_root(root, "backup restore allowed root")?;
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+                return Err("backup restore allowed root is unsafe".to_string());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("backup restore allowed root is unavailable".to_string())
+        }
+        Err(_) => return Err("backup restore allowed root is unavailable".to_string()),
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_target_ancestry(
+    allowed_roots: &[PathBuf],
+    target: &Path,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| "backup restore target has no parent".to_string())?;
+    let root = allowed_roots
+        .iter()
+        .filter(|root| target != root.as_path() && target.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .ok_or_else(|| "backup restore target escaped its allowed roots".to_string())?;
+    validate_backup_restore_allowed_root(root)?;
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| "backup restore target parent escaped its allowed root".to_string())?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err("backup restore target parent is invalid".to_string());
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+                    return Err("backup restore target parent is unsafe".to_string());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(_) => return Err("backup restore target parent is unavailable".to_string()),
+        }
+    }
+    Ok(())
+}
+
+// Each cfg branch is the complete platform implementation, so the explicit
+// return keeps the mutually exclusive bodies readable.
+#[allow(clippy::needless_return)]
+fn backup_restore_file_identity(path: &Path) -> Result<RegularFileIdentity, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        let file = fs::File::open(path)
+            .map_err(|_| "backup restore file identity is unavailable".to_string())?;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        let ok =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+        if ok == 0 {
+            return Err("backup restore file identity is unavailable".to_string());
+        }
+        return Ok(RegularFileIdentity {
+            volume_serial_number: u64::from(information.dwVolumeSerialNumber),
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .map_err(|_| "backup restore file identity is unavailable".to_string())?;
+        return Ok(RegularFileIdentity {
+            volume_serial_number: metadata.dev(),
+            file_index: metadata.ino(),
+        });
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        Err("backup restore file identity is unsupported".to_string())
+    }
+}
+
+fn backup_restore_same_file_identity(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(backup_restore_file_identity(left)? == backup_restore_file_identity(right)?)
+}
+
+#[cfg(windows)]
+fn create_backup_restore_hardlink(source: &Path, witness: &Path) -> Result<(), String> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, CreateHardLinkW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_READ_AND_WRITE_AND_DELETE: u32 = 0xC001_0000;
+    if source.parent() != witness.parent() {
+        return Err("backup restore witness must share the target parent".to_string());
+    }
+    let canonical_parent = fs::canonicalize(
+        source
+            .parent()
+            .ok_or_else(|| "backup restore witness parent is invalid".to_string())?,
+    )
+    .map_err(|_| "backup restore witness parent is unavailable".to_string())?;
+    let source = canonical_parent.join(
+        source
+            .file_name()
+            .ok_or_else(|| "backup restore source name is invalid".to_string())?,
+    );
+    let witness = canonical_parent.join(
+        witness
+            .file_name()
+            .ok_or_else(|| "backup restore witness name is invalid".to_string())?,
+    );
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let witness_wide = witness
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let source_handle = unsafe {
+        CreateFileW(
+            source_wide.as_ptr(),
+            GENERIC_READ_AND_WRITE_AND_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if source_handle == INVALID_HANDLE_VALUE {
+        return Err("backup restore target writer barrier is unavailable".to_string());
+    }
+    let source_guard = unsafe { fs::File::from_raw_handle(source_handle as _) };
+    let before = backup_restore_file_identity_from_handle(&source_guard)?;
+    if unsafe {
+        CreateHardLinkW(
+            witness_wide.as_ptr(),
+            source_wide.as_ptr(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err("failed to create backup restore original witness".to_string());
+    }
+    let witness_handle = unsafe {
+        CreateFileW(
+            witness_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if witness_handle == INVALID_HANDLE_VALUE {
+        return Err("backup restore original witness is unavailable".to_string());
+    }
+    let witness_guard = unsafe { fs::File::from_raw_handle(witness_handle as _) };
+    if before != backup_restore_file_identity_from_handle(&source_guard)?
+        || before != backup_restore_file_identity_from_handle(&witness_guard)?
+    {
+        return Err("backup restore target changed during witness creation".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn create_backup_restore_hardlink(source: &Path, witness: &Path) -> Result<(), String> {
+    fs::hard_link(source, witness).map_err(|error| match error.kind() {
+        io::ErrorKind::AlreadyExists => {
+            "backup restore original witness appeared concurrently".to_string()
+        }
+        _ => "failed to create backup restore original witness".to_string(),
+    })
+}
+
+#[cfg(windows)]
+fn backup_restore_file_identity_from_handle(
+    file: &fs::File,
+) -> Result<RegularFileIdentity, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let ok =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if ok == 0 {
+        return Err("backup restore file identity is unavailable".to_string());
+    }
+    Ok(RegularFileIdentity {
+        volume_serial_number: u64::from(information.dwVolumeSerialNumber),
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+fn load_backup_restore_journal(
+    data_root: &Path,
+    operation_id: &str,
+) -> Result<BackupRestoreJournal, String> {
+    validate_backup_restore_operation_id(operation_id)?;
+    let path = backup_restore_journal_path(data_root, operation_id)?;
+    let operation_root = path
+        .parent()
+        .ok_or_else(|| "backup restore operation directory is invalid".to_string())?;
+    let mut entries = fs::read_dir(operation_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    if entries.len() != 1 || entries.pop().is_none_or(|entry| entry.path() != path) {
+        return Err("backup restore operation contains undeclared artifacts".to_string());
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| "backup restore journal is unavailable".to_string())?;
+    if !metadata.is_file()
+        || backup_metadata_is_link_or_reparse(&metadata)
+        || metadata.len() == 0
+        || metadata.len() > BACKUP_RESTORE_MAX_CIPHERTEXT_BYTES
+    {
+        return Err("backup restore journal is unsafe".to_string());
+    }
+    let file =
+        fs::File::open(&path).map_err(|_| "backup restore journal is unavailable".to_string())?;
+    let mut bytes = Vec::new();
+    file.take(BACKUP_RESTORE_MAX_CIPHERTEXT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "backup restore journal is unreadable".to_string())?;
+    if bytes.is_empty() || bytes.len() as u64 > BACKUP_RESTORE_MAX_CIPHERTEXT_BYTES {
+        return Err("backup restore journal is invalid".to_string());
+    }
+    let plaintext = decode_backup_restore_journal_bytes(&bytes)?;
+    if plaintext.len() as u64 > BACKUP_RESTORE_MAX_JOURNAL_BYTES {
+        return Err("backup restore journal is invalid".to_string());
+    }
+    let envelope = serde_json::from_slice::<BackupRestoreJournalEnvelope>(&plaintext)
+        .map_err(|_| "backup restore journal is invalid".to_string())?;
+    validate_backup_restore_journal(&envelope.journal)?;
+    if envelope.integrity_sha256 != backup_restore_journal_digest(&envelope.journal)? {
+        return Err("backup restore journal integrity check failed".to_string());
+    }
+    if envelope.journal.plan.operation_id != operation_id {
+        return Err("backup restore journal operation identity is invalid".to_string());
+    }
+    Ok(envelope.journal)
+}
+
+fn encode_backup_restore_journal(journal: &BackupRestoreJournal) -> Result<Vec<u8>, String> {
+    validate_backup_restore_journal(journal)?;
+    let envelope = BackupRestoreJournalEnvelope {
+        journal: journal.clone(),
+        integrity_sha256: backup_restore_journal_digest(journal)?,
+    };
+    let plaintext = serde_json::to_vec(&envelope)
+        .map_err(|_| "failed to serialize backup restore journal".to_string())?;
+    if plaintext.len() as u64 > BACKUP_RESTORE_MAX_JOURNAL_BYTES {
+        return Err("backup restore journal reached its size limit".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let ciphertext = protect(&plaintext)
+            .map_err(|_| "failed to protect backup restore journal".to_string())?;
+        let mut encoded = Vec::with_capacity(BACKUP_RESTORE_JOURNAL_MAGIC.len() + ciphertext.len());
+        encoded.extend_from_slice(BACKUP_RESTORE_JOURNAL_MAGIC);
+        encoded.extend_from_slice(&ciphertext);
+        if encoded.len() as u64 > BACKUP_RESTORE_MAX_CIPHERTEXT_BYTES {
+            return Err("protected backup restore journal reached its size limit".to_string());
+        }
+        Ok(encoded)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(plaintext)
+    }
+}
+
+fn decode_backup_restore_journal_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(windows)]
+    {
+        let ciphertext = bytes
+            .strip_prefix(BACKUP_RESTORE_JOURNAL_MAGIC)
+            .ok_or_else(|| "backup restore journal is not DPAPI protected".to_string())?;
+        if ciphertext.is_empty() {
+            return Err("backup restore journal is invalid".to_string());
+        }
+        unprotect(ciphertext).map_err(|_| "backup restore journal is unreadable".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = BACKUP_RESTORE_JOURNAL_MAGIC;
+        Ok(bytes.to_vec())
+    }
+}
+
+fn backup_restore_journal_path(data_root: &Path, operation_id: &str) -> Result<PathBuf, String> {
+    validate_backup_restore_operation_id(operation_id)?;
+    let data_root = validate_backup_restore_data_root(data_root)?;
+    let operations_root = data_root.join(BACKUP_RESTORE_OPERATION_DIRECTORY);
+    let operation_root = operations_root.join(operation_id);
+    validate_backup_restore_operation_root(&operations_root, &operation_root)?;
+    Ok(operation_root.join(BACKUP_RESTORE_JOURNAL_FILE))
+}
+
+fn validate_backup_restore_data_root(data_root: &Path) -> Result<PathBuf, String> {
+    let data_root = validate_absolute_root(data_root, "backup restore data root")?;
+    let metadata = fs::symlink_metadata(&data_root)
+        .map_err(|_| "backup restore data root is unavailable".to_string())?;
+    if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+        return Err("backup restore data root is unsafe".to_string());
+    }
+    let canonical = fs::canonicalize(&data_root)
+        .map_err(|_| "backup restore data root is unavailable".to_string())?;
+    if canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| !name.eq_ignore_ascii_case("codex-switch"))
+    {
+        return Err("backup restore data root identity is invalid".to_string());
+    }
+    for ancestor in canonical.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| "backup restore data root ancestry is unavailable".to_string())?;
+        if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+            return Err("backup restore data root ancestry is unsafe".to_string());
+        }
+    }
+    Ok(canonical)
+}
+
+fn ensure_backup_restore_operations_root(data_root: &Path) -> Result<PathBuf, String> {
+    let data_root = validate_backup_restore_data_root(data_root)?;
+    let operations_root = data_root.join(BACKUP_RESTORE_OPERATION_DIRECTORY);
+    match fs::create_dir(&operations_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err("failed to create backup restore operation inventory".to_string()),
+    }
+    let metadata = fs::symlink_metadata(&operations_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+        return Err("backup restore operation inventory is unsafe".to_string());
+    }
+    let canonical = fs::canonicalize(&operations_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    if canonical.parent() != Some(data_root.as_path()) {
+        return Err("backup restore operation inventory escaped its data root".to_string());
+    }
+    Ok(canonical)
+}
+
+fn validate_backup_restore_operation_root(
+    operations_root: &Path,
+    operation_root: &Path,
+) -> Result<(), String> {
+    let operations_metadata = fs::symlink_metadata(operations_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    if !operations_metadata.is_dir() || backup_metadata_is_link_or_reparse(&operations_metadata) {
+        return Err("backup restore operation inventory is unsafe".to_string());
+    }
+    let operations_root = fs::canonicalize(operations_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    let metadata = fs::symlink_metadata(operation_root)
+        .map_err(|_| "backup restore operation is unavailable".to_string())?;
+    if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) {
+        return Err("backup restore operation directory is unsafe".to_string());
+    }
+    let operation_root = fs::canonicalize(operation_root)
+        .map_err(|_| "backup restore operation is unavailable".to_string())?;
+    if operation_root.parent() != Some(operations_root.as_path()) {
+        return Err("backup restore operation escaped its inventory".to_string());
+    }
+    Ok(())
+}
+
+fn backup_restore_plan_digest(plan: &BackupRestorePlan) -> Result<String, String> {
+    let bytes = serde_json::to_vec(plan)
+        .map_err(|_| "failed to serialize backup restore plan".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-switch-backup-restore-plan-v1\0");
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn backup_restore_journal_digest(journal: &BackupRestoreJournal) -> Result<String, String> {
+    let bytes = serde_json::to_vec(journal)
+        .map_err(|_| "failed to serialize backup restore journal".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-switch-backup-restore-journal-v1\0");
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_backup_restore_operation_id(value: &str) -> Result<(), String> {
+    if !value.is_empty()
+        && value.len() <= BACKUP_RESTORE_MAX_OPERATION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err("backup restore operation ID is invalid".to_string())
+    }
+}
+
+fn validate_backup_restore_sha256(value: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err("backup restore SHA-256 is invalid".to_string())
+    }
+}
+
+fn backup_restore_path_key(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path
+    }
+}
+
+enum BackupRestoreResolvedMutation {
+    Replace(ResolvedHandleReplace),
+    Create(ResolvedHandleCreate),
+    Delete(ResolvedHandleDelete),
+}
+
+impl BackupRestoreResolvedMutation {
+    fn cleanup_after_durable_terminal(self) -> Result<(), String> {
+        match self {
+            Self::Replace(value) => {
+                drop(
+                    value
+                        .cleanup_after_durable_terminal()
+                        .map_err(|(error, _)| error)?,
+                );
+            }
+            Self::Create(value) => {
+                drop(
+                    value
+                        .cleanup_after_durable_terminal()
+                        .map_err(|(error, _)| error)?,
+                );
+            }
+            Self::Delete(value) => {
+                drop(
+                    value
+                        .cleanup_after_durable_terminal()
+                        .map_err(|(error, _)| error)?,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn transition_backup_restore_mutation_phase(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+    index: usize,
+    phase: BackupRestoreMutationPhase,
+) -> Result<(), String> {
+    transition_backup_restore_mutation(data_root, journal, index, phase, None, None, None)
+}
+
+/// Restores one verified managed backup through a durable, identity-bound
+/// operation journal. Every live create/replace/delete remains recoverable
+/// until the committed or rolled-back terminal has been persisted.
+pub fn restore_backup_with_recovery(
+    backup_dir: &Path,
+    target_home: &Path,
+    data_root: &Path,
+    operation_id: &str,
+) -> Result<RestoreResult, String> {
+    let data_root = validate_backup_restore_data_root(data_root)?;
+    let mut prepared = prepare_backup_restore_plan(backup_dir, target_home, operation_id)?;
+    create_backup_restore_journal(&data_root, &prepared.journal)?;
+
+    if let Err(error) =
+        stage_backup_restore_witnesses(&data_root, &prepared.manifest, &mut prepared.journal)
+    {
+        let rollback = rollback_backup_restore_operation(&data_root, &mut prepared.journal);
+        return match rollback {
+            Ok(()) => Err(format!("{error}; backup restore rolled back")),
+            Err(rollback_error) => Err(format!(
+                "{error}; backup restore rollback remains pending: {rollback_error}"
+            )),
+        };
+    }
+
+    let resolved = match apply_backup_restore_mutations(&data_root, &mut prepared.journal) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let rollback = rollback_backup_restore_operation(&data_root, &mut prepared.journal);
+            return match rollback {
+                Ok(()) => Err(format!("{error}; backup restore rolled back")),
+                Err(rollback_error) => Err(format!(
+                    "{error}; backup restore rollback remains pending: {rollback_error}"
+                )),
+            };
+        }
+    };
+
+    transition_backup_restore_operation(
+        &data_root,
+        &mut prepared.journal,
+        BackupRestoreOperationPhase::Validating,
+    )?;
+    if let Err(error) = validate_backup_restore_applied(&prepared.manifest, &prepared.journal) {
+        drop(resolved);
+        let rollback = rollback_backup_restore_operation(&data_root, &mut prepared.journal);
+        return match rollback {
+            Ok(()) => Err(format!("{error}; backup restore rolled back")),
+            Err(rollback_error) => Err(format!(
+                "{error}; backup restore rollback remains pending: {rollback_error}"
+            )),
+        };
+    }
+    transition_backup_restore_operation(
+        &data_root,
+        &mut prepared.journal,
+        BackupRestoreOperationPhase::Committing,
+    )?;
+    transition_backup_restore_operation(
+        &data_root,
+        &mut prepared.journal,
+        BackupRestoreOperationPhase::Committed,
+    )?;
+    cleanup_backup_restore_terminal(
+        &data_root,
+        &mut prepared.journal,
+        Some(resolved.into_iter().enumerate().collect()),
+        true,
+    )?;
+
+    Ok(RestoreResult {
+        backup_dir: prepared.journal.plan.backup_dir.clone(),
+        target_root: prepared.journal.plan.target_root.clone(),
+        restored_files: prepared.journal.plan.restored_file_count,
+        verified: true,
+    })
+}
+
+fn apply_backup_restore_mutations(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+) -> Result<Vec<BackupRestoreResolvedMutation>, String> {
+    if journal.phase != BackupRestoreOperationPhase::Applying {
+        return Err("backup restore journal is not ready to apply".to_string());
+    }
+    let mut resolved = Vec::new();
+    for index in 0..journal.plan.mutations.len() {
+        let mutation = journal.plan.mutations[index].clone();
+        let state = journal.mutation_states[index].clone();
+        if state.phase != BackupRestoreMutationPhase::WitnessReady {
+            return Err("backup restore mutation is not ready to apply".to_string());
+        }
+        transition_backup_restore_mutation_phase(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::Preparing,
+        )?;
+        let value = match mutation.kind {
+            BackupRestoreMutationKind::Replace => {
+                let original_sha256 = mutation
+                    .original_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore original hash is missing".to_string())?;
+                let replacement_sha256 = mutation
+                    .replacement_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore replacement hash is missing".to_string())?;
+                let expected = state.replace_bindings()?;
+                let paths = mutation.artifacts.replace_paths(&mutation.target_path)?;
+                let mut guard = WriteExclusionGuard::acquire(&mutation.target_path)?;
+                guard.verify_current_path(Some(original_sha256))?;
+                if guard.identity()? != expected.original_identity {
+                    return Err("backup restore original identity changed".to_string());
+                }
+                let staged = guard.stage_handle_hardlink_replace(
+                    &mutation.artifacts.replacement_witness_path,
+                    replacement_sha256,
+                    &paths,
+                )?;
+                if staged.identity_bindings()? != expected {
+                    return Err("backup restore replacement identity changed".to_string());
+                }
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Prepared,
+                )?;
+                let prepared = staged.prepare().map_err(|(error, _)| error)?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Publishing,
+                )?;
+                let published = prepared.publish().map_err(|(error, _)| error)?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Published,
+                )?;
+                BackupRestoreResolvedMutation::Replace(
+                    published.commit().map_err(|(error, _)| error)?,
+                )
+            }
+            BackupRestoreMutationKind::Create => {
+                let replacement_sha256 = mutation
+                    .replacement_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore replacement hash is missing".to_string())?;
+                let expected = state.create_bindings()?;
+                let paths = mutation.artifacts.create_paths(&mutation.target_path)?;
+                let staged = stage_handle_hardlink_create(
+                    &mutation.artifacts.replacement_witness_path,
+                    replacement_sha256,
+                    &paths,
+                )?;
+                if staged.identity_bindings()? != expected {
+                    return Err("backup restore created identity changed".to_string());
+                }
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Prepared,
+                )?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Publishing,
+                )?;
+                let published = staged.publish().map_err(|(error, _)| error)?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Published,
+                )?;
+                BackupRestoreResolvedMutation::Create(
+                    published.commit().map_err(|(error, _)| error)?,
+                )
+            }
+            BackupRestoreMutationKind::Delete => {
+                let original_sha256 = mutation
+                    .original_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore original hash is missing".to_string())?;
+                let expected = state.delete_bindings()?;
+                let paths = mutation.artifacts.delete_paths(&mutation.target_path)?;
+                let staged = stage_handle_delete(&paths, original_sha256)?;
+                if staged.identity_bindings()? != expected {
+                    return Err("backup restore deleted identity changed".to_string());
+                }
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Prepared,
+                )?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Publishing,
+                )?;
+                let prepared = staged.prepare().map_err(|(error, _)| error)?;
+                transition_backup_restore_mutation_phase(
+                    data_root,
+                    journal,
+                    index,
+                    BackupRestoreMutationPhase::Published,
+                )?;
+                BackupRestoreResolvedMutation::Delete(
+                    prepared.commit().map_err(|(error, _)| error)?,
+                )
+            }
+        };
+        transition_backup_restore_mutation_phase(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::CommittedWithRecovery,
+        )?;
+        resolved.push(value);
+    }
+    Ok(resolved)
+}
+
+fn validate_backup_restore_applied(
+    manifest: &BackupManifest,
+    journal: &BackupRestoreJournal,
+) -> Result<(), String> {
+    if verify_backup(&journal.plan.backup_dir)? != *manifest
+        || backup_restore_existing_file_digest(
+            &journal.plan.backup_dir.join("manifest.json"),
+            "backup restore manifest",
+        )?
+        .1 != journal.plan.backup_manifest_sha256
+    {
+        return Err("backup restore source changed during apply".to_string());
+    }
+    for (mutation, state) in journal.plan.mutations.iter().zip(&journal.mutation_states) {
+        match mutation.kind {
+            BackupRestoreMutationKind::Create | BackupRestoreMutationKind::Replace => {
+                let expected = mutation
+                    .replacement_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore replacement hash is missing".to_string())?;
+                let (_, actual) = backup_restore_existing_file_digest(
+                    &mutation.target_path,
+                    "applied backup restore target",
+                )?;
+                if actual != expected
+                    || backup_restore_file_identity(&mutation.target_path)?
+                        != state.replacement_identity.ok_or_else(|| {
+                            "backup restore replacement identity is missing".to_string()
+                        })?
+                {
+                    return Err("applied backup restore target changed".to_string());
+                }
+                validate_backup_restore_readback(mutation)?;
+            }
+            BackupRestoreMutationKind::Delete => {
+                if backup_restore_optional_file_digest(
+                    &mutation.target_path,
+                    "deleted backup restore target",
+                )?
+                .is_some()
+                {
+                    return Err("deleted backup restore target reappeared".to_string());
+                }
+                let expected = mutation
+                    .original_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore original hash is missing".to_string())?;
+                let (_, actual) = backup_restore_existing_file_digest(
+                    &mutation.artifacts.recovery_path,
+                    "backup restore delete recovery",
+                )?;
+                if actual != expected
+                    || backup_restore_file_identity(&mutation.artifacts.recovery_path)?
+                        != state.original_identity.ok_or_else(|| {
+                            "backup restore original identity is missing".to_string()
+                        })?
+                {
+                    return Err("backup restore delete recovery changed".to_string());
+                }
+            }
+        }
+    }
+    validate_backup_restore_session_inventory(manifest, journal)
+}
+
+fn validate_backup_restore_readback(mutation: &BackupRestoreMutationPlan) -> Result<(), String> {
+    if mutation.sqlite {
+        quick_check_sqlite(&mutation.target_path, "restored SQLite")?;
+    }
+    if mutation.logical_path == Path::new("config.toml") {
+        let bytes = fs::read(&mutation.target_path)
+            .map_err(|_| "restored config.toml is unavailable".to_string())?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| "restored config.toml is not UTF-8".to_string())?;
+        DocumentMut::from_str(text).map_err(|_| "restored config.toml is invalid".to_string())?;
+    } else if mutation.logical_path == Path::new("auth.json") {
+        let bytes = fs::read(&mutation.target_path)
+            .map_err(|_| "restored auth.json is unavailable".to_string())?;
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|_| "restored auth.json is invalid".to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_backup_restore_session_inventory(
+    manifest: &BackupManifest,
+    journal: &BackupRestoreJournal,
+) -> Result<(), String> {
+    let scope = manifest_scope(manifest);
+    for (relative_root, tracked) in [
+        (
+            "sessions",
+            scope.tracks_sessions() && manifest.complete_sessions,
+        ),
+        (
+            "archived_sessions",
+            scope.tracks_archived_sessions() && manifest.complete_sessions,
+        ),
+    ] {
+        if !tracked {
+            continue;
+        }
+        let root = journal.plan.target_root.join(relative_root);
+        let actual = if root.exists() {
+            walk_jsonl_files(&root)?
+                .into_iter()
+                .map(|path| backup_restore_path_key(&path))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        let expected = journal
+            .plan
+            .mutations
+            .iter()
+            .filter(|mutation| {
+                mutation.replacement_sha256.is_some()
+                    && mutation.logical_path.starts_with(relative_root)
+                    && mutation
+                        .logical_path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        == Some("jsonl")
+            })
+            .map(|mutation| backup_restore_path_key(&mutation.target_path))
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err("backup restore session inventory changed during apply".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn rollback_backup_restore_operation(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+) -> Result<(), String> {
+    if !matches!(
+        journal.phase,
+        BackupRestoreOperationPhase::RollingBack | BackupRestoreOperationPhase::RolledBack
+    ) {
+        transition_backup_restore_operation(
+            data_root,
+            journal,
+            BackupRestoreOperationPhase::RollingBack,
+        )?;
+    }
+    let mut resolved = BTreeMap::new();
+    for index in (0..journal.plan.mutations.len()).rev() {
+        let mutation = journal.plan.mutations[index].clone();
+        let state = journal.mutation_states[index].clone();
+        if matches!(
+            state.phase,
+            BackupRestoreMutationPhase::RolledBack | BackupRestoreMutationPhase::Cleaned
+        ) {
+            continue;
+        }
+        if state.parent_identity.is_none() {
+            ensure_unowned_backup_restore_mutation_unchanged(&mutation)?;
+            transition_backup_restore_mutation_phase(
+                data_root,
+                journal,
+                index,
+                BackupRestoreMutationPhase::RollbackPreparing,
+            )?;
+            transition_backup_restore_mutation_phase(
+                data_root,
+                journal,
+                index,
+                BackupRestoreMutationPhase::RolledBack,
+            )?;
+            continue;
+        }
+        transition_backup_restore_mutation_phase(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::RollbackPreparing,
+        )?;
+        let value = recover_backup_restore_mutation(&mutation, &state, false)?;
+        transition_backup_restore_mutation_phase(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::RolledBack,
+        )?;
+        resolved.insert(index, value);
+    }
+    if journal.phase != BackupRestoreOperationPhase::RolledBack {
+        transition_backup_restore_operation(
+            data_root,
+            journal,
+            BackupRestoreOperationPhase::RolledBack,
+        )?;
+    }
+    cleanup_backup_restore_terminal(data_root, journal, Some(resolved), false)
+}
+
+fn ensure_unowned_backup_restore_mutation_unchanged(
+    mutation: &BackupRestoreMutationPlan,
+) -> Result<(), String> {
+    for artifact in [
+        &mutation.artifacts.original_witness_path,
+        &mutation.artifacts.replacement_witness_path,
+        &mutation.artifacts.staging_path,
+        &mutation.artifacts.recovery_path,
+        &mutation.artifacts.rollback_tombstone_path,
+    ] {
+        if fs::symlink_metadata(artifact).is_ok() {
+            return Err("backup restore witness creation is incomplete".to_string());
+        }
+    }
+    match mutation.original_sha256.as_deref() {
+        Some(expected) => {
+            if backup_restore_existing_file_digest(
+                &mutation.target_path,
+                "backup restore rollback target",
+            )?
+            .1 != expected
+            {
+                return Err("backup restore rollback target changed".to_string());
+            }
+        }
+        None => {
+            if backup_restore_optional_file_digest(
+                &mutation.target_path,
+                "backup restore rollback target",
+            )?
+            .is_some()
+            {
+                return Err("backup restore rollback target appeared".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recover_backup_restore_mutation(
+    mutation: &BackupRestoreMutationPlan,
+    state: &BackupRestoreMutationState,
+    commit: bool,
+) -> Result<BackupRestoreResolvedMutation, String> {
+    match mutation.kind {
+        BackupRestoreMutationKind::Replace => Ok(BackupRestoreResolvedMutation::Replace(
+            recover_handle_replace(
+                &mutation.artifacts.replace_paths(&mutation.target_path)?,
+                state.replace_bindings()?,
+                mutation
+                    .original_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore original hash is missing".to_string())?,
+                mutation
+                    .replacement_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore replacement hash is missing".to_string())?,
+                if commit {
+                    HandleReplaceRecoveryDecision::Commit
+                } else {
+                    HandleReplaceRecoveryDecision::Restore
+                },
+            )?,
+        )),
+        BackupRestoreMutationKind::Create => Ok(BackupRestoreResolvedMutation::Create(
+            recover_handle_create(
+                &mutation.artifacts.create_paths(&mutation.target_path)?,
+                state.create_bindings()?,
+                mutation
+                    .replacement_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore replacement hash is missing".to_string())?,
+                if commit {
+                    HandleCreateRecoveryDecision::Commit
+                } else {
+                    HandleCreateRecoveryDecision::Restore
+                },
+            )?,
+        )),
+        BackupRestoreMutationKind::Delete => Ok(BackupRestoreResolvedMutation::Delete(
+            recover_handle_delete(
+                &mutation.artifacts.delete_paths(&mutation.target_path)?,
+                state.delete_bindings()?,
+                mutation
+                    .original_sha256
+                    .as_deref()
+                    .ok_or_else(|| "backup restore original hash is missing".to_string())?,
+                if commit {
+                    HandleDeleteRecoveryDecision::Commit
+                } else {
+                    HandleDeleteRecoveryDecision::Restore
+                },
+            )?,
+        )),
+    }
+}
+
+fn cleanup_backup_restore_terminal(
+    data_root: &Path,
+    journal: &mut BackupRestoreJournal,
+    resolved: Option<BTreeMap<usize, BackupRestoreResolvedMutation>>,
+    committed: bool,
+) -> Result<(), String> {
+    let mut resolved = resolved.unwrap_or_default();
+    for index in 0..journal.plan.mutations.len() {
+        if journal.mutation_states[index].phase == BackupRestoreMutationPhase::Cleaned {
+            continue;
+        }
+        let mutation = journal.plan.mutations[index].clone();
+        let state = journal.mutation_states[index].clone();
+        let value = match resolved.remove(&index) {
+            Some(value) => Some(value),
+            None => match recover_backup_restore_mutation(&mutation, &state, committed) {
+                Ok(value) => Some(value),
+                Err(_error)
+                    if committed
+                        && mutation.kind == BackupRestoreMutationKind::Replace
+                        && backup_restore_committed_replace_was_already_cleaned(
+                            &mutation, &state,
+                        )? =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        if let Some(value) = value {
+            value.cleanup_after_durable_terminal()?;
+        }
+        cleanup_backup_restore_witnesses(&mutation, &state)?;
+        transition_backup_restore_mutation_phase(
+            data_root,
+            journal,
+            index,
+            BackupRestoreMutationPhase::Cleaned,
+        )?;
+    }
+    transition_backup_restore_operation(
+        data_root,
+        journal,
+        if committed {
+            BackupRestoreOperationPhase::CommittedCleanupComplete
+        } else {
+            BackupRestoreOperationPhase::RolledBackCleanupComplete
+        },
+    )
+}
+
+fn backup_restore_committed_replace_was_already_cleaned(
+    mutation: &BackupRestoreMutationPlan,
+    state: &BackupRestoreMutationState,
+) -> Result<bool, String> {
+    let replacement_sha256 = mutation
+        .replacement_sha256
+        .as_deref()
+        .ok_or_else(|| "backup restore replacement hash is missing".to_string())?;
+    let target = backup_restore_optional_file_digest(
+        &mutation.target_path,
+        "committed backup restore target",
+    )?;
+    if target.as_ref().map(|(_, digest)| digest.as_str()) != Some(replacement_sha256)
+        || backup_restore_file_identity(&mutation.target_path)?
+            != state
+                .replacement_identity
+                .ok_or_else(|| "backup restore replacement identity is missing".to_string())?
+    {
+        return Ok(false);
+    }
+    for path in [
+        &mutation.artifacts.staging_path,
+        &mutation.artifacts.recovery_path,
+        &mutation.artifacts.rollback_tombstone_path,
+    ] {
+        if fs::symlink_metadata(path).is_ok() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cleanup_backup_restore_witnesses(
+    mutation: &BackupRestoreMutationPlan,
+    state: &BackupRestoreMutationState,
+) -> Result<(), String> {
+    if let (Some(expected_sha256), Some(identity)) =
+        (mutation.original_sha256.as_deref(), state.original_identity)
+    {
+        cleanup_backup_restore_witness(
+            &mutation.artifacts.original_witness_path,
+            expected_sha256,
+            identity,
+        )?;
+    }
+    if let (Some(expected_sha256), Some(identity)) = (
+        mutation.replacement_sha256.as_deref(),
+        state.replacement_identity,
+    ) {
+        cleanup_backup_restore_witness(
+            &mutation.artifacts.replacement_witness_path,
+            expected_sha256,
+            identity,
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_backup_restore_witness(
+    path: &Path,
+    expected_sha256: &str,
+    expected_identity: RegularFileIdentity,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("backup restore witness is unavailable".to_string()),
+        Ok(metadata) if !metadata.is_file() || backup_metadata_is_link_or_reparse(&metadata) => {
+            return Err("backup restore witness is unsafe".to_string())
+        }
+        Ok(_) => {}
+    }
+    let mut guard = crate::session_storage::write_barrier::DestructiveFileGuard::acquire(path)?;
+    if guard.identity()? != expected_identity {
+        return Err("backup restore witness identity changed".to_string());
+    }
+    guard.verify_current_path(Some(expected_sha256))?;
+    guard.delete()
+}
+
+/// Reconciles every direct-child restore journal for the current/shared
+/// managed roots. Pre-commit work always rolls back; durably committed work
+/// only completes exact artifact cleanup.
+pub fn recover_pending_backup_restores(
+    data_root: &Path,
+    current_home: &Path,
+    shared_home: &Path,
+) -> Result<BackupRestoreRecoveryReceipt, String> {
+    let data_root = validate_backup_restore_data_root(data_root)?;
+    let current_home = validate_absolute_root(current_home, "current restore root")?;
+    let shared_home = validate_absolute_root(shared_home, "shared restore root")?;
+    let operations_root = data_root.join(BACKUP_RESTORE_OPERATION_DIRECTORY);
+    match fs::symlink_metadata(&operations_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(BackupRestoreRecoveryReceipt::default())
+        }
+        Err(_) => return Err("backup restore operation inventory is unavailable".to_string()),
+        Ok(metadata) if !metadata.is_dir() || backup_metadata_is_link_or_reparse(&metadata) => {
+            return Err("backup restore operation inventory is unsafe".to_string())
+        }
+        Ok(_) => {}
+    }
+    let mut entries = fs::read_dir(&operations_root)
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "backup restore operation inventory is unavailable".to_string())?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut receipt = BackupRestoreRecoveryReceipt::default();
+    for entry in entries {
+        receipt.discovered_operation_count += 1;
+        let operation_id = match entry.file_name().to_str() {
+            Some(value) if validate_backup_restore_operation_id(value).is_ok() => value.to_string(),
+            _ => {
+                receipt.blocked_operation_count += 1;
+                continue;
+            }
+        };
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) if metadata.is_dir() && !backup_metadata_is_link_or_reparse(&metadata) => {
+                metadata
+            }
+            _ => {
+                receipt.blocked_operation_count += 1;
+                continue;
+            }
+        };
+        let _ = metadata;
+        let mut journal = match load_backup_restore_journal(&data_root, &operation_id) {
+            Ok(journal) => journal,
+            Err(_) => {
+                receipt.blocked_operation_count += 1;
+                continue;
+            }
+        };
+        let target_key = backup_restore_path_key(&journal.plan.target_root);
+        if target_key != backup_restore_path_key(&current_home)
+            && target_key != backup_restore_path_key(&shared_home)
+        {
+            receipt.blocked_operation_count += 1;
+            continue;
+        }
+        let recovered = match journal.phase {
+            BackupRestoreOperationPhase::CommittedCleanupComplete
+            | BackupRestoreOperationPhase::RolledBackCleanupComplete => {
+                receipt.already_terminal_count += 1;
+                Ok(())
+            }
+            BackupRestoreOperationPhase::Committed => {
+                cleanup_backup_restore_terminal(&data_root, &mut journal, None, true).map(|()| {
+                    receipt.committed_cleanup_count += 1;
+                })
+            }
+            BackupRestoreOperationPhase::RolledBack => {
+                cleanup_backup_restore_terminal(&data_root, &mut journal, None, false).map(|()| {
+                    receipt.rolled_back_operation_count += 1;
+                })
+            }
+            _ => rollback_backup_restore_operation(&data_root, &mut journal).map(|()| {
+                receipt.rolled_back_operation_count += 1;
+            }),
+        };
+        if recovered.is_err() {
+            receipt.blocked_operation_count += 1;
+        }
+    }
+    Ok(receipt)
+}
+
+#[cfg(test)]
 pub fn restore_backup(backup_dir: &Path, target_home: &Path) -> Result<RestoreResult, String> {
     validate_absolute_root(backup_dir, "backup directory")?;
     validate_absolute_root(target_home, "restore target root")?;
@@ -2284,6 +5219,7 @@ pub fn restore_backup(backup_dir: &Path, target_home: &Path) -> Result<RestoreRe
     restore_verified_backup(backup_dir, target_home, &manifest)
 }
 
+#[cfg(test)]
 fn restore_verified_backup(
     backup_dir: &Path,
     target_home: &Path,
@@ -2314,6 +5250,7 @@ fn restore_verified_backup(
     restore_staged_backup(backup_dir, target_home, manifest, &old_paths, &mut staged)
 }
 
+#[cfg(test)]
 fn restore_staged_backup(
     backup_dir: &Path,
     target_home: &Path,
@@ -2392,11 +5329,13 @@ fn restore_staged_backup(
     })
 }
 
+#[cfg(test)]
 struct RestoreStage {
     root: PathBuf,
     files: Vec<StagedBackupFile>,
 }
 
+#[cfg(test)]
 impl RestoreStage {
     fn create(target_home: &Path) -> Result<Self, String> {
         let parent = target_home
@@ -2433,6 +5372,7 @@ impl RestoreStage {
     }
 }
 
+#[cfg(test)]
 impl Drop for RestoreStage {
     fn drop(&mut self) {
         self.files.clear();
@@ -2440,6 +5380,7 @@ impl Drop for RestoreStage {
     }
 }
 
+#[cfg(test)]
 struct StagedBackupFile {
     relative_path: PathBuf,
     plaintext_bytes: u64,
@@ -2447,6 +5388,7 @@ struct StagedBackupFile {
     handle: fs::File,
 }
 
+#[cfg(test)]
 fn stage_backup_payloads(
     backup_dir: &Path,
     target_home: &Path,
@@ -2518,6 +5460,7 @@ fn stage_backup_payloads(
     Ok(stage)
 }
 
+#[cfg(test)]
 fn open_restore_file(path: &Path, create_new: bool) -> Result<fs::File, String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -2535,6 +5478,7 @@ fn open_restore_file(path: &Path, create_new: bool) -> Result<fs::File, String> 
     })
 }
 
+#[cfg(test)]
 fn restore_staged_file(
     stage: &mut RestoreStage,
     index: usize,
@@ -2586,12 +5530,14 @@ fn restore_staged_file(
     })
 }
 
+#[cfg(test)]
 fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
     let mut name = database.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     database.with_file_name(name)
 }
 
+#[cfg(test)]
 fn remove_sqlite_sidecars(database: &Path) -> Result<(), String> {
     for suffix in ["-wal", "-shm"] {
         let sidecar = sqlite_sidecar(database, suffix);
@@ -2607,6 +5553,7 @@ fn remove_sqlite_sidecars(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_sqlite_files(database: &Path) -> Result<(), String> {
     if database.is_file() {
         fs::remove_file(database).map_err(|error| {
@@ -2619,6 +5566,7 @@ fn remove_sqlite_files(database: &Path) -> Result<(), String> {
     remove_sqlite_sidecars(database)
 }
 
+#[cfg(test)]
 fn remove_absent_core_files(
     manifest: &BackupManifest,
     target_home: &Path,
@@ -2814,6 +5762,7 @@ fn restore_target(
     Ok(target_home.join(relative_path))
 }
 
+#[cfg(test)]
 fn remove_extra_session_files(manifest: &BackupManifest, target_home: &Path) -> Result<(), String> {
     let scope = manifest_scope(manifest);
     let mut roots = vec![Path::new("sessions")];
@@ -2842,6 +5791,7 @@ fn remove_extra_session_files(manifest: &BackupManifest, target_home: &Path) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn clear_known_codex_state(
     target_home: &Path,
     paths: &CodexPaths,
@@ -2998,6 +5948,44 @@ fn safe_reason(reason: &str) -> String {
     }
 }
 
+fn managed_backup_directory_name_matches(path: &Path, manifest: &BackupManifest) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let mut parts = name.splitn(4, '-');
+    parts.next() == Some(manifest.created_at_ms.to_string().as_str())
+        && parts.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next() == Some(safe_reason(&manifest.reason).as_str())
+}
+
+fn backup_path_key(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+#[cfg(windows)]
+fn backup_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn backup_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("failed to hash backup file: {error}"))?;
@@ -3031,6 +6019,7 @@ mod tests {
     };
 
     use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use crate::operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus};
@@ -3045,16 +6034,21 @@ mod tests {
         create_state_checkpoint_with_paths, delete_verified_full_backup,
         ensure_encryptable_payload_size, ensure_roots_disjoint, estimate_backup_peak,
         estimate_backup_peak_with_source_count, existing_capacity_ancestor,
-        finish_backup_creation_with_cleanup, finish_capacity_preflight, inspect_checkpoint_storage,
-        list_recent_backups, load_process_state_checkpoint, migrate_legacy_plaintext_auth,
-        percentage_ceil, preflight_backup_capacity, preflight_backup_capacity_for_sources,
-        preflight_backup_capacity_with_paths, restore_backup, restore_staged_backup,
-        restore_verified_backup, sqlite_logical_bytes, stage_backup_payloads,
-        validate_directory_entry, verify_backup, BackupCapacitySource, BackupManifest, BackupScope,
-        BackupSourceCapacityMetadata, CheckpointRole, BACKUP_FILE_OVERHEAD_BYTES,
-        CHAT_PROCESS_STATE_RELATIVE_PATH, MANIFEST_BASE_OVERHEAD_BYTES,
-        MANIFEST_ENTRY_OVERHEAD_BYTES, MAX_DPAPI_PAYLOAD_BYTES, MIN_CAPACITY_RESERVE_BYTES,
-        SCOPED_BACKUP_MANIFEST_VERSION,
+        extract_verified_backup_file, finish_backup_creation_with_cleanup,
+        finish_capacity_preflight, inspect_checkpoint_storage, list_recent_backups,
+        load_process_state_checkpoint, migrate_legacy_plaintext_auth, percentage_ceil,
+        preflight_backup_capacity, preflight_backup_capacity_for_sources,
+        preflight_backup_capacity_with_paths, prepare_backup_restore_plan, restore_backup,
+        restore_staged_backup, restore_verified_backup, sqlite_logical_bytes,
+        stage_backup_payloads, stage_backup_restore_witnesses,
+        validate_backup_restore_journal_update, validate_backup_restore_plan,
+        validate_directory_entry, verify_backup, BackupCapacitySource, BackupManifest,
+        BackupRestoreMutationKind, BackupRestoreMutationPhase, BackupRestoreMutationPlan,
+        BackupRestoreOperationPhase, BackupRestorePlan, BackupScope, BackupSourceCapacityMetadata,
+        CheckpointRole, RegularFileIdentity, BACKUP_FILE_OVERHEAD_BYTES,
+        BACKUP_RESTORE_JOURNAL_MAGIC, CHAT_PROCESS_STATE_RELATIVE_PATH,
+        MANIFEST_BASE_OVERHEAD_BYTES, MANIFEST_ENTRY_OVERHEAD_BYTES, MAX_DPAPI_PAYLOAD_BYTES,
+        MIN_CAPACITY_RESERVE_BYTES, SCOPED_BACKUP_MANIFEST_VERSION,
     };
 
     fn seed_home(home: &std::path::Path) -> std::path::PathBuf {
@@ -3200,6 +6194,397 @@ mod tests {
     #[cfg(unix)]
     fn create_directory_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
         std::os::unix::fs::symlink(target, link)
+    }
+
+    fn backup_restore_plan_fixture(root: &Path, operation_id: &str) -> BackupRestorePlan {
+        let backup_dir = root.join("backup");
+        let target_root = root.join("target");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&target_root).unwrap();
+        let target_path = target_root.join("config.toml");
+        let artifacts = super::build_backup_restore_artifact_paths(operation_id, &target_path)
+            .expect("fixture artifact paths");
+        BackupRestorePlan {
+            operation_id: operation_id.to_string(),
+            created_at_ms: 123,
+            backup_dir,
+            backup_manifest_sha256: "a".repeat(64),
+            target_root: target_root.clone(),
+            allowed_roots: vec![target_root],
+            restored_file_count: 1,
+            mutations: vec![BackupRestoreMutationPlan {
+                kind: BackupRestoreMutationKind::Replace,
+                logical_path: "config.toml".into(),
+                target_path,
+                original_sha256: Some("b".repeat(64)),
+                replacement_sha256: Some("c".repeat(64)),
+                artifacts,
+                sqlite: false,
+            }],
+        }
+    }
+
+    fn backup_restore_data_root_fixture(root: &Path) -> std::path::PathBuf {
+        let data_root = root.join("codex-switch");
+        fs::create_dir_all(&data_root).unwrap();
+        data_root
+    }
+
+    fn applying_backup_restore_journal(
+        current: &super::BackupRestoreJournal,
+    ) -> super::BackupRestoreJournal {
+        let mut next = current.clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        next.phase = BackupRestoreOperationPhase::Applying;
+        next.mutation_states[0].phase = BackupRestoreMutationPhase::WitnessCreating;
+        next
+    }
+
+    #[test]
+    fn backup_restore_journal_is_integrity_bound_and_update_is_cas_verified() {
+        let root = tempdir().unwrap();
+        let data_root = backup_restore_data_root_fixture(root.path());
+        let plan = backup_restore_plan_fixture(root.path(), "restore-op-1");
+        let journal = super::new_backup_restore_journal(plan).unwrap();
+
+        let journal_path = super::create_backup_restore_journal(&data_root, &journal).unwrap();
+        let encoded = fs::read(&journal_path).unwrap();
+        #[cfg(windows)]
+        {
+            assert!(encoded.starts_with(BACKUP_RESTORE_JOURNAL_MAGIC));
+            assert!(!encoded
+                .windows(journal.plan.target_root.as_os_str().len())
+                .any(|window| window == journal.plan.target_root.to_string_lossy().as_bytes()));
+        }
+        let loaded =
+            super::load_backup_restore_journal(&data_root, &journal.plan.operation_id).unwrap();
+        assert_eq!(loaded, journal);
+
+        let next = applying_backup_restore_journal(&journal);
+        let persisted = super::persist_backup_restore_journal(&data_root, &journal, &next).unwrap();
+        assert_eq!(persisted, next);
+        assert_eq!(
+            super::load_backup_restore_journal(&data_root, &journal.plan.operation_id).unwrap(),
+            next
+        );
+
+        let bytes_before_duplicate = fs::read(&journal_path).unwrap();
+        let error = super::create_backup_restore_journal(&data_root, &journal).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read(&journal_path).unwrap(), bytes_before_duplicate);
+    }
+
+    #[test]
+    fn backup_restore_journal_tampering_and_extra_files_fail_closed() {
+        let root = tempdir().unwrap();
+        let data_root = backup_restore_data_root_fixture(root.path());
+        let plan = backup_restore_plan_fixture(root.path(), "restore-op-tamper");
+        let journal = super::new_backup_restore_journal(plan).unwrap();
+        let journal_path = super::create_backup_restore_journal(&data_root, &journal).unwrap();
+
+        let extra = journal_path.parent().unwrap().join("extra.bin");
+        fs::write(&extra, b"contender").unwrap();
+        let error =
+            super::load_backup_restore_journal(&data_root, "restore-op-tamper").unwrap_err();
+        assert!(error.contains("undeclared artifacts"), "{error}");
+        fs::remove_file(extra).unwrap();
+
+        let mut bytes = fs::read(&journal_path).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x5a;
+        fs::write(&journal_path, bytes).unwrap();
+        let error =
+            super::load_backup_restore_journal(&data_root, "restore-op-tamper").unwrap_err();
+        assert!(
+            error.contains("unreadable")
+                || error.contains("invalid")
+                || error.contains("integrity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn backup_restore_journal_rejects_identity_and_phase_rewrites() {
+        let root = tempdir().unwrap();
+        let plan = backup_restore_plan_fixture(root.path(), "restore-op-transition");
+        let journal = super::new_backup_restore_journal(plan).unwrap();
+        let applying = applying_backup_restore_journal(&journal);
+        validate_backup_restore_journal_update(&journal, &applying).unwrap();
+
+        let mut ready = applying.clone();
+        ready.revision += 1;
+        ready.updated_at_ms += 1;
+        ready.mutation_states[0].phase = BackupRestoreMutationPhase::WitnessReady;
+        ready.mutation_states[0].parent_identity = Some(RegularFileIdentity {
+            volume_serial_number: 1,
+            file_index: 1,
+        });
+        ready.mutation_states[0].original_identity = Some(RegularFileIdentity {
+            volume_serial_number: 1,
+            file_index: 2,
+        });
+        ready.mutation_states[0].replacement_identity = Some(RegularFileIdentity {
+            volume_serial_number: 1,
+            file_index: 3,
+        });
+        validate_backup_restore_journal_update(&applying, &ready).unwrap();
+
+        let mut changed_identity = ready.clone();
+        changed_identity.revision += 1;
+        changed_identity.updated_at_ms += 1;
+        changed_identity.mutation_states[0].original_identity = Some(RegularFileIdentity {
+            volume_serial_number: 9,
+            file_index: 9,
+        });
+        let error = validate_backup_restore_journal_update(&ready, &changed_identity).unwrap_err();
+        assert!(error.contains("identity changed"), "{error}");
+
+        let mut skipped_phase = ready.clone();
+        skipped_phase.revision += 1;
+        skipped_phase.updated_at_ms += 1;
+        skipped_phase.phase = BackupRestoreOperationPhase::Committed;
+        skipped_phase.mutation_states[0].phase = BackupRestoreMutationPhase::CommittedWithRecovery;
+        let error = validate_backup_restore_journal_update(&ready, &skipped_phase).unwrap_err();
+        assert!(error.contains("phase transition"), "{error}");
+    }
+
+    #[test]
+    fn backup_restore_plan_rejects_non_deterministic_or_escaping_identity() {
+        let root = tempdir().unwrap();
+        let mut plan = backup_restore_plan_fixture(root.path(), "restore-op-plan");
+        validate_backup_restore_plan(&plan).unwrap();
+
+        plan.mutations[0].artifacts.recovery_path = root.path().join("attacker.recovery");
+        let error = validate_backup_restore_plan(&plan).unwrap_err();
+        assert!(error.contains("not deterministic"), "{error}");
+
+        assert!(super::build_backup_restore_artifact_paths(
+            "../escape",
+            &root.path().join("target/config.toml")
+        )
+        .unwrap_err()
+        .contains("operation ID"));
+
+        let unsafe_data_root = root.path().join("somewhere-else");
+        fs::create_dir_all(&unsafe_data_root).unwrap();
+        let error = super::validate_backup_restore_data_root(&unsafe_data_root).unwrap_err();
+        assert!(error.contains("identity is invalid"), "{error}");
+    }
+
+    #[test]
+    fn backup_restore_preflight_builds_complete_plan_without_mutating_live_bytes() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_backup(home.path(), backup_root.path(), "journal-plan").unwrap();
+
+        fs::write(home.path().join("config.toml"), b"model = \"later\"\n").unwrap();
+        fs::write(home.path().join("auth.json"), b"later-auth").unwrap();
+        fs::write(home.path().join("state_5.sqlite-wal"), b"late-wal").unwrap();
+        let extra = home.path().join("sessions/2026/08/12/rollout-extra.jsonl");
+        fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        fs::write(&extra, b"late-session\n").unwrap();
+        let before = [
+            home.path().join("config.toml"),
+            home.path().join("auth.json"),
+            home.path().join("state_5.sqlite"),
+            home.path().join("state_5.sqlite-wal"),
+            extra.clone(),
+        ]
+        .into_iter()
+        .map(|path| (path.clone(), fs::read(&path).unwrap()))
+        .collect::<Vec<_>>();
+
+        let prepared =
+            prepare_backup_restore_plan(&manifest.backup_dir, home.path(), "restore-plan-complete")
+                .unwrap();
+
+        assert_eq!(prepared.manifest, manifest);
+        assert_eq!(
+            prepared.journal.plan.restored_file_count,
+            manifest.files.len()
+        );
+        assert!(prepared.journal.plan.mutations.iter().any(|mutation| {
+            mutation.target_path == home.path().join("config.toml")
+                && mutation.kind == BackupRestoreMutationKind::Replace
+        }));
+        assert!(prepared.journal.plan.mutations.iter().any(|mutation| {
+            mutation.target_path == home.path().join("state_5.sqlite-wal")
+                && mutation.kind == BackupRestoreMutationKind::Delete
+        }));
+        assert!(prepared.journal.plan.mutations.iter().any(|mutation| {
+            mutation.target_path == extra && mutation.kind == BackupRestoreMutationKind::Delete
+        }));
+        for mutation in &prepared.journal.plan.mutations {
+            assert_eq!(
+                mutation.artifacts,
+                super::build_backup_restore_artifact_paths(
+                    &prepared.journal.plan.operation_id,
+                    &mutation.target_path
+                )
+                .unwrap()
+            );
+        }
+        for (path, bytes) in before {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn backup_restore_preflight_rejects_corrupt_sqlite_before_journal_or_live_mutation() {
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_backup(home.path(), backup_root.path(), "invalid-sqlite").unwrap();
+        let state = manifest
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new("state_5.sqlite"))
+            .unwrap();
+        let invalid = super::protect(b"not a SQLite database").unwrap();
+        fs::write(&state.backup_path, &invalid).unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest.backup_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        let file = raw["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|file| file["relativePath"] == "state_5.sqlite")
+            .unwrap();
+        file["bytes"] = serde_json::json!(invalid.len() as u64);
+        file["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(&invalid)));
+        fs::write(
+            manifest.backup_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+        let live_before = fs::read(home.path().join("state_5.sqlite")).unwrap();
+
+        let error = prepare_backup_restore_plan(
+            &manifest.backup_dir,
+            home.path(),
+            "restore-corrupt-sqlite",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("SQLite") || error.contains("state_5.sqlite"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(home.path().join("state_5.sqlite")).unwrap(),
+            live_before
+        );
+    }
+
+    #[test]
+    fn backup_restore_staging_is_durable_and_leaves_live_targets_untouched() {
+        let root = tempdir().unwrap();
+        let data_root = backup_restore_data_root_fixture(root.path());
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_backup(home.path(), backup_root.path(), "stage-witnesses").unwrap();
+        fs::write(home.path().join("config.toml"), b"model = \"later\"\n").unwrap();
+        fs::write(home.path().join("auth.json"), b"later-auth").unwrap();
+        fs::write(home.path().join("state_5.sqlite-wal"), b"late-wal").unwrap();
+        let live_before = [
+            home.path().join("config.toml"),
+            home.path().join("auth.json"),
+            home.path().join("state_5.sqlite"),
+            home.path().join("state_5.sqlite-wal"),
+        ]
+        .into_iter()
+        .map(|path| (path.clone(), fs::read(&path).unwrap()))
+        .collect::<Vec<_>>();
+        let prepared =
+            prepare_backup_restore_plan(&manifest.backup_dir, home.path(), "restore-stage-durable")
+                .unwrap();
+        let mut journal = prepared.journal;
+        super::create_backup_restore_journal(&data_root, &journal).unwrap();
+
+        stage_backup_restore_witnesses(&data_root, &manifest, &mut journal).unwrap();
+
+        assert_eq!(journal.phase, BackupRestoreOperationPhase::Applying);
+        assert!(journal
+            .mutation_states
+            .iter()
+            .all(|state| state.phase == BackupRestoreMutationPhase::WitnessReady));
+        for (mutation, state) in journal.plan.mutations.iter().zip(&journal.mutation_states) {
+            if mutation.original_sha256.is_some() {
+                assert!(super::backup_restore_same_file_identity(
+                    &mutation.target_path,
+                    &mutation.artifacts.original_witness_path
+                )
+                .unwrap());
+                assert_eq!(
+                    state.original_identity,
+                    Some(super::backup_restore_file_identity(&mutation.target_path).unwrap())
+                );
+            }
+            if mutation.replacement_sha256.is_some() {
+                assert_eq!(
+                    state.replacement_identity,
+                    Some(
+                        super::backup_restore_file_identity(
+                            &mutation.artifacts.replacement_witness_path
+                        )
+                        .unwrap()
+                    )
+                );
+                if mutation.sqlite {
+                    super::quick_check_sqlite(
+                        &mutation.artifacts.replacement_witness_path,
+                        "staged test SQLite",
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            super::load_backup_restore_journal(&data_root, "restore-stage-durable").unwrap(),
+            journal
+        );
+        for (path, bytes) in live_before {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn backup_restore_staging_refuses_artifact_contender_without_touching_live_target() {
+        let root = tempdir().unwrap();
+        let data_root = backup_restore_data_root_fixture(root.path());
+        let home = tempdir().unwrap();
+        seed_home(home.path());
+        let backup_root = tempdir().unwrap();
+        let manifest = create_backup(home.path(), backup_root.path(), "stage-contender").unwrap();
+        fs::write(home.path().join("config.toml"), b"model = \"later\"\n").unwrap();
+        let live_before = fs::read(home.path().join("config.toml")).unwrap();
+        let prepared = prepare_backup_restore_plan(
+            &manifest.backup_dir,
+            home.path(),
+            "restore-stage-contender",
+        )
+        .unwrap();
+        let mut journal = prepared.journal;
+        super::create_backup_restore_journal(&data_root, &journal).unwrap();
+        let contender = journal.plan.mutations[0]
+            .artifacts
+            .replacement_witness_path
+            .clone();
+        fs::write(&contender, b"contender").unwrap();
+
+        let error =
+            stage_backup_restore_witnesses(&data_root, &manifest, &mut journal).unwrap_err();
+
+        assert!(error.contains("appeared before staging"), "{error}");
+        assert_eq!(
+            fs::read(home.path().join("config.toml")).unwrap(),
+            live_before
+        );
+        assert_eq!(fs::read(contender).unwrap(), b"contender");
     }
 
     #[test]
@@ -6092,5 +9477,29 @@ mod tests {
                 .unwrap();
         assert_eq!(cleanup.reclaimed_count, 1);
         assert!(!checkpoint.backup_dir.exists());
+    }
+
+    #[test]
+    fn verified_payload_extraction_does_not_interpret_backed_up_config_paths() {
+        let home = tempdir().unwrap();
+        let rollout = seed_home(home.path());
+        fs::write(
+            home.path().join("config.toml"),
+            "sqlite_home = \"Z:\\\\must-not-be-opened\"\n",
+        )
+        .unwrap();
+        let backup_root = tempdir().unwrap();
+        let backup = create_local_backup(home.path(), backup_root.path(), "manual-full").unwrap();
+        let output_root = tempdir().unwrap();
+        let output = output_root.path().join("isolated.jsonl");
+        let relative = rollout.strip_prefix(home.path()).unwrap();
+
+        let (bytes, sha256) =
+            extract_verified_backup_file(&backup.backup_dir, relative, &output).unwrap();
+
+        assert_eq!(bytes, fs::metadata(&rollout).unwrap().len());
+        assert_eq!(fs::read(&output).unwrap(), fs::read(&rollout).unwrap());
+        assert_eq!(sha256.len(), 64);
+        assert!(!output_root.path().join("state_5.sqlite").exists());
     }
 }

@@ -114,7 +114,7 @@ try {
     }
     Invoke-NativeCommand `
         -FilePath $resolvedUpxPath `
-        -ArgumentList @('--best', '--lzma', $stagingExe) `
+        -ArgumentList @('--ultra-brute', '--lzma', $stagingExe) `
         -Description 'UPX packing'
     Invoke-NativeCommand `
         -FilePath $resolvedUpxPath `

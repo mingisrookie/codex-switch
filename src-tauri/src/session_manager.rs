@@ -14,14 +14,21 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     backup::{
-        create_backup_with_paths, create_state_checkpoint_with_paths, ensure_roots_disjoint,
-        preflight_backup_capacity_for_sources, preflight_backup_capacity_with_paths,
-        restore_backup, BackupCapacitySource, BackupManifest, BackupScope, CheckpointRole,
+        create_state_checkpoint_with_paths, preflight_backup_capacity_with_paths, BackupManifest,
+        BackupScope, CheckpointRole,
     },
-    codex_paths::{
-        local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
+    codex_paths::{local_codex_paths, resolve_user_codex_paths, CodexPaths},
+    file_ops::walk_jsonl_files,
+};
+
+#[cfg(test)]
+use crate::{
+    backup::{
+        create_backup_with_paths, ensure_roots_disjoint, preflight_backup_capacity_for_sources,
+        restore_backup, BackupCapacitySource,
     },
-    file_ops::{atomic_write, walk_jsonl_files},
+    codex_paths::validate_absolute_root,
+    file_ops::atomic_write,
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -104,6 +111,7 @@ struct SessionSourceRecord {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct DeleteMutationRoots<'a> {
     current_home: &'a Path,
     shared_home: &'a Path,
@@ -201,6 +209,7 @@ fn delete_managed_sessions_detailed(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn delete_managed_sessions_detailed_with_prepare<Prepare>(
     codex_home: &Path,
     shared_home: &Path,
@@ -323,6 +332,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn delete_managed_sessions_inner<Capacity, Prepare, FinalGate>(
     roots: DeleteMutationRoots<'_>,
     ids: &[String],
@@ -412,6 +422,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn preflight_delete_backup_capacity(
     current_home: &Path,
     current_paths: &CodexPaths,
@@ -437,6 +448,7 @@ fn preflight_delete_backup_capacity(
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn restore_status(result: Result<crate::backup::RestoreResult, String>) -> String {
     match result {
         Ok(_) => "ok".to_string(),
@@ -589,6 +601,7 @@ fn preflight_visibility_backup_capacity(
         .map(|_| ())
 }
 
+#[cfg(test)]
 fn resolve_mutation_paths(
     codex_home: &Path,
     shared_home: &Path,
@@ -745,6 +758,7 @@ fn read_session_files(path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     Ok(output)
 }
 
+#[cfg(test)]
 fn apply_delete_to_root(
     paths: &CodexPaths,
     ids: &HashSet<String>,
@@ -758,6 +772,7 @@ fn apply_delete_to_root(
     Ok(())
 }
 
+#[cfg(test)]
 fn delete_auxiliary_db_rows(paths: &CodexPaths, ids: &HashSet<String>) -> Result<(), String> {
     delete_rows_in_database(
         &paths.goals_db,
@@ -782,6 +797,7 @@ fn delete_auxiliary_db_rows(paths: &CodexPaths, ids: &HashSet<String>) -> Result
     )
 }
 
+#[cfg(test)]
 fn delete_rows_in_database(
     path: &Path,
     database_name: &str,
@@ -827,6 +843,7 @@ fn delete_rows_in_database(
         .map_err(|error| format!("failed to commit {database_name} delete transaction: {error}"))
 }
 
+#[cfg(test)]
 fn delete_db_rows(path: &Path, ids: &HashSet<String>) -> Result<usize, String> {
     if !path.exists() {
         return Ok(0);
@@ -942,6 +959,7 @@ fn matching_row_count(
     usize::try_from(count).map_err(|_| format!("invalid row count returned by {table}"))
 }
 
+#[cfg(test)]
 fn table_row_count(conn: &Connection, table: &str) -> Result<usize, String> {
     if !table_exists(conn, table)? {
         return Ok(0);
@@ -956,6 +974,7 @@ fn table_row_count(conn: &Connection, table: &str) -> Result<usize, String> {
 
 #[derive(Clone, Copy)]
 enum SnapshotSelection {
+    #[cfg(test)]
     All,
     Matching,
     NotMatching,
@@ -1010,6 +1029,7 @@ fn table_rows_snapshot(
             .map_err(|error| format!("failed to read {table} snapshot selector: {error}"))?
             != 0;
         let include = match selection {
+            #[cfg(test)]
             SnapshotSelection::All => true,
             SnapshotSelection::Matching => matches,
             SnapshotSelection::NotMatching => !matches,
@@ -1064,6 +1084,7 @@ fn encode_snapshot_bytes(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
+#[cfg(test)]
 fn delete_matching_rows(
     conn: &Connection,
     table: &str,
@@ -1094,6 +1115,7 @@ fn delete_matching_rows(
     Ok(())
 }
 
+#[cfg(test)]
 fn delete_session_files(paths: &CodexPaths, ids: &HashSet<String>) -> Result<usize, String> {
     let mut deleted = 0;
     for root in [&paths.sessions_dir, &paths.archived_sessions_dir] {
@@ -1112,6 +1134,7 @@ fn delete_session_files(paths: &CodexPaths, ids: &HashSet<String>) -> Result<usi
     Ok(deleted)
 }
 
+#[cfg(test)]
 fn remove_session_index_entries(path: &Path, ids: &HashSet<String>) -> Result<usize, String> {
     if !path.exists() {
         return Ok(0);
@@ -1248,6 +1271,7 @@ fn rollout_file_for_record(paths: &CodexPaths, record: &SessionSourceRecord) -> 
     }
 }
 
+#[cfg(test)]
 fn remove_file_under_root(path: &Path, root: &Path) -> Result<bool, String> {
     let canonical_path = path
         .canonicalize()
@@ -1314,6 +1338,7 @@ fn session_file_id(path: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+#[cfg(test)]
 fn session_index_line_id(line: &str) -> Option<String> {
     let value = serde_json::from_str::<JsonValue>(line).ok()?;
     value

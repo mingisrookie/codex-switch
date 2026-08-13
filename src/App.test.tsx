@@ -10,6 +10,7 @@ import type {
   RuntimeDashboardData,
   RuntimeSwitchProgress,
   RuntimeSwitchResult,
+  ShadowScanReport,
   UpdateInstallReceipt,
 } from './types';
 
@@ -31,7 +32,6 @@ const apiMocks = vi.hoisted(() => ({
   deleteBackup: vi.fn(),
   importPlusRuntime: vi.fn(),
   upsertRelayRuntime: vi.fn(),
-  verifyRelayRuntime: vi.fn(),
   getMobileContinuityStatus: vi.fn(),
   setMobileContinuityEnabled: vi.fn(),
   acknowledgeMobileContinuityNotice: vi.fn(),
@@ -43,9 +43,9 @@ const apiMocks = vi.hoisted(() => ({
   loadRuntimeDashboard: vi.fn(),
   loadSessionDashboard: vi.fn(),
   loadBackupDashboard: vi.fn(),
-  syncAllSessions: vi.fn(),
-  deleteManagedSessions: vi.fn(),
+  mergeAndRepairSessions: vi.fn(),
   restoreSessionsVisible: vi.fn(),
+  scanSessionStorage: vi.fn(),
   restoreBackup: vi.fn(),
   listSkills: vi.fn(),
   installSkill: vi.fn(),
@@ -58,6 +58,76 @@ vi.mock('./api', async () => {
 });
 
 import App from './App';
+
+function shadowScanReport(): ShadowScanReport {
+  return {
+    schemaVersion: 1,
+    scanId: 'session-storage-shadow-1',
+    generatedAtMs: 1_786_400_000_000,
+    status: 'reviewRequired',
+    migrationRequired: true,
+    deletionEnabled: false,
+    summary: {
+      schemaVersion: 1,
+      onlineScanOnly: true,
+      nonAtomicAcrossDatabases: true,
+      logicalSessionCount: 995,
+      canonicalCandidateCount: 945,
+      duplicatedSessionCount: 751,
+      conflictSessionCount: 50,
+      highConfidenceCopyCount: 701,
+      sessionFileCount: 3_610,
+      sessionBytes: 7_068_846_886,
+      potentialReclaimBytes: 3_000_000_000,
+      markerFileCount: 2_349,
+      runtimeDatabaseCount: 3,
+      backupDatabaseCount: 0,
+      runtimeReferenceCount: 3_182,
+      missingRuntimeReferenceCount: 0,
+      mismatchedRuntimeReferenceCount: 0,
+      cacheHitCount: 3_000,
+      cacheMissCount: 610,
+      stableFileCount: 3_000,
+      turnContextCount: 4_000,
+      resolvedTurnProvenanceCount: 500,
+      historicalUnknownTurnCount: 3_500,
+      incompleteTurnProvenanceCount: 0,
+      relationCounts: {
+        equal: 1,
+        equalExceptProvider: 696,
+        prefix: 4,
+        divergent: 50,
+        unknown: 0,
+      },
+    },
+    issues: [{ code: 'divergentSession', count: 50 }],
+  };
+}
+
+function canonicalReadyShadowScanReport(): ShadowScanReport {
+  const report = shadowScanReport();
+  return {
+    ...report,
+    status: 'canonicalReady',
+    migrationRequired: false,
+    summary: {
+      ...report.summary,
+      duplicatedSessionCount: 0,
+      conflictSessionCount: 0,
+      highConfidenceCopyCount: 0,
+      potentialReclaimBytes: 0,
+      markerFileCount: 0,
+      relationCounts: {
+        equal: 0,
+        equalExceptProvider: 0,
+        prefix: 0,
+        divergent: 0,
+        unknown: 0,
+      },
+    },
+    issues: [],
+  };
+}
 
 function dashboardData(): DashboardData {
   return {
@@ -95,6 +165,7 @@ function dashboardData(): DashboardData {
         sessions: [],
       },
     },
+    sessionStorage: { status: 'ready', data: canonicalReadyShadowScanReport() },
     runtimes: {
       status: 'ready',
       data: [
@@ -190,7 +261,7 @@ describe('App release-hardening UI', () => {
       available: true,
       eventCount: 0,
       totalBytes: 0,
-      retentionDays: 14,
+      retentionDays: 7,
       maxBytes: 10 * 1024 * 1024,
       oldestEventAtMs: null,
       newestEventAtMs: null,
@@ -199,6 +270,7 @@ describe('App release-hardening UI', () => {
     const initial = dashboardData();
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: initial.codexHome,
+      sessionStorage: initial.sessionStorage,
       runtimes: initial.runtimes,
       runtimeStatus: initial.runtimeStatus,
       operations: initial.operations,
@@ -206,6 +278,7 @@ describe('App release-hardening UI', () => {
     apiMocks.loadSessionDashboard.mockResolvedValue({
       sessions: initial.sessions,
       managedSessions: initial.managedSessions,
+      sessionStorage: initial.sessionStorage,
     });
     apiMocks.loadBackupDashboard.mockResolvedValue({
       backups: initial.backups,
@@ -279,6 +352,29 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.checkForUpdates).toHaveBeenCalledTimes(1));
     expect(screen.getByText('v0.1.5 · 已是最新版')).toBeTruthy();
     expect(screen.queryByRole('region', { name: '发现新版本' })).toBeNull();
+  });
+
+  it('renders the scan-only storage contract and refreshes the typed shadow report', async () => {
+    const refreshed = shadowScanReport();
+    refreshed.status = 'migrationAvailable';
+    refreshed.summary.conflictSessionCount = 0;
+    refreshed.issues = [];
+    apiMocks.scanSessionStorage.mockResolvedValue(refreshed);
+    const data = dashboardData();
+    data.sessionStorage = { status: 'ready', data: shadowScanReport() };
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const panel = await screen.findByRole('complementary', { name: '会话存储状态' });
+    expect(within(panel).getByText('发现冲突或异常，需先复核', { exact: false })).toBeTruthy();
+    expect(within(panel).getByText('在线仅扫描，不删除', { exact: false })).toBeTruthy();
+    expect(within(panel).getByText('回合来源已解析 500/4000', { exact: false })).toBeTruthy();
+    expect(within(panel).getByText('3500 个迁移前回合来源未知', { exact: false })).toBeTruthy();
+
+    fireEvent.click(within(panel).getByRole('button', { name: '扫描会话存储' }));
+
+    await waitFor(() => expect(apiMocks.scanSessionStorage).toHaveBeenCalledTimes(1));
+    expect(await within(panel).findByText('检测到旧版存储，建议迁移', { exact: false })).toBeTruthy();
+    expect(within(panel).queryByText('自动删除', { exact: false })).toBeNull();
   });
 
   it('does not duplicate the startup check during React StrictMode effect replay', async () => {
@@ -394,7 +490,7 @@ describe('App release-hardening UI', () => {
     fireEvent.click(await screen.findByRole('button', { name: '立即更新' }));
     await waitFor(() => expect(apiMocks.installUpdate).toHaveBeenCalledTimes(1));
     const saveAccount = screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement;
-    const sync = screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement;
+    const sync = screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement;
     expect(saveAccount.disabled).toBe(true);
     expect(sync.disabled).toBe(true);
     fireEvent.click(saveAccount);
@@ -526,16 +622,16 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '检查更新' })).toBeTruthy());
   });
 
-  it('renders saved, current, and verified as separate runtime states', async () => {
+  it('renders saved and current without presenting stale verification health', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
     const account = await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     const relay = screen.getByRole('article', { name: 'API 中转站态' });
     expect(within(account).getByText('已保存')).toBeTruthy();
     expect(within(account).getByText('非当前')).toBeTruthy();
-    expect(within(account).getByText('未验证')).toBeTruthy();
+    expect(within(account).queryByText('未验证')).toBeNull();
     expect(within(relay).getByText('当前运行')).toBeTruthy();
-    expect(within(relay).getByText('已验证')).toBeTruthy();
+    expect(within(relay).queryByText('已验证')).toBeNull();
     expect((within(relay).getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getAllByText(/任务执行器会安全关闭，并在成功后自动打开 ChatGPT/)).toHaveLength(2);
   });
@@ -758,6 +854,7 @@ describe('App release-hardening UI', () => {
   it('keeps the successful receipt and closes the dialog when only refresh fails', async () => {
     const pendingRefresh = deferred<{
       codexHome: DashboardData['codexHome'];
+      sessionStorage: DashboardData['sessionStorage'];
       runtimes: DashboardData['runtimes'];
       runtimeStatus: DashboardData['runtimeStatus'];
       operations: DashboardData['operations'];
@@ -781,6 +878,7 @@ describe('App release-hardening UI', () => {
   it('keeps the relay key and shows backend save failures inside the dialog', async () => {
     const pendingRefresh = deferred<{
       codexHome: DashboardData['codexHome'];
+      sessionStorage: DashboardData['sessionStorage'];
       runtimes: DashboardData['runtimes'];
       runtimeStatus: DashboardData['runtimeStatus'];
       operations: DashboardData['operations'];
@@ -817,7 +915,7 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     expect(await screen.findByText('SQLite locked')).toBeTruthy();
-    expect((screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -827,8 +925,8 @@ describe('App release-hardening UI', () => {
     if (data.managedSessions.status !== 'ready') throw new Error('fixture mismatch');
     data.managedSessions.data.sessions = [{
       id: 'thread-a', title: '可管理会话', preview: null, modelProvider: 'openai',
-      updatedAt: 1, updatedAtMs: 1000, archived: false, archivedAt: null, scope: 'current',
-      current: { home: 'C:\\Users\\alice\\.codex', rolloutPath: 'sessions/thread-a.jsonl', sessionFile: 'sessions/thread-a.jsonl', archived: false, archivedAt: null, updatedAt: 1, updatedAtMs: 1000 },
+      updatedAt: 1, updatedAtMs: 1000, archived: true, archivedAt: 1000, scope: 'current',
+      current: { home: 'C:\\Users\\alice\\.codex', rolloutPath: 'sessions/thread-a.jsonl', sessionFile: 'sessions/thread-a.jsonl', archived: true, archivedAt: 1000, updatedAt: 1, updatedAtMs: 1000 },
       shared: null,
     }];
     data.managedSessions.data.totalCount = 1;
@@ -836,8 +934,8 @@ describe('App release-hardening UI', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '会话' }));
     fireEvent.click(screen.getByLabelText(/^选择 thread-a/));
-    expect((screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: '删除所选' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '恢复可见' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('gates account import on its required files while trusting successful session domains', async () => {
@@ -848,7 +946,16 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     expect((await screen.findByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('keeps merge and repair disabled until the v0.3 storage migration is complete', async () => {
+    const data = dashboardData();
+    data.sessionStorage = { status: 'ready', data: shadowScanReport() };
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    expect((await screen.findByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('完成 v0.3 前台迁移后可用；旧完全同步已停用。')).toBeTruthy();
   });
 
   it('shows the inline ChatGPT login next step when auth or config is missing', async () => {
@@ -870,14 +977,14 @@ describe('App release-hardening UI', () => {
     expect((screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('keeps relay verification and backup recovery available when Codex Home itself is damaged', async () => {
+  it('keeps relay configuration and backup recovery available when Codex Home itself is damaged', async () => {
     const data = dashboardData();
     data.codexHome = { status: 'error', error: 'auth.json is malformed' };
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
     const relay = await screen.findByRole('article', { name: 'API 中转站态' });
     expect((within(relay).getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled).toBe(false);
-    expect((within(relay).getByRole('button', { name: '验证连接' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(relay).queryByRole('button', { name: '验证连接' })).toBeNull();
     expect((screen.getByRole('button', { name: /^恢复此备份/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -892,7 +999,7 @@ describe('App release-hardening UI', () => {
     expect(confirm).not.toHaveBeenCalled();
   });
 
-  it('confirms one full sync without a duplicate dry-run and renders the backend receipt', async () => {
+  it('confirms one merge and repair operation without provider copies and renders the backend receipt', async () => {
     const confirm = vi.spyOn(window, 'confirm');
     const receipt = {
       operationId: 'sync-1', backups: [{ backupDir: 'C:\\backups\\sync-1' }],
@@ -902,7 +1009,7 @@ describe('App release-hardening UI', () => {
       warnings: ['审计日志写入失败'],
       chatgptLaunch: { status: 'launched', message: null },
     };
-    apiMocks.syncAllSessions.mockImplementation(async (onProgress) => {
+    apiMocks.mergeAndRepairSessions.mockImplementation(async (onProgress) => {
       onProgress({ phase: 'preparing', timestampMs: 100 });
       onProgress({ phase: 'closingApp', timestampMs: 300 });
       onProgress({ phase: 'backingUp', timestampMs: 800 });
@@ -913,16 +1020,17 @@ describe('App release-hardening UI', () => {
       return receipt;
     });
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
-    fireEvent.click(await screen.findByRole('button', { name: '完全同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '会话合并与修复' }));
 
-    const confirmation = await screen.findByRole('region', { name: '完全同步活跃会话' });
-    expect(within(confirmation).getByText('不执行重复 dry-run')).toBeTruthy();
-    fireEvent.click(within(confirmation).getByRole('button', { name: '开始完全同步' }));
-    await waitFor(() => expect(apiMocks.syncAllSessions).toHaveBeenCalled());
+    const confirmation = await screen.findByRole('region', { name: '会话合并与修复' });
+    expect(within(confirmation).getByText('不生成 provider 正文副本')).toBeTruthy();
+    expect(within(confirmation).getByText('冲突默认不覆盖')).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '开始合并与修复' }));
+    await waitFor(() => expect(apiMocks.mergeAndRepairSessions).toHaveBeenCalled());
     expect(await screen.findByText('操作 ID：sync-1')).toBeTruthy();
     expect(screen.getByText('新增线程：3')).toBeTruthy();
     expect(screen.getByText('耗时·对账活跃会话：1.5s')).toBeTruthy();
-    expect(screen.getByText('完全同步总耗时：2.7s')).toBeTruthy();
+    expect(screen.getByText('合并与修复总耗时：2.7s')).toBeTruthy();
     expect(screen.getByText('备份：1')).toBeTruthy();
     expect(screen.getByText('警告：审计日志写入失败')).toBeTruthy();
     expect(apiMocks.listCodexProcesses).not.toHaveBeenCalled();
@@ -934,7 +1042,7 @@ describe('App release-hardening UI', () => {
     const load = vi.fn()
       .mockResolvedValueOnce(dashboardData())
       .mockReturnValueOnce(pendingRefresh.promise);
-    apiMocks.syncAllSessions.mockResolvedValue({
+    apiMocks.mergeAndRepairSessions.mockResolvedValue({
       operationId: 'sync-refresh-failed', backups: [], insertedThreads: 1,
       copiedSessionFiles: 1, duplicateThreads: 0, skippedMissingSessionFiles: 0,
       skippedArchivedThreads: 0, mergedSessionIndexEntries: 1,
@@ -942,14 +1050,14 @@ describe('App release-hardening UI', () => {
       chatgptLaunch: { status: 'launched', message: null },
     });
     render(<App loadDashboard={load} />);
-    fireEvent.click(await screen.findByRole('button', { name: '完全同步' }));
-    fireEvent.click(await screen.findByRole('button', { name: '开始完全同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '会话合并与修复' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始合并与修复' }));
 
     expect(await screen.findByText('操作 ID：sync-refresh-failed')).toBeTruthy();
     expect(screen.getByText('会话净变化：0 B')).toBeTruthy();
     expect(screen.queryByText('会话净变化：+0 B')).toBeNull();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-    const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled;
+    const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled;
     pendingRefresh.reject(new Error('refresh failed'));
     expect(await screen.findByText(/操作已成功，但状态刷新失败：refresh failed/)).toBeTruthy();
     expect(syncEnabledBeforeRefresh).toBe(true);
@@ -966,7 +1074,7 @@ describe('App release-hardening UI', () => {
     const load = vi.fn()
       .mockResolvedValueOnce(dashboardData())
       .mockReturnValueOnce(pendingRefresh.promise);
-    apiMocks.syncAllSessions.mockImplementation(async (onProgress) => {
+    apiMocks.mergeAndRepairSessions.mockImplementation(async (onProgress) => {
       onProgress({
         phase: 'failed',
         timestampMs: 21,
@@ -975,13 +1083,13 @@ describe('App release-hardening UI', () => {
       throw new Error('sync apply failed');
     });
     render(<App loadDashboard={load} />);
-    fireEvent.click(await screen.findByRole('button', { name: '完全同步' }));
-    fireEvent.click(await screen.findByRole('button', { name: '开始完全同步' }));
+    fireEvent.click(await screen.findByRole('button', { name: '会话合并与修复' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始合并与修复' }));
 
     expect(await screen.findByText('sync apply failed')).toBeTruthy();
     expect(screen.getByRole('button', { name: '导出本次诊断' })).toBeTruthy();
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-    const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '完全同步' }) as HTMLButtonElement).disabled;
+    const syncEnabledBeforeRefresh = !(screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled;
     pendingRefresh.resolve(failed);
     const history = await screen.findByRole('complementary', { name: '操作历史' });
     expect(within(history).getByText('sync-failed-1')).toBeTruthy();
@@ -1314,7 +1422,7 @@ describe('App release-hardening UI', () => {
   it('queues a fresh backup scan when another mutation finishes during an older scan', async () => {
     const firstRefresh = deferred<BackupDashboardData>();
     const secondRefresh = deferred<BackupDashboardData>();
-    apiMocks.syncAllSessions.mockResolvedValue({
+    apiMocks.mergeAndRepairSessions.mockResolvedValue({
       operationId: 'sync-after-cleanup',
       backups: [],
       insertedThreads: 0,
@@ -1346,8 +1454,8 @@ describe('App release-hardening UI', () => {
     await screen.findByText('操作 ID：cleanup-default');
     await waitFor(() => expect(apiMocks.loadBackupDashboard).toHaveBeenCalledTimes(2));
 
-    fireEvent.click(screen.getByRole('button', { name: '完全同步' }));
-    fireEvent.click(await screen.findByRole('button', { name: '开始完全同步' }));
+    fireEvent.click(screen.getByRole('button', { name: '会话合并与修复' }));
+    fireEvent.click(await screen.findByRole('button', { name: '开始合并与修复' }));
     await screen.findByText('操作 ID：sync-after-cleanup');
 
     const stale = dashboardData();
@@ -1507,26 +1615,31 @@ describe('App release-hardening UI', () => {
     expect(within(history).getByText('C:\\backups\\safe-1')).toBeTruthy();
   });
 
-  it('refreshes durable operation history after a failed backend action', async () => {
+  it('refreshes durable operation history after a failed runtime switch', async () => {
     const failed = dashboardData();
     if (failed.operations.status !== 'ready') throw new Error('fixture mismatch');
     failed.operations.data = [{
-      operationId: 'verify-failed-1', action: 'verifyRelay', status: 'failed', phase: 'verify',
+      operationId: 'switch-failed-1', action: 'switchRuntime', status: 'failed', phase: 'apply',
       startedAtMs: 11, completedAtMs: 12, backupDirs: [], counts: {},
     }];
     apiMocks.loadRuntimeDashboard.mockResolvedValueOnce({
       codexHome: failed.codexHome,
+      sessionStorage: failed.sessionStorage,
       runtimes: failed.runtimes,
       runtimeStatus: failed.runtimeStatus,
       operations: failed.operations,
     });
-    apiMocks.verifyRelayRuntime.mockRejectedValue(new Error('relay unreachable'));
+    apiMocks.switchRuntime.mockRejectedValue({
+      message: 'request route unavailable',
+      operationId: 'switch-failed-1',
+    });
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: '验证连接' }));
-    expect(await screen.findByText('relay unreachable')).toBeTruthy();
+    fireEvent.click(await screen.findByRole('button', { name: '切换到 ChatGPT 账号' }));
+    expect(await screen.findByText('request route unavailable')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '关闭任务' }));
     const history = await screen.findByRole('complementary', { name: '操作历史' });
-    expect(within(history).getByText('verify-failed-1')).toBeTruthy();
+    expect(within(history).getByText('switch-failed-1')).toBeTruthy();
     expect(within(history).getByText('失败')).toBeTruthy();
   });
 
@@ -1538,6 +1651,7 @@ describe('App release-hardening UI', () => {
       changed: boolean;
       runtime: (typeof dashboard.runtimes.data)[number];
       incrementalSessionSync: ReturnType<typeof emptyIncrementalSyncResult>;
+      routeProvenance: ReturnType<typeof recordedRouteProvenance>;
       relayValidation: 'notApplicable';
       chatProcessStateRepaired: boolean;
       chatgptLaunch: { status: 'launched'; message: null };
@@ -1578,6 +1692,7 @@ describe('App release-hardening UI', () => {
     pendingSwitch.resolve({
       operationId: 'switch-1', changed: true, runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1601,6 +1716,7 @@ describe('App release-hardening UI', () => {
         changed: true,
         runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
+        routeProvenance: recordedRouteProvenance(),
         relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'launched', message: null },
@@ -1627,6 +1743,7 @@ describe('App release-hardening UI', () => {
     };
     runtimeRefresh.resolve({
       codexHome: refreshed.codexHome,
+      sessionStorage: refreshed.sessionStorage,
       runtimes: refreshed.runtimes,
       runtimeStatus: refreshed.runtimeStatus,
       operations: refreshed.operations,
@@ -1654,6 +1771,7 @@ describe('App release-hardening UI', () => {
         changed: true,
         runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
+        routeProvenance: recordedRouteProvenance(),
         relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'failed' as const, message: 'activation unavailable' },
@@ -1709,6 +1827,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1731,6 +1850,7 @@ describe('App release-hardening UI', () => {
         detectedThreads: 1,
         syncedThreads: 1,
       },
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1744,7 +1864,7 @@ describe('App release-hardening UI', () => {
     await waitFor(() => expect(apiMocks.loadSessionDashboard).toHaveBeenCalledTimes(1));
   });
 
-  it('asks once before the first relay switch and direct mode skips frontend verification', async () => {
+  it('switches to relay directly without a verification prompt or network probe choice', async () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('fixture mismatch');
     if (dashboard.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
@@ -1755,15 +1875,14 @@ describe('App release-hardening UI', () => {
       modelProvider: 'openai',
       detectedAtMs: 20,
     };
-    dashboard.runtimes.data[1].relaySwitchPreference = null;
     apiMocks.switchRuntime.mockResolvedValue({
       operationId: 'switch-direct',
       changed: true,
       runtime: {
         ...dashboard.runtimes.data[1],
-        relaySwitchPreference: 'direct',
       },
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'skipped',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1771,16 +1890,11 @@ describe('App release-hardening UI', () => {
     render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '切换到中转站' }));
-
-    expect(await screen.findByRole('region', { name: '选择中转站切换方式' })).toBeTruthy();
-    expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '直接切换' }));
-
     await waitFor(() => expect(apiMocks.switchRuntime).toHaveBeenCalledWith(
       'relay',
       expect.any(Function),
-      'direct',
     ));
+    expect(screen.queryByRole('region', { name: '选择中转站切换方式' })).toBeNull();
   });
 
   it('ignores progress from an older switch after a newer switch has started', async () => {
@@ -1812,6 +1926,7 @@ describe('App release-hardening UI', () => {
     };
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: plusDashboard.codexHome,
+      sessionStorage: plusDashboard.sessionStorage,
       runtimes: plusDashboard.runtimes,
       runtimeStatus: plusDashboard.runtimeStatus,
       operations: plusDashboard.operations,
@@ -1824,6 +1939,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1847,6 +1963,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[1],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1899,6 +2016,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[1],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -1971,6 +2089,7 @@ describe('App release-hardening UI', () => {
       changed: true,
       runtime: dashboard.runtimes.data[0],
       incrementalSessionSync: emptyIncrementalSyncResult(),
+      routeProvenance: recordedRouteProvenance(),
       relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
       chatgptLaunch: { status: 'launched', message: null },
@@ -2039,6 +2158,10 @@ function emptyIncrementalSyncResult() {
   };
 }
 
+function recordedRouteProvenance() {
+  return { status: 'recorded' as const };
+}
+
   it('loads runtime state first, then sessions and backups only on demand', async () => {
     const dashboard = dashboardData();
     if (dashboard.runtimes.status !== 'ready') throw new Error('test fixture must include runtimes');
@@ -2050,6 +2173,7 @@ function emptyIncrementalSyncResult() {
       return {
         operationId: 'switch-lazy', changed: true, runtime: plusRuntime,
         incrementalSessionSync: emptyIncrementalSyncResult(),
+        routeProvenance: recordedRouteProvenance(),
         relayValidation: 'notApplicable',
       chatProcessStateRepaired: false,
         chatgptLaunch: { status: 'launched', message: null },
@@ -2060,6 +2184,8 @@ function emptyIncrementalSyncResult() {
 
     await screen.findByRole('article', { name: 'ChatGPT 账号态' });
     expect(apiMocks.loadRuntimeDashboard).toHaveBeenCalledTimes(1);
+    const storage = await screen.findByRole('complementary', { name: '会话存储状态' });
+    expect(within(storage).getByText('在线仅扫描，不删除', { exact: false })).toBeTruthy();
     expect(apiMocks.loadSessionDashboard).not.toHaveBeenCalled();
     expect(apiMocks.loadBackupDashboard).not.toHaveBeenCalled();
 
@@ -2103,7 +2229,7 @@ function emptyIncrementalSyncResult() {
     expect(within(progress).queryByText('正在恢复原始请求配置')).toBeNull();
   });
 
-  it('closes a running ChatGPT process only after inline session-delete confirmation', async () => {
+  it('does not expose the retired hard-delete flow or close ChatGPT for it', async () => {
     const dashboard = dashboardData();
     if (dashboard.managedSessions.status !== 'ready') throw new Error('test fixture must include sessions');
     dashboard.managedSessions.data.sessions = [{
@@ -2118,23 +2244,13 @@ function emptyIncrementalSyncResult() {
     }];
     dashboard.managedSessions.data.totalCount = 1;
     dashboard.managedSessions.data.archivedCount = 1;
-    apiMocks.listCodexProcesses.mockResolvedValue([{ imageName: 'ChatGPT.exe', pid: 1234, parentPid: 10 }]);
-    const confirm = vi.spyOn(window, 'confirm');
-    apiMocks.deleteManagedSessions.mockResolvedValue({
-      operationId: 'delete-1', selectedCount: 1, backups: [], deletedThreads: 1,
-      deletedSessionFiles: 1, removedSessionIndexEntries: 1, restoredThreads: 0,
-    });
     render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '会话' }));
     fireEvent.click(screen.getByLabelText(/^选择 thread-a/));
-    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
-    expect(apiMocks.deleteManagedSessions).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
-
-    await waitFor(() => expect(apiMocks.closeCodexProcesses).toHaveBeenCalled());
-    expect(apiMocks.deleteManagedSessions).toHaveBeenCalledWith(['thread-a'], true);
-    expect(confirm).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /删除所选|确认删除|硬删除/ })).toBeNull();
+    expect(screen.getByText(/v0\.3 不提供直接硬删除/)).toBeTruthy();
+    expect(apiMocks.closeCodexProcesses).not.toHaveBeenCalled();
   });
 
   it('does not present a restore-visible checkpoint after the backend has reclaimed it', async () => {

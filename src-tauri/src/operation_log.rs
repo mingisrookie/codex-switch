@@ -9,12 +9,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::file_ops::atomic_write;
 
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OPERATION_LOG_LOCK: Mutex<()> = Mutex::new(());
+const PROTECTED_RECORD_PREFIX: &[u8] = b"csop1:";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -107,24 +110,25 @@ impl OperationLog {
             .lock()
             .map_err(|_| "operation log lock is poisoned".to_string())?;
         on_locked();
-        let mut payload = if self.path.exists() {
+        let existing_payload = if self.path.exists() {
             fs::read(&self.path)
                 .map_err(|error| format!("failed to read operation log before append: {error}"))?
         } else {
             Vec::new()
         };
-        let existing = parse_operation_records_strict(&payload)?;
+        let existing = parse_operation_records_strict(&existing_payload)?;
         if existing
             .iter()
             .any(|existing| existing.operation_id == record.operation_id)
         {
             return Err("operation log already contains this operation ID".to_string());
         }
-        if !payload.is_empty() && !payload.ends_with(b"\n") {
+        let mut payload = Vec::new();
+        for existing_record in &existing {
+            payload.extend_from_slice(&encode_operation_record(existing_record)?);
             payload.push(b'\n');
         }
-        let mut encoded = serde_json::to_vec(record)
-            .map_err(|error| format!("failed to serialize operation record: {error}"))?;
+        let mut encoded = encode_operation_record(record)?;
         encoded.push(b'\n');
         payload.extend_from_slice(&encoded);
         write_log(&self.path, &payload)
@@ -146,6 +150,30 @@ impl OperationLog {
         let mut records = parse_operation_records_strict(&payload)?;
         records.reverse();
         Ok(records)
+    }
+
+    pub fn prune_completed_before(&self, cutoff_ms: u128) -> Result<usize, String> {
+        let _guard = OPERATION_LOG_LOCK
+            .lock()
+            .map_err(|_| "operation log lock is poisoned".to_string())?;
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        let payload = fs::read(&self.path)
+            .map_err(|error| format!("failed to read operation log before retention: {error}"))?;
+        let records = parse_operation_records_strict(&payload)?;
+        let retained = records
+            .iter()
+            .filter(|record| record.completed_at_ms >= cutoff_ms)
+            .collect::<Vec<_>>();
+        let removed = records.len().saturating_sub(retained.len());
+        let mut encoded = Vec::new();
+        for record in retained {
+            encoded.extend_from_slice(&encode_operation_record(record)?);
+            encoded.push(b'\n');
+        }
+        atomic_write(&self.path, &encoded)?;
+        Ok(removed)
     }
 
     fn list_with_lock<F>(&self, limit: usize, on_locked: F) -> Result<Vec<OperationRecord>, String>
@@ -170,7 +198,7 @@ impl OperationLog {
             .collect::<Vec<_>>();
         let mut records = Vec::new();
         for (index, line) in lines.iter().enumerate() {
-            match serde_json::from_slice(line) {
+            match decode_operation_record(line) {
                 Ok(record) => records.push(record),
                 Err(_) if index + 1 == lines.len() => break,
                 Err(error) => {
@@ -188,11 +216,50 @@ fn parse_operation_records_strict(payload: &[u8]) -> Result<Vec<OperationRecord>
     payload
         .split(|byte| *byte == b'\n')
         .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
-        .map(|line| {
-            serde_json::from_slice(line)
-                .map_err(|error| format!("failed to parse operation record: {error}"))
-        })
+        .map(decode_operation_record)
         .collect()
+}
+
+fn encode_operation_record(record: &OperationRecord) -> Result<Vec<u8>, String> {
+    let plaintext = serde_json::to_vec(record)
+        .map_err(|error| format!("failed to serialize operation record: {error}"))?;
+    #[cfg(windows)]
+    {
+        let ciphertext = crate::crypto::protect(&plaintext)
+            .map_err(|_| "failed to protect operation record".to_string())?;
+        let mut output = Vec::with_capacity(PROTECTED_RECORD_PREFIX.len() + ciphertext.len() * 2);
+        output.extend_from_slice(PROTECTED_RECORD_PREFIX);
+        output.extend_from_slice(BASE64.encode(ciphertext).as_bytes());
+        Ok(output)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(plaintext)
+    }
+}
+
+fn decode_operation_record(line: &[u8]) -> Result<OperationRecord, String> {
+    let plaintext = if let Some(encoded) = line.strip_prefix(PROTECTED_RECORD_PREFIX) {
+        #[cfg(windows)]
+        {
+            let ciphertext = BASE64.decode(encoded).map_err(|_| {
+                "failed to parse operation record: protected payload is invalid".to_string()
+            })?;
+            crate::crypto::unprotect(&ciphertext).map_err(|_| {
+                "failed to parse operation record: protected payload is unreadable".to_string()
+            })?
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(
+                "failed to parse operation record: protected payload is unsupported".to_string(),
+            );
+        }
+    } else {
+        line.to_vec()
+    };
+    serde_json::from_slice(&plaintext)
+        .map_err(|error| format!("failed to parse operation record: {error}"))
 }
 
 pub fn operation_id(prefix: &str) -> Result<String, String> {
@@ -299,6 +366,62 @@ mod tests {
             error.contains("failed to parse operation record"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn retention_prunes_only_records_older_than_the_cutoff() {
+        let root = tempdir().unwrap();
+        let log = OperationLog::new(root.path().join("operations.jsonl"));
+        for (id, completed) in [("old", 10), ("boundary", 20), ("new", 30)] {
+            log.append(&record(id, completed)).unwrap();
+        }
+
+        assert_eq!(log.prune_completed_before(20).unwrap(), 1);
+        let records = log.list_all_strict().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "boundary"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn append_and_zero_removal_retention_reprotect_legacy_plaintext_records() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("operations.jsonl");
+        let log = OperationLog::new(path.clone());
+        let mut legacy = record("legacy", 20);
+        legacy.backup_dirs = vec![std::path::PathBuf::from(
+            r"C:\Users\private-user\sensitive-backup",
+        )];
+        let plaintext = format!("{}\n", serde_json::to_string(&legacy).unwrap());
+
+        fs::write(&path, plaintext.as_bytes()).unwrap();
+        log.append(&record("new", 30)).unwrap();
+        assert_operation_log_is_fully_protected(&path, 2);
+
+        fs::write(&path, plaintext.as_bytes()).unwrap();
+        assert_eq!(log.prune_completed_before(0).unwrap(), 0);
+        assert_operation_log_is_fully_protected(&path, 1);
+    }
+
+    #[cfg(windows)]
+    fn assert_operation_log_is_fully_protected(path: &std::path::Path, expected_lines: usize) {
+        let payload = fs::read(path).unwrap();
+        let lines = payload
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), expected_lines);
+        assert!(lines
+            .iter()
+            .all(|line| line.starts_with(super::PROTECTED_RECORD_PREFIX)));
+        assert!(!payload
+            .windows(b"private-user".len())
+            .any(|window| window == b"private-user"));
     }
 
     #[test]

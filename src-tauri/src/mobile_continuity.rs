@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
 const MAX_AUTO_PUBLISH_THREADS: usize = 8;
 const MAX_AUTO_PUBLISH_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_LOCAL_ONLY_INSPECTION_BYTES: u64 = 4 * 1024 * 1024;
 const RELAY_PROVIDER: &str = "openai_custom";
 const ACCOUNT_PROVIDER: &str = "openai";
 
@@ -146,6 +146,7 @@ pub fn acknowledge_notice(
     Ok(status_from_state(&state))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_account_publication(
     state_path: &Path,
     current: &CodexPaths,
@@ -153,6 +154,7 @@ pub(crate) fn prepare_account_publication(
     prepare_account_publication_between(state_path, current, current)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_account_publication_between(
     state_path: &Path,
     source: &CodexPaths,
@@ -284,7 +286,6 @@ pub(crate) fn prepare_account_publication_between(
                 .map(|thread| (thread.id.clone(), thread))
                 .collect::<BTreeMap<_, _>>();
             let mut published = 0;
-            let mut partial = 0;
             for id in &selected {
                 if result.preserved_divergent_thread_ids.contains(id) {
                     if let Some(item) = state.items.get_mut(id) {
@@ -308,16 +309,9 @@ pub(crate) fn prepare_account_publication_between(
                             id,
                         )
                         .expect("remote rollout was validated above");
-                        if rollout_has_local_only_markers(&remote_path) {
-                            partial += 1;
-                            (
-                                MobileContinuityItemStatus::Partial,
-                                Some("localOnlyContent".to_string()),
-                            )
-                        } else {
-                            published += 1;
-                            (MobileContinuityItemStatus::RemotePublished, None)
-                        }
+                        let _ = remote_path;
+                        published += 1;
+                        (MobileContinuityItemStatus::RemotePublished, None)
                     }
                     _ => (
                         MobileContinuityItemStatus::NeedsManual,
@@ -346,7 +340,7 @@ pub(crate) fn prepare_account_publication_between(
                         )
                     })
                     .count(),
-                partial_threads: partial,
+                partial_threads: 0,
             })
         }
         Err(error) => {
@@ -470,14 +464,8 @@ pub(crate) fn publish_single_account_session_between(
                 thread_id,
             )
             .expect("remote rollout was validated above");
-            if rollout_has_local_only_markers(&remote_path) {
-                (
-                    MobileContinuityItemStatus::Partial,
-                    Some("localOnlyContent".to_string()),
-                )
-            } else {
-                (MobileContinuityItemStatus::RemotePublished, None)
-            }
+            let _ = remote_path;
+            (MobileContinuityItemStatus::RemotePublished, None)
         }
         _ => (
             MobileContinuityItemStatus::NeedsManual,
@@ -549,13 +537,9 @@ fn reconcile_completed_publications(
         let Some(path) = managed_rollout_path(current, path, &item.thread_id) else {
             continue;
         };
-        item.status = if rollout_has_local_only_markers(&path) {
-            item.failure_category = Some("localOnlyContent".to_string());
-            MobileContinuityItemStatus::Partial
-        } else {
-            item.failure_category = None;
-            MobileContinuityItemStatus::RemotePublished
-        };
+        let _ = path;
+        item.failure_category = None;
+        item.status = MobileContinuityItemStatus::RemotePublished;
         item.next_retry_at_ms = None;
         item.updated_at_ms = timestamp_millis()?;
         changed = true;
@@ -599,7 +583,9 @@ fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> 
         &current.state_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|error| format!("failed to open mobile continuity state database: {error}"))?;
+    .map_err(|error| {
+        redacted_sqlite_failure("failed to open mobile continuity state database", &error)
+    })?;
     let columns = connection
         .prepare("PRAGMA table_info(threads)")
         .and_then(|mut statement| {
@@ -607,7 +593,9 @@ fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> 
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()
         })
-        .map_err(|error| format!("failed to inspect mobile continuity schema: {error}"))?;
+        .map_err(|error| {
+            redacted_sqlite_failure("failed to inspect mobile continuity schema", &error)
+        })?;
     if !columns.iter().any(|column| column == "id") {
         return Ok(Vec::new());
     }
@@ -620,9 +608,9 @@ fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> 
         if rollout { "rollout_path" } else { "NULL" },
         if archived { "archived" } else { "0" },
     );
-    let mut statement = connection
-        .prepare(&sql)
-        .map_err(|error| format!("failed to prepare mobile continuity query: {error}"))?;
+    let mut statement = connection.prepare(&sql).map_err(|error| {
+        redacted_sqlite_failure("failed to prepare mobile continuity query", &error)
+    })?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -632,11 +620,14 @@ fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> 
                 row.get::<_, i64>(3)?,
             ))
         })
-        .map_err(|error| format!("failed to read mobile continuity threads: {error}"))?;
+        .map_err(|error| {
+            redacted_sqlite_failure("failed to read mobile continuity threads", &error)
+        })?;
     let mut output = Vec::new();
     for row in rows {
-        let (id, provider, rollout_path, archived) =
-            row.map_err(|error| format!("failed to collect mobile continuity threads: {error}"))?;
+        let (id, provider, rollout_path, archived) = row.map_err(|error| {
+            redacted_sqlite_failure("failed to collect mobile continuity threads", &error)
+        })?;
         if validate_remote_thread_id(&id).is_err() {
             continue;
         }
@@ -650,13 +641,23 @@ fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> 
     Ok(output)
 }
 
+fn redacted_sqlite_failure(context: &str, error: &rusqlite::Error) -> String {
+    match error.sqlite_error() {
+        Some(sqlite) => format!(
+            "{context} (SQLite code {:?}, extended {})",
+            sqlite.code, sqlite.extended_code
+        ),
+        None => context.to_string(),
+    }
+}
+
 fn is_remote_rollout(current: &CodexPaths, rollout_path: &Path, thread_id: &str) -> bool {
     let Some(candidate) = managed_rollout_path(current, rollout_path, thread_id) else {
         return false;
     };
     candidate.is_file()
         && is_remote_rollout_path(&candidate, thread_id)
-        && first_meta_matches(&candidate, thread_id, ACCOUNT_PROVIDER)
+        && first_meta_matches_thread(&candidate, thread_id)
 }
 
 fn managed_rollout_path(
@@ -724,7 +725,7 @@ fn stable_source_fingerprint(path: &Path) -> Result<SourceFingerprint, String> {
     })
 }
 
-fn first_meta_matches(path: &Path, thread_id: &str, provider: &str) -> bool {
+fn first_meta_matches_thread(path: &Path, thread_id: &str) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
@@ -751,32 +752,6 @@ fn first_meta_matches(path: &Path, thread_id: &str, provider: &str) -> bool {
             .and_then(|payload| payload.get("id"))
             .and_then(serde_json::Value::as_str)
             == Some(thread_id)
-        && value
-            .get("payload")
-            .and_then(|payload| payload.get("model_provider"))
-            .and_then(serde_json::Value::as_str)
-            == Some(provider)
-}
-
-fn rollout_has_local_only_markers(path: &Path) -> bool {
-    if fs::metadata(path)
-        .map(|metadata| metadata.len() > MAX_LOCAL_ONLY_INSPECTION_BYTES)
-        .unwrap_or(true)
-    {
-        return true;
-    }
-    let Ok(bytes) = fs::read(path) else {
-        return true;
-    };
-    bytes
-        .windows(b"local_file".len())
-        .any(|window| window == b"local_file")
-        || bytes
-            .windows(b"file_path".len())
-            .any(|window| window == b"file_path")
-        || bytes
-            .windows(b"attachment".len())
-            .any(|window| window == b"attachment")
 }
 
 fn classify_publish_error(error: &str) -> &'static str {
@@ -823,8 +798,8 @@ mod tests {
 
     use super::{
         initialize_status, is_remote_rollout_path, load_existing_state,
-        prepare_account_publication, prepare_account_publication_between,
-        publish_single_account_session, set_enabled, MobileContinuityItemStatus,
+        prepare_account_publication, prepare_account_publication_between, redacted_sqlite_failure,
+        set_enabled, MobileContinuityItemStatus,
     };
     use crate::codex_paths::{codex_paths_with_sqlite_home, local_codex_paths};
 
@@ -871,6 +846,22 @@ mod tests {
         let state_root = tempdir().unwrap();
         let paths = local_codex_paths(home.path());
         (home, state_root, paths)
+    }
+
+    #[test]
+    fn sqlite_failures_never_expose_embedded_windows_paths() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(r"unable to open database file: C:\Users\private\state_5.sqlite".to_string()),
+        );
+
+        let message =
+            redacted_sqlite_failure("failed to open mobile continuity state database", &error);
+
+        assert!(message.starts_with("failed to open mobile continuity state database (SQLite code"));
+        assert!(message.contains("extended"));
+        assert!(!message.contains(r"C:\"));
+        assert!(!message.contains("private"));
     }
 
     #[test]
@@ -1062,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn local_only_content_is_sanitized_in_successor_and_original_is_unchanged() {
+    fn canonical_view_keeps_local_only_content_in_place_without_copying() {
         let (home, state_root, paths) = setup();
         let state_path = state_root.path().join("mobile-continuity.json");
         initialize_status(&state_path, &paths).unwrap();
@@ -1093,12 +1084,20 @@ mod tests {
             )
             .unwrap();
         let original = fs::read(&source_path).unwrap();
+        let jsonl_before = fs::read_dir(Path::new(&source_path).parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+            })
+            .count();
 
         let result = prepare_account_publication(&state_path, &paths).unwrap();
 
-        assert_eq!(result.partial_threads, 1);
+        assert_eq!(result.published_threads, 1);
+        assert_eq!(result.partial_threads, 0);
         assert_eq!(fs::read(&source_path).unwrap(), original);
-        let (provider, successor): (String, String) = connection
+        let (provider, canonical): (String, String) = connection
             .query_row(
                 "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
                 [&id],
@@ -1106,16 +1105,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider, "openai");
-        let successor = fs::read_to_string(successor).unwrap();
-        assert!(!successor.contains(private_path));
-        assert!(successor.contains("部分内容仅本机"));
+        assert_eq!(Path::new(&canonical), Path::new(&source_path));
+        assert!(!fs::read_to_string(&canonical)
+            .unwrap()
+            .contains("部分内容仅本机"));
+        let jsonl_after = fs::read_dir(Path::new(&source_path).parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+            })
+            .count();
+        assert_eq!(jsonl_after, jsonl_before);
     }
 
     #[test]
-    fn divergent_provider_branch_is_preserved_and_reported_as_conflict() {
-        let (home, state_root, paths) = setup();
+    fn divergent_canonical_view_paths_are_preserved_and_reported_as_conflict() {
+        let (home, state_root, relay_paths) = setup();
+        let account_sqlite = tempdir().unwrap();
+        let account_paths =
+            codex_paths_with_sqlite_home(home.path(), account_sqlite.path()).unwrap();
+        Connection::open(&account_paths.state_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT,
+                    model_provider TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
         let state_path = state_root.path().join("mobile-continuity.json");
-        initialize_status(&state_path, &paths).unwrap();
+        initialize_status(&state_path, &relay_paths).unwrap();
         let id = "66666666-6666-4666-8666-666666666666".to_string();
         insert_thread(home.path(), &id, "openai_custom");
         let connection = Connection::open(home.path().join("state_5.sqlite")).unwrap();
@@ -1132,25 +1154,30 @@ mod tests {
             .unwrap()
             .write_all(b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"branch-a\"}}\n")
             .unwrap();
-        prepare_account_publication(&state_path, &paths).unwrap();
-
+        let target_path = Path::new(&source_path)
+            .with_file_name(format!("rollout-2026-07-28T00-00-01-{id}.jsonl"));
         fs::write(
-            &source_path,
+            &target_path,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai_custom\"}}}}\n\
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai\"}}}}\n\
                  {{\"type\":\"event_msg\",\"payload\":{{\"message\":\"branch-b\"}}}}\n"
             ),
         )
         .unwrap();
-        connection
+        Connection::open(&account_paths.state_db)
+            .unwrap()
             .execute(
-                "UPDATE threads SET rollout_path = ?1, model_provider = 'openai_custom' WHERE id = ?2",
-                (&source_path, &id),
+                "INSERT INTO threads (id, rollout_path, model_provider, archived)
+                 VALUES (?1, ?2, 'openai', 0)",
+                (&id, target_path.to_string_lossy().to_string()),
             )
             .unwrap();
 
-        let status = publish_single_account_session(&state_path, &paths, &id).unwrap();
+        let result =
+            prepare_account_publication_between(&state_path, &relay_paths, &account_paths).unwrap();
+        let status = super::status_from_state(&load_existing_state(&state_path).unwrap().unwrap());
 
+        assert_eq!(result.published_threads, 0);
         assert_eq!(status.conflict, 1);
         assert_eq!(
             status
@@ -1163,17 +1190,9 @@ mod tests {
         );
         assert!(fs::read_to_string(&source_path)
             .unwrap()
-            .contains("branch-b"));
-        let openai_successors = fs::read_dir(Path::new(&source_path).parent().unwrap())
+            .contains("branch-a"));
+        assert!(fs::read_to_string(&target_path)
             .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
-                    && fs::read_to_string(entry.path())
-                        .ok()
-                        .is_some_and(|content| content.contains("\"model_provider\":\"openai\""))
-            })
-            .count();
-        assert!(openai_successors >= 2);
+            .contains("branch-b"));
     }
 }

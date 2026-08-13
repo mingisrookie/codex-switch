@@ -1,21 +1,26 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::path::PathBuf;
 
+#[cfg(test)]
+use std::{fs, path::Path, time::Duration};
+
+#[cfg(test)]
 use rusqlite::{Connection, OpenFlags, MAIN_DB};
 use serde::Serialize;
 
 use crate::{
     backup::{BackupManifest, BackupScope},
-    codex_paths::CodexPaths,
     process_control::{
         ChatGptLaunchResult as ProcessChatGptLaunchResult,
         ChatGptLaunchStatus as ProcessChatGptLaunchStatus,
     },
     runtime_store::RuntimeMetadata,
     session_incremental::IncrementalSessionSyncReceipt,
+    session_storage::provenance::RouteProvenanceReceipt,
+};
+
+#[cfg(test)]
+use crate::{
+    codex_paths::CodexPaths,
     session_sync::{sync_user_home_to_shared_with_paths, SessionSyncResult},
 };
 
@@ -93,6 +98,7 @@ pub struct RuntimeSwitchResult {
     pub runtime: RuntimeMetadata,
     pub warnings: Vec<String>,
     pub incremental_session_sync: IncrementalSessionSyncReceipt,
+    pub route_provenance: RouteProvenanceReceipt,
     pub relay_validation: RelayValidationStatus,
     pub chat_process_state_repaired: bool,
     pub chatgpt_launch: ChatGptLaunchReceipt,
@@ -141,6 +147,7 @@ pub struct RuntimeSwitchFailure {
     pub operation_id: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn sync_home_with_shared_complete_with_paths(
     current_paths: &CodexPaths,
     shared_paths: &CodexPaths,
@@ -155,6 +162,7 @@ pub(crate) fn sync_home_with_shared_complete_with_paths(
     combine_session_sync_results(to_shared, from_shared)
 }
 
+#[cfg(test)]
 pub(crate) fn combine_session_sync_results(
     to_shared: SessionSyncResult,
     from_shared: SessionSyncResult,
@@ -189,6 +197,7 @@ pub(crate) fn combine_session_sync_results(
     })
 }
 
+#[cfg(test)]
 fn ensure_shared_sessions_with_paths(
     current_paths: &CodexPaths,
     shared_paths: &CodexPaths,
@@ -206,6 +215,7 @@ fn ensure_shared_sessions_with_paths(
     Ok(())
 }
 
+#[cfg(test)]
 fn initialize_shared_database(source: &Path, target: &Path) -> Result<(), String> {
     let source_conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("failed to open source state_5.sqlite: {error}"))?;
@@ -241,6 +251,7 @@ fn initialize_shared_database(source: &Path, target: &Path) -> Result<(), String
         .map_err(|error| format!("failed to commit shared initialization: {error}"))
 }
 
+#[cfg(test)]
 fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
     let count: i64 = conn
         .query_row(

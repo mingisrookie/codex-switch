@@ -59,15 +59,6 @@ const steps: Step[] = [
     icon: ShieldCheck,
   },
   {
-    id: 'relay',
-    phases: ['verifyingRelay'],
-    group: '准备',
-    label: '验证中转站',
-    description: '仅确认地址、网络与鉴权可用，不检查模型',
-    icon: RadioTower,
-    relayOnly: true,
-  },
-  {
     id: 'close',
     phases: ['detectingApp', 'closingApp'],
     group: '准备',
@@ -419,18 +410,6 @@ function SwitchSuccessResult({
       <dl className="switch-receipt" aria-label="切换回执">
         <div><dt>操作 ID</dt><dd>{result.operationId}</dd></div>
         <div><dt>目标请求端</dt><dd>{result.runtime.kind === 'plus' ? 'OpenAI 官方' : 'API Relay'}</dd></div>
-        {result.runtime.kind === 'relay' ? (
-          <div>
-            <dt>Relay 验证</dt>
-            <dd>
-              {result.relayValidation === 'verified'
-                ? '连接与鉴权已验证'
-                : result.relayValidation === 'skipped'
-                  ? '未验证（直接切换）'
-                  : '不适用'}
-            </dd>
-          </div>
-        ) : null}
         <div><dt>官方登录态</dt><dd>已验证保持不变</dd></div>
         <div><dt>配置变更</dt><dd>{result.changed ? '已原子应用' : '无需变更'}</dd></div>
         <div>
@@ -445,6 +424,10 @@ function SwitchSuccessResult({
           <dt>会话视图</dt>
           <dd>{incrementalSyncLabel(result.incrementalSessionSync, result.runtime.kind)}</dd>
         </div>
+        <div>
+          <dt>回合来源</dt>
+          <dd>{routeProvenanceLabel(result.routeProvenance.status)}</dd>
+        </div>
       </dl>
 
       {result.warnings?.length ? (
@@ -456,10 +439,10 @@ function SwitchSuccessResult({
       <footer className="switch-task-footer">
         <p>
           {launchBlocked
-            ? '增量会话未到达可验证的安全终态；请先检查操作记录与保留的检查点，不要直接打开 ChatGPT。'
+            ? '切换后安全记录未到达可验证终态；请先检查操作记录与保留的检查点，不要直接打开 ChatGPT。'
             : launchFailed
             ? '运行态切换已经成功，不会因启动失败而回滚。'
-            : '切换回执已持久化；超出快速预算的会话维护保留为手动完全同步。'}
+            : '切换回执已持久化；需要深度处理的会话保留给“会话合并与修复”。'}
         </p>
         <div className="switch-task-actions">
           {launchFailed ? (
@@ -601,10 +584,17 @@ function incrementalSyncLabel(
   }
   if (result.status === 'applied') return `已同步 ${result.syncedThreads} 个变化 · ${duration}`;
   if (result.status === 'unchanged') return `无变化 · ${duration}`;
-  if (result.status === 'needsFullSync') return '需要手动完全同步';
+  if (result.status === 'needsFullSync') return '需要会话合并与修复';
   if (result.status === 'deferred') return `已超出快速预算并延期 · ${duration}`;
-  if (result.status === 'failed') return `未完成，需要手动完全同步 · ${duration}`;
+  if (result.status === 'failed') return `未完成，需要会话合并与修复 · ${duration}`;
   return '本次无需执行';
+}
+
+function routeProvenanceLabel(status: RuntimeSwitchResult['routeProvenance']['status']) {
+  if (status === 'recorded') return '已记录当前 provider、模型与账号槽位';
+  if (status === 'unchanged') return '已验证现有来源基线';
+  if (status === 'failed') return '未就绪，已阻止启动';
+  return '等待记录';
 }
 
 function launchTitle(result?: RuntimeSwitchResult) {
@@ -627,7 +617,7 @@ function launchDescription(result: RuntimeSwitchResult) {
     return '切换结果仍然有效，你可以重试或稍后手动打开。';
   }
   if (result.chatgptLaunch.status === 'blocked') {
-    return '增量会话未到达可验证终态；必须先检查操作记录与保留的安全检查点。';
+    return '切换后安全记录未到达可验证终态；必须先检查操作记录与保留的安全检查点。';
   }
   return result.changed
     ? '后端没有请求启动应用，请查看任务说明。'

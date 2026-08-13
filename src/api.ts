@@ -18,8 +18,20 @@ import type {
   DiagnosticStatus,
   FrontendDiagnosticInput,
   ManagedSessionInventory,
+  MigrationPreflightReport,
+  MigrationBackupManifest,
+  MigrationCancellationReceipt,
+  MigrationPreparationReceipt,
+  MigrationApplyReceipt,
+  OfflineGcReceipt,
+  DowngradeExportReceipt,
+  RestoreImportReceipt,
+  LegacyBackupReconciliationReceipt,
+  PendingRecoveryList,
+  ConflictResolutionAction,
+  ConflictResolutionReceipt,
+  SessionConflictList,
   RelayRuntimeInput,
-  RelaySwitchPreference,
   MobileContinuityStatus,
   RestoreResult,
   RuntimeStatus,
@@ -27,6 +39,9 @@ import type {
   RuntimeMetadata,
   SessionMutationResult,
   SessionInventory,
+  ShadowScanReport,
+  SessionStorageControlState,
+  SessionStorageInvestigationReceipt,
   SessionSyncProgress,
   SessionSyncResult,
   OperationRecord,
@@ -180,11 +195,152 @@ export function getUpdateStartupNotice() {
   return invoke<UpdateStartupNotice | null>('get_update_startup_notice');
 }
 
+export function getSessionStorageStatus() {
+  return invoke<ShadowScanReport | null>('get_session_storage_status');
+}
+
+export function getSessionStorageControlState() {
+  return invoke<SessionStorageControlState>('get_session_storage_control_state');
+}
+
+export function setSessionStorageAutomaticCleanup(enabled: boolean) {
+  return invokeMutation<SessionStorageControlState>('set_session_storage_automatic_cleanup', { enabled });
+}
+
+export function scanSessionStorage() {
+  return invoke<ShadowScanReport>('scan_session_storage');
+}
+
+export function createSessionStorageInvestigationTask() {
+  return invokeMutation<SessionStorageInvestigationReceipt>(
+    'create_session_storage_investigation_task',
+  );
+}
+
+export function openSessionStorageInvestigationTask(taskId: string) {
+  return invoke<void>('open_session_storage_investigation_task', { taskId });
+}
+
+export function preflightSessionStorageMigration(backupDestination: string) {
+  return invokeMutation<MigrationPreflightReport>('preflight_session_storage_migration', {
+    backupDestination,
+  });
+}
+
+export function createSessionStorageMigrationBackup(operationId: string) {
+  return invokeMutation<MigrationBackupManifest>('create_session_storage_migration_backup', {
+    operationId,
+  });
+}
+
+export function verifySessionStorageMigrationBackup(operationId: string) {
+  return invokeMutation<MigrationBackupManifest>('verify_session_storage_migration_backup', {
+    operationId,
+  });
+}
+
+export function prepareSessionStorageMigration(operationId: string) {
+  return invokeMutation<MigrationPreparationReceipt>('prepare_session_storage_migration', {
+    operationId,
+  });
+}
+
+export function cancelSessionStorageMigration(operationId: string) {
+  return invokeMutation<MigrationCancellationReceipt>('cancel_session_storage_migration', {
+    operationId,
+  });
+}
+
+export function applySessionStorageMigration(operationId: string) {
+  return invokeMutation<MigrationApplyReceipt>('apply_session_storage_migration', {
+    operationId,
+  });
+}
+
+export function runSessionStorageOfflineGc(migrationOperationId: string) {
+  return invokeMutation<OfflineGcReceipt>('run_session_storage_offline_gc', {
+    migrationOperationId,
+  });
+}
+
+export function exportSessionStorageDowngrade(
+  migrationOperationId: string,
+  targetVersion: string,
+  destinationRoot: string,
+) {
+  return invokeMutation<DowngradeExportReceipt>('export_session_storage_downgrade', {
+    migrationOperationId,
+    targetVersion,
+    destinationRoot,
+  });
+}
+
+export function importSessionStorageDowngrade(
+  migrationOperationId: string,
+  packageDir: string,
+) {
+  return invokeMutation<RestoreImportReceipt>('import_session_storage_downgrade', {
+    migrationOperationId,
+    packageDir,
+  });
+}
+
+export function reconcileSessionStorageLegacyBackups(migrationOperationId: string) {
+  return invokeMutation<LegacyBackupReconciliationReceipt>('reconcile_session_storage_legacy_backups', {
+    migrationOperationId,
+  });
+}
+
+export function listSessionStoragePendingRecovery(migrationOperationId: string) {
+  return invoke<PendingRecoveryList>('list_session_storage_pending_recovery', {
+    migrationOperationId,
+  });
+}
+
+export function deferSessionStoragePendingRecovery(
+  migrationOperationId: string,
+  entryId: string,
+) {
+  return invokeMutation<PendingRecoveryList>('defer_session_storage_pending_recovery', {
+    migrationOperationId,
+    entryId,
+  });
+}
+
+export function restoreSessionStoragePendingRecovery(
+  migrationOperationId: string,
+  entryId: string,
+) {
+  return invokeMutation<RestoreImportReceipt>('restore_session_storage_pending_recovery', {
+    migrationOperationId,
+    entryId,
+  });
+}
+
+export function listSessionStorageConflicts(migrationOperationId: string) {
+  return invoke<SessionConflictList>('list_session_storage_conflicts', {
+    migrationOperationId,
+  });
+}
+
+export function resolveSessionStorageConflict(
+  migrationOperationId: string,
+  conflictId: string,
+  action: ConflictResolutionAction,
+) {
+  return invokeMutation<ConflictResolutionReceipt>('resolve_session_storage_conflict', {
+    migrationOperationId,
+    conflictId,
+    action,
+  });
+}
+
 export async function loadDashboard(): Promise<DashboardData> {
   const [
     codexHome,
     sessions,
     managedSessions,
+    sessionStorage,
     runtimes,
     runtimeStatus,
     backups,
@@ -194,6 +350,7 @@ export async function loadDashboard(): Promise<DashboardData> {
       invoke<CodexHomeStatus>('scan_codex_home'),
       invoke<SessionInventory>('scan_sessions'),
       invoke<ManagedSessionInventory>('scan_managed_sessions'),
+      invoke<ShadowScanReport | null>('get_session_storage_status'),
       invoke<RuntimeMetadata[]>('list_runtimes'),
       invoke<RuntimeStatus>('scan_runtime_status'),
       invoke<BackupSummary[]>('list_backups'),
@@ -207,6 +364,7 @@ export async function loadDashboard(): Promise<DashboardData> {
     codexHome: settledDomain(codexHome),
     sessions: settledDomain(sessions),
     managedSessions: settledDomain(managedSessions),
+    sessionStorage: settledDomain(sessionStorage),
     runtimes: settledDomain(runtimes),
     runtimeStatus: settledDomain(runtimeStatus),
     backups: settledDomain(backups),
@@ -216,8 +374,9 @@ export async function loadDashboard(): Promise<DashboardData> {
 }
 
 export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
-  const [codexHome, runtimes, runtimeStatus, operations] = await Promise.allSettled([
+  const [codexHome, sessionStorage, runtimes, runtimeStatus, operations] = await Promise.allSettled([
     invoke<CodexHomeStatus>('scan_codex_home'),
+    invoke<ShadowScanReport | null>('get_session_storage_status'),
     invoke<RuntimeMetadata[]>('list_runtimes'),
     invoke<RuntimeStatus>('scan_runtime_status'),
     invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
@@ -225,6 +384,7 @@ export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
 
   return {
     codexHome: settledDomain(codexHome),
+    sessionStorage: settledDomain(sessionStorage),
     runtimes: settledDomain(runtimes),
     runtimeStatus: settledDomain(runtimeStatus),
     operations: settledDomain(operations),
@@ -232,14 +392,16 @@ export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
 }
 
 export async function loadSessionDashboard(): Promise<SessionDashboardData> {
-  const [sessions, managedSessions] = await Promise.allSettled([
+  const [sessions, managedSessions, sessionStorage] = await Promise.allSettled([
     invoke<SessionInventory>('scan_sessions'),
     invoke<ManagedSessionInventory>('scan_managed_sessions'),
+    invoke<ShadowScanReport | null>('get_session_storage_status'),
   ]);
 
   return {
     sessions: settledDomain(sessions),
     managedSessions: settledDomain(managedSessions),
+    sessionStorage: settledDomain(sessionStorage),
   };
 }
 
@@ -263,6 +425,7 @@ export function loadingDashboard(): DashboardData {
     codexHome: { status: 'loading' },
     sessions: { status: 'loading' },
     managedSessions: { status: 'loading' },
+    sessionStorage: { status: 'loading' },
     runtimes: { status: 'loading' },
     runtimeStatus: { status: 'loading' },
     backups: { status: 'loading' },
@@ -290,12 +453,11 @@ export function closeCodexProcesses() {
 export function switchRuntime(
   runtimeId: RuntimeKind,
   onProgress: (event: RuntimeSwitchProgress) => void,
-  relayPreference: RelaySwitchPreference | null = null,
 ) {
   const onProgressChannel = new Channel<RuntimeSwitchProgress>(onProgress);
   return invokeMutation<RuntimeSwitchResult>('switch_runtime', {
     runtimeId,
-    relayPreference,
+    relayPreference: null,
     onProgress: onProgressChannel,
   });
 }
@@ -304,13 +466,9 @@ export function launchChatgpt() {
   return invokeMutation<ChatGptLaunchResult>('launch_chatgpt');
 }
 
-export function syncAllSessions(onProgress: (event: SessionSyncProgress) => void) {
+export function mergeAndRepairSessions(onProgress: (event: SessionSyncProgress) => void) {
   const onProgressChannel = new Channel<SessionSyncProgress>(onProgress);
-  return invokeMutation<SessionSyncResult>('sync_all_sessions', { onProgress: onProgressChannel });
-}
-
-export function verifyRelayRuntime() {
-  return invokeMutation<RuntimeMetadata>('test_relay_connection');
+  return invokeMutation<SessionSyncResult>('merge_and_repair_sessions', { onProgress: onProgressChannel });
 }
 
 export function getMobileContinuityStatus() {
@@ -327,10 +485,6 @@ export function acknowledgeMobileContinuityNotice() {
 
 export function publishMobileContinuitySession(threadId: string) {
   return invokeMutation<MobileContinuityStatus>('publish_mobile_continuity_session', { threadId });
-}
-
-export function deleteManagedSessions(ids: string[], confirmed: boolean) {
-  return invokeMutation<SessionMutationResult>('delete_managed_sessions', { ids, confirmed });
 }
 
 export function restoreSessionsVisible(ids: string[]) {

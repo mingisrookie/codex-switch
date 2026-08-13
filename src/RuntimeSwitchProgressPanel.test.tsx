@@ -43,6 +43,7 @@ function result(
       durationMs: 20,
       requiresFullSync: false,
     },
+    routeProvenance: { status: 'recorded' },
     relayValidation: 'verified',
     chatProcessStateRepaired: false,
     chatgptLaunch: { status, message },
@@ -76,7 +77,7 @@ describe('RuntimeSwitchProgressPanel', () => {
       status: 'running',
       target: 'relay',
       startedAtMs: 100,
-      events: [event('verifyingRelay', 110)],
+      events: [event('validatingOfficialAuth', 110)],
     };
 
     renderPanel(flow);
@@ -86,10 +87,10 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(dialog.getAttribute('aria-busy')).toBe('true');
     expect(screen.getAllByRole('dialog')).toHaveLength(1);
     expect(screen.getByRole('region', { name: '切换步骤与回执' }).getAttribute('tabindex')).toBe('0');
-    expect(screen.getByRole('status').textContent).toBe('验证中转站');
+    expect(screen.getByRole('status').textContent).toBe('准备目标与登录态');
     expect(dialog.querySelector('.switch-task-clock')?.textContent).toContain('1.0s');
-    expect(dialog.querySelector('.switch-timeline li.active')?.textContent).toContain('验证中转站');
-    expect(dialog.querySelectorAll('.switch-timeline > li')).toHaveLength(7);
+    expect(dialog.querySelector('.switch-timeline li.active')?.textContent).toContain('准备目标与登录态');
+    expect(dialog.querySelectorAll('.switch-timeline > li')).toHaveLength(6);
     expect(document.activeElement).toBe(within(dialog).getByRole('heading'));
   });
 
@@ -260,10 +261,35 @@ describe('RuntimeSwitchProgressPanel', () => {
     });
 
     expect(screen.getAllByText('切换成功，ChatGPT 已保持关闭').length).toBeGreaterThan(0);
-    expect(screen.getByRole('alert').textContent).toContain('必须先检查操作记录与保留的安全检查点');
+    expect(screen.getByRole('alert').textContent).toContain('切换后安全记录未到达可验证终态');
     expect(screen.queryByRole('button', { name: '重试打开 ChatGPT' })).toBeNull();
     expect(screen.queryByRole('button', { name: '稍后手动打开' })).toBeNull();
     expect(screen.getByRole('button', { name: '完成' })).toBeTruthy();
+  });
+
+  it('shows a failed route provenance receipt and keeps ChatGPT closed', () => {
+    const receipt = result(
+      'blocked',
+      '会话来源账本未写入；为避免产生无来源回合，ChatGPT 已保持关闭',
+    );
+    receipt.routeProvenance = {
+      status: 'failed',
+      message: '会话来源账本未写入；为避免产生无来源回合，ChatGPT 已保持关闭',
+    };
+
+    renderPanel({
+      status: 'succeeded',
+      target: 'relay',
+      startedAtMs: 100,
+      completedAtMs: 220,
+      events: [event('recordingResult', 180), event('complete', 210)],
+      result: receipt,
+    });
+
+    expect(screen.getByText('回合来源').nextSibling?.textContent)
+      .toBe('未就绪，已阻止启动');
+    expect(screen.getByRole('alert').textContent).toContain('会话来源账本未写入');
+    expect(screen.queryByRole('button', { name: '重试打开 ChatGPT' })).toBeNull();
   });
 
   it('reports the auth-preserving request-route contract instead of session mutations', () => {
@@ -292,6 +318,8 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('已安全修复');
     expect(screen.getByText('会话视图').nextSibling?.textContent)
       .toContain('已准备 2 条会话索引 · 0.5s');
+    expect(screen.getByText('回合来源').nextSibling?.textContent)
+      .toBe('已记录当前 provider、模型与账号槽位');
   });
 
   it('does not claim process state was checked for an exact no-op', () => {

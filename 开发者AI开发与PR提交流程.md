@@ -8,7 +8,7 @@ AI 在本项目里进行开发、整理改动、发起 PR、更新 PR、补充�
 
 <!-- DXM-DOC-RULES:START -->
 
-<!-- DXM-CONTRACT:1 -->
+<!-- DXM-CONTRACT:2 -->
 
 ## DXM 文档维护规则
 
@@ -159,10 +159,20 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
    npm test -- --run
    npm run typecheck
    npm run build
-   cargo test --manifest-path src-tauri/Cargo.toml
-   npm run tauri -- build
-   npm run check:release
+   cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+   cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+   cargo test --locked --manifest-path src-tauri/Cargo.toml --all-targets
+   npm run tauri -- build --no-bundle
+   node scripts/check-release-contract.mjs src-tauri/target/release/codex-switch.exe
    ```
+
+   v0.3.0 还必须在任何 tag/Release 前完成并留证：
+
+   - PRD 全量对抗矩阵：数据关系、全局引用/WAL、并发 TOCTOU、每阶段故障注入与迁移/GC/降级幂等；任一有效消息、工具关系、被引用正文或真实分叉受损都阻断发布。
+   - 当前真实主库只做最后一次只读 preflight，并在前后复核源 bytes/hash/mtime；破坏性迁移/GC 只运行本机隔离副本，不上传、不进 Git/Release。
+   - v0.2.0–v0.2.7 精确旧版运行时分别验证隔离降级包的列表、恢复和继续会话。下载/本地构建旧版 EXE 每次执行前都需要行动时确认，不得把当前新版 runtime 验证代替旧版验证。
+   - `release/codex-switch.exe` 在隔离 `APPDATA` / `CODEX_HOME` 且无 Vite listener 时真实启动、进入 Tauri Ready、显示 v0.3.0 并 graceful close；生产 UI 在 1200×820、900×640、390×844 完成导航/hit-test/reduced-motion/视觉检查。
+   - 文档/编码/隐私/secret/path 扫描必须完成，Trellis 最终 `check.md` 必须先达到 PASS 门；此时任务仍保持 active。不得在 tag、公开资产回下载和 updater 成功/回滚证据之前执行 finish/archive 或生成宣称完成的 DXM completion receipt。
 
 4. tag 和 release 必须指向已提交、已推送的 commit。不得用脏工作区产物发布。
 
@@ -182,7 +192,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
      -OutputExe "release/codex-switch.exe"
    ```
 
-   该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --best --lzma`，并对 packed 文件执行 `upx -t`。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，确认主窗口、版本和基本切换入口可用；只验证 raw EXE 不算发布验证完成。
+   该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --ultra-brute --lzma`，并对 packed 文件执行 `upx -t`。v0.3 关闭 Tauri runtime Brotli asset feature，仅保留 `wry` / Windows `common-controls-v6`，因此必须由最终固定 UPX 层压缩并做 custom-protocol 启动验证。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，确认主窗口、版本和基本切换入口可用；只验证 raw EXE 不算发布验证完成。
 
    公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；既有 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
 
@@ -219,7 +229,21 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
    `gh release view --json` 不支持 `isLatest` 字段；必须把 `gh api .../releases/latest` 返回的 tag 与目标 `<tag>` 对比，不能仅凭 release 列表顺序推断 latest。
 
-8. 自动更新必须使用已发布 Release 做真实首跳烟测。以 `v0.2.1` 为例，必须从干净隔离环境中的正式 `v0.2.0` 启动，触发一键更新并证明 updater 下载的正是 Release 中的 `codex-switch.exe`，随后完成退出、替换、重启并显示 `v0.2.1`；同时复核中转站配置、会话数据和其他用户状态未被破坏。tag-CI、Release 回下载或真实 `v0.2.0 -> v0.2.1` 首跳任一未完成，都不得宣称发布闭环完成。
+8. 自动更新必须使用已发布 Release 做真实首跳烟测。以 `v0.2.1` 为例，必须从干净隔离环境中的正式 `v0.2.0` 启动，触发一键更新并证明 updater 下载的正是 Release 中的 `codex-switch.exe`，随后完成退出、替换、重启并显示 `v0.2.1`；同时复核中转站配置、会话数据和其他用户状态未被破坏。v0.3 还必须用同一路径覆盖替换锁失败后的自动回滚、旧 EXE 可重新启动以及零 helper/staging 残留。tag-CI、Release 回下载、真实首跳或回滚任一未完成，都不得宣称发布闭环完成。
+
+9. Release 型 Trellis 任务只能在上述公开入口证据全部绑定到精确发布 commit 后收口，固定顺序为：
+
+   ```text
+   final check.md PASS
+   -> commit / push
+   -> tag / tag-CI / public Release / public asset re-download
+   -> updater success + rollback evidence
+   -> task.py finish
+   -> task.py archive <task> --no-commit
+   -> schema v2 completion receipt
+   ```
+
+   `check.md` PASS 是发布动作的前置质量门，不等于任务已归档。`finish`、`archive` 和 completion v2 不得出现在 public/updater evidence 之前；最终 receipt 必须记录真实 Git、tag、Release、公开回下载和 updater 事实，不能用 pending/计划值冒充完成证据。
 
 Release 文案必须说明用户可见变化、风险/兼容性和本次验证命令，不得用空泛“更新 release”替代。
 
@@ -234,4 +258,5 @@ Release 文案必须说明用户可见变化、风险/兼容性和本次验证�
 7. 是否创建或更新 Release；Release tag、链接和资产名称是什么。
 8. 运行过哪些测试或检查；如果没跑，要明确说明。
 9. 是否已经合并；如果已合并，要说明合并目标、PR 状态和合并提交。
-10. 未完成项、阻塞或风险。
+10. Release 型任务是否按 `check PASS -> commit/push/tag/public/updater evidence -> finish/archive/completion v2` 收口。
+11. 未完成项、阻塞或风险。

@@ -1,11 +1,15 @@
 [package]
 name = "codex-switch"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
 name = "codex_switch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+runtime-evidence = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -13,10 +17,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6"] }
 toml_edit = "0.23"
 rusqlite = { version = "0.37", features = ["backup", "bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 sha2 = "0.10"
 walkdir = "2"
 base64 = "0.22"

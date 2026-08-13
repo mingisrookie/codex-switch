@@ -216,6 +216,7 @@ pub fn plan_runtime_config_patch(
                     format!("relay runtime config is missing model_providers.{provider}")
                 })?;
             let target_table = provider_table_mut(&mut live, provider)?;
+            let previous_table = target_table.to_string();
             target_table.clear();
             for (key, item) in source_table.iter() {
                 if matches!(
@@ -229,7 +230,9 @@ pub fn plan_runtime_config_patch(
             target_table["experimental_bearer_token"] = value(relay_bearer_token);
             target_table["requires_openai_auth"] = value(true);
             target_table["supports_websockets"] = value(true);
-            changed_keys.push(format!("model_providers.{provider}"));
+            if target_table.to_string() != previous_table {
+                changed_keys.push(format!("model_providers.{provider}"));
+            }
         }
     }
 
@@ -424,6 +427,39 @@ supports_websockets = false
         assert!(plan.patched_toml.contains("requires_openai_auth = true"));
         assert!(plan.patched_toml.contains("supports_websockets = true"));
         assert!(!plan.patched_toml.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn relay_runtime_patch_is_idempotent_after_the_managed_table_is_published() {
+        let live = "model = \"account\"\n";
+        let stored_relay = r#"
+model = "relay-model"
+model_provider = "openai_custom"
+
+[model_providers.openai_custom]
+name = "openai_custom"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+"#;
+        let first = plan_runtime_config_patch(
+            live,
+            stored_relay,
+            RuntimeConfigKind::Relay,
+            Some("sk-relay-secret"),
+        )
+        .unwrap();
+        assert!(!first.changed_keys.is_empty());
+
+        let second = plan_runtime_config_patch(
+            &first.patched_toml,
+            stored_relay,
+            RuntimeConfigKind::Relay,
+            Some("sk-relay-secret"),
+        )
+        .unwrap();
+
+        assert!(second.changed_keys.is_empty());
+        assert_eq!(second.patched_toml, first.patched_toml);
     }
 
     #[test]

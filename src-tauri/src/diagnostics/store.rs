@@ -14,7 +14,7 @@ use super::{
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 512 * 1024;
 

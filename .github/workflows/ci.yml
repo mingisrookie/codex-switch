@@ -40,6 +40,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Verify release harness safety contracts
+        run: node --test scripts/v030-release-harness.test.mjs
+
       - name: Check Rust formatting
         working-directory: src-tauri
         run: cargo fmt --check
@@ -50,7 +53,19 @@ jobs:
 
       - name: Run Rust tests
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked --all-targets --features runtime-evidence
+
+      - name: Verify v0.2.7 saved runtime slot apply on isolated runner
+        shell: pwsh
+        run: node scripts/v030-old-saved-slot-ci.mjs (Join-Path $env:RUNNER_TEMP 'v030-old-saved-slot')
+
+      - name: Upload old saved-slot apply evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v030-old-saved-slot-apply-${{ github.sha }}
+          path: ${{ runner.temp }}/v030-old-saved-slot/evidence/old-saved-slot-apply.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Build portable release executable
         run: npm run tauri -- build
