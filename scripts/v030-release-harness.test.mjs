@@ -219,6 +219,15 @@ test("old saved-slot apply gate refuses every non-GitHub-hosted invocation", () 
   assert.equal(fs.existsSync(runRoot), false);
 });
 
+test("old saved-slot CI gate binds an exact dev-only native Codex runtime", () => {
+  const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  assert.equal(packageJson.devDependencies?.["@openai/codex"], "0.147.0");
+  const source = fs.readFileSync("scripts/v030-old-saved-slot-ci.mjs", "utf8");
+  assert.match(source, /codex-win32-x64/);
+  assert.match(source, /CODEX_SWITCH_CODEX_RUNTIME_EXE: pinnedCodexRuntime/);
+  assert.match(source, /\^codex-cli 0\\\.147\\\.0/);
+});
+
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));

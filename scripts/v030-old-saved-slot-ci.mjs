@@ -28,6 +28,11 @@ import {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageName = "codex-switch-downgrade-0-2-7-downgrade-runtime-v0-2-7";
+const pinnedCodexRuntime = path.join(
+  repoRoot,
+  "node_modules", "@openai", "codex-win32-x64", "vendor",
+  "x86_64-pc-windows-msvc", "bin", "codex.exe",
+);
 
 async function freePort() {
   return await new Promise((resolve, reject) => {
@@ -49,6 +54,16 @@ async function assertNoCodexDesktopProcess() {
 }
 
 async function generateFixture(runRoot) {
+  if (!fs.statSync(pinnedCodexRuntime, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error("the pinned Windows Codex runtime dependency is unavailable");
+  }
+  const runtimeVersion = await runCommand(pinnedCodexRuntime, ["--version"], {
+    cwd: repoRoot,
+    timeoutMs: 30_000,
+  });
+  if (!/^codex-cli 0\.147\.0\s*$/.test(runtimeVersion.stdout)) {
+    throw new Error("the pinned Windows Codex runtime version is invalid");
+  }
   await runCommand("cargo", [
     "test", "--locked", "--manifest-path", "src-tauri/Cargo.toml",
     "--test", "downgrade_old_runtime_contract",
@@ -59,6 +74,7 @@ async function generateFixture(runRoot) {
       ...process.env,
       CODEX_SWITCH_DOWNGRADE_FIXTURE_ROOT: runRoot,
       CODEX_SWITCH_DOWNGRADE_FIXTURE_PATCH: "7",
+      CODEX_SWITCH_CODEX_RUNTIME_EXE: pinnedCodexRuntime,
     },
     timeoutMs: 20 * 60_000,
   });
