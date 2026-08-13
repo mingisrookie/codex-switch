@@ -118,7 +118,7 @@ async function main() {
   });
   const download = await downloadBoundAsset(release, executable);
   const workspace = requireInside(packageDir, path.join(packageDir, "workspace"), "workspace");
-  fs.mkdirSync(workspace);
+  fs.mkdirSync(workspace, { recursive: true });
   const liveConfigPath = path.join(codexHome, "config.toml");
   const packageSqlite = codexHome.replaceAll("\\", "\\\\");
   fs.writeFileSync(liveConfigPath, [
