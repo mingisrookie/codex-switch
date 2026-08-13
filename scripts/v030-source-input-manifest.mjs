@@ -53,6 +53,7 @@ function sha256File(file) {
 
 function regularFilesUnder(relativeRoot) {
   const files = [];
+  if (!fs.existsSync(path.resolve(repoRoot, relativeRoot))) return files;
   const visit = (relativeDirectory) => {
     const absoluteDirectory = path.resolve(repoRoot, relativeDirectory);
     for (const entry of fs.readdirSync(absoluteDirectory, { withFileTypes: true })) {

@@ -64,7 +64,14 @@ test("argument parsing fails closed and normalizes new absolute roots", () => {
     assert.throws(() => parseOldRuntimeOptions(["--run-root", oldRoot]), /must not already exist/);
   });
   const ignoredRoot = path.resolve("target", `v030-harness-ignored-${process.pid}`);
-  assert.equal(parseUpdaterOptions(["--run-root", ignoredRoot, "--dry-run"]).runRoot, ignoredRoot);
+  const ignoredParent = path.dirname(ignoredRoot);
+  const ignoredParentExisted = fs.existsSync(ignoredParent);
+  fs.mkdirSync(ignoredParent, { recursive: true });
+  try {
+    assert.equal(parseUpdaterOptions(["--run-root", ignoredRoot, "--dry-run"]).runRoot, ignoredRoot);
+  } finally {
+    if (!ignoredParentExisted) fs.rmdirSync(ignoredParent);
+  }
   const unignoredRoot = path.resolve(`v030-harness-unignored-${process.pid}`);
   assert.throws(() => parseUpdaterOptions(["--run-root", unignoredRoot, "--dry-run"]), /not ignored/);
 });
@@ -223,7 +230,10 @@ test("source-input manifest covers release inputs and excludes generated artifac
   assert.equal(names.has("public/favicon.ico"), true);
   assert.equal(names.has("rust-toolchain.toml"), true);
   assert.equal(names.has("src/App.tsx"), true);
-  assert.equal(names.has(".trellis/spec/backend/database-guidelines.md"), true);
+  assert.equal(
+    names.has(".trellis/spec/backend/database-guidelines.md"),
+    fs.existsSync(path.resolve(".trellis/spec")),
+  );
   assert.equal(names.has("docs/USER_GUIDE.md"), true);
   assert.equal(names.has("docs/SECURITY.md"), true);
   assert.equal([...names].some((name) => name.startsWith("src-tauri/target/")), false);
