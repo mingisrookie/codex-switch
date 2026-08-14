@@ -511,6 +511,7 @@ fn patch_runtime_state_db(
         return Err("isolated Codex threads schema is incompatible".to_string());
     }
     let has_source = columns.iter().any(|column| column == "source");
+    let has_cwd = columns.iter().any(|column| column == "cwd");
     let rows = {
         let query = if has_source {
             "SELECT id, rollout_path, source FROM threads"
@@ -627,8 +628,21 @@ fn patch_runtime_state_db(
                 });
             }
         }
-        let updated = transaction
-            .execute(
+        let updated = if has_cwd {
+            transaction.execute(
+                "UPDATE threads SET rollout_path = ?1, model_provider = ?2, cwd = ?3 WHERE id = ?4",
+                (
+                    restored_path.to_string_lossy().to_string(),
+                    PROBE_PROVIDER,
+                    isolated_root
+                        .join("workspace")
+                        .to_string_lossy()
+                        .to_string(),
+                    &thread_id,
+                ),
+            )
+        } else {
+            transaction.execute(
                 "UPDATE threads SET rollout_path = ?1, model_provider = ?2 WHERE id = ?3",
                 (
                     restored_path.to_string_lossy().to_string(),
@@ -636,7 +650,8 @@ fn patch_runtime_state_db(
                     &thread_id,
                 ),
             )
-            .map_err(|_| "failed to patch isolated Codex thread view".to_string())?;
+        }
+        .map_err(|_| "failed to patch isolated Codex thread view".to_string())?;
         if updated != 1 {
             return Err("isolated Codex thread view changed during patching".to_string());
         }
@@ -656,6 +671,7 @@ fn patch_runtime_state_db(
             "isolated Codex session payload is not bound to the complete runtime view".to_string(),
         );
     }
+    sanitize_isolated_thread_metadata(&transaction, &columns, isolated_root)?;
     let (mut category_samples, capability_conflict_proof) = install_runtime_capability_fixture(
         &transaction,
         isolated_root,
@@ -687,6 +703,49 @@ fn patch_runtime_state_db(
     ))
 }
 
+/// The source database is copied only for an isolated native-runtime probe. Its
+/// thread index can contain stale UI metadata (including user text, external
+/// working directories, or an older CLI schema) that the native app-server
+/// tries to hydrate during `initialize`. Keep the restored JSONL untouched for
+/// semantic verification, but replace optional index metadata with deterministic
+/// probe-safe values before adding the capability fixture. This also guarantees
+/// that a real user message or credential-like preview never enters the runtime
+/// probe database or its evidence path.
+fn sanitize_isolated_thread_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    columns: &[String],
+    isolated_root: &Path,
+) -> Result<(), String> {
+    let metadata = [
+        ("source", "cli".to_string()),
+        ("model_provider", PROBE_PROVIDER.to_string()),
+        (
+            "cwd",
+            isolated_root
+                .join("workspace")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        ("title", "isolated runtime probe".to_string()),
+        ("first_user_message", "isolated runtime probe".to_string()),
+        ("preview", "isolated runtime probe".to_string()),
+        ("cli_version", "0.3.0".to_string()),
+        ("model", PROBE_MODEL.to_string()),
+        ("reasoning_effort", "medium".to_string()),
+        ("thread_source", "user".to_string()),
+    ];
+    for (column, value) in metadata {
+        if !columns.iter().any(|candidate| candidate == column) {
+            continue;
+        }
+        let quoted = format!("\"{}\"", column.replace('"', "\"\""));
+        transaction
+            .execute(&format!("UPDATE threads SET {quoted} = ?1"), [value])
+            .map_err(|_| "failed to sanitize isolated Codex thread metadata".to_string())?;
+    }
+    Ok(())
+}
+
 fn install_runtime_capability_fixture(
     connection: &Connection,
     isolated_root: &Path,
@@ -694,7 +753,9 @@ fn install_runtime_capability_fixture(
     thread_columns: &[String],
     template_thread_id: &str,
 ) -> Result<(Vec<RuntimeSample>, MigrationRuntimeCapabilityConflictProof), String> {
-    let fixture_root = isolated_root.join("runtime-capability-fixture");
+    // Keep generated capability payload paths short enough for the native
+    // Windows runtime even when the caller's isolated root is deeply nested.
+    let fixture_root = isolated_root.join("f");
     fs::create_dir(&fixture_root)
         .map_err(|_| "failed to create isolated runtime capability fixture".to_string())?;
     let mut reserved = existing_thread_ids.clone();

@@ -756,7 +756,17 @@ pub fn verify_applied_migration_with_runtime<V: MigrationBackupRuntimeVerifier>(
         );
     }
 
-    let validation_root = plan.staging_root.join("post-apply-runtime-validation");
+    // Keep the native validation tree outside the operation/evidence root. The
+    // latter can be deeply nested under an evidence workspace, and Windows
+    // SQLite resolves `sqlite_home` against the full path before initialize;
+    // shortening only the final component is not enough to stay below
+    // MAX_PATH. The temp root is still test-owned, link-checked, and removed
+    // by the same cleanup guard below.
+    let validation_root = std::env::temp_dir().join(format!(
+        "codex-switch-v030-runtime-{}-{}",
+        std::process::id(),
+        timestamp_millis()?
+    ));
     if validation_root.exists() {
         return Err("post-apply runtime validation staging already exists".to_string());
     }
@@ -830,10 +840,17 @@ pub fn verify_applied_migration_with_runtime<V: MigrationBackupRuntimeVerifier>(
         }
         Ok(runtime)
     })();
-    if result.is_err() {
-        let _ = remove_owned_staging_tree(&validation_root);
+    let cleanup_result = remove_owned_staging_tree(&validation_root);
+    match (result, cleanup_result) {
+        (Ok(runtime), Ok(())) => Ok(runtime),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(format!(
+            "post-apply runtime validation cleanup failed: {cleanup}"
+        )),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{error}; post-apply runtime validation cleanup failed: {cleanup}"
+        )),
     }
-    result
 }
 
 pub fn rollback_migration_plan<Guard>(

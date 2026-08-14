@@ -1379,6 +1379,9 @@ fn rewrite_fixture_references(
                 .filter_map(Result::ok)
                 .collect::<Vec<_>>()
         };
+        let has_spawn_edges = connection
+            .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges LIMIT 0")
+            .is_ok();
         let transaction = connection.transaction().unwrap();
         for (thread_id, source_path) in rows {
             if let Some(target) = copied_sessions.get(&PathBuf::from(source_path)) {
@@ -1396,6 +1399,28 @@ fn rewrite_fixture_references(
                 );
             }
         }
+        if has_spawn_edges {
+            transaction
+                .execute(
+                    "DELETE FROM thread_spawn_edges
+                     WHERE parent_thread_id NOT IN (SELECT id FROM threads)
+                        OR child_thread_id NOT IN (SELECT id FROM threads)",
+                    [],
+                )
+                .unwrap();
+        }
+        // The sampled real database can contain subagent rows whose parent
+        // lives outside the bounded fixture. Once those orphan edges are
+        // removed, keep the remaining rows as ordinary CLI records; the
+        // native capability fixture below supplies the independent subagent
+        // category without leaving an invalid parent reference in the DB.
+        transaction
+            .execute(
+                "UPDATE threads SET source = 'cli'
+                 WHERE lower(COALESCE(source, '')) LIKE '%subagent%'",
+                [],
+            )
+            .unwrap();
         transaction.commit().unwrap();
         let quick_check: String = connection
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
