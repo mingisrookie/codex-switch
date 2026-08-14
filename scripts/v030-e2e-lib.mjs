@@ -570,11 +570,11 @@ export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resol
 // explanation of a failed start. Every launch is observed instead: child output is
 // streamed to the run-owned log directory and lifecycle events are recorded so a
 // readiness timeout can report why the process never served CDP.
-export function spawnObservedProduct(executable, { cwd, env, logDirectory, label }) {
+export function spawnObservedProduct(executable, { cwd, env, logDirectory, label, args = [] }) {
   fs.mkdirSync(logDirectory, { recursive: true });
   const stdoutPath = path.join(logDirectory, `${label}-stdout.log`);
   const stderrPath = path.join(logDirectory, `${label}-stderr.log`);
-  const child = spawn(executable, [], {
+  const child = spawn(executable, args, {
     cwd,
     env,
     windowsHide: true,

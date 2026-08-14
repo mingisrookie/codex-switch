@@ -251,6 +251,17 @@ test("CDP target discovery tries every local loopback address family", () => {
   assert.match(source, /\[::1\]/);
 });
 
+test("the old saved-slot gate injects debugging switches through both WebView2 channels", () => {
+  const source = fs.readFileSync("scripts/v030-old-saved-slot-ci.mjs", "utf8");
+  // The environment variable alone is not enough: hosted runners receive it and
+  // decline to act on it, so the host command line channel must be present too.
+  assert.match(source, /WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: debuggingSwitches/);
+  assert.match(source, /--edge-webview-switches=\$\{debuggingSwitches\}/);
+  assert.match(source, /WEBVIEW2_USER_DATA_FOLDER: webViewProfile/);
+  const lib = fs.readFileSync("scripts/v030-e2e-lib.mjs", "utf8");
+  assert.match(lib, /export async function probeChildEnvironment/);
+});
+
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));

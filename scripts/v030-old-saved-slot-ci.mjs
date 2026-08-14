@@ -104,7 +104,7 @@ async function verifyDatabaseContainment(database, codexHome) {
   return count;
 }
 
-async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspace, environment, port, logDirectory) {
+async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspace, environment, port, logDirectory, args) {
   const localState = path.join(webViewProfile, "EBWebView", "Local State");
   if (fs.existsSync(localState)) return false;
   const observed = spawnObservedProduct(executable, {
@@ -112,6 +112,7 @@ async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspac
     env: environment,
     logDirectory,
     label: "prime",
+    args,
   });
   const child = observed.child;
   let primaryError;
@@ -200,11 +201,18 @@ async function main() {
   // same way, so CDP silently never came up on hosted runners.
   const webViewProfile = requireInside(packageDir, path.join(packageDir, "webview2-profile"), "WebView2 profile");
   fs.mkdirSync(webViewProfile, { recursive: true });
+  const debuggingSwitches = `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`;
+  // Two independent channels carry the same switches. Hosted runners do receive
+  // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS intact and still decline to act on it,
+  // leaving the browser with no debugging port. The host command line channel is
+  // honoured there and is documented to be processed last, so the duplicate is
+  // harmless where both are read.
+  const browserSwitchArguments = [`--edge-webview-switches=${debuggingSwitches}`];
   const environment = isolatedEnvironment(packageDir, {
     CODEX_HOME: codexHome,
     CODEX_SQLITE_HOME: codexHome,
     WEBVIEW2_USER_DATA_FOLDER: webViewProfile,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: debuggingSwitches,
   }, false);
   const logDirectory = requireInside(runRoot, path.join(runRoot, "evidence", "logs"), "launch log directory");
   const environmentProbe = await probeChildEnvironment(environment, [
@@ -223,12 +231,14 @@ async function main() {
     environment,
     port,
     logDirectory,
+    browserSwitchArguments,
   );
   const observed = spawnObservedProduct(executable, {
     cwd: workspace,
     env: environment,
     logDirectory,
     label: "apply",
+    args: browserSwitchArguments,
   });
   const child = observed.child;
   let cdp;
