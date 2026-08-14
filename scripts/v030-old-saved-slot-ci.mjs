@@ -96,6 +96,40 @@ async function verifyDatabaseContainment(database, codexHome) {
   return count;
 }
 
+async function primeOldSwitchWebViewProfile(packageDir, executable, workspace, environment, port) {
+  const localState = path.join(packageDir, "codex-switch.exe.WebView2", "EBWebView", "Local State");
+  if (fs.existsSync(localState)) return false;
+  const child = spawn(executable, [], {
+    cwd: workspace,
+    env: environment,
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  let primaryError;
+  try {
+    const deadline = Date.now() + 180_000;
+    while (!fs.existsSync(localState) && Date.now() < deadline) await sleep(250);
+    if (!fs.existsSync(localState)) throw new Error("WebView2 profile bootstrap did not create Local State");
+    await sleep(2_000);
+    await closeMainWindowExact(child.pid, executable);
+    await waitForNoExecutableProcess(executable, 90_000);
+    await waitForDebugPortClosed(port, 30_000);
+    return true;
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (await processRowsForExecutable(executable).then((rows) => rows.length > 0).catch(() => false)) {
+      try {
+        await closeMainWindowExact(child.pid, executable);
+        await waitForNoExecutableProcess(executable, 90_000);
+      } catch (cleanupError) {
+        if (!primaryError) throw cleanupError;
+      }
+    }
+  }
+}
+
 async function main() {
   if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true" || process.env.CI !== "true") {
     throw new Error("the old saved-slot apply gate may run only on an isolated GitHub Actions Windows runner");
@@ -140,6 +174,13 @@ async function main() {
     CODEX_SQLITE_HOME: codexHome,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
+  const webViewProfilePrimed = await primeOldSwitchWebViewProfile(
+    packageDir,
+    executable,
+    workspace,
+    environment,
+    port,
+  );
   const child = spawn(executable, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
   let cdp;
   let closed = false;
@@ -190,6 +231,7 @@ async function main() {
       runner: "github-actions-windows",
       oldSwitch: { version: "v0.2.7", bytes: download.bytes, sha256: download.sha256, tagCommit: release.tagCommit },
       savedPlusSlot: { sanitizedBeforeApply: true, configSha256: sha256File(savedConfigPath) },
+      webViewProfilePrimed,
       apply: { uiAction: "switch-to-account", liveConfigChanged: true, sqliteHomeAbsentAfterApply: true, runtimeReadback: "plus" },
       database: { threadCount: databaseThreadCount, rolloutPathsContainedInPackage: true },
       safety: { codexDesktopAbsentBeforeApply: true, exactOldSwitchExited: true, debugPortClosed: true },
