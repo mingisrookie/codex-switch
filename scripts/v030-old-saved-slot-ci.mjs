@@ -149,17 +149,18 @@ async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspac
   }
 }
 
-// Reads the product's own diagnostics stream for the terminal reason a switch
-// failed, which is far more specific than any observation available from outside.
-function readTerminalFailure(packageDir) {
+// Reads the product's own diagnostics stream. The terminal failure alone is not
+// always present: an apply that never starts records no failure at all, so the
+// recent event stream is returned with it.
+function readProductEvents(packageDir) {
   const directory = path.join(packageDir, "appdata", "codex-switch", "logs", "diagnostics");
-  let files;
+  const events = [];
+  let files = [];
   try {
     files = fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"));
   } catch {
-    return undefined;
+    return { directoryPresent: false, files: [], events: [], terminalFailure: undefined };
   }
-  let latest;
   for (const name of files) {
     let lines;
     try {
@@ -169,22 +170,38 @@ function readTerminalFailure(packageDir) {
     }
     for (const line of lines) {
       if (!line.trim()) continue;
-      let event;
       try {
-        event = JSON.parse(line);
+        events.push(JSON.parse(line));
       } catch {
         continue;
       }
-      if (event.eventKind !== "operationTerminal" || event.terminalStatus !== "failed") continue;
-      if (!latest || Number(event.timestamp) >= Number(latest.timestamp)) latest = event;
     }
   }
-  if (!latest) return undefined;
+  events.sort((left, right) => Number(left.timestamp ?? 0) - Number(right.timestamp ?? 0));
+  const terminal = events.filter((event) => event.eventKind === "operationTerminal" && event.terminalStatus === "failed").pop();
   return {
-    errorCode: String(latest.errorCode ?? "unknown"),
-    safeMessage: String(latest.safeMessage ?? ""),
-    action: String(latest.action ?? ""),
+    directoryPresent: true,
+    files,
+    events: events.slice(-16).map((event) => ({
+      kind: event.eventKind,
+      component: event.component,
+      action: event.action,
+      phase: event.phase,
+      level: event.level,
+      terminalStatus: event.terminalStatus,
+      errorCode: event.errorCode,
+      safeMessage: event.safeMessage,
+    })),
+    terminalFailure: terminal && {
+      errorCode: String(terminal.errorCode ?? "unknown"),
+      safeMessage: String(terminal.safeMessage ?? ""),
+      action: String(terminal.action ?? ""),
+    },
   };
+}
+
+function readTerminalFailure(packageDir) {
+  return readProductEvents(packageDir).terminalFailure;
 }
 
 async function main() {
@@ -311,11 +328,14 @@ async function main() {
       await sleep(250);
     }
     if (sha256File(liveConfigPath) === liveBeforeSha256 || /\bsqlite_home\s*=/.test(liveAfter)) {
-      const refusal = readTerminalFailure(packageDir);
+      const product = readProductEvents(packageDir);
+      const page = await cdp.evaluate(
+        `(()=>({text:(document.body?.innerText??'').slice(0,1500),buttons:Array.from(document.querySelectorAll('button')).map(node=>({label:node.textContent?.trim()?.slice(0,60),disabled:node.disabled})).slice(0,24)}))()`,
+      ).catch((error) => ({ error: String(error?.message ?? error) }));
       throw new Error(
-        refusal
-          ? `v0.2.7 refused the saved Plus slot apply: ${refusal.errorCode}: ${refusal.safeMessage}`
-          : "v0.2.7 did not apply the sanitized saved Plus slot",
+        `${product.terminalFailure
+          ? `v0.2.7 refused the saved Plus slot apply: ${product.terminalFailure.errorCode}: ${product.terminalFailure.safeMessage}`
+          : "v0.2.7 did not apply the sanitized saved Plus slot"}\n${JSON.stringify({ product, page }, null, 2)}`,
       );
     }
     const originalCanonicalRoot = path.join(runRoot, "input", "canonical");
