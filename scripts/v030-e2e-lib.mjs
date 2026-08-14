@@ -552,16 +552,23 @@ export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resol
 export async function waitForTauriTarget(port, predicate = undefined, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
+  const endpoints = [
+    `http://127.0.0.1:${port}/json/list`,
+    `http://localhost:${port}/json/list`,
+    `http://[::1]:${port}/json/list`,
+  ];
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) });
-      const targets = await response.json();
-      for (const target of targets) {
-        if (target.type !== "page" || target.url !== "http://tauri.localhost/" || !target.webSocketDebuggerUrl) continue;
-        if (!predicate || await predicate(target)) return target;
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, { signal: AbortSignal.timeout(1000) });
+        const targets = await response.json();
+        for (const target of targets) {
+          if (target.type !== "page" || target.url !== "http://tauri.localhost/" || !target.webSocketDebuggerUrl) continue;
+          if (!predicate || await predicate(target)) return target;
+        }
+      } catch (error) {
+        lastError = String(error);
       }
-    } catch (error) {
-      lastError = String(error);
     }
     await sleep(250);
   }
@@ -570,12 +577,23 @@ export async function waitForTauriTarget(port, predicate = undefined, timeoutMs 
 
 export async function waitForDebugPortClosed(port, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
+  const endpoints = [
+    `http://127.0.0.1:${port}/json/list`,
+    `http://localhost:${port}/json/list`,
+    `http://[::1]:${port}/json/list`,
+  ];
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(500) });
-      const targets = await response.json();
-      if (!targets.some((target) => target.type === "page" && target.url === "http://tauri.localhost/")) return;
-    } catch {
+    let observed = false;
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, { signal: AbortSignal.timeout(500) });
+        const targets = await response.json();
+        observed ||= targets.some((target) => target.type === "page" && target.url === "http://tauri.localhost/");
+      } catch {
+        // A closed listener on any loopback family is the desired terminal state.
+      }
+    }
+    if (!observed) {
       return;
     }
     await sleep(200);

@@ -230,6 +230,13 @@ test("old saved-slot CI gate binds an exact dev-only native Codex runtime", () =
   assert.match(source, /waitForTauriTarget\(port, undefined, 300_000\)/);
 });
 
+test("CDP target discovery tries every local loopback address family", () => {
+  const source = fs.readFileSync("scripts/v030-e2e-lib.mjs", "utf8");
+  assert.match(source, /127\.0\.0\.1/);
+  assert.match(source, /localhost/);
+  assert.match(source, /\[::1\]/);
+});
+
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));
