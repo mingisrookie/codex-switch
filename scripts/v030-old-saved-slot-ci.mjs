@@ -103,8 +103,8 @@ async function verifyDatabaseContainment(database, codexHome) {
   return count;
 }
 
-async function primeOldSwitchWebViewProfile(packageDir, executable, workspace, environment, port, logDirectory) {
-  const localState = path.join(packageDir, "codex-switch.exe.WebView2", "EBWebView", "Local State");
+async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspace, environment, port, logDirectory) {
+  const localState = path.join(webViewProfile, "EBWebView", "Local State");
   if (fs.existsSync(localState)) return false;
   const observed = spawnObservedProduct(executable, {
     cwd: workspace,
@@ -193,14 +193,21 @@ async function main() {
   ].join("\n"));
   const liveBeforeSha256 = sha256File(liveConfigPath);
   const port = await freePort();
+  // Pin the WebView2 profile. Left to its default the runtime picks either the
+  // app-identifier folder or an executable-adjacent fallback depending on the
+  // host, and the two paths do not honour the additional browser arguments the
+  // same way, so CDP silently never came up on hosted runners.
+  const webViewProfile = requireInside(packageDir, path.join(packageDir, "webview2-profile"), "WebView2 profile");
+  fs.mkdirSync(webViewProfile, { recursive: true });
   const environment = isolatedEnvironment(packageDir, {
     CODEX_HOME: codexHome,
     CODEX_SQLITE_HOME: codexHome,
+    WEBVIEW2_USER_DATA_FOLDER: webViewProfile,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
   const logDirectory = requireInside(runRoot, path.join(runRoot, "evidence", "logs"), "launch log directory");
   const webViewProfilePrimed = await primeOldSwitchWebViewProfile(
-    packageDir,
+    webViewProfile,
     executable,
     workspace,
     environment,
