@@ -14,6 +14,7 @@ import {
   invokeExpression,
   isolatedEnvironment,
   processRowsForExecutable,
+  probeChildEnvironment,
   requireInside,
   requireNewRoot,
   resolvePublicRelease,
@@ -206,6 +207,15 @@ async function main() {
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
   const logDirectory = requireInside(runRoot, path.join(runRoot, "evidence", "logs"), "launch log directory");
+  const environmentProbe = await probeChildEnvironment(environment, [
+    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    "WEBVIEW2_USER_DATA_FOLDER",
+  ]);
+  process.stdout.write(`ENVIRONMENT_REACHING_CHILD=${JSON.stringify(environmentProbe)}
+`);
+  if (!environmentProbe.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS) {
+    throw new Error("the WebView2 debugging arguments did not survive into a child process environment");
+  }
   const webViewProfilePrimed = await primeOldSwitchWebViewProfile(
     webViewProfile,
     executable,

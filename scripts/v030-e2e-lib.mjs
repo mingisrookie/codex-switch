@@ -547,6 +547,23 @@ export class CdpClient {
   }
 }
 
+// Distinguishes "the variable never reached the child" from "the runtime ignored
+// it". Without this the two look identical from outside: no debug port either way.
+export async function probeChildEnvironment(environment, names) {
+  const result = await runCommand(environment.ComSpec ?? "cmd.exe", ["/d", "/c", "set"], {
+    env: environment,
+    timeoutMs: 20_000,
+  });
+  const lines = result.stdout.split(/\r?\n/);
+  const observed = {};
+  for (const name of names) {
+    const prefix = `${name.toUpperCase()}=`;
+    const line = lines.find((candidate) => candidate.toUpperCase().startsWith(prefix));
+    observed[name] = line === undefined ? null : line.slice(name.length + 1);
+  }
+  return observed;
+}
+
 export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 // Launching the product with discarded stdio throws away the only first-party
