@@ -227,6 +227,7 @@ test("old saved-slot CI gate binds an exact dev-only native Codex runtime", () =
   assert.match(source, /CODEX_SWITCH_CODEX_RUNTIME_EXE: pinnedCodexRuntime/);
   assert.match(source, /\^codex-cli 0\\\.147\\\.0/);
   assert.match(source, /mkdirSync\(workspace, \{ recursive: true \}\)/);
+  assert.match(source, /waitForTauriTarget\(port, undefined, 300_000\)/);
 });
 
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {

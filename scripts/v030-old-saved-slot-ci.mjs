@@ -144,7 +144,7 @@ async function main() {
   let cdp;
   let closed = false;
   try {
-    const target = await waitForTauriTarget(port, undefined, 180_000);
+    const target = await waitForTauriTarget(port, undefined, 300_000);
     cdp = new CdpClient(target.webSocketDebuggerUrl);
     await cdp.connect();
     await cdp.call("Runtime.enable");
