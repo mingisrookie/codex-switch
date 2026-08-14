@@ -624,8 +624,12 @@ export async function captureLaunchDiagnostics(port, executable, observed) {
     "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
     "$port=[int]$env:V030_DEBUG_PORT",
     "$listeners=@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue|ForEach-Object{[ordered]@{address=$_.LocalAddress;owner=$_.OwningProcess}})",
-    "$webview=@(Get-Process -Name 'msedgewebview2' -ErrorAction SilentlyContinue|ForEach-Object{[ordered]@{pid=$_.Id}})",
-    "[ordered]@{listeners=$listeners;webview2=$webview}|ConvertTo-Json -Compress -Depth 4",
+    // The browser command line settles whether the debugging switches ever reached
+    // WebView2, which no amount of timeout tuning can distinguish from a refusal.
+    "$webview=@(Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" -ErrorAction SilentlyContinue|ForEach-Object{[ordered]@{pid=$_.ProcessId;type=([regex]::Match($_.CommandLine,'--type=([^ ]+)').Groups[1].Value);remoteDebugging=($_.CommandLine -match '--remote-debugging-port');userDataDir=([regex]::Match($_.CommandLine,'--user-data-dir=\"?([^\"]*)\"?').Groups[1].Value)}})",
+    "$runtime=''",
+    "foreach($key in @('HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}','HKLM:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}')){if(-not $runtime -and (Test-Path $key)){$runtime=(Get-ItemProperty $key).pv}}",
+    "[ordered]@{webView2Runtime=$runtime;listeners=$listeners;webview2=$webview}|ConvertTo-Json -Compress -Depth 4",
   ].join(";");
   try {
     const result = await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
