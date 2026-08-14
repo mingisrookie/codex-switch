@@ -228,6 +228,7 @@ test("old saved-slot CI gate binds an exact dev-only native Codex runtime", () =
   assert.match(source, /\^codex-cli 0\\\.147\\\.0/);
   assert.match(source, /mkdirSync\(workspace, \{ recursive: true \}\)/);
   assert.match(source, /waitForTauriTarget\(port, undefined, 300_000\)/);
+  assert.match(source, /remote-debugging-address=127\.0\.0\.1/);
 });
 
 test("CDP target discovery tries every local loopback address family", () => {

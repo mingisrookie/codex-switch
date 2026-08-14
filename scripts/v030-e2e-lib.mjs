@@ -465,7 +465,7 @@ export function isolatedEnvironment(root, extra = {}, allowNetwork = false) {
     environment.HTTP_PROXY = "http://127.0.0.1:9";
     environment.HTTPS_PROXY = "http://127.0.0.1:9";
     environment.ALL_PROXY = "http://127.0.0.1:9";
-    environment.NO_PROXY = "127.0.0.1,localhost,tauri.localhost";
+    environment.NO_PROXY = "127.0.0.1,localhost,tauri.localhost,::1,[::1]";
   }
   const user = path.join(root, "user");
   const appdata = path.join(root, "appdata");

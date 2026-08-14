@@ -138,7 +138,7 @@ async function main() {
   const environment = isolatedEnvironment(packageDir, {
     CODEX_HOME: codexHome,
     CODEX_SQLITE_HOME: codexHome,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-allow-origins=*`,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
   const child = spawn(executable, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
   let cdp;

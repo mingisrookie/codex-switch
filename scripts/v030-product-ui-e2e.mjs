@@ -140,7 +140,7 @@ async function main() {
   const environment = isolatedEnvironment(parsed.runRoot, {
     CODEX_HOME: codexHome,
     CODEX_SQLITE_HOME: codexHome,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-allow-origins=*`,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
   await initializeNativeCodexState(parsed.codexExe ?? "codex.exe", codexHome, workspace, environment);
   fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture-token" } }));
