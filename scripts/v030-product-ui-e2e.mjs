@@ -17,6 +17,7 @@ import {
   requireInside,
   sha256File,
   sleep,
+  spawnObservedProduct,
   waitForDebugPortClosed,
   waitForNoExecutableProcess,
   waitForTauriTarget,
@@ -47,7 +48,8 @@ async function hasListener(port) {
 async function primeWebViewProfile(root, executable, workspace, environment, port) {
   const localState = path.join(root, "install", "codex-switch.exe.WebView2", "EBWebView", "Local State");
   if (fs.existsSync(localState)) return false;
-  const child = spawn(executable, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
+  const logDirectory = path.join(root, "evidence", "logs");
+  const child = spawnObservedProduct(executable, { cwd: workspace, env: environment, logDirectory, label: "prime" }).child;
   try {
     const deadline = Date.now() + 60_000;
     while (!fs.existsSync(localState) && Date.now() < deadline) await sleep(250);
@@ -146,12 +148,18 @@ async function main() {
   fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture-token" } }));
   fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
   const webViewProfilePrimed = await primeWebViewProfile(parsed.runRoot, executable, workspace, environment, port);
-  const child = spawn(executable, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
+  const observed = spawnObservedProduct(executable, {
+    cwd: workspace,
+    env: environment,
+    logDirectory: path.join(parsed.runRoot, "evidence", "logs"),
+    label: "product-ui",
+  });
+  const child = observed.child;
   let cdp;
   let exited = false;
   child.once("exit", () => { exited = true; });
   try {
-    const target = await waitForTauriTarget(port, undefined, 180_000);
+    const target = await waitForTauriTarget(port, undefined, 180_000, { observed, executable });
     cdp = new CdpClient(target.webSocketDebuggerUrl);
     await cdp.connect();
     const runtimeErrors = [];

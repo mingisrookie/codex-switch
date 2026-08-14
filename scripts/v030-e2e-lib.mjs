@@ -549,7 +549,98 @@ export class CdpClient {
 
 export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-export async function waitForTauriTarget(port, predicate = undefined, timeoutMs = 60_000) {
+// Launching the product with discarded stdio throws away the only first-party
+// explanation of a failed start. Every launch is observed instead: child output is
+// streamed to the run-owned log directory and lifecycle events are recorded so a
+// readiness timeout can report why the process never served CDP.
+export function spawnObservedProduct(executable, { cwd, env, logDirectory, label }) {
+  fs.mkdirSync(logDirectory, { recursive: true });
+  const stdoutPath = path.join(logDirectory, `${label}-stdout.log`);
+  const stderrPath = path.join(logDirectory, `${label}-stderr.log`);
+  const child = spawn(executable, [], {
+    cwd,
+    env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const state = {
+    label,
+    pid: child.pid ?? null,
+    exited: false,
+    exitCode: null,
+    exitSignal: null,
+    spawnError: null,
+    stdoutPath,
+    stderrPath,
+  };
+  child.stdout.pipe(fs.createWriteStream(stdoutPath));
+  child.stderr.pipe(fs.createWriteStream(stderrPath));
+  child.on("exit", (code, signal) => {
+    state.exited = true;
+    state.exitCode = code;
+    state.exitSignal = signal;
+  });
+  child.on("error", (error) => {
+    state.exited = true;
+    state.spawnError = String(error?.message ?? error);
+  });
+  return { child, state };
+}
+
+function tailFile(file, bytes = 4000) {
+  try {
+    const size = fs.statSync(file).size;
+    if (size === 0) return "";
+    const handle = fs.openSync(file, "r");
+    try {
+      const length = Math.min(size, bytes);
+      const buffer = Buffer.allocUnsafe(length);
+      fs.readSync(handle, buffer, 0, length, size - length);
+      return buffer.toString("utf8").trim();
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    return "";
+  }
+}
+
+// Answers the questions a bare "fetch failed" cannot: is the product still alive,
+// did a WebView2 host ever start, and is anything listening on the debug port.
+export async function captureLaunchDiagnostics(port, executable, observed) {
+  const diagnostics = {
+    port,
+    process: observed ? { ...observed.state } : null,
+    stdoutTail: observed ? tailFile(observed.state.stdoutPath) : "",
+    stderrTail: observed ? tailFile(observed.state.stderrPath) : "",
+  };
+  try {
+    diagnostics.productProcesses = await processRowsForExecutable(executable);
+  } catch (error) {
+    diagnostics.productProcesses = `unavailable: ${String(error?.message ?? error)}`;
+  }
+  const command = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+    "$port=[int]$env:V030_DEBUG_PORT",
+    "$listeners=@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue|ForEach-Object{[ordered]@{address=$_.LocalAddress;owner=$_.OwningProcess}})",
+    "$webview=@(Get-Process -Name 'msedgewebview2' -ErrorAction SilentlyContinue|ForEach-Object{[ordered]@{pid=$_.Id}})",
+    "[ordered]@{listeners=$listeners;webview2=$webview}|ConvertTo-Json -Compress -Depth 4",
+  ].join(";");
+  try {
+    const result = await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+      env: { ...process.env, V030_DEBUG_PORT: String(port) },
+      timeoutMs: 20_000,
+    });
+    diagnostics.host = JSON.parse(result.stdout.trim() || "{}");
+  } catch (error) {
+    diagnostics.host = `unavailable: ${String(error?.message ?? error)}`;
+  }
+  return diagnostics;
+}
+
+export async function waitForTauriTarget(port, predicate = undefined, timeoutMs = 60_000, options = {}) {
+  const { observed, executable } = options;
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
   const endpoints = [
@@ -557,7 +648,21 @@ export async function waitForTauriTarget(port, predicate = undefined, timeoutMs 
     `http://localhost:${port}/json/list`,
     `http://[::1]:${port}/json/list`,
   ];
+  const fail = async (reason) => {
+    const diagnostics = executable ? await captureLaunchDiagnostics(port, executable, observed) : { observed: observed?.state };
+    const error = new Error(`${reason}\n${JSON.stringify(diagnostics, null, 2)}`);
+    error.diagnostics = diagnostics;
+    throw error;
+  };
   while (Date.now() < deadline) {
+    // A dead child can never serve CDP; waiting out the full timeout only hides the cause.
+    if (observed?.state.exited) {
+      await fail(
+        observed.state.spawnError
+          ? `product failed to start: ${observed.state.spawnError}`
+          : `product exited before serving CDP (code=${observed.state.exitCode}, signal=${observed.state.exitSignal})`,
+      );
+    }
     for (const endpoint of endpoints) {
       try {
         const response = await fetch(endpoint, { signal: AbortSignal.timeout(1000) });
@@ -572,7 +677,7 @@ export async function waitForTauriTarget(port, predicate = undefined, timeoutMs 
     }
     await sleep(250);
   }
-  throw new Error(`WebView2 target did not become ready: ${lastError.slice(-300)}`);
+  await fail(`WebView2 target did not become ready: ${lastError.slice(-300)}`);
 }
 
 export async function waitForDebugPortClosed(port, timeoutMs = 30_000) {

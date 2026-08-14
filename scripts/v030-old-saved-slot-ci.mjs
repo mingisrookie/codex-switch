@@ -3,12 +3,12 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   CdpClient,
   V02_RELEASE_SHA256,
   assertEvidenceHasNoAbsoluteWindowsPath,
+  captureLaunchDiagnostics,
   closeMainWindowExact,
   downloadBoundAsset,
   invokeExpression,
@@ -20,6 +20,7 @@ import {
   runCommand,
   sha256File,
   sleep,
+  spawnObservedProduct,
   waitForDebugPortClosed,
   waitForNoExecutableProcess,
   waitForTauriTarget,
@@ -46,9 +47,15 @@ async function freePort() {
 }
 
 async function assertNoCodexDesktopProcess() {
+  // v0.2.7 refuses to switch while any standalone Codex CLI is alive, so the
+  // preflight must cover the CLI and its code-mode host too. Checking only the
+  // Desktop shell let the gate fail minutes later with an unrelated message.
   const command = [
-    "$rows=@(Get-Process -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue)",
-    "if($rows.Count -ne 0){throw 'OpenAI.Codex must be absent on the isolated CI runner'}",
+    "$ErrorActionPreference='Stop'",
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+    "$names=@('OpenAI.Codex','codex','codex-code-mode-host')",
+    "$rows=@(Get-Process -Name $names -ErrorAction SilentlyContinue|ForEach-Object{$_.ProcessName}|Sort-Object -Unique)",
+    "if($rows.Count -ne 0){throw \"close these processes before running the gate: $($rows -join ', ')\"}",
   ].join(";");
   await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command]);
 }
@@ -96,20 +103,30 @@ async function verifyDatabaseContainment(database, codexHome) {
   return count;
 }
 
-async function primeOldSwitchWebViewProfile(packageDir, executable, workspace, environment, port) {
+async function primeOldSwitchWebViewProfile(packageDir, executable, workspace, environment, port, logDirectory) {
   const localState = path.join(packageDir, "codex-switch.exe.WebView2", "EBWebView", "Local State");
   if (fs.existsSync(localState)) return false;
-  const child = spawn(executable, [], {
+  const observed = spawnObservedProduct(executable, {
     cwd: workspace,
     env: environment,
-    windowsHide: true,
-    stdio: "ignore",
+    logDirectory,
+    label: "prime",
   });
+  const child = observed.child;
   let primaryError;
   try {
     const deadline = Date.now() + 180_000;
-    while (!fs.existsSync(localState) && Date.now() < deadline) await sleep(250);
-    if (!fs.existsSync(localState)) throw new Error("WebView2 profile bootstrap did not create Local State");
+    while (!fs.existsSync(localState) && Date.now() < deadline) {
+      if (observed.state.exited) {
+        const diagnostics = await captureLaunchDiagnostics(port, executable, observed);
+        throw new Error(`WebView2 profile bootstrap process exited early\n${JSON.stringify(diagnostics, null, 2)}`);
+      }
+      await sleep(250);
+    }
+    if (!fs.existsSync(localState)) {
+      const diagnostics = await captureLaunchDiagnostics(port, executable, observed);
+      throw new Error(`WebView2 profile bootstrap did not create Local State\n${JSON.stringify(diagnostics, null, 2)}`);
+    }
     await sleep(2_000);
     await closeMainWindowExact(child.pid, executable);
     await waitForNoExecutableProcess(executable, 90_000);
@@ -131,8 +148,15 @@ async function primeOldSwitchWebViewProfile(packageDir, executable, workspace, e
 }
 
 async function main() {
-  if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true" || process.env.CI !== "true") {
-    throw new Error("the old saved-slot apply gate may run only on an isolated GitHub Actions Windows runner");
+  if (process.platform !== "win32") {
+    throw new Error("the old saved-slot apply gate is Windows-only");
+  }
+  // The gate stays hosted-by-default, but a maintainer can reproduce it on an
+  // isolated local Windows box by opting in explicitly. Locking the gate to
+  // GitHub Actions made every hypothesis cost a commit and a full CI round trip.
+  const hosted = process.env.GITHUB_ACTIONS === "true" && process.env.CI === "true";
+  if (!hosted && process.env.V030_ALLOW_LOCAL_GATE !== "1") {
+    throw new Error("the old saved-slot apply gate needs an isolated GitHub Actions Windows runner or V030_ALLOW_LOCAL_GATE=1");
   }
   const argument = process.argv[2];
   if (!argument || process.argv.length !== 3) throw new Error("Usage: node scripts/v030-old-saved-slot-ci.mjs <new-absolute-run-root>");
@@ -174,18 +198,26 @@ async function main() {
     CODEX_SQLITE_HOME: codexHome,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
+  const logDirectory = requireInside(runRoot, path.join(runRoot, "evidence", "logs"), "launch log directory");
   const webViewProfilePrimed = await primeOldSwitchWebViewProfile(
     packageDir,
     executable,
     workspace,
     environment,
     port,
+    logDirectory,
   );
-  const child = spawn(executable, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
+  const observed = spawnObservedProduct(executable, {
+    cwd: workspace,
+    env: environment,
+    logDirectory,
+    label: "apply",
+  });
+  const child = observed.child;
   let cdp;
   let closed = false;
   try {
-    const target = await waitForTauriTarget(port, undefined, 300_000);
+    const target = await waitForTauriTarget(port, undefined, 300_000, { observed, executable });
     cdp = new CdpClient(target.webSocketDebuggerUrl);
     await cdp.connect();
     await cdp.call("Runtime.enable");

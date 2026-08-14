@@ -206,16 +206,16 @@ test("production Relay switching exposes no link-status verifier or pre-switch p
   assert.match(commands, /relay_validation_without_network/);
 });
 
-test("old saved-slot apply gate refuses every non-GitHub-hosted invocation", () => {
+test("old saved-slot apply gate refuses unhosted invocations that did not opt in", () => {
   const runRoot = path.join(os.tmpdir(), `v030-old-saved-slot-refused-${process.pid}`);
   const result = spawnSync(process.execPath, ["scripts/v030-old-saved-slot-ci.mjs", runRoot], {
     cwd: path.resolve("."),
     encoding: "utf8",
-    env: { ...process.env, GITHUB_ACTIONS: "false", CI: "false" },
+    env: { ...process.env, GITHUB_ACTIONS: "false", CI: "false", V030_ALLOW_LOCAL_GATE: "" },
     windowsHide: true,
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /only on an isolated GitHub Actions Windows runner/);
+  assert.match(result.stderr, /isolated GitHub Actions Windows runner or V030_ALLOW_LOCAL_GATE=1/);
   assert.equal(fs.existsSync(runRoot), false);
 });
 
@@ -226,9 +226,22 @@ test("old saved-slot CI gate binds an exact dev-only native Codex runtime", () =
   assert.match(source, /codex-win32-x64/);
   assert.match(source, /CODEX_SWITCH_CODEX_RUNTIME_EXE: pinnedCodexRuntime/);
   assert.match(source, /\^codex-cli 0\\\.147\\\.0/);
-  assert.match(source, /mkdirSync\(workspace, \{ recursive: true \}\)/);
-  assert.match(source, /waitForTauriTarget\(port, undefined, 300_000\)/);
-  assert.match(source, /remote-debugging-address=127\.0\.0\.1/);
+});
+
+test("every product launch in the release harness is observed, never stdio-ignored", () => {
+  for (const file of [
+    "scripts/v030-old-saved-slot-ci.mjs",
+    "scripts/v030-e2e-lib.mjs",
+    "scripts/v030-product-ui-e2e.mjs",
+  ]) {
+    const source = fs.readFileSync(file, "utf8");
+    const offender = source.split("\n").findIndex((line) => /windowsHide: true, stdio: "ignore"|^\s*stdio: "ignore",/.test(line));
+    assert.equal(offender, -1, `${file}:${offender + 1} launches the product with discarded output`);
+  }
+  const lib = fs.readFileSync("scripts/v030-e2e-lib.mjs", "utf8");
+  assert.match(lib, /export function spawnObservedProduct/);
+  assert.match(lib, /export async function captureLaunchDiagnostics/);
+  assert.match(lib, /product exited before serving CDP/);
 });
 
 test("CDP target discovery tries every local loopback address family", () => {
