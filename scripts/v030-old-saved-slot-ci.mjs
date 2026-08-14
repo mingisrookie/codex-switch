@@ -149,6 +149,44 @@ async function primeOldSwitchWebViewProfile(webViewProfile, executable, workspac
   }
 }
 
+// Reads the product's own diagnostics stream for the terminal reason a switch
+// failed, which is far more specific than any observation available from outside.
+function readTerminalFailure(packageDir) {
+  const directory = path.join(packageDir, "appdata", "codex-switch", "logs", "diagnostics");
+  let files;
+  try {
+    files = fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"));
+  } catch {
+    return undefined;
+  }
+  let latest;
+  for (const name of files) {
+    let lines;
+    try {
+      lines = fs.readFileSync(path.join(directory, name), "utf8").split("\n");
+    } catch {
+      continue;
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event.eventKind !== "operationTerminal" || event.terminalStatus !== "failed") continue;
+      if (!latest || Number(event.timestamp) >= Number(latest.timestamp)) latest = event;
+    }
+  }
+  if (!latest) return undefined;
+  return {
+    errorCode: String(latest.errorCode ?? "unknown"),
+    safeMessage: String(latest.safeMessage ?? ""),
+    action: String(latest.action ?? ""),
+  };
+}
+
 async function main() {
   if (process.platform !== "win32") {
     throw new Error("the old saved-slot apply gate is Windows-only");
@@ -165,6 +203,9 @@ async function main() {
   const runRoot = requireNewRoot(path.resolve(argument), "CI run root");
   await assertNoCodexDesktopProcess();
   await generateFixture(runRoot);
+  // Fixture generation drives the pinned native runtime, and v0.2.7 refuses to
+  // switch while any of those processes is still alive.
+  await assertNoCodexDesktopProcess();
 
   const packageDir = requireInside(runRoot, path.join(runRoot, "packages", packageName), "v0.2.7 package");
   const executable = requireInside(packageDir, path.join(packageDir, "codex-switch.exe"), "v0.2.7 executable");
@@ -259,15 +300,23 @@ async function main() {
     const clicked = await cdp.evaluate(`(()=>{const button=Array.from(document.querySelectorAll('button')).find(node=>node.textContent?.trim()==='切换到 ChatGPT 账号'&&!node.disabled);if(!button)return false;button.click();return true})()`);
     if (!clicked) throw new Error("v0.2.7 saved Plus apply click was not accepted");
 
+    // The product records why a switch was refused; without it an unchanged
+    // config is indistinguishable from a dozen different preflight refusals.
     let liveAfter = "";
     const applyDeadline = Date.now() + 180_000;
     while (Date.now() < applyDeadline) {
       liveAfter = fs.readFileSync(liveConfigPath, "utf8");
       if (sha256File(liveConfigPath) !== liveBeforeSha256 && !/\bsqlite_home\s*=/.test(liveAfter)) break;
+      if (readTerminalFailure(packageDir)) break;
       await sleep(250);
     }
     if (sha256File(liveConfigPath) === liveBeforeSha256 || /\bsqlite_home\s*=/.test(liveAfter)) {
-      throw new Error("v0.2.7 did not apply the sanitized saved Plus slot");
+      const refusal = readTerminalFailure(packageDir);
+      throw new Error(
+        refusal
+          ? `v0.2.7 refused the saved Plus slot apply: ${refusal.errorCode}: ${refusal.safeMessage}`
+          : "v0.2.7 did not apply the sanitized saved Plus slot",
+      );
     }
     const originalCanonicalRoot = path.join(runRoot, "input", "canonical");
     if (liveAfter.toLowerCase().includes(originalCanonicalRoot.toLowerCase()) || savedConfig.toLowerCase().includes(originalCanonicalRoot.toLowerCase())) {
