@@ -105,8 +105,16 @@ export function createSourceInputManifest() {
   };
 }
 
+const USAGE = "Usage: node scripts/v030-source-input-manifest.mjs <absolute-output.json>";
+
 function main() {
-  if (process.argv.length !== 3) throw new Error("Usage: node scripts/v030-source-input-manifest.mjs <absolute-output.json>");
+  // Without this, --help is taken as the output path and the manifest is written
+  // to a file literally named "--help" in the working directory.
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    process.stdout.write(`${USAGE}\n`);
+    return;
+  }
+  if (process.argv.length !== 3) throw new Error(USAGE);
   const output = path.resolve(process.argv[2]);
   if (!path.isAbsolute(output)) throw new Error("source manifest output must be absolute");
   if (isReleaseInput(path.relative(repoRoot, output))) throw new Error("source manifest output must not be a release input");

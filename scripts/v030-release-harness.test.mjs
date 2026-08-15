@@ -274,6 +274,24 @@ test("the saved-slot gate asserts sqlite_home containment rather than absence", 
   assert.doesNotMatch(source, /sqliteHomeAbsentAfterApply/);
 });
 
+test("the source-input manifest prints help instead of writing a file named --help", () => {
+  // Run from a scratch directory: the bug wrote the manifest to <cwd>/--help, so
+  // the assertion must not depend on whatever is already in the repository root.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "v030-manifest-help-"));
+  try {
+    const result = spawnSync(process.execPath, [path.resolve("scripts/v030-source-input-manifest.mjs"), "--help"], {
+      cwd: directory,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Usage: node scripts\/v030-source-input-manifest\.mjs/);
+    assert.deepEqual(fs.readdirSync(directory), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));
