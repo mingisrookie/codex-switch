@@ -23,6 +23,7 @@ import {
   runCommand,
   sha256File,
   sleep,
+  spawnObservedProduct,
   versionTriplet,
   waitForNoExecutableProcess,
   waitForDebugPortClosed,
@@ -228,19 +229,35 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
   const workspace = path.join(scenarioRoot, "workspace");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(workspace, { recursive: true });
+  // Same lesson as the saved-slot gate: the WebView2 runtime does not honour
+  // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS on every host/profile combination, so
+  // the switches also travel on the host command line, and the profile is pinned.
+  // The env channel stays because the updater helper relaunches the app with its
+  // own arguments only, and the restarted instance inherits the environment.
+  const webViewProfile = requireInside(scenarioRoot, path.join(scenarioRoot, "webview2-profile"), "WebView2 profile");
+  fs.mkdirSync(webViewProfile, { recursive: true });
+  const debuggingSwitches = `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`;
   const environment = isolatedEnvironment(scenarioRoot, {
     CODEX_HOME: codexHome,
     CODEX_SQLITE_HOME: codexHome,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-allow-origins=*`,
+    WEBVIEW2_USER_DATA_FOLDER: webViewProfile,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: debuggingSwitches,
   }, true);
-  const child = spawn(target, [], { cwd: workspace, env: environment, windowsHide: true, stdio: "ignore" });
+  const observed = spawnObservedProduct(target, {
+    cwd: workspace,
+    env: environment,
+    logDirectory: path.join(scenarioRoot, "logs"),
+    label: name,
+    args: [`--edge-webview-switches=${debuggingSwitches}`],
+  });
+  const child = observed.child;
   let initialCdp;
   let restartedCdp;
   let targetLock;
   let restartedObserved = false;
   let failure;
   try {
-    const initialTarget = await waitForTauriTarget(port, undefined, 60_000);
+    const initialTarget = await waitForTauriTarget(port, undefined, 60_000, { observed, executable: target });
     initialCdp = new CdpClient(initialTarget.webSocketDebuggerUrl);
     await initialCdp.connect();
     const initial = await initialCdp.evaluate(`(async()=>{
