@@ -335,7 +335,13 @@ async function main() {
       throw new Error(
         `${product.terminalFailure
           ? `v0.2.7 refused the saved Plus slot apply: ${product.terminalFailure.errorCode}: ${product.terminalFailure.safeMessage}`
-          : "v0.2.7 did not apply the sanitized saved Plus slot"}\n${JSON.stringify({ product, page }, null, 2)}`,
+          : "v0.2.7 did not apply the sanitized saved Plus slot"}\n${JSON.stringify({
+          liveConfigChanged: sha256File(liveConfigPath) !== liveBeforeSha256,
+          sqliteHomeStillPresent: /\bsqlite_home\s*=/.test(liveAfter),
+          liveConfigAfter: liveAfter,
+          product,
+          page,
+        }, null, 2)}`,
       );
     }
     const originalCanonicalRoot = path.join(runRoot, "input", "canonical");
