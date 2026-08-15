@@ -22,6 +22,7 @@ import {
   resolvePublicRelease,
   runCommand,
   sha256File,
+  primeWebViewProfile,
   sleep,
   spawnObservedProduct,
   versionTriplet,
@@ -243,13 +244,45 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
     WEBVIEW2_USER_DATA_FOLDER: webViewProfile,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: debuggingSwitches,
   }, true);
-  const observed = spawnObservedProduct(target, {
+  const browserSwitchArguments = [`--edge-webview-switches=${debuggingSwitches}`];
+  const webViewProfilePrimed = await primeWebViewProfile(webViewProfile, target, {
     cwd: workspace,
     env: environment,
     logDirectory: path.join(scenarioRoot, "logs"),
-    label: name,
-    args: [`--edge-webview-switches=${debuggingSwitches}`],
+    args: browserSwitchArguments,
   });
+  // The WebView2 debug listener does not start reliably on every launch even with
+  // a primed profile and the switches present on the browser command line: two
+  // otherwise identical runs on the same host produced opposite outcomes. Retry a
+  // bounded number of whole launches rather than waiting longer on a browser that
+  // already decided not to listen.
+  let observed;
+  let initialTarget;
+  let launchAttempts = 0;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    launchAttempts = attempt;
+    observed = spawnObservedProduct(target, {
+      cwd: workspace,
+      env: environment,
+      logDirectory: path.join(scenarioRoot, "logs"),
+      label: attempt === 1 ? name : `${name}-attempt-${attempt}`,
+      args: browserSwitchArguments,
+    });
+    try {
+      initialTarget = await waitForTauriTarget(port, undefined, 60_000, { observed, executable: target });
+      break;
+    } catch (error) {
+      if (attempt === 3) throw error;
+      try {
+        await closeMainWindowExact(observed.state.pid, target);
+        await waitForNoExecutableProcess(target, 60_000);
+      } catch {
+        try { process.kill(observed.state.pid); } catch {}
+      }
+      await waitForDebugPortClosed(port, 30_000).catch(() => {});
+      await sleep(3_000);
+    }
+  }
   const child = observed.child;
   let initialCdp;
   let restartedCdp;
@@ -257,13 +290,27 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
   let restartedObserved = false;
   let failure;
   try {
-    const initialTarget = await waitForTauriTarget(port, undefined, 60_000, { observed, executable: target });
     initialCdp = new CdpClient(initialTarget.webSocketDebuggerUrl);
     await initialCdp.connect();
     const initial = await initialCdp.evaluate(`(async()=>{
       const invoke=window.__TAURI_INTERNALS__?.invoke??window.__TAURI__?.core?.invoke??window.__TAURI__?.invoke;
-      return {app:await invoke("get_app_status"),update:await invoke("check_for_updates"),readyState:document.readyState,title:document.title,bodyTextLength:document.body?.innerText?.length??0};
-    })()`, 60_000);
+      const app=await invoke("get_app_status");
+      // The product runs its own update check at startup and rejects a second
+      // concurrent one, so the gate waits for that check to settle instead of
+      // racing it. Only this exact contention is retried; every other failure
+      // still propagates.
+      let update;
+      const deadline=Date.now()+90000;
+      for(;;){
+        try{ update=await invoke("check_for_updates"); break; }
+        catch(error){
+          const message=String(error?.message??error);
+          if(!/already in progress/i.test(message)||Date.now()>deadline) throw error;
+          await new Promise((resolve)=>setTimeout(resolve,750));
+        }
+      }
+      return {app,update,readyState:document.readyState,title:document.title,bodyTextLength:document.body?.innerText?.length??0};
+    })()`, 120_000);
     if (initial.app.version !== "0.2.7" || !initial.update.updateAvailable || initial.update.latestVersion !== "0.3.0" || initial.readyState !== "complete") throw new Error("v0.2.7 did not observe the public v0.3.0 update");
     if (rollback) targetLock = await startTargetLock(target, path.join(scenarioRoot, "control"));
     const receipt = await initialCdp.evaluate(invokeExpression("install_update"), 12 * 60_000);
@@ -307,7 +354,7 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
       productionPath: "check_for_updates -> install_update -> helper -> Ready ACK",
       injection: rollback ? "external exact-target read handle with no write/delete sharing" : "none",
       oldAsset: { bytes: oldDownload.bytes, sha256: oldDownload.sha256 },
-      initial: { version: initial.app.version, pid: child.pid, ready: true, updateAvailable: true },
+      initial: { version: initial.app.version, pid: child.pid, ready: true, updateAvailable: true, webViewProfilePrimed, launchAttempts },
       receipt,
       restarted: {
         version: restarted.state.version,

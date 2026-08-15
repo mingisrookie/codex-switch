@@ -538,7 +538,16 @@ export class CdpClient {
 
   async evaluate(expression, timeoutMs = 30_000) {
     const result = await this.call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, timeoutMs);
-    if (result.exceptionDetails) throw new Error("CDP expression failed");
+    if (result.exceptionDetails) {
+      // The thrown value carries which command failed and why; discarding it left
+      // every in-page failure looking identical from the harness side.
+      const details = result.exceptionDetails;
+      const described = details.exception?.description
+        ?? (details.exception?.value !== undefined ? JSON.stringify(details.exception.value) : undefined)
+        ?? details.text
+        ?? "unknown";
+      throw new Error(`CDP expression failed: ${String(described).slice(0, 600)}`);
+    }
     return result.result.value;
   }
 
@@ -658,6 +667,37 @@ export async function captureLaunchDiagnostics(port, executable, observed) {
     diagnostics.host = `unavailable: ${String(error?.message ?? error)}`;
   }
   return diagnostics;
+}
+
+// A freshly created WebView2 user data folder does not serve CDP on its first
+// launch even when the debugging switches are present on the browser command
+// line; the same profile serves it on every later launch. Every CDP-driven gate
+// therefore has to bring the profile into existence once before it can drive the
+// product, otherwise it waits out its readiness window against a browser that was
+// never going to listen.
+export async function primeWebViewProfile(webViewProfile, executable, { cwd, env, logDirectory, args, timeoutMs = 180_000 }) {
+  const localState = path.join(webViewProfile, "EBWebView", "Local State");
+  if (fs.existsSync(localState)) return false;
+  const observed = spawnObservedProduct(executable, { cwd, env, logDirectory, label: "prime", args });
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (!fs.existsSync(localState) && Date.now() < deadline) {
+      if (observed.state.exited) {
+        throw new Error(`WebView2 profile bootstrap exited early (code=${observed.state.exitCode}, spawnError=${observed.state.spawnError})`);
+      }
+      await sleep(250);
+    }
+    if (!fs.existsSync(localState)) throw new Error("WebView2 profile bootstrap did not create Local State");
+    await sleep(2_000);
+    return true;
+  } finally {
+    try {
+      await closeMainWindowExact(observed.state.pid, executable);
+      await waitForNoExecutableProcess(executable, 90_000);
+    } catch {
+      try { process.kill(observed.state.pid); } catch {}
+    }
+  }
 }
 
 export async function waitForTauriTarget(port, predicate = undefined, timeoutMs = 60_000, options = {}) {
