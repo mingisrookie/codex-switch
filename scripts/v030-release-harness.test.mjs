@@ -262,6 +262,18 @@ test("the old saved-slot gate injects debugging switches through both WebView2 c
   assert.match(lib, /export async function probeChildEnvironment/);
 });
 
+test("the saved-slot gate asserts sqlite_home containment rather than absence", () => {
+  const source = fs.readFileSync("scripts/v030-old-saved-slot-ci.mjs", "utf8");
+  // v0.2.7 owns sqlite_home and rewrites it to the home it manages, so absence is
+  // not a property the old runtime can satisfy. The gate must still refuse a value
+  // that escapes the isolated package, and must still refuse the tampered slot.
+  assert.match(source, /isPathInside\(packageDir, path\.resolve\(value/);
+  assert.match(source, /sqliteHomeEscapedPackage/);
+  assert.match(source, /exported saved Plus slot retained sqlite_home/);
+  assert.match(source, /saved-slot apply reintroduced the source canonical root/);
+  assert.doesNotMatch(source, /sqliteHomeAbsentAfterApply/);
+});
+
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));

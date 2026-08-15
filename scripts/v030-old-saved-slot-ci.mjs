@@ -12,6 +12,7 @@ import {
   closeMainWindowExact,
   downloadBoundAsset,
   invokeExpression,
+  isPathInside,
   isolatedEnvironment,
   processRowsForExecutable,
   probeChildEnvironment,
@@ -317,17 +318,23 @@ async function main() {
     const clicked = await cdp.evaluate(`(()=>{const button=Array.from(document.querySelectorAll('button')).find(node=>node.textContent?.trim()==='切换到 ChatGPT 账号'&&!node.disabled);if(!button)return false;button.click();return true})()`);
     if (!clicked) throw new Error("v0.2.7 saved Plus apply click was not accepted");
 
-    // The product records why a switch was refused; without it an unchanged
-    // config is indistinguishable from a dozen different preflight refusals.
+    // v0.2.7 owns sqlite_home and rewrites it to the home it manages, so its mere
+    // presence proves nothing. The property that matters is that applying the
+    // tampered slot never points the old runtime outside its own isolated home.
+    const sqliteHomeEscaped = (config) => {
+      const value = config.match(/^\s*sqlite_home\s*=\s*"((?:[^"\\]|\\.)*)"/m)?.[1];
+      if (value === undefined) return false;
+      return !isPathInside(packageDir, path.resolve(value.replace(/\\\\/g, "\\")), true);
+    };
     let liveAfter = "";
     const applyDeadline = Date.now() + 180_000;
     while (Date.now() < applyDeadline) {
       liveAfter = fs.readFileSync(liveConfigPath, "utf8");
-      if (sha256File(liveConfigPath) !== liveBeforeSha256 && !/\bsqlite_home\s*=/.test(liveAfter)) break;
+      if (sha256File(liveConfigPath) !== liveBeforeSha256) break;
       if (readTerminalFailure(packageDir)) break;
       await sleep(250);
     }
-    if (sha256File(liveConfigPath) === liveBeforeSha256 || /\bsqlite_home\s*=/.test(liveAfter)) {
+    if (sha256File(liveConfigPath) === liveBeforeSha256 || sqliteHomeEscaped(liveAfter)) {
       const product = readProductEvents(packageDir);
       const page = await cdp.evaluate(
         `(()=>({text:(document.body?.innerText??'').slice(0,1500),buttons:Array.from(document.querySelectorAll('button')).map(node=>({label:node.textContent?.trim()?.slice(0,60),disabled:node.disabled})).slice(0,24)}))()`,
@@ -337,7 +344,7 @@ async function main() {
           ? `v0.2.7 refused the saved Plus slot apply: ${product.terminalFailure.errorCode}: ${product.terminalFailure.safeMessage}`
           : "v0.2.7 did not apply the sanitized saved Plus slot"}\n${JSON.stringify({
           liveConfigChanged: sha256File(liveConfigPath) !== liveBeforeSha256,
-          sqliteHomeStillPresent: /\bsqlite_home\s*=/.test(liveAfter),
+          sqliteHomeEscapedPackage: sqliteHomeEscaped(liveAfter),
           liveConfigAfter: liveAfter,
           product,
           page,
@@ -366,7 +373,7 @@ async function main() {
       oldSwitch: { version: "v0.2.7", bytes: download.bytes, sha256: download.sha256, tagCommit: release.tagCommit },
       savedPlusSlot: { sanitizedBeforeApply: true, configSha256: sha256File(savedConfigPath) },
       webViewProfilePrimed,
-      apply: { uiAction: "switch-to-account", liveConfigChanged: true, sqliteHomeAbsentAfterApply: true, runtimeReadback: "plus" },
+      apply: { uiAction: "switch-to-account", liveConfigChanged: true, sqliteHomeContainedInPackage: true, runtimeReadback: "plus" },
       database: { threadCount: databaseThreadCount, rolloutPathsContainedInPackage: true },
       safety: { codexDesktopAbsentBeforeApply: true, exactOldSwitchExited: true, debugPortClosed: true },
     };
