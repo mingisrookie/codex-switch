@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Manual runs let a maintainer re-check a gate without spending a commit on it.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -55,17 +57,64 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked --all-targets --features runtime-evidence
 
+  old-saved-slot-gate:
+    name: v0.2.7 saved-slot apply gate
+    # Runs beside the quality gate instead of behind it: a gate that only exercises
+    # the shipped v0.2.7 binary must not wait on a full clippy and test sweep.
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
       - name: Verify v0.2.7 saved runtime slot apply on isolated runner
         shell: pwsh
         run: node scripts/v030-old-saved-slot-ci.mjs (Join-Path $env:RUNNER_TEMP 'v030-old-saved-slot')
 
       - name: Upload old saved-slot apply evidence
+        # Always upload: a failed gate is exactly when the launch logs are needed.
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: v030-old-saved-slot-apply-${{ github.sha }}
-          path: ${{ runner.temp }}/v030-old-saved-slot/evidence/old-saved-slot-apply.json
-          if-no-files-found: error
+          path: ${{ runner.temp }}/v030-old-saved-slot/evidence
+          if-no-files-found: warn
           retention-days: 14
+
+  release:
+    name: Portable release build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: [quality, old-saved-slot-gate]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - name: Install frontend dependencies
+        run: npm ci
 
       - name: Build portable release executable
         run: npm run tauri -- build
