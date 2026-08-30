@@ -112,7 +112,7 @@ function options(argv) {
     const token = argv[index];
     if (token === "--dry-run") { dryRun = true; continue; }
     if (token === "--help") return { help: true };
-    if (!new Set(["--run-root", "--executable", "--codex-exe", "--expected-version"]).has(token) || !argv[index + 1]) throw new Error(`invalid option ${token}`);
+    if (!new Set(["--run-root", "--executable", "--codex-exe", "--expected-version", "--home-mode"]).has(token) || !argv[index + 1]) throw new Error(`invalid option ${token}`);
     values.set(token.slice(2), argv[++index]);
   }
   const executable = path.resolve(values.get("executable") ?? "");
@@ -121,13 +121,15 @@ function options(argv) {
   if (codexExe && !fs.statSync(codexExe).isFile()) throw new Error("codex executable must be an existing file");
   const expectedVersion = values.get("expected-version") ?? PACKAGE_VERSION;
   if (!/^\d+\.\d+\.\d+$/.test(expectedVersion)) throw new Error("expected version must be a three-part release version");
-  return { help: false, dryRun, executable, codexExe, expectedVersion, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
+  const homeMode = values.get("home-mode") ?? "initialized";
+  if (!new Set(["initialized", "fresh"]).has(homeMode)) throw new Error("home mode must be initialized or fresh");
+  return { help: false, dryRun, executable, codexExe, expectedVersion, homeMode, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
 }
 
 async function main() {
   const parsed = options(process.argv.slice(2));
   if (parsed.help) {
-    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> --codex-exe <native-codex.exe> [--expected-version <x.y.z>] [--dry-run]\n");
+    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> [--codex-exe <native-codex.exe>] [--expected-version <x.y.z>] [--home-mode initialized|fresh] [--dry-run]\n");
     return;
   }
   if (parsed.dryRun) {
@@ -150,9 +152,11 @@ async function main() {
     CODEX_SQLITE_HOME: codexHome,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
-  await initializeNativeCodexState(parsed.codexExe ?? "codex.exe", codexHome, workspace, environment, parsed.expectedVersion);
-  fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture-token" } }));
-  fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
+  if (parsed.homeMode === "initialized") {
+    await initializeNativeCodexState(parsed.codexExe ?? "codex.exe", codexHome, workspace, environment, parsed.expectedVersion);
+    fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture-token" } }));
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
+  }
   const webViewProfilePrimed = await primeWebViewProfile(parsed.runRoot, executable, workspace, environment, port);
   const observed = spawnObservedProduct(executable, {
     cwd: workspace,
@@ -186,13 +190,31 @@ async function main() {
     if (rendered?.title !== "ChatGPT Switch" || rendered.readyState !== "complete" || rendered.text <= 100 || !rendered.invoke) {
       throw new Error(`production UI did not render: ${JSON.stringify({ ...rendered, runtimeErrorCount: runtimeErrors.length })}`);
     }
+    let startupDomains;
+    const startupDomainDeadline = Date.now() + 60_000;
+    while (Date.now() < startupDomainDeadline) {
+      startupDomains = await cdp.evaluate(`(()=>{const visible=(node)=>{if(!node)return false;const style=getComputedStyle(node);const r=node.getBoundingClientRect();return style.display!=="none"&&style.visibility!=="hidden"&&r.width>0&&r.height>0};const panel=document.querySelector('[aria-label="Relay 会话视图"]');const configure=Array.from(document.querySelectorAll('button')).find(node=>node.textContent?.trim()==='配置中转站');const alerts=Array.from(document.querySelectorAll('[role="alert"]')).filter(visible);return {continuityReady:Boolean(panel)&&!panel.innerText.includes('连续性状态读取中'),configureReady:Boolean(configure)&&!configure.disabled,visibleAlertCount:alerts.length}})()`);
+      if (startupDomains.visibleAlertCount > 0) throw new Error(`production UI rendered visible startup alerts: ${startupDomains.visibleAlertCount}`);
+      if (runtimeErrors.length > 0) throw new Error(`production UI emitted runtime errors: ${runtimeErrors.length}`);
+      if (startupDomains.continuityReady && startupDomains.configureReady) break;
+      await sleep(250);
+    }
+    if (!startupDomains?.continuityReady || !startupDomains.configureReady) {
+      throw new Error(`production UI startup domains did not settle: ${JSON.stringify({ ...startupDomains, runtimeErrorCount: runtimeErrors.length })}`);
+    }
     const visibleStartupText = await cdp.evaluate(`document.body?.innerText??""`);
     assertEvidenceHasNoAbsoluteWindowsPath(visibleStartupText);
-    const startupAlerts = await cdp.evaluate(`Array.from(document.querySelectorAll('[role="alert"]')).filter(node=>{const style=getComputedStyle(node);const r=node.getBoundingClientRect();return style.display!=="none"&&style.visibility!=="hidden"&&r.width>0&&r.height>0}).map(node=>node.textContent?.trim()??"")`);
-    if (startupAlerts.length > 0) throw new Error(`production UI rendered visible startup alerts: ${startupAlerts.length}`);
-    if (runtimeErrors.length > 0) throw new Error(`production UI emitted runtime errors: ${runtimeErrors.length}`);
     const status = await cdp.evaluate(invokeExpression("get_app_status"));
     if (status.version !== parsed.expectedVersion || path.resolve(status.codexHome).toLowerCase() !== codexHome.toLowerCase()) throw new Error(`runtime status is not bound to the isolated v${parsed.expectedVersion} process`);
+    let freshHome;
+    if (parsed.homeMode === "fresh") {
+      const runtimeStatus = await cdp.evaluate(invokeExpression("scan_runtime_status"));
+      const continuityStatus = await cdp.evaluate(invokeExpression("get_mobile_continuity_status"));
+      const absentFiles = ["auth.json", "config.toml", "state_5.sqlite"].filter((name) => !fs.existsSync(path.join(codexHome, name)));
+      if (runtimeStatus.activeRuntimeId !== null || runtimeStatus.confidence !== "unknown" || absentFiles.length !== 3) throw new Error("fresh home runtime status was not preserved as an empty legal state");
+      if ([continuityStatus.queued, continuityStatus.publishing, continuityStatus.remotePublished, continuityStatus.partial, continuityStatus.conflict, continuityStatus.needsManual].some((count) => count !== 0) || continuityStatus.items.length !== 0) throw new Error("fresh home continuity status was not empty");
+      freshHome = { authAbsent: true, configAbsent: true, stateDatabaseAbsent: true, runtimeConfidence: runtimeStatus.confidence, continuityItems: 0 };
+    }
     if (await hasListener(1420)) throw new Error("production UI opened with a Vite listener present");
 
     await cdp.call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
@@ -252,6 +274,8 @@ async function main() {
       customProtocol: target.url,
       viteListenerAbsent: true,
       isolatedRuntime: true,
+      homeMode: parsed.homeMode,
+      freshHome,
       webViewProfilePrimed,
       reducedMotion: true,
       runtimeErrors: [],

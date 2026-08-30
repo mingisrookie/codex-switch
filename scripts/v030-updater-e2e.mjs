@@ -172,6 +172,23 @@ async function waitForOriginalPidExit(executable, originalPid, timeoutMs = 30_00
   throw new Error("the original updater parent PID did not exit");
 }
 
+export async function waitForTauriInvoke(cdp, timeoutMs = 60_000, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  let lastState;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    try {
+      lastState = await cdp.evaluate(`(()=>({readyState:document.readyState,title:document.title,bodyTextLength:document.body?.innerText?.length??0,invokeReady:typeof(window.__TAURI_INTERNALS__?.invoke??window.__TAURI__?.core?.invoke??window.__TAURI__?.invoke)==="function"}))()`);
+      if (lastState.invokeReady && lastState.readyState === "complete" && lastState.title === "ChatGPT Switch" && lastState.bodyTextLength >= 50) return lastState;
+      lastError = "";
+    } catch (error) {
+      lastError = String(error?.message ?? error);
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`Tauri invoke did not become ready: ${JSON.stringify({ lastState, lastError })}`);
+}
+
 async function waitForRestartedApp(port, expectedVersion, expectedNotice, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
@@ -315,6 +332,7 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease, versions
   try {
     initialCdp = new CdpClient(initialTarget.webSocketDebuggerUrl);
     await initialCdp.connect();
+    await waitForTauriInvoke(initialCdp);
     const initial = await initialCdp.evaluate(`(async()=>{
       const invoke=window.__TAURI_INTERNALS__?.invoke??window.__TAURI__?.core?.invoke??window.__TAURI__?.invoke;
       const app=await invoke("get_app_status");

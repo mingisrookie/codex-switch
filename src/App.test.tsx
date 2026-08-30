@@ -1006,6 +1006,44 @@ describe('App release-hardening UI', () => {
     expect(screen.getByText('切换到 Account 前需要先在 ChatGPT 完成官方登录。')).toBeTruthy();
   });
 
+  it('does not let an immediate mutation race startup continuity initialization', async () => {
+    const continuity = deferred<Awaited<ReturnType<typeof import('./api').getMobileContinuityStatus>>>();
+    apiMocks.getMobileContinuityStatus.mockReturnValue(continuity.promise);
+    const data = dashboardData();
+    if (data.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
+    data.runtimeStatus.data = {
+      activeRuntimeId: 'plus',
+      confidence: 'exact',
+      authMode: 'chatgpt',
+      modelProvider: 'openai',
+      detectedAtMs: 5,
+    };
+
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const configure = await screen.findByRole('button', { name: '配置中转站' });
+    const switchRelay = screen.getByRole('button', { name: '切换到中转站' });
+    expect((configure as HTMLButtonElement).disabled).toBe(true);
+    expect((switchRelay as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('连续性状态读取中…')).toBeTruthy();
+
+    continuity.resolve({
+      enabled: true,
+      noticePending: false,
+      initializedAtMs: 1,
+      queued: 0,
+      publishing: 0,
+      remotePublished: 0,
+      partial: 0,
+      conflict: 0,
+      needsManual: 0,
+      items: [],
+    });
+
+    await waitFor(() => expect((configure as HTMLButtonElement).disabled).toBe(false));
+    expect((switchRelay as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('keeps relay configuration and backup recovery available when Codex Home itself is damaged', async () => {
     const data = dashboardData();
     data.codexHome = { status: 'error', error: 'auth.json is malformed' };

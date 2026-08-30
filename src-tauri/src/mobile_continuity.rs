@@ -579,6 +579,12 @@ fn save_state(state_path: &Path, state: &MobileContinuityState) -> Result<(), St
 }
 
 fn observe_threads(current: &CodexPaths) -> Result<Vec<ObservedThread>, String> {
+    match fs::symlink_metadata(&current.state_db) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err("mobile continuity state database is not a regular file".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("failed to inspect mobile continuity state database".to_string()),
+    }
     let connection = Connection::open_with_flags(
         &current.state_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -862,6 +868,46 @@ mod tests {
         assert!(message.contains("extended"));
         assert!(!message.contains(r"C:\"));
         assert!(!message.contains("private"));
+    }
+
+    #[test]
+    fn fresh_home_without_state_database_has_empty_continuity_status() {
+        let home = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let paths = local_codex_paths(home.path());
+        let state_path = state_root.path().join("mobile-continuity.json");
+
+        let first = initialize_status(&state_path, &paths).unwrap();
+        let second = initialize_status(&state_path, &paths).unwrap();
+
+        assert!(state_path.is_file());
+        assert!(!paths.state_db.exists());
+        for status in [first, second] {
+            assert_eq!(status.queued, 0);
+            assert_eq!(status.publishing, 0);
+            assert_eq!(status.remote_published, 0);
+            assert_eq!(status.partial, 0);
+            assert_eq!(status.conflict, 0);
+            assert_eq!(status.needs_manual, 0);
+            assert!(status.items.is_empty());
+        }
+    }
+
+    #[test]
+    fn non_file_state_database_is_rejected_without_leaking_its_path() {
+        let home = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let paths = local_codex_paths(home.path());
+        fs::create_dir_all(&paths.state_db).unwrap();
+
+        let message = initialize_status(&state_root.path().join("mobile-continuity.json"), &paths)
+            .unwrap_err();
+
+        assert_eq!(
+            message,
+            "mobile continuity state database is not a regular file"
+        );
+        assert!(!message.contains(&paths.state_db.display().to_string()));
     }
 
     #[test]

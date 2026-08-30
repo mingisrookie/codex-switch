@@ -26,6 +26,7 @@ import {
   parseUpdaterOptions,
   runUpdaterE2e,
   startTargetLock,
+  waitForTauriInvoke,
 } from "./v030-updater-e2e.mjs";
 import { collectReleaseInputs, createSourceInputManifest } from "./v030-source-input-manifest.mjs";
 
@@ -60,9 +61,9 @@ test("argument parsing fails closed and normalizes new absolute roots", () => {
     assert.equal(updaterOptions.runRoot, updateRoot);
     assert.equal(updaterOptions.oldTag, "v0.2.7");
     assert.equal(updaterOptions.newTag, "v0.3.0");
-    const patchOptions = parseUpdaterOptions(["--run-root", path.join(parent, "patch-updater"), "--dry-run", "--old-tag", "v0.3.0", "--new-tag", "v0.3.1"]);
-    assert.equal(patchOptions.oldVersion, "0.3.0");
-    assert.equal(patchOptions.newVersion, "0.3.1");
+    const patchOptions = parseUpdaterOptions(["--run-root", path.join(parent, "patch-updater"), "--dry-run", "--old-tag", "v0.3.1", "--new-tag", "v0.3.2"]);
+    assert.equal(patchOptions.oldVersion, "0.3.1");
+    assert.equal(patchOptions.newVersion, "0.3.2");
     assert.throws(() => parseOldRuntimeOptions(["--run-root", oldRoot, "--unknown"]), /unknown option/);
     assert.throws(() => parseUpdaterOptions(["--run-root", updateRoot, "--mode", "unsafe"]), /mode is invalid/);
     assert.throws(() => parseUpdaterOptions(["--run-root", updateRoot, "--old-tag", "v0.3.1", "--new-tag", "v0.3.0"]), /strictly newer/);
@@ -191,6 +192,26 @@ test("current product and updater gates use graceful test-owned shutdown only", 
     assert.doesNotMatch(source, /\bprocess\.kill\s*\(|\.kill\s*\(/);
     assert.match(source, /request_app_exit|closeMainWindowExact/);
   }
+  const library = fs.readFileSync("scripts/v030-e2e-lib.mjs", "utf8");
+  const primeProfile = library.match(/export async function primeWebViewProfile[\s\S]*?\n}\n\nexport async function waitForTauriTarget/)?.[0] ?? "";
+  assert.ok(primeProfile.length > 0);
+  assert.doesNotMatch(primeProfile, /\bprocess\.kill\s*\(|\.kill\s*\(/);
+});
+
+test("updater waits for the Tauri invoke bridge instead of racing first paint", async () => {
+  let calls = 0;
+  const cdp = {
+    async evaluate() {
+      calls += 1;
+      if (calls === 1) throw new Error("execution context was replaced during navigation");
+      return calls === 2
+        ? { readyState: "loading", title: "", bodyTextLength: 0, invokeReady: false }
+        : { readyState: "complete", title: "ChatGPT Switch", bodyTextLength: 100, invokeReady: true };
+    },
+  };
+  const result = await waitForTauriInvoke(cdp, 1_000, 0);
+  assert.equal(calls, 3);
+  assert.equal(result.invokeReady, true);
 });
 
 test("exact process inventory tolerates an absent or already-exited executable", async () => {
@@ -202,6 +223,8 @@ test("exact process inventory tolerates an absent or already-exited executable",
 test("product UI gate seeds a complete runtime and re-navigates after CDP subscription", () => {
   const source = fs.readFileSync("scripts/v030-product-ui-e2e.mjs", "utf8");
   assert.match(source, /config\.toml[\s\S]*model_provider = "openai"/);
+  assert.match(source, /home-mode[\s\S]*initialized[\s\S]*fresh/);
+  assert.match(source, /scan_runtime_status[\s\S]*get_mobile_continuity_status/);
   assert.match(source, /Runtime\.enable[\s\S]*Page\.enable[\s\S]*Page\.navigate/);
   assert.doesNotMatch(source, /Page\.reload/);
 });

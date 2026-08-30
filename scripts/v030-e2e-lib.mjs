@@ -691,12 +691,19 @@ export async function primeWebViewProfile(webViewProfile, executable, { cwd, env
     await sleep(2_000);
     return true;
   } finally {
-    try {
-      await closeMainWindowExact(observed.state.pid, executable);
-      await waitForNoExecutableProcess(executable, 90_000);
-    } catch {
-      try { process.kill(observed.state.pid); } catch {}
+    let closeError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await closeMainWindowExact(observed.state.pid, executable);
+        await waitForNoExecutableProcess(executable, 90_000);
+        closeError = undefined;
+        break;
+      } catch (error) {
+        closeError = error;
+        await sleep(1_000);
+      }
     }
+    if (closeError) throw closeError;
   }
 }
 

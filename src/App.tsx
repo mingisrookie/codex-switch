@@ -150,6 +150,7 @@ function App({
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [relaySubmitError, setRelaySubmitError] = useState<OperationFailureView | null>(null);
   const [mobileContinuity, setMobileContinuity] = useState<MobileContinuityStatus | null>(null);
+  const [mobileContinuityLoading, setMobileContinuityLoading] = useState(true);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [switchFlow, setSwitchFlow] = useState<RuntimeSwitchFlow | null>(null);
   const [sessionsStale, setSessionsStale] = useState(() => loadDashboard === undefined);
@@ -262,7 +263,8 @@ function App({
         setError({
           message: `Relay 会话视图状态读取失败：${errorMessage(reason)}。请求端切换不会恢复旧 provider 正文复制。`,
         });
-      });
+      })
+      .finally(() => setMobileContinuityLoading(false));
   }, []);
 
   useEffect(() => {
@@ -416,7 +418,11 @@ function App({
     && sessionStorage.status !== 'reviewRequired';
   const canMutateSessions = data.managedSessions.status === 'ready';
   const canRestoreBackup = !backupsStale && data.backups.status === 'ready';
-  const exclusiveBusy = busy !== null || updateInstalling;
+  // Startup continuity initialization owns the same backend mutation guard as
+  // route/config writes. Keep every mutation control disabled until that one
+  // background mutation settles so an immediate click cannot lose a try-lock
+  // race and surface a spurious "another mutation" failure.
+  const exclusiveBusy = busy !== null || updateInstalling || mobileContinuityLoading;
 
   function handleChildBusyChange(label: string | null) {
     childActionInFlight.current = label !== null;

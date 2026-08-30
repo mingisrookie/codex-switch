@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.2 - 2026-08-30
+
+### Fixed
+
+- 修复真正空的 Codex Home 尚未生成 `state_5.sqlite` 时，启动页把 Relay 会话视图初始化为 SQLite `CannotOpen` 错误的问题。缺失数据库现在是合法的零会话状态；只读状态检查不会创建数据库，后续 Codex 生成数据库后会正常读取。
+- 补齐 fresh-home 生产 UI 验收：同时要求 `auth.json`、`config.toml`、`state_5.sqlite` 保持不存在，运行态为 `unknown`、连续性队列为空且页面无错误提示，避免再次用预先填充的登录态/数据库掩盖首次使用问题。
+- 修复 updater E2E 在 WebView 首屏已出现但 Tauri invoke bridge 尚未就绪时偶发 `invoke is not a function` 的竞态。验证器现在等待真实 bridge/完整页面就绪后再调用更新命令，并继续只使用正常退出和精确窗口关闭，不强杀本机 ChatGPT/Codex。
+- 修复应用刚启动时，手机连续性初始化与用户立即保存/切换 Relay 争抢同一个 mutation guard、导致偶发“another mutation”失败的问题。初始化完成前所有写操作短暂禁用；读取完成或明确失败后立即恢复，不再让前台点击撞上后台初始化窗口。
+
+### Release note
+
+- `v0.3.1` 已修复未登录官方 ChatGPT 时的 Relay 保存与切换，但遗漏了空 Home 的 Relay 会话视图状态读取；`v0.3.2` 取代它成为 Latest。最终资产、SHA-256 和公开更新结果以 [GitHub Release v0.3.2](https://github.com/mingisrookie/codex-switch/releases/tag/v0.3.2) 为准。
+
 ## v0.3.1 - 2026-08-30
 
 ### Fixed

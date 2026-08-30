@@ -192,7 +192,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
      -OutputExe "release/codex-switch.exe"
    ```
 
-   该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --ultra-brute --lzma`，并对 packed 文件执行 `upx -t`。v0.3 关闭 Tauri runtime Brotli asset feature，仅保留 `wry` / Windows `common-controls-v6`，因此必须由最终固定 UPX 层压缩并做 custom-protocol 启动验证。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，确认主窗口、版本和基本切换入口可用；只验证 raw EXE 不算发布验证完成。
+   该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --ultra-brute --lzma`，并对 packed 文件执行 `upx -t`。v0.3 关闭 Tauri runtime Brotli asset feature，仅保留 `wry` / Windows `common-controls-v6`，因此必须由最终固定 UPX 层压缩并做 custom-protocol 启动验证。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，分别在 initialized Home 与完全 fresh Home 验证主窗口、版本、基本切换入口和零状态读取；fresh Home 中 `auth.json`、`config.toml`、`state_5.sqlite` 必须保持缺失。只验证 raw EXE 或预填充 Home 不算发布验证完成。
 
    公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；既有 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
 
@@ -229,7 +229,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
    `gh release view --json` 不支持 `isLatest` 字段；必须把 `gh api .../releases/latest` 返回的 tag 与目标 `<tag>` 对比，不能仅凭 release 列表顺序推断 latest。
 
-8. 自动更新必须使用已发布 Release 做真实首跳烟测。以 `v0.2.1` 为例，必须从干净隔离环境中的正式 `v0.2.0` 启动，触发一键更新并证明 updater 下载的正是 Release 中的 `codex-switch.exe`，随后完成退出、替换、重启并显示 `v0.2.1`；同时复核中转站配置、会话数据和其他用户状态未被破坏。v0.3 还必须用同一路径覆盖替换锁失败后的自动回滚、旧 EXE 可重新启动以及零 helper/staging 残留。tag-CI、Release 回下载、真实首跳或回滚任一未完成，都不得宣称发布闭环完成。
+8. 自动更新必须使用已发布 Release 做真实首跳烟测。以 `v0.2.1` 为例，必须从干净隔离环境中的正式 `v0.2.0` 启动，触发一键更新并证明 updater 下载的正是 Release 中的 `codex-switch.exe`，随后完成退出、替换、重启并显示 `v0.2.1`；同时复核中转站配置、会话数据和其他用户状态未被破坏。v0.3 还必须用同一路径覆盖替换锁失败后的自动回滚、旧 EXE 可重新启动以及零 helper/staging 残留。自动化不得在页面刚出现时直接调用原生命令，必须等待完整页面与 Tauri invoke bridge 就绪，并有界容忍导航时 execution context 更换；清理只允许产品正常退出、Ready ACK 或精确关闭测试自有窗口。tag-CI、Release 回下载、真实首跳或回滚任一未完成，都不得宣称发布闭环完成。
 
 9. Release 型 Trellis 任务只能在上述公开入口证据全部绑定到精确发布 commit 后收口，固定顺序为：
 
