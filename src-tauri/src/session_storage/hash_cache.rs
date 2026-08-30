@@ -369,14 +369,7 @@ fn decode_semantic(
             {
                 return Err("cached session line hashes have the wrong length".to_string());
             }
-            let normalized_line_sha256 = hashes
-                .chunks_exact(32)
-                .map(|chunk| {
-                    chunk
-                        .try_into()
-                        .expect("chunks_exact always returns 32-byte chunks")
-                })
-                .collect();
+            let normalized_line_sha256 = hashes.as_chunks::<32>().0.to_vec();
             let message_hashes = BASE64
                 .decode(message_line_sha256)
                 .map_err(|_| "cached session message hashes are invalid".to_string())?;
@@ -386,14 +379,7 @@ fn decode_semantic(
             {
                 return Err("cached session message hashes have the wrong length".to_string());
             }
-            let message_line_sha256 = message_hashes
-                .chunks_exact(32)
-                .map(|chunk| {
-                    chunk
-                        .try_into()
-                        .expect("chunks_exact always returns 32-byte chunks")
-                })
-                .collect();
+            let message_line_sha256 = message_hashes.as_chunks::<32>().0.to_vec();
             Ok(Ok(SemanticSession {
                 path: path.to_path_buf(),
                 thread_id: thread_id.clone(),

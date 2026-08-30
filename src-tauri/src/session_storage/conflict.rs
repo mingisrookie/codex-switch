@@ -1014,7 +1014,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], String> {
         return Err("session conflict checksum is invalid".to_string());
     }
     let mut output = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let encoded = std::str::from_utf8(chunk)
             .map_err(|_| "session conflict checksum is invalid".to_string())?;
         output[index] = u8::from_str_radix(encoded, 16)
