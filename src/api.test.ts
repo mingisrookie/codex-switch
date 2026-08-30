@@ -69,7 +69,7 @@ import {
   upsertRelayRuntime,
   verifySessionStorageMigrationBackup,
 } from './api';
-import type { BackupSummary } from './types';
+import type { BackupSummary, RuntimeSwitchProgress } from './types';
 
 describe('dashboard API', () => {
   beforeEach(() => invoke.mockReset());
@@ -679,21 +679,29 @@ describe('dashboard API', () => {
 
   it('passes a per-switch channel and forwards backend progress events', async () => {
     invoke.mockResolvedValue({ changed: true });
-    const events: string[] = [];
+    const events: RuntimeSwitchProgress[] = [];
 
-    await switchRuntime('relay', (event) => events.push(event.phase));
+    await switchRuntime('relay', (event) => events.push(event));
 
     const payload = invoke.mock.calls[0][1] as {
       runtimeId: string;
-      onProgress: { onmessage: (event: { phase: string }) => void };
+      onProgress: { onmessage: (event: RuntimeSwitchProgress) => void };
     };
     expect(invoke).toHaveBeenCalledWith('switch_runtime', {
       runtimeId: 'relay',
       relayPreference: null,
       onProgress: expect.any(Channel),
     });
-    payload.onProgress.onmessage({ phase: 'detectingApp' });
-    expect(events).toEqual(['detectingApp']);
+    payload.onProgress.onmessage({
+      phase: 'failed',
+      timestampMs: 10,
+      outcome: 'failedBeforeWrite',
+      reason: 'standaloneWriterActive',
+    });
+    expect(events).toEqual([expect.objectContaining({
+      phase: 'failed',
+      reason: 'standaloneWriterActive',
+    })]);
   });
 
   it('runs manual full sync once with a progress channel and no dry-run command', async () => {

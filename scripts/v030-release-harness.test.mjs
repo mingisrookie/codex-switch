@@ -27,7 +27,7 @@ import {
   runUpdaterE2e,
   startTargetLock,
 } from "./v030-updater-e2e.mjs";
-import { collectReleaseInputs } from "./v030-source-input-manifest.mjs";
+import { collectReleaseInputs, createSourceInputManifest } from "./v030-source-input-manifest.mjs";
 
 function withTemporaryParent(callback) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "v030-harness-test-"));
@@ -58,8 +58,14 @@ test("argument parsing fails closed and normalizes new absolute roots", () => {
     const updaterOptions = parseUpdaterOptions(["--run-root", updateRoot, "--dry-run", "--mode", "both"]);
     assert.equal(oldOptions.runRoot, oldRoot);
     assert.equal(updaterOptions.runRoot, updateRoot);
+    assert.equal(updaterOptions.oldTag, "v0.2.7");
+    assert.equal(updaterOptions.newTag, "v0.3.0");
+    const patchOptions = parseUpdaterOptions(["--run-root", path.join(parent, "patch-updater"), "--dry-run", "--old-tag", "v0.3.0", "--new-tag", "v0.3.1"]);
+    assert.equal(patchOptions.oldVersion, "0.3.0");
+    assert.equal(patchOptions.newVersion, "0.3.1");
     assert.throws(() => parseOldRuntimeOptions(["--run-root", oldRoot, "--unknown"]), /unknown option/);
     assert.throws(() => parseUpdaterOptions(["--run-root", updateRoot, "--mode", "unsafe"]), /mode is invalid/);
+    assert.throws(() => parseUpdaterOptions(["--run-root", updateRoot, "--old-tag", "v0.3.1", "--new-tag", "v0.3.0"]), /strictly newer/);
     fs.mkdirSync(oldRoot);
     assert.throws(() => parseOldRuntimeOptions(["--run-root", oldRoot]), /must not already exist/);
   });
@@ -179,6 +185,14 @@ test("native helper exposes help and all harnesses avoid broad taskkill", () => 
   }
 });
 
+test("current product and updater gates use graceful test-owned shutdown only", () => {
+  for (const file of ["scripts/v030-product-ui-e2e.mjs", "scripts/v030-updater-e2e.mjs"]) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, /\bprocess\.kill\s*\(|\.kill\s*\(/);
+    assert.match(source, /request_app_exit|closeMainWindowExact/);
+  }
+});
+
 test("exact process inventory tolerates an absent or already-exited executable", async () => {
   if (process.platform !== "win32") return;
   const missing = path.join(os.tmpdir(), `v030-no-process-${process.pid}`, "codex-switch.exe");
@@ -293,6 +307,10 @@ test("the source-input manifest prints help instead of writing a file named --he
 });
 
 test("source-input manifest covers release inputs and excludes generated artifacts", () => {
+  const manifest = createSourceInputManifest();
+  const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+  assert.equal(manifest.version, packageVersion);
+  assert.equal(manifest.gate, `v${packageVersion}-frozen-source-inputs`);
   const inputs = collectReleaseInputs();
   const names = new Set(inputs.map((entry) => entry.path));
   assert.equal(names.has("scripts/v030-source-input-manifest.mjs"), true);

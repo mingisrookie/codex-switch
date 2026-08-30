@@ -919,7 +919,16 @@ export type ChatGptLaunchStatus =
 export type ChatGptLaunchResult = {
   status: ChatGptLaunchStatus;
   message: string | null;
+  reason?: ChatGptLaunchFailureReason | null;
 };
+
+export type ChatGptLaunchFailureReason =
+  | 'launchTargetMissing'
+  | 'launchTargetAmbiguous'
+  | 'processInventoryUnavailable'
+  | 'activationFailed'
+  | 'verificationFailed'
+  | 'unsupported';
 
 export type RuntimeSwitchPhase =
   | 'loadingRuntime'
@@ -944,7 +953,19 @@ export type RuntimeSwitchProgress = {
   operationId?: string | null;
   message?: string | null;
   outcome?: 'failedBeforeWrite' | 'rolledBack' | 'rollbackFailed' | null;
+  reason?: RuntimeSwitchFailureReason | null;
 };
+
+export type RuntimeSwitchFailureReason =
+  | 'officialAuthRequired'
+  | 'invalidAuthState'
+  | 'configUnavailable'
+  | 'sessionViewUnavailable'
+  | 'standaloneWriterActive'
+  | 'mutationBusy'
+  | 'processCloseFailed'
+  | 'routeVerificationFailed'
+  | 'unknown';
 
 export type AppExitRequestResult = {
   scheduled: boolean;

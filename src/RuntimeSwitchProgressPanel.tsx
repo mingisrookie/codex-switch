@@ -55,7 +55,7 @@ const steps: Step[] = [
     phases: ['loadingRuntime', 'validatingOfficialAuth'],
     group: '准备',
     label: '准备目标与登录态',
-    description: '加载目标配置，并锁定只读的官方 auth.json',
+    description: '加载目标配置，并按目标锁定只读的 auth.json 状态',
     icon: ShieldCheck,
   },
   {
@@ -303,12 +303,12 @@ export function RuntimeSwitchProgressPanel({
           {rollingBack ? (
             <div className="rollback-track">
               <RotateCcw className="spin-slow" aria-hidden="true" />
-              <div><strong>正在恢复原始请求配置</strong><span>只回滚 config.toml，官方登录态不会被触碰</span></div>
+              <div><strong>正在恢复原始请求配置</strong><span>只回滚 config.toml，auth.json 原字节或缺失状态不会被触碰</span></div>
             </div>
           ) : flow.status === 'failed' && latestEvent?.outcome === 'rolledBack' ? (
             <div className="rollback-track complete">
               <Check aria-hidden="true" />
-              <div><strong>已恢复原始请求配置</strong><span>本次切换未生效，官方登录态保持不变</span></div>
+              <div><strong>已恢复原始请求配置</strong><span>本次切换未生效，auth.json 原字节或缺失状态保持不变</span></div>
             </div>
           ) : flow.status === 'failed' && latestEvent?.outcome === 'rollbackFailed' ? (
             <div className="rollback-track failed">
@@ -322,7 +322,8 @@ export function RuntimeSwitchProgressPanel({
               <CircleAlert aria-hidden="true" />
               <div>
                 <strong>{failureLabel(latestEvent?.outcome)}</strong>
-                {flow.error ? <p>{flow.error}</p> : null}
+                <p>{failureGuidance(latestEvent?.reason)}</p>
+                {flow.error ? <small>{flow.error}</small> : null}
               </div>
             </section>
           ) : flow.status === 'succeeded' && flow.result ? (
@@ -382,6 +383,9 @@ function SwitchSuccessResult({
   const launchFailed = launch.status === 'failed';
   const launchBlocked = launch.status === 'blocked';
   const launchProblem = launchFailed || launchBlocked;
+  const launchRetryable = launchFailed && (
+    launch.reason === 'activationFailed' || launch.reason === 'verificationFailed' || !launch.reason
+  );
   const LaunchIcon = flow.launchRetrying
     ? LoaderCircle
     : launchProblem
@@ -410,7 +414,7 @@ function SwitchSuccessResult({
       <dl className="switch-receipt" aria-label="切换回执">
         <div><dt>操作 ID</dt><dd>{result.operationId}</dd></div>
         <div><dt>目标请求端</dt><dd>{result.runtime.kind === 'plus' ? 'OpenAI 官方' : 'API Relay'}</dd></div>
-        <div><dt>官方登录态</dt><dd>已验证保持不变</dd></div>
+        <div><dt>登录文件</dt><dd>{result.runtime.kind === 'relay' ? '未改写（允许不存在）' : '已验证保持不变'}</dd></div>
         <div><dt>配置变更</dt><dd>{result.changed ? '已原子应用' : '无需变更'}</dd></div>
         <div>
           <dt>进程状态</dt>
@@ -440,12 +444,14 @@ function SwitchSuccessResult({
         <p>
           {launchBlocked
             ? '切换后安全记录未到达可验证终态；请先检查操作记录与保留的检查点，不要直接打开 ChatGPT。'
-            : launchFailed
+            : launchRetryable
             ? '运行态切换已经成功，不会因启动失败而回滚。'
+            : launchFailed
+              ? '运行态切换已经成功；启动目标需要先按上方说明恢复，当前不会猜测应用或 EXE。'
             : '切换回执已持久化；需要深度处理的会话保留给“会话合并与修复”。'}
         </p>
         <div className="switch-task-actions">
-          {launchFailed ? (
+          {launchRetryable ? (
             <button className="primary-button" onClick={onRetryLaunch} disabled={flow.launchRetrying}>
               {flow.launchRetrying
                 ? <LoaderCircle className="button-icon spin" aria-hidden="true" />
@@ -614,7 +620,19 @@ function launchDescription(result: RuntimeSwitchResult) {
     return '检测到目标应用已经运行，没有重复启动进程。';
   }
   if (result.chatgptLaunch.status === 'failed') {
-    return '切换结果仍然有效，你可以重试或稍后手动打开。';
+    if (result.chatgptLaunch.reason === 'launchTargetAmbiguous') {
+      return '切换结果仍然有效；检测到多个可信 Windows 应用身份，未猜测启动目标。请先手动打开希望使用的 ChatGPT/Codex 应用一次。';
+    }
+    if (result.chatgptLaunch.reason === 'launchTargetMissing') {
+      return '切换结果仍然有效；尚未建立可验证的 Windows 应用身份。请先手动打开目标应用一次。';
+    }
+    if (result.chatgptLaunch.reason === 'processInventoryUnavailable') {
+      return '切换结果仍然有效；本次无法验证目标应用进程，未继续自动启动。';
+    }
+    if (result.chatgptLaunch.reason === 'unsupported') {
+      return '切换结果仍然有效；当前平台不支持受控自动启动。';
+    }
+    return '切换结果仍然有效，你可以重试自动打开或稍后手动打开。';
   }
   if (result.chatgptLaunch.status === 'blocked') {
     return '切换后安全记录未到达可验证终态；必须先检查操作记录与保留的安全检查点。';
@@ -627,6 +645,18 @@ function launchDescription(result: RuntimeSwitchResult) {
 function failureLabel(outcome: RuntimeSwitchProgress['outcome']) {
   if (outcome === 'rolledBack') return '切换失败，已恢复原始请求配置';
   if (outcome === 'rollbackFailed') return '切换失败且配置恢复未完成，请先不要重新打开 ChatGPT';
-  if (outcome === 'failedBeforeWrite') return '切换在写入前失败，官方登录态与请求配置均未变更';
+  if (outcome === 'failedBeforeWrite') return '切换在写入前失败，登录文件状态与请求配置均未变更';
   return '切换失败，但未收到可验证的终态；请先不要重新打开 ChatGPT';
+}
+
+function failureGuidance(reason: RuntimeSwitchProgress['reason']) {
+  if (reason === 'officialAuthRequired') return 'Account 请求端需要现有的 ChatGPT 官方登录；Relay 配置没有被改动。';
+  if (reason === 'invalidAuthState') return 'auth.json 存在但无法安全解析。修复或移走损坏文件后重试，应用不会代写登录态。';
+  if (reason === 'configUnavailable') return '请求配置无法安全读取、写入或恢复。请检查 config.toml 权限与格式后重试。';
+  if (reason === 'sessionViewUnavailable') return '会话数据库视图缺失、冲突或无法证明所有权。请保留现场并导出诊断。';
+  if (reason === 'standaloneWriterActive') return '检测到独立 Codex CLI/工作进程仍在写入。请让对应任务自然结束或自行关闭后重试；应用不会终止它。';
+  if (reason === 'mutationBusy') return '另一个真实写入任务正在执行。等待该任务到达终态后重试。';
+  if (reason === 'processCloseFailed') return '受管 ChatGPT 进程未能安全退出。请先保存工作并手动关闭应用后重试。';
+  if (reason === 'routeVerificationFailed') return '写入后的请求端校验未通过；系统已按终态尝试回滚，请查看诊断。';
+  return '未收到可识别的失败原因。请导出诊断后重试，避免反复覆盖当前现场。';
 }

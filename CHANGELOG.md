@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.1 - 2026-08-30
+
+### Fixed
+
+- 修复未登录官方 ChatGPT 时无法配置或切换 API 中转站的问题。Relay 目标现在允许 `auth.json` 不存在或为可解析的非官方状态，并根据冻结的登录态设置 `requires_openai_auth`；切换过程不创建、替换或伪造官方登录文件，Account 目标仍明确要求有效官方登录。
+- 修复 fresh Codex Home 缺少 `config.toml` 或 `state_5.sqlite` 时 Relay 保存/切换失败的问题。缺失配置可从最小受管模板原子创建并在失败时恢复为不存在；空 Relay 会话视图使用带所有权证明的 bootstrap 状态，不伪造官方数据库，首次产生 Relay 数据后可安全物化 Account 视图。
+- 修复后台自动 GC 轮询占有全局 mutation lock、导致前台切换偶发 `mutationBusy` 的竞争。writer 存在或 Shadow 待稳定时先无锁等待，真正恢复/写入前才加锁并二次校验；请求路由成功后只排队 coalesced Shadow。
+- 修复切换失败只能依赖字符串判断的问题。认证、配置、会话视图、独立 writer、真实并发、进程关闭、路由验证和启动目标现在以稳定 camelCase reason 从 Rust/Tauri 传到 UI，并显示对应恢复建议；路由成功与 ChatGPT 启动失败继续作为两个独立事实。
+- 修复多个可信 ChatGPT AppUserModelID 同时注册时重启目标偶发歧义的问题。应用只持久化最近验证且仍在可信白名单/注册表中的 AUMID；没有可信证据时保持 fail-closed，不猜 EXE 或 PATH。
+
+### Safety and compatibility
+
+- 已有官方登录、Relay Key DPAPI 槽位、Account/Relay 两槽合同和 `supports_websockets = true` 规则保持兼容；已有官方登录在 Relay 切换前后仍按字节保持不变。
+- 配置回滚新增外部替换保护：只有 live bytes 仍等于本次 operation 写入值时才恢复旧快照，避免覆盖并发外部写入；独立 Account/Relay bootstrap 数据库冲突继续 fail closed。
+- 本版本的本地/CI/公开资产与 updater 证据必须绑定精确 `v0.3.1` 提交；历史 `v0.3.0` 结果不作为本版本发布证明。最终文件大小、SHA-256 和公开更新结果以 [GitHub Release v0.3.1](https://github.com/mingisrookie/codex-switch/releases/tag/v0.3.1) 为准。
+
 ## v0.3.0 - 2026-08-15
 
 > 本版本只有在精确旧版运行时、最终真实库只读预检、完整质量门、tag-CI、公开资产回下载、updater 首跳与回滚全部闭环后才构成正式发布。

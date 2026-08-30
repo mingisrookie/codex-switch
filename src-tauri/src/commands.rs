@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -59,7 +60,7 @@ use crate::{
     },
     runtime_switcher::{
         BackupReceiptSummary, ChatGptLaunchReceipt, ChatGptLaunchStatus, RelayValidationStatus,
-        RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
+        RuntimeSwitchFailureReason, RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
     },
     session_incremental::IncrementalSessionSyncStatus,
     session_manager::{
@@ -769,6 +770,33 @@ fn reconcile_committed_session_storage_reclaim_metrics() -> Result<usize, String
 fn run_session_storage_startup_retention() -> Result<Option<SessionStorageRetentionReceipt>, String>
 {
     let _mutation_guard = acquire_mutation_lock()?;
+    run_session_storage_retention_with_lock_held()
+}
+
+fn run_automatic_session_storage_retention(
+    expected_generation: u64,
+) -> Result<Option<SessionStorageRetentionReceipt>, String> {
+    let mutation_window = acquire_writer_free_mutation_lock_with(
+        Some(expected_generation),
+        || AUTOMATIC_GC_GENERATION.load(Ordering::Acquire),
+        active_codex_writer_count,
+        acquire_mutation_lock,
+    )?;
+    let _mutation_guard = match mutation_window {
+        AutomaticGcMutationWindow::Ready(guard) => guard,
+        AutomaticGcMutationWindow::Stale => {
+            return Err("automatic GC request was superseded before mutation".to_string())
+        }
+        AutomaticGcMutationWindow::WaitForWriter => return Err(
+            "session storage mutation requires every Codex writer to be closed; activeProcesses=1+"
+                .to_string(),
+        ),
+    };
+    run_session_storage_retention_with_lock_held()
+}
+
+fn run_session_storage_retention_with_lock_held(
+) -> Result<Option<SessionStorageRetentionReceipt>, String> {
     let appdata = appdata_root()?;
     let data_root = appdata.join("codex-switch");
     if !data_root.exists() {
@@ -1207,6 +1235,8 @@ pub struct RuntimeSwitchProgress {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RuntimeSwitchOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RuntimeSwitchFailureReason>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2680,8 +2710,35 @@ fn run_session_storage_offline_gc_blocking(
 
 fn run_automatic_session_storage_offline_gc_blocking(
     migration_operation_id: &str,
+    expected_generation: u64,
 ) -> Result<OfflineGcReceipt, String> {
-    run_session_storage_offline_gc_blocking_with_policy(migration_operation_id, true)
+    let codex_home = managed_codex_home()?;
+    let data_root = appdata_root()?.join("codex-switch");
+    let mutation_window = acquire_writer_free_mutation_lock_with(
+        Some(expected_generation),
+        || AUTOMATIC_GC_GENERATION.load(Ordering::Acquire),
+        active_codex_writer_count,
+        acquire_mutation_lock,
+    )?;
+    let _mutation_guard = match mutation_window {
+        AutomaticGcMutationWindow::Ready(guard) => guard,
+        AutomaticGcMutationWindow::Stale => {
+            return Err("automatic GC request was superseded before mutation".to_string())
+        }
+        AutomaticGcMutationWindow::WaitForWriter => return Err(
+            "session storage mutation requires every Codex writer to be closed; activeProcesses=1+"
+                .to_string(),
+        ),
+    };
+    let mut ensure_no_writer = |action: &str| ensure_no_codex_writer_for_session_storage(action);
+    run_session_storage_offline_gc_at_with_policy(
+        &codex_home,
+        &data_root,
+        migration_operation_id,
+        true,
+        &mut ensure_no_writer,
+        true,
+    )
 }
 
 fn run_session_storage_offline_gc_blocking_with_policy(
@@ -4373,6 +4430,7 @@ pub async fn switch_runtime(
                 diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+                RuntimeSwitchFailureReason::Unknown,
             );
             record_diagnostic_terminal(
                 diagnostic.as_ref(),
@@ -4393,7 +4451,7 @@ pub async fn switch_runtime(
                 appdata_root().ok()?.join("codex-switch"),
             ))
         },
-        request_shadow_and_automatic_gc,
+        request_background_shadow_scan,
     );
     correlate_mutation_result(result, diagnostic.as_ref())
 }
@@ -4607,36 +4665,6 @@ fn background_automatic_gc_loop() {
         let Some(request) = request else {
             break;
         };
-        match recover_deferred_automatic_offline_gc(&request.data_root) {
-            Ok(AutomaticGcRecoveryDecision::Continue) => {}
-            Ok(AutomaticGcRecoveryDecision::WaitForSafeWindow) => {
-                AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
-                thread::sleep(AUTOMATIC_GC_SAFE_WINDOW_RETRY);
-                continue;
-            }
-            Err(error) if error == mutation_busy_error() => {
-                AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
-                thread::sleep(AUTOMATIC_GC_SAFE_WINDOW_RETRY);
-                continue;
-            }
-            Err(error) => {
-                record_background_result(
-                    "recoverAutomaticSessionStorageOfflineGc",
-                    "commands.automatic_session_storage_gc.recovery_failed",
-                    &Err::<(), String>(error),
-                );
-                continue;
-            }
-        }
-        let retention = run_session_storage_startup_retention();
-        if let Err(error) = &retention {
-            record_background_result(
-                "runSessionStorageRetentionAtSafeWindow",
-                "commands.session_storage_safe_window_retention.failed",
-                &Err::<(), String>(error.clone()),
-            );
-            continue;
-        }
         let decision = inspect_automatic_gc_window(
             &request.codex_home,
             &request.data_root,
@@ -4658,8 +4686,49 @@ fn background_automatic_gc_loop() {
                 &Err::<(), String>(error.to_string()),
             ),
             Ok(AutomaticGcDecision::Run(migration_operation_id)) => {
-                let result =
-                    run_automatic_session_storage_offline_gc_blocking(&migration_operation_id);
+                match recover_deferred_automatic_offline_gc(&request.data_root) {
+                    Ok(AutomaticGcRecoveryDecision::Continue) => {}
+                    Ok(AutomaticGcRecoveryDecision::WaitForSafeWindow) => {
+                        AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
+                        thread::sleep(AUTOMATIC_GC_SAFE_WINDOW_RETRY);
+                        continue;
+                    }
+                    Err(error) if error == mutation_busy_error() => {
+                        AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
+                        thread::sleep(AUTOMATIC_GC_SAFE_WINDOW_RETRY);
+                        continue;
+                    }
+                    Err(error) => {
+                        record_background_result(
+                            "recoverAutomaticSessionStorageOfflineGc",
+                            "commands.automatic_session_storage_gc.recovery_failed",
+                            &Err::<(), String>(error),
+                        );
+                        continue;
+                    }
+                }
+                let retention = run_automatic_session_storage_retention(request.generation);
+                if let Err(error) = &retention {
+                    if automatic_gc_error_is_transient(error) {
+                        AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
+                        thread::sleep(AUTOMATIC_GC_SAFE_WINDOW_RETRY);
+                        continue;
+                    }
+                    record_background_result(
+                        "runSessionStorageRetentionAtSafeWindow",
+                        "commands.session_storage_safe_window_retention.failed",
+                        &Err::<(), String>(error.clone()),
+                    );
+                    continue;
+                }
+                if AUTOMATIC_GC_GENERATION.load(Ordering::Acquire) != request.generation {
+                    AUTOMATIC_GC_PENDING.store(true, Ordering::Release);
+                    continue;
+                }
+                let result = run_automatic_session_storage_offline_gc_blocking(
+                    &migration_operation_id,
+                    request.generation,
+                );
                 if result
                     .as_ref()
                     .err()
@@ -4690,6 +4759,7 @@ fn background_automatic_gc_loop() {
 
 fn automatic_gc_error_is_transient(error: &str) -> bool {
     error == mutation_busy_error()
+        || error == "automatic GC request was superseded before mutation"
         || error.starts_with(
             "session storage mutation requires every Codex writer to be closed; activeProcesses=",
         )
@@ -4701,11 +4771,18 @@ fn automatic_gc_error_is_transient(error: &str) -> bool {
 fn recover_deferred_automatic_offline_gc(
     data_root: &Path,
 ) -> Result<AutomaticGcRecoveryDecision, String> {
-    let _mutation_guard = acquire_mutation_lock()?;
-    let (managed, standalone) = list_process_inventory()?;
-    if !managed.is_empty() || !standalone.is_empty() {
-        return Ok(AutomaticGcRecoveryDecision::WaitForSafeWindow);
-    }
+    let mutation_window = acquire_writer_free_mutation_lock_with(
+        None,
+        || AUTOMATIC_GC_GENERATION.load(Ordering::Acquire),
+        active_codex_writer_count,
+        acquire_mutation_lock,
+    )?;
+    let _mutation_guard = match mutation_window {
+        AutomaticGcMutationWindow::Ready(guard) => guard,
+        AutomaticGcMutationWindow::Stale | AutomaticGcMutationWindow::WaitForWriter => {
+            return Ok(AutomaticGcRecoveryDecision::WaitForSafeWindow)
+        }
+    };
     let store = OperationLedgerStore::new(data_root);
     let interrupted = store
         .unfinished()?
@@ -4749,6 +4826,45 @@ fn recover_deferred_automatic_offline_gc(
         }
     }
     Ok(AutomaticGcRecoveryDecision::Continue)
+}
+
+#[derive(Debug)]
+enum AutomaticGcMutationWindow<Guard> {
+    Stale,
+    WaitForWriter,
+    Ready(Guard),
+}
+
+fn active_codex_writer_count() -> Result<usize, String> {
+    let (managed, standalone) = list_process_inventory()?;
+    Ok(managed.len().saturating_add(standalone.len()))
+}
+
+fn acquire_writer_free_mutation_lock_with<Guard, Generation, Writers, Acquire>(
+    expected_generation: Option<u64>,
+    mut current_generation: Generation,
+    mut active_writers: Writers,
+    acquire: Acquire,
+) -> Result<AutomaticGcMutationWindow<Guard>, String>
+where
+    Generation: FnMut() -> u64,
+    Writers: FnMut() -> Result<usize, String>,
+    Acquire: FnOnce() -> Result<Guard, String>,
+{
+    if expected_generation.is_some_and(|expected| current_generation() != expected) {
+        return Ok(AutomaticGcMutationWindow::Stale);
+    }
+    if active_writers()? > 0 {
+        return Ok(AutomaticGcMutationWindow::WaitForWriter);
+    }
+    let guard = acquire()?;
+    if expected_generation.is_some_and(|expected| current_generation() != expected) {
+        return Ok(AutomaticGcMutationWindow::Stale);
+    }
+    if active_writers()? > 0 {
+        return Ok(AutomaticGcMutationWindow::WaitForWriter);
+    }
+    Ok(AutomaticGcMutationWindow::Ready(guard))
 }
 
 fn inspect_automatic_gc_window(
@@ -4803,17 +4919,23 @@ fn switch_runtime_blocking(
     let _mutation_guard = match acquire_mutation_lock() {
         Ok(guard) => guard,
         Err(error) => {
+            let reason = if error == mutation_busy_error() {
+                RuntimeSwitchFailureReason::MutationBusy
+            } else {
+                RuntimeSwitchFailureReason::Unknown
+            };
             emit_runtime_switch_failure_diagnostic(
                 &on_progress,
                 diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+                reason,
             );
             record_diagnostic_terminal(
                 diagnostic.as_ref(),
                 diagnostic_status_for_command_error(&error),
                 "preflight",
-                Some("commands.switch_runtime.mutation_lock"),
+                Some(runtime_switch_failure_reason_code(reason)),
                 Some(&error),
             );
             return Err(error);
@@ -4827,6 +4949,7 @@ fn switch_runtime_blocking(
                 diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+                RuntimeSwitchFailureReason::Unknown,
             );
             record_diagnostic_terminal(
                 diagnostic.as_ref(),
@@ -4846,6 +4969,7 @@ fn switch_runtime_blocking(
                 diagnostic.as_ref(),
                 &error,
                 RuntimeSwitchOutcome::FailedBeforeWrite,
+                RuntimeSwitchFailureReason::Unknown,
             );
             record_diagnostic_terminal(
                 diagnostic.as_ref(),
@@ -4859,6 +4983,7 @@ fn switch_runtime_blocking(
     };
     let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
     let mut failure_operation_id = None;
+    let failure_reason = Cell::new(RuntimeSwitchFailureReason::Unknown);
     let target_is_account = runtime_id == PLUS_RUNTIME_ID;
     let relay_validation = relay_validation_without_network(&runtime_id);
     let mut launch_target_captured = false;
@@ -4877,20 +5002,37 @@ fn switch_runtime_blocking(
             RuntimeSwitchPhase::ValidatingOfficialAuth,
             None,
         );
-        let plan = preflight_request_route_switch(&store, &runtime_id, &current_home)?;
+        let plan = preflight_request_route_switch(&store, &runtime_id, &current_home).map_err(
+            |failure| {
+                failure_reason.set(failure.reason);
+                failure_operation_id = failure.operation_id;
+                failure_outcome = failure.outcome;
+                failure.message
+            },
+        )?;
         if plan.requires_change() || target_is_account {
-            close_runtime_processes_with_progress(
+            let close_result = close_runtime_processes_with_progress(
                 || {
-                    let processes =
-                        list_managed_processes_for_closed_mutation("switching request routes")?;
+                    let (processes, standalone) = list_process_inventory()?;
+                    if !standalone.is_empty() {
+                        failure_reason.set(RuntimeSwitchFailureReason::StandaloneWriterActive);
+                        return Err(
+                            "a standalone Codex CLI is still running; close it before switching request routes"
+                                .to_string(),
+                        );
+                    }
                     capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
                         // The pre-close inventory is the only point at which the
                         // running package identity may be captured.
-                        let _ = cache_chatgpt_launch_target();
+                        cache_chatgpt_launch_target().is_ok()
                     });
                     Ok(processes)
                 },
-                || close_codex().map(|_| ()),
+                || {
+                    close_codex().map(|_| ()).inspect_err(|_| {
+                        failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
+                    })
+                },
                 |phase, message| {
                     emit_runtime_switch_progress_diagnostic(
                         &on_progress,
@@ -4899,19 +5041,32 @@ fn switch_runtime_blocking(
                         message,
                     )
                 },
-            )?;
+            );
+            if close_result.is_err() && failure_reason.get() == RuntimeSwitchFailureReason::Unknown
+            {
+                failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
+            }
+            close_result?;
         } else {
             // A Relay no-op does not enter the process-close gate, so retain
             // the running package identity for the controlled launcher.
             capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                let _ = cache_chatgpt_launch_target();
+                cache_chatgpt_launch_target().is_ok()
             });
         }
         match switch_request_route_preflighted_with_progress(
             &store,
             &current_home,
             plan,
-            &mut || ensure_codex_closed("switching request routes"),
+            &mut || {
+                let (managed, standalone) = list_process_inventory()?;
+                if !standalone.is_empty() {
+                    failure_reason.set(RuntimeSwitchFailureReason::StandaloneWriterActive);
+                } else if !managed.is_empty() {
+                    failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
+                }
+                ensure_codex_closed_from_processes("switching request routes", managed, standalone)
+            },
             &mut |phase| {
                 emit_runtime_switch_progress_diagnostic(
                     &on_progress,
@@ -4971,6 +5126,9 @@ fn switch_runtime_blocking(
             Err(failure) => {
                 failure_operation_id = failure.operation_id;
                 failure_outcome = failure.outcome;
+                if failure_reason.get() != RuntimeSwitchFailureReason::StandaloneWriterActive {
+                    failure_reason.set(failure.reason);
+                }
                 Err(failure.message)
             }
         }
@@ -4983,7 +5141,7 @@ fn switch_runtime_blocking(
                     "requestRouteChanged".to_string(),
                     usize::from(receipt.changed),
                 ),
-                ("officialAuthPreserved".to_string(), 1),
+                ("authStatePreserved".to_string(), 1),
                 (
                     "chatProcessStateRepaired".to_string(),
                     usize::from(receipt.chat_process_state_repaired),
@@ -5059,6 +5217,7 @@ fn switch_runtime_blocking(
                 ChatGptLaunchReceipt {
                     status: ChatGptLaunchStatus::Blocked,
                     message: receipt.route_provenance.message.clone(),
+                    reason: None,
                 }
             };
         }
@@ -5081,11 +5240,12 @@ fn switch_runtime_blocking(
             }
         }
     }
-    emit_runtime_switch_terminal_diagnostic(
+    emit_runtime_switch_terminal_diagnostic_with_reason(
         &on_progress,
         diagnostic.as_ref(),
         &result,
         failure_outcome,
+        failure_reason.get(),
     );
     if diagnostic
         .as_ref()
@@ -5106,7 +5266,7 @@ fn switch_runtime_blocking(
                 diagnostic.as_ref(),
                 runtime_switch_diagnostic_status(failure_outcome),
                 runtime_switch_diagnostic_terminal_phase(failure_outcome),
-                Some(runtime_switch_diagnostic_error_code(failure_outcome)),
+                Some(runtime_switch_failure_reason_code(failure_reason.get())),
                 Some(error),
             ),
         }
@@ -5116,13 +5276,12 @@ fn switch_runtime_blocking(
 
 fn capture_chatgpt_launch_target_once<Capture>(captured: &mut bool, capture: Capture)
 where
-    Capture: FnOnce(),
+    Capture: FnOnce() -> bool,
 {
     if *captured {
         return;
     }
-    capture();
-    *captured = true;
+    *captured = capture();
 }
 
 fn successful_switch_requests_chatgpt_launch(_changed: bool) -> bool {
@@ -5140,11 +5299,12 @@ where
 {
     if !terminal_recorded {
         return ChatGptLaunchReceipt {
-            status: ChatGptLaunchStatus::Failed,
+            status: ChatGptLaunchStatus::Blocked,
             message: Some(
                 "ChatGPT was not launched because the runtime switch terminal record could not be persisted."
                     .to_string(),
             ),
+            reason: None,
         };
     }
     launch()
@@ -5183,7 +5343,14 @@ fn emit_runtime_switch_progress_diagnostic(
     phase: RuntimeSwitchPhase,
     message: Option<String>,
 ) {
-    emit_runtime_switch_progress_event_diagnostic(on_progress, diagnostic, phase, message, None);
+    emit_runtime_switch_progress_event_diagnostic(
+        on_progress,
+        diagnostic,
+        phase,
+        message,
+        None,
+        None,
+    );
 }
 
 fn emit_runtime_switch_progress_event_diagnostic(
@@ -5192,6 +5359,7 @@ fn emit_runtime_switch_progress_event_diagnostic(
     phase: RuntimeSwitchPhase,
     message: Option<String>,
     outcome: Option<RuntimeSwitchOutcome>,
+    reason: Option<RuntimeSwitchFailureReason>,
 ) {
     record_diagnostic_phase(diagnostic, runtime_switch_phase_name(phase));
     let _ = on_progress.send(RuntimeSwitchProgress {
@@ -5200,6 +5368,7 @@ fn emit_runtime_switch_progress_event_diagnostic(
         operation_id: diagnostic_correlation_id(diagnostic),
         message,
         outcome,
+        reason,
     });
 }
 
@@ -5208,6 +5377,7 @@ fn emit_runtime_switch_failure_diagnostic(
     diagnostic: Option<&DiagnosticOperation>,
     error: &str,
     outcome: RuntimeSwitchOutcome,
+    reason: RuntimeSwitchFailureReason,
 ) {
     emit_runtime_switch_progress_event_diagnostic(
         on_progress,
@@ -5215,6 +5385,7 @@ fn emit_runtime_switch_failure_diagnostic(
         RuntimeSwitchPhase::Failed,
         Some(error.to_string()),
         Some(outcome),
+        Some(reason),
     );
 }
 
@@ -5224,14 +5395,37 @@ fn emit_runtime_switch_terminal<T>(
     result: &Result<T, String>,
     failure_outcome: RuntimeSwitchOutcome,
 ) {
-    emit_runtime_switch_terminal_diagnostic(on_progress, None, result, failure_outcome);
+    emit_runtime_switch_terminal_diagnostic_with_reason(
+        on_progress,
+        None,
+        result,
+        failure_outcome,
+        RuntimeSwitchFailureReason::Unknown,
+    );
 }
 
+#[cfg(test)]
 fn emit_runtime_switch_terminal_diagnostic<T>(
     on_progress: &Channel<RuntimeSwitchProgress>,
     diagnostic: Option<&DiagnosticOperation>,
     result: &Result<T, String>,
     failure_outcome: RuntimeSwitchOutcome,
+) {
+    emit_runtime_switch_terminal_diagnostic_with_reason(
+        on_progress,
+        diagnostic,
+        result,
+        failure_outcome,
+        RuntimeSwitchFailureReason::Unknown,
+    );
+}
+
+fn emit_runtime_switch_terminal_diagnostic_with_reason<T>(
+    on_progress: &Channel<RuntimeSwitchProgress>,
+    diagnostic: Option<&DiagnosticOperation>,
+    result: &Result<T, String>,
+    failure_outcome: RuntimeSwitchOutcome,
+    failure_reason: RuntimeSwitchFailureReason,
 ) {
     match result {
         Ok(_) => {
@@ -5243,7 +5437,13 @@ fn emit_runtime_switch_terminal_diagnostic<T>(
             );
         }
         Err(error) => {
-            emit_runtime_switch_failure_diagnostic(on_progress, diagnostic, error, failure_outcome);
+            emit_runtime_switch_failure_diagnostic(
+                on_progress,
+                diagnostic,
+                error,
+                failure_outcome,
+                failure_reason,
+            );
         }
     }
 }
@@ -5276,11 +5476,31 @@ fn runtime_switch_diagnostic_status(outcome: RuntimeSwitchOutcome) -> Diagnostic
     }
 }
 
-fn runtime_switch_diagnostic_error_code(outcome: RuntimeSwitchOutcome) -> &'static str {
-    match outcome {
-        RuntimeSwitchOutcome::FailedBeforeWrite => "commands.switch_runtime.failed_before_write",
-        RuntimeSwitchOutcome::RolledBack => "commands.switch_runtime.rolled_back",
-        RuntimeSwitchOutcome::RollbackFailed => "commands.switch_runtime.rollback_failed",
+fn runtime_switch_failure_reason_code(reason: RuntimeSwitchFailureReason) -> &'static str {
+    match reason {
+        RuntimeSwitchFailureReason::OfficialAuthRequired => {
+            "commands.switch_runtime.official_auth_required"
+        }
+        RuntimeSwitchFailureReason::InvalidAuthState => {
+            "commands.switch_runtime.invalid_auth_state"
+        }
+        RuntimeSwitchFailureReason::ConfigUnavailable => {
+            "commands.switch_runtime.config_unavailable"
+        }
+        RuntimeSwitchFailureReason::SessionViewUnavailable => {
+            "commands.switch_runtime.session_view_unavailable"
+        }
+        RuntimeSwitchFailureReason::StandaloneWriterActive => {
+            "commands.switch_runtime.standalone_writer_active"
+        }
+        RuntimeSwitchFailureReason::MutationBusy => "commands.switch_runtime.mutation_busy",
+        RuntimeSwitchFailureReason::ProcessCloseFailed => {
+            "commands.switch_runtime.process_close_failed"
+        }
+        RuntimeSwitchFailureReason::RouteVerificationFailed => {
+            "commands.switch_runtime.route_verification_failed"
+        }
+        RuntimeSwitchFailureReason::Unknown => "commands.switch_runtime.unknown",
     }
 }
 
@@ -6057,7 +6277,7 @@ fn legacy_provider_full_sync_for_migration_fixture(
         let processes =
             list_managed_processes_for_closed_mutation("completely syncing active sessions")?;
         capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-            let _ = cache_chatgpt_launch_target();
+            cache_chatgpt_launch_target().is_ok()
         });
         if !processes.is_empty() {
             emit_session_sync_progress_diagnostic(
@@ -8279,7 +8499,7 @@ mod tests {
         operation_log::{
             OperationAction, OperationLog, OperationPhase, OperationRecord, OperationStatus,
         },
-        process_control::CodexProcess,
+        process_control::{ChatGptLaunchFailureReason, CodexProcess},
         session_manager::SessionMutationResult,
         session_storage::{
             migration::{persist_migration_preflight, run_migration_preflight},
@@ -8289,16 +8509,17 @@ mod tests {
     };
 
     use super::{
-        acquire_mutation_lock_at, after_capacity_preflight, append_operation_record_to,
-        automatic_gc_decision, automatic_gc_error_is_transient, capture_chatgpt_launch_target_once,
-        checkpoint_cleanup_counts, checkpoint_cleanup_diagnostic_status,
-        checkpoint_cleanup_terminal, classify_failed_commit_transition,
-        cleanup_automatic_checkpoints, close_codex_processes,
+        acquire_mutation_lock_at, acquire_writer_free_mutation_lock_with, after_capacity_preflight,
+        append_operation_record_to, automatic_gc_decision, automatic_gc_error_is_transient,
+        capture_chatgpt_launch_target_once, checkpoint_cleanup_counts,
+        checkpoint_cleanup_diagnostic_status, checkpoint_cleanup_terminal,
+        classify_failed_commit_transition, cleanup_automatic_checkpoints, close_codex_processes,
         close_runtime_processes_with_progress, collect_session_conflict_candidates,
         correlate_mutation_result, create_full_backup, default_codex_home_from_env, delete_backup,
         delete_backup_at, diagnostic_status_for_command_error, diagnostic_terminal_status,
         emit_runtime_switch_progress_diagnostic, emit_runtime_switch_terminal,
-        emit_runtime_switch_terminal_diagnostic, emit_session_sync_progress_diagnostic,
+        emit_runtime_switch_terminal_diagnostic,
+        emit_runtime_switch_terminal_diagnostic_with_reason, emit_session_sync_progress_diagnostic,
         encode_mutation_error, ensure_codex_closed_from_processes, ensure_codex_paths_unchanged,
         failed_runtime_switch_checkpoints_are_releasable, finish_session_mutation_with_log,
         get_app_status, inspect_checkpoint_storage, launch_chatgpt,
@@ -8316,12 +8537,12 @@ mod tests {
         rollback_unapplied_session_storage_migration_with_cleanup,
         schedule_shadow_scan_after_switch, schedule_shadow_with_optional_automatic_gc,
         successful_switch_requests_chatgpt_launch, switch_runtime, validate_backup_selection,
-        AutomaticGcDecision, BackupDeleteReceipt, BackupReceiptSummary, ChatGptLaunchReceipt,
-        ChatGptLaunchStatus, CheckpointCleanupReceipt, CommitTransitionDisposition,
-        CreateFullBackupReceipt, MutationCoordinator, OperationTerminal, RuntimeSwitchOutcome,
-        RuntimeSwitchPhase, RuntimeSwitchProgress, RuntimeSwitchResult,
-        SessionStorageOperationPhase, SessionSyncPhase, SessionSyncProgress,
-        MAX_LISTED_FULL_BACKUPS, MUTATION_ERROR_ENVELOPE_PREFIX,
+        AutomaticGcDecision, AutomaticGcMutationWindow, BackupDeleteReceipt, BackupReceiptSummary,
+        ChatGptLaunchReceipt, ChatGptLaunchStatus, CheckpointCleanupReceipt,
+        CommitTransitionDisposition, CreateFullBackupReceipt, MutationCoordinator,
+        OperationTerminal, RuntimeSwitchFailureReason, RuntimeSwitchOutcome, RuntimeSwitchPhase,
+        RuntimeSwitchProgress, RuntimeSwitchResult, SessionStorageOperationPhase, SessionSyncPhase,
+        SessionSyncProgress, MAX_LISTED_FULL_BACKUPS, MUTATION_ERROR_ENVELOPE_PREFIX,
     };
 
     #[cfg(windows)]
@@ -8645,9 +8866,54 @@ mod tests {
         assert!(automatic_gc_error_is_transient(
             "offline session storage cleanup rollback is waiting for every Codex writer to close"
         ));
+        assert!(automatic_gc_error_is_transient(
+            "automatic GC request was superseded before mutation"
+        ));
         assert!(!automatic_gc_error_is_transient(
             "offline GC candidate checksum changed"
         ));
+    }
+
+    #[test]
+    fn automatic_gc_polling_checks_writers_before_lock_and_rechecks_after_lock() {
+        let acquire_calls = Cell::new(0_usize);
+        let writers = RefCell::new(VecDeque::from([1_usize]));
+        let window = acquire_writer_free_mutation_lock_with(
+            Some(7),
+            || 7,
+            || Ok(writers.borrow_mut().pop_front().unwrap()),
+            || {
+                acquire_calls.set(acquire_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(window, AutomaticGcMutationWindow::WaitForWriter));
+        assert_eq!(acquire_calls.get(), 0);
+
+        let writers = RefCell::new(VecDeque::from([0_usize, 1_usize]));
+        let window = acquire_writer_free_mutation_lock_with(
+            Some(7),
+            || 7,
+            || Ok(writers.borrow_mut().pop_front().unwrap()),
+            || {
+                acquire_calls.set(acquire_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(window, AutomaticGcMutationWindow::WaitForWriter));
+        assert_eq!(acquire_calls.get(), 1);
+
+        let window = acquire_writer_free_mutation_lock_with(
+            Some(7),
+            || 8,
+            || panic!("stale generation must be rejected before process inspection"),
+            || -> Result<(), String> { panic!("stale generation must not acquire the lock") },
+        )
+        .unwrap();
+        assert!(matches!(window, AutomaticGcMutationWindow::Stale));
+        assert_eq!(acquire_calls.get(), 1);
     }
 
     #[test]
@@ -9016,6 +9282,7 @@ mod tests {
         let failed_result = Ok(ChatGptLaunchReceipt {
             status: ChatGptLaunchStatus::Failed,
             message: Some("Windows activation failed".to_string()),
+            reason: Some(ChatGptLaunchFailureReason::ActivationFailed),
         });
         record_chatgpt_launch_diagnostic(Some(&failed), &failed_result);
 
@@ -9023,6 +9290,7 @@ mod tests {
         let blocked_result = Ok(ChatGptLaunchReceipt {
             status: ChatGptLaunchStatus::Blocked,
             message: Some("launch remained blocked".to_string()),
+            reason: None,
         });
         record_chatgpt_launch_diagnostic(Some(&blocked), &blocked_result);
 
@@ -9054,6 +9322,7 @@ mod tests {
             &ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::Failed,
                 message: Some("Windows activation failed".to_string()),
+                reason: Some(ChatGptLaunchFailureReason::ActivationFailed),
             },
             "commands.switch_runtime.launch_failed",
             "commands.switch_runtime.launch_blocked",
@@ -9064,6 +9333,7 @@ mod tests {
             &ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::Blocked,
                 message: Some("launch remained blocked".to_string()),
+                reason: None,
             },
             "commands.merge_and_repair_sessions.launch_failed",
             "commands.merge_and_repair_sessions.launch_blocked",
@@ -9456,9 +9726,17 @@ mod tests {
             &rollback_failed,
             RuntimeSwitchOutcome::RollbackFailed,
         );
+        let typed_failure: Result<(), String> = Err("standalone writer active".to_string());
+        emit_runtime_switch_terminal_diagnostic_with_reason(
+            &on_progress,
+            None,
+            &typed_failure,
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+            RuntimeSwitchFailureReason::StandaloneWriterActive,
+        );
 
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert_eq!(events[0]["phase"], "complete");
         assert!(events[0]["timestampMs"].as_u64().unwrap() > 0);
         assert!(events[0].get("message").is_none());
@@ -9469,6 +9747,7 @@ mod tests {
         assert!(events[1]["timestampMs"].as_u64().unwrap() > 0);
         assert_eq!(events[2]["outcome"], "rolledBack");
         assert_eq!(events[3]["outcome"], "rollbackFailed");
+        assert_eq!(events[4]["reason"], "standaloneWriterActive");
     }
 
     #[test]
@@ -9910,12 +10189,28 @@ mod tests {
 
         capture_chatgpt_launch_target_once(&mut captured, || {
             capture_calls.set(capture_calls.get() + 1);
+            true
         });
         capture_chatgpt_launch_target_once(&mut captured, || {
             capture_calls.set(capture_calls.get() + 1);
+            true
         });
 
         assert!(captured);
+        assert_eq!(capture_calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_chatgpt_launch_target_capture_is_not_reported_as_captured() {
+        let capture_calls = Cell::new(0);
+        let mut captured = false;
+
+        capture_chatgpt_launch_target_once(&mut captured, || {
+            capture_calls.set(capture_calls.get() + 1);
+            false
+        });
+
+        assert!(!captured);
         assert_eq!(capture_calls.get(), 1);
     }
 
@@ -9927,11 +10222,13 @@ mod tests {
             ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::Launched,
                 message: None,
+                reason: None,
             }
         });
 
         assert_eq!(launch_calls.get(), 0);
-        assert_eq!(terminal_failure.status, ChatGptLaunchStatus::Failed);
+        assert_eq!(terminal_failure.status, ChatGptLaunchStatus::Blocked);
+        assert_eq!(terminal_failure.reason, None);
         assert!(terminal_failure
             .message
             .as_deref()
@@ -9943,6 +10240,7 @@ mod tests {
             ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::Failed,
                 message: Some("injected activation failure".to_string()),
+                reason: Some(ChatGptLaunchFailureReason::ActivationFailed),
             }
         });
 
@@ -9952,6 +10250,7 @@ mod tests {
             ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::Failed,
                 message: Some("injected activation failure".to_string()),
+                reason: Some(ChatGptLaunchFailureReason::ActivationFailed),
             }
         );
     }
@@ -9966,6 +10265,7 @@ mod tests {
             ChatGptLaunchReceipt {
                 status: ChatGptLaunchStatus::AlreadyRunning,
                 message: None,
+                reason: None,
             }
         });
 

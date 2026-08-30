@@ -1991,6 +1991,13 @@ span.section-icon svg {
   border-color: var(--ink);
 }
 
+.runtime-action-help {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .runtime-switch-note {
   display: flex;
   align-items: center;

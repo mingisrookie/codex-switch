@@ -155,6 +155,22 @@ pub fn plan_runtime_config_patch(
     kind: RuntimeConfigKind,
     relay_bearer_token: Option<&str>,
 ) -> Result<ConfigPatchPlan, String> {
+    plan_runtime_config_patch_with_relay_auth(
+        live_toml,
+        runtime_toml,
+        kind,
+        relay_bearer_token,
+        true,
+    )
+}
+
+pub fn plan_runtime_config_patch_with_relay_auth(
+    live_toml: &str,
+    runtime_toml: &str,
+    kind: RuntimeConfigKind,
+    relay_bearer_token: Option<&str>,
+    relay_requires_openai_auth: bool,
+) -> Result<ConfigPatchPlan, String> {
     let mut live = DocumentMut::from_str(live_toml)
         .map_err(|_| "failed to parse live config.toml".to_string())?;
     let runtime = DocumentMut::from_str(runtime_toml)
@@ -228,7 +244,7 @@ pub fn plan_runtime_config_patch(
                 target_table.insert(key, item.clone());
             }
             target_table["experimental_bearer_token"] = value(relay_bearer_token);
-            target_table["requires_openai_auth"] = value(true);
+            target_table["requires_openai_auth"] = value(relay_requires_openai_auth);
             target_table["supports_websockets"] = value(true);
             if target_table.to_string() != previous_table {
                 changed_keys.push(format!("model_providers.{provider}"));
@@ -278,8 +294,9 @@ pub fn apply_sqlite_home_patch(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sqlite_home_patch, plan_config_patch, plan_runtime_config_patch, ConfigOverlay,
-        RuntimeConfigKind, SqliteHomePatch,
+        apply_sqlite_home_patch, plan_config_patch, plan_runtime_config_patch,
+        plan_runtime_config_patch_with_relay_auth, ConfigOverlay, RuntimeConfigKind,
+        SqliteHomePatch,
     };
 
     #[test]
@@ -525,6 +542,32 @@ wire_api = "responses"
         .unwrap_err();
 
         assert_eq!(error, "relay bearer token is required");
+    }
+
+    #[test]
+    fn relay_auth_policy_overrides_legacy_saved_templates_and_is_idempotent() {
+        let runtime = "model = \"relay\"\nmodel_provider = \"openai_custom\"\n\
+            [model_providers.openai_custom]\nbase_url = \"https://relay.example.com/v1\"\n\
+            requires_openai_auth = true\n";
+        let first = plan_runtime_config_patch_with_relay_auth(
+            "",
+            runtime,
+            RuntimeConfigKind::Relay,
+            Some("relay-fixture"),
+            false,
+        )
+        .unwrap();
+        assert!(first.patched_toml.contains("requires_openai_auth = false"));
+        let second = plan_runtime_config_patch_with_relay_auth(
+            &first.patched_toml,
+            runtime,
+            RuntimeConfigKind::Relay,
+            Some("relay-fixture"),
+            false,
+        )
+        .unwrap();
+        assert!(second.changed_keys.is_empty());
+        assert_eq!(first.patched_toml, second.patched_toml);
     }
 
     #[test]

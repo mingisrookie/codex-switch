@@ -204,8 +204,11 @@ impl RuntimeStore {
                 return Err("relay API key is required when changing the relay origin".to_string());
             }
         }
-        let base_config = fs::read_to_string(codex_home.join("config.toml"))
-            .map_err(|error| format!("failed to read live config.toml: {error}"))?;
+        let base_config = match fs::read_to_string(codex_home.join("config.toml")) {
+            Ok(config) => config,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("failed to read live config.toml: {error}")),
+        };
         let config_toml = relay_config_template(&base_config, &normalized_base_url, model)?;
         let auth = if input.api_key.trim().is_empty() {
             self.load_runtime_files(RELAY_RUNTIME_ID)
@@ -272,40 +275,44 @@ impl RuntimeStore {
     }
 
     pub fn detect_active_runtime(&self, codex_home: &Path) -> Result<RuntimeStatus, String> {
-        let live_auth = fs::read(codex_home.join("auth.json"))
-            .map_err(|error| format!("failed to read live auth.json: {error}"))?;
-        let live_config = fs::read_to_string(codex_home.join("config.toml"))
-            .map_err(|error| format!("failed to read live config.toml: {error}"))?;
-        let auth_mode = auth_mode_from_bytes(&live_auth)?;
+        let auth_mode = match fs::read(codex_home.join("auth.json")) {
+            Ok(live_auth) => auth_mode_from_bytes(&live_auth)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("failed to read live auth.json: {error}")),
+        };
+        let live_config = match fs::read_to_string(codex_home.join("config.toml")) {
+            Ok(config) => config,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("failed to read live config.toml: {error}")),
+        };
         let model_provider = config_string(&live_config, "model_provider")?;
+        let has_official_auth = auth_mode.as_deref() == Some("chatgpt");
 
-        if auth_mode.as_deref() == Some("chatgpt") {
-            for runtime in self.list_runtimes()? {
-                let files = self.load_runtime_files(&runtime.id)?;
-                if runtime_binding_matches(
-                    &runtime,
-                    &files.auth_json,
-                    &files.config_toml,
-                    &live_config,
-                )? {
-                    return Ok(RuntimeStatus {
-                        active_runtime_id: Some(runtime.id),
-                        confidence: RuntimeConfidence::Exact,
-                        auth_mode,
-                        model_provider,
-                        detected_at_ms: timestamp_millis()?,
-                    });
-                }
+        for runtime in self.list_runtimes()? {
+            if runtime.kind == RuntimeKind::Plus && !has_official_auth {
+                continue;
+            }
+            let files = self.load_runtime_files(&runtime.id)?;
+            if runtime_binding_matches(
+                &runtime,
+                &files.auth_json,
+                &files.config_toml,
+                &live_config,
+                has_official_auth,
+            )? {
+                return Ok(RuntimeStatus {
+                    active_runtime_id: Some(runtime.id),
+                    confidence: RuntimeConfidence::Exact,
+                    auth_mode,
+                    model_provider,
+                    detected_at_ms: timestamp_millis()?,
+                });
             }
         }
 
-        let active_runtime_id = match (auth_mode.as_deref(), model_provider.as_deref()) {
-            (Some("chatgpt"), provider) if provider != Some(MANAGED_RELAY_PROVIDER_ID) => {
-                Some(PLUS_RUNTIME_ID.to_string())
-            }
-            (Some("chatgpt"), Some(MANAGED_RELAY_PROVIDER_ID)) => {
-                Some(RELAY_RUNTIME_ID.to_string())
-            }
+        let active_runtime_id = match model_provider.as_deref() {
+            Some(MANAGED_RELAY_PROVIDER_ID) => Some(RELAY_RUNTIME_ID.to_string()),
+            _ if has_official_auth => Some(PLUS_RUNTIME_ID.to_string()),
             _ => None,
         };
         let confidence = if active_runtime_id.is_some() {
@@ -938,7 +945,7 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
     provider["name"] = value(MANAGED_RELAY_PROVIDER_ID);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(true);
+    provider["requires_openai_auth"] = value(false);
     provider["supports_websockets"] = value(true);
     provider["request_max_retries"] = value(6);
     provider["stream_max_retries"] = value(3);
@@ -1062,6 +1069,7 @@ fn runtime_binding_matches(
     stored_auth: &[u8],
     stored_config: &str,
     live_config: &str,
+    relay_requires_openai_auth: bool,
 ) -> Result<bool, String> {
     let stored = DocumentMut::from_str(stored_config)
         .map_err(|_| "failed to parse stored runtime config.toml".to_string())?;
@@ -1086,6 +1094,7 @@ fn runtime_binding_matches(
                 &stored,
                 MANAGED_RELAY_PROVIDER_ID,
                 &relay_api_key,
+                relay_requires_openai_auth,
             );
             let stored_provider = document_string(&stored, "model_provider");
             Ok(stored_provider == Some(MANAGED_RELAY_PROVIDER_ID)
@@ -1124,6 +1133,7 @@ fn provider_config_fingerprint_with_bearer(
     doc: &DocumentMut,
     provider: &str,
     bearer_token: &str,
+    requires_openai_auth: bool,
 ) -> Option<Vec<(String, SemanticToml)>> {
     let mut entries = provider_config_fingerprint(doc, provider)?;
     entries.retain(|(key, _)| {
@@ -1139,7 +1149,7 @@ fn provider_config_fingerprint_with_bearer(
     });
     entries.push((
         "requires_openai_auth".to_string(),
-        SemanticToml::Boolean(true),
+        SemanticToml::Boolean(requires_openai_auth),
     ));
     entries.push((
         "experimental_bearer_token".to_string(),
@@ -1379,6 +1389,33 @@ mod tests {
                 .model
                 .as_deref(),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn fresh_home_can_save_relay_without_creating_live_auth_or_config() {
+        let home = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+
+        store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "relay-fixture".to_string(),
+                    model: "relay-model".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        assert!(!home.path().join("auth.json").exists());
+        assert!(!home.path().join("config.toml").exists());
+        let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
+        assert!(files.config_toml.contains("requires_openai_auth = false"));
+        assert_eq!(
+            store.detect_active_runtime(home.path()).unwrap().confidence,
+            RuntimeConfidence::Unknown
         );
     }
 

@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::{
     backup::{BackupManifest, BackupScope},
     process_control::{
-        ChatGptLaunchResult as ProcessChatGptLaunchResult,
+        ChatGptLaunchFailureReason, ChatGptLaunchResult as ProcessChatGptLaunchResult,
         ChatGptLaunchStatus as ProcessChatGptLaunchStatus,
     },
     runtime_store::RuntimeMetadata,
@@ -39,6 +39,8 @@ pub enum ChatGptLaunchStatus {
 pub struct ChatGptLaunchReceipt {
     pub status: ChatGptLaunchStatus,
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ChatGptLaunchFailureReason>,
 }
 
 impl ChatGptLaunchReceipt {
@@ -46,6 +48,7 @@ impl ChatGptLaunchReceipt {
         Self {
             status: ChatGptLaunchStatus::NotRequested,
             message: None,
+            reason: None,
         }
     }
 }
@@ -60,6 +63,7 @@ impl From<ProcessChatGptLaunchResult> for ChatGptLaunchReceipt {
         Self {
             status,
             message: result.message,
+            reason: result.reason,
         }
     }
 }
@@ -140,11 +144,26 @@ pub enum RuntimeSwitchOutcome {
     RollbackFailed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeSwitchFailureReason {
+    OfficialAuthRequired,
+    InvalidAuthState,
+    ConfigUnavailable,
+    SessionViewUnavailable,
+    StandaloneWriterActive,
+    MutationBusy,
+    ProcessCloseFailed,
+    RouteVerificationFailed,
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSwitchFailure {
     pub message: String,
     pub outcome: RuntimeSwitchOutcome,
     pub operation_id: Option<String>,
+    pub reason: RuntimeSwitchFailureReason,
 }
 
 #[cfg(test)]
@@ -270,7 +289,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::sync_home_with_shared_complete_with_paths;
+    use super::{sync_home_with_shared_complete_with_paths, RuntimeSwitchFailureReason};
     use crate::codex_paths::local_codex_paths;
 
     fn create_session_root(
@@ -313,6 +332,48 @@ mod tests {
             .unwrap();
         }
         paths
+    }
+
+    #[test]
+    fn runtime_switch_failure_reasons_serialize_as_stable_camel_case_values() {
+        let cases = [
+            (
+                RuntimeSwitchFailureReason::OfficialAuthRequired,
+                "officialAuthRequired",
+            ),
+            (
+                RuntimeSwitchFailureReason::InvalidAuthState,
+                "invalidAuthState",
+            ),
+            (
+                RuntimeSwitchFailureReason::ConfigUnavailable,
+                "configUnavailable",
+            ),
+            (
+                RuntimeSwitchFailureReason::SessionViewUnavailable,
+                "sessionViewUnavailable",
+            ),
+            (
+                RuntimeSwitchFailureReason::StandaloneWriterActive,
+                "standaloneWriterActive",
+            ),
+            (RuntimeSwitchFailureReason::MutationBusy, "mutationBusy"),
+            (
+                RuntimeSwitchFailureReason::ProcessCloseFailed,
+                "processCloseFailed",
+            ),
+            (
+                RuntimeSwitchFailureReason::RouteVerificationFailed,
+                "routeVerificationFailed",
+            ),
+            (RuntimeSwitchFailureReason::Unknown, "unknown"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
     }
 
     #[test]

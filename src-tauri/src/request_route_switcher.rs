@@ -5,7 +5,8 @@ use serde_json::Value as JsonValue;
 use crate::{
     chat_process_state::{read_snapshot as read_chat_process_state, repair_after_shutdown},
     config_patch::{
-        apply_sqlite_home_patch, plan_runtime_config_patch, ConfigPatchPlan, RuntimeConfigKind,
+        apply_sqlite_home_patch, plan_runtime_config_patch_with_relay_auth, ConfigPatchPlan,
+        RuntimeConfigKind,
     },
     file_ops::atomic_write,
     operation_log::operation_id,
@@ -17,8 +18,8 @@ use crate::{
         relay_api_key_from_auth, RuntimeConfidence, RuntimeKind, RuntimeMetadata, RuntimeStore,
     },
     runtime_switcher::{
-        ChatGptLaunchReceipt, RelayValidationStatus, RuntimeSwitchFailure, RuntimeSwitchOutcome,
-        RuntimeSwitchPhase, RuntimeSwitchResult,
+        ChatGptLaunchReceipt, RelayValidationStatus, RuntimeSwitchFailure,
+        RuntimeSwitchFailureReason, RuntimeSwitchOutcome, RuntimeSwitchPhase, RuntimeSwitchResult,
     },
     session_incremental::IncrementalSessionSyncReceipt,
     session_storage::provenance::RouteProvenanceReceipt,
@@ -29,10 +30,118 @@ pub(crate) struct RequestRouteSwitchPlan {
     operation_id: String,
     runtime: RuntimeMetadata,
     config_plan: ConfigPatchPlan,
-    auth_snapshot: Vec<u8>,
-    config_snapshot: Vec<u8>,
+    auth_snapshot: OptionalFileSnapshot,
+    config_snapshot: OptionalFileSnapshot,
     session_view: SessionViewPlan,
     requires_change: bool,
+}
+
+#[derive(Debug)]
+struct RequestRoutePlanError {
+    message: String,
+    reason: RuntimeSwitchFailureReason,
+}
+
+impl RequestRoutePlanError {
+    fn new(reason: RuntimeSwitchFailureReason, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason,
+        }
+    }
+
+    fn into_failure(self, operation_id: Option<String>) -> RuntimeSwitchFailure {
+        RuntimeSwitchFailure {
+            message: self.message,
+            outcome: RuntimeSwitchOutcome::FailedBeforeWrite,
+            operation_id,
+            reason: self.reason,
+        }
+    }
+}
+
+impl From<String> for RequestRoutePlanError {
+    fn from(message: String) -> Self {
+        Self::new(RuntimeSwitchFailureReason::Unknown, message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionalFileSnapshot {
+    Absent,
+    Present(Vec<u8>),
+}
+
+impl OptionalFileSnapshot {
+    fn read(path: &Path, label: &str) -> Result<Self, String> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Self::Present(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Absent),
+            Err(error) => Err(format!("failed to read {label}: {error}")),
+        }
+    }
+
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Absent => None,
+            Self::Present(bytes) => Some(bytes),
+        }
+    }
+
+    fn verify(&self, path: &Path, label: &str) -> Result<(), String> {
+        let observed = Self::read(path, label)?;
+        if observed == *self {
+            Ok(())
+        } else {
+            Err(format!("{label} changed during request route switch"))
+        }
+    }
+
+    fn restore(&self, path: &Path, label: &str) -> Result<(), String> {
+        match self {
+            Self::Present(bytes) => atomic_write(path, bytes)?,
+            Self::Absent => match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to remove operation-created {label}: {error}"
+                    ))
+                }
+            },
+        }
+        self.verify(path, label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveAuthState {
+    Absent,
+    OfficialChatGpt,
+    OtherValid,
+}
+
+impl LiveAuthState {
+    fn load(codex_home: &Path) -> Result<(Self, OptionalFileSnapshot), String> {
+        let snapshot = OptionalFileSnapshot::read(&codex_home.join("auth.json"), "live auth.json")?;
+        let state = match snapshot.bytes() {
+            None => Self::Absent,
+            Some(bytes) => {
+                let value = serde_json::from_slice::<JsonValue>(bytes)
+                    .map_err(|error| format!("failed to parse live auth.json: {error}"))?;
+                if value.get("auth_mode").and_then(JsonValue::as_str) == Some("chatgpt") {
+                    Self::OfficialChatGpt
+                } else {
+                    Self::OtherValid
+                }
+            }
+        };
+        Ok((state, snapshot))
+    }
+
+    fn is_official_chatgpt(&self) -> bool {
+        matches!(self, Self::OfficialChatGpt)
+    }
 }
 
 impl RequestRouteSwitchPlan {
@@ -52,8 +161,15 @@ pub(crate) fn preflight_request_route_switch(
     store: &RuntimeStore,
     runtime_id: &str,
     codex_home: &Path,
-) -> Result<RequestRouteSwitchPlan, String> {
-    build_request_route_switch_plan(store, runtime_id, codex_home, None)
+) -> Result<RequestRouteSwitchPlan, RuntimeSwitchFailure> {
+    let operation_id = operation_id("switch-runtime").map_err(|message| RuntimeSwitchFailure {
+        message,
+        outcome: RuntimeSwitchOutcome::FailedBeforeWrite,
+        operation_id: None,
+        reason: RuntimeSwitchFailureReason::Unknown,
+    })?;
+    build_request_route_switch_plan(store, runtime_id, codex_home, Some(&operation_id))
+        .map_err(|error| error.into_failure(Some(operation_id)))
 }
 
 pub(crate) fn switch_request_route_preflighted_with_progress(
@@ -84,30 +200,62 @@ fn switch_request_route_from_plan(
     let operation_id = plan.operation_id.clone();
     let runtime_id = plan.runtime.id.clone();
     if !plan.requires_change {
-        verify_requested_runtime(store, codex_home, &runtime_id)
-            .map_err(|message| before_write_failure(message, &operation_id))?;
+        verify_requested_runtime(store, codex_home, &runtime_id).map_err(|message| {
+            before_write_failure_with_reason(
+                message,
+                &operation_id,
+                RuntimeSwitchFailureReason::RouteVerificationFailed,
+            )
+        })?;
         return no_op_result(store, &runtime_id, operation_id);
     }
 
-    verify_processes_closed().map_err(|message| before_write_failure(message, &operation_id))?;
+    verify_processes_closed().map_err(|message| {
+        before_write_failure_with_reason(
+            message,
+            &operation_id,
+            RuntimeSwitchFailureReason::ProcessCloseFailed,
+        )
+    })?;
     on_progress(RuntimeSwitchPhase::PreparingRuntime);
     plan.session_view
         .recover_pending(codex_home)
-        .map_err(|message| before_write_failure(message, &operation_id))?;
+        .map_err(|message| {
+            before_write_failure_with_reason(
+                message,
+                &operation_id,
+                RuntimeSwitchFailureReason::SessionViewUnavailable,
+            )
+        })?;
     let closed_plan = build_request_route_switch_plan(
         store,
         &runtime_id,
         codex_home,
         Some(operation_id.as_str()),
     )
-    .map_err(|message| before_write_failure(message, &operation_id))?;
+    .map_err(|error| error.into_failure(Some(operation_id.clone())))?;
     if !closed_plan.requires_change {
-        verify_processes_closed()
-            .map_err(|message| before_write_failure(message, &operation_id))?;
-        verify_auth_unchanged(codex_home, &closed_plan.auth_snapshot)
-            .map_err(|message| before_write_failure(message, &operation_id))?;
-        verify_requested_runtime(store, codex_home, &runtime_id)
-            .map_err(|message| before_write_failure(message, &operation_id))?;
+        verify_processes_closed().map_err(|message| {
+            before_write_failure_with_reason(
+                message,
+                &operation_id,
+                RuntimeSwitchFailureReason::ProcessCloseFailed,
+            )
+        })?;
+        verify_auth_unchanged(codex_home, &closed_plan.auth_snapshot).map_err(|message| {
+            before_write_failure_with_reason(
+                message,
+                &operation_id,
+                RuntimeSwitchFailureReason::InvalidAuthState,
+            )
+        })?;
+        verify_requested_runtime(store, codex_home, &runtime_id).map_err(|message| {
+            before_write_failure_with_reason(
+                message,
+                &operation_id,
+                RuntimeSwitchFailureReason::RouteVerificationFailed,
+            )
+        })?;
         return no_op_result(store, &runtime_id, operation_id);
     }
 
@@ -118,7 +266,13 @@ fn switch_request_route_from_plan(
         .as_ref()
         .map(|snapshot| snapshot.bytes.clone());
     drop(process_state);
-    verify_processes_closed().map_err(|message| before_write_failure(message, &operation_id))?;
+    verify_processes_closed().map_err(|message| {
+        before_write_failure_with_reason(
+            message,
+            &operation_id,
+            RuntimeSwitchFailureReason::ProcessCloseFailed,
+        )
+    })?;
     let chat_process_state_repaired =
         repair_after_shutdown(codex_home, process_state_bytes.as_deref())
             .map_err(|message| before_write_failure(message, &operation_id))?;
@@ -130,8 +284,15 @@ fn switch_request_route_from_plan(
         PreparedViewTransition::skipped(&closed_plan.session_view)
     } else {
         on_progress(RuntimeSwitchPhase::SyncingIncrementalSessions);
-        prepare_transition(&closed_plan.session_view, closed_plan.operation_id.as_str())
-            .map_err(|message| before_write_failure(message, &operation_id))?
+        prepare_transition(&closed_plan.session_view, closed_plan.operation_id.as_str()).map_err(
+            |message| {
+                before_write_failure_with_reason(
+                    message,
+                    &operation_id,
+                    RuntimeSwitchFailureReason::SessionViewUnavailable,
+                )
+            },
+        )?
     };
     let incremental_session_sync = prepared_view.receipt().clone();
 
@@ -143,23 +304,33 @@ fn switch_request_route_from_plan(
     .err();
 
     let config_written = config_write_error.is_none();
-    let applied: Result<RuntimeMetadata, String> = if let Some(error) = config_write_error {
-        Err(error)
-    } else {
-        (|| {
-            #[cfg(test)]
-            if failure_point == RequestRouteFailurePoint::AfterConfigWrite {
-                return Err("injected failure after request config write".to_string());
-            }
-            let _ = failure_point;
-            verify_processes_closed()?;
-            on_progress(RuntimeSwitchPhase::Verifying);
-            verify_auth_unchanged(codex_home, &closed_plan.auth_snapshot)?;
-            verify_requested_runtime(store, codex_home, &runtime_id)?;
-            let runtime = store.mark_used(&runtime_id)?;
-            Ok(runtime)
-        })()
-    };
+    let applied: Result<RuntimeMetadata, (RuntimeSwitchFailureReason, String)> =
+        if let Some(error) = config_write_error {
+            Err((RuntimeSwitchFailureReason::ConfigUnavailable, error))
+        } else {
+            (|| {
+                #[cfg(test)]
+                if failure_point == RequestRouteFailurePoint::AfterConfigWrite {
+                    return Err((
+                        RuntimeSwitchFailureReason::RouteVerificationFailed,
+                        "injected failure after request config write".to_string(),
+                    ));
+                }
+                let _ = failure_point;
+                verify_processes_closed()
+                    .map_err(|message| (RuntimeSwitchFailureReason::ProcessCloseFailed, message))?;
+                on_progress(RuntimeSwitchPhase::Verifying);
+                verify_auth_unchanged(codex_home, &closed_plan.auth_snapshot)
+                    .map_err(|message| (RuntimeSwitchFailureReason::InvalidAuthState, message))?;
+                verify_requested_runtime(store, codex_home, &runtime_id).map_err(|message| {
+                    (RuntimeSwitchFailureReason::RouteVerificationFailed, message)
+                })?;
+                let runtime = store
+                    .mark_used(&runtime_id)
+                    .map_err(|message| (RuntimeSwitchFailureReason::Unknown, message))?;
+                Ok(runtime)
+            })()
+        };
 
     match applied {
         Ok(runtime) => {
@@ -167,6 +338,7 @@ fn switch_request_route_from_plan(
                 message,
                 outcome: RuntimeSwitchOutcome::RollbackFailed,
                 operation_id: Some(operation_id.clone()),
+                reason: RuntimeSwitchFailureReason::SessionViewUnavailable,
             })?;
             Ok(RuntimeSwitchResult {
                 operation_id,
@@ -180,7 +352,7 @@ fn switch_request_route_from_plan(
                 chatgpt_launch: ChatGptLaunchReceipt::not_requested(),
             })
         }
-        Err(error) => {
+        Err((reason, error)) => {
             on_progress(RuntimeSwitchPhase::RollingBack);
             if config_written {
                 if let Err(gate_error) = verify_processes_closed() {
@@ -190,6 +362,29 @@ fn switch_request_route_from_plan(
                         ),
                         outcome: RuntimeSwitchOutcome::RollbackFailed,
                         operation_id: Some(operation_id),
+                        reason: RuntimeSwitchFailureReason::ProcessCloseFailed,
+                    });
+                }
+                let applied_config = OptionalFileSnapshot::Present(
+                    closed_plan.config_plan.patched_toml.as_bytes().to_vec(),
+                );
+                if let Err(config_drift) =
+                    applied_config.verify(&codex_home.join("config.toml"), "live config.toml")
+                {
+                    let view_rollback = rollback_transition(prepared_view);
+                    let message = match view_rollback {
+                        Ok(()) => format!(
+                            "{error}; config rollback was not attempted because {config_drift}; operation-owned session view changes were rolled back"
+                        ),
+                        Err(view_error) => format!(
+                            "{error}; config rollback was not attempted because {config_drift}; session view rollback requires recovery: {view_error}"
+                        ),
+                    };
+                    return Err(RuntimeSwitchFailure {
+                        message,
+                        outcome: RuntimeSwitchOutcome::RollbackFailed,
+                        operation_id: Some(operation_id),
+                        reason: RuntimeSwitchFailureReason::ConfigUnavailable,
                     });
                 }
             }
@@ -205,6 +400,7 @@ fn switch_request_route_from_plan(
                             message: format!("{error}; config rollback failed: {rollback_error}"),
                             outcome: RuntimeSwitchOutcome::RollbackFailed,
                             operation_id: Some(operation_id),
+                            reason: RuntimeSwitchFailureReason::ConfigUnavailable,
                         });
                     }
                 }
@@ -215,15 +411,17 @@ fn switch_request_route_from_plan(
                     ),
                     outcome: RuntimeSwitchOutcome::RollbackFailed,
                     operation_id: Some(operation_id),
+                    reason: RuntimeSwitchFailureReason::ProcessCloseFailed,
                 });
             }
             match rollback_transition(prepared_view) {
                 Ok(()) => Err(RuntimeSwitchFailure {
                     message: format!(
-                        "{error}; restored the original config.toml and session database view; official auth.json was not changed"
+                        "{error}; restored the original config.toml and session database view; auth.json bytes or absence were not changed"
                     ),
                     outcome: RuntimeSwitchOutcome::RolledBack,
                     operation_id: Some(operation_id),
+                    reason,
                 }),
                 Err(view_error) => Err(RuntimeSwitchFailure {
                     message: format!(
@@ -231,6 +429,7 @@ fn switch_request_route_from_plan(
                     ),
                     outcome: RuntimeSwitchOutcome::RollbackFailed,
                     operation_id: Some(operation_id),
+                    reason: RuntimeSwitchFailureReason::SessionViewUnavailable,
                 }),
             }
         }
@@ -242,25 +441,56 @@ fn build_request_route_switch_plan(
     runtime_id: &str,
     codex_home: &Path,
     existing_operation_id: Option<&str>,
-) -> Result<RequestRouteSwitchPlan, String> {
+) -> Result<RequestRouteSwitchPlan, RequestRoutePlanError> {
     let operation_id = match existing_operation_id {
         Some(id) => id.to_string(),
         None => operation_id("switch-runtime")?,
     };
-    let auth_snapshot = load_official_auth_snapshot(codex_home)?;
-    let config_snapshot = fs::read(codex_home.join("config.toml"))
-        .map_err(|error| format!("failed to read live config.toml: {error}"))?;
-    let live_config = std::str::from_utf8(&config_snapshot)
-        .map_err(|_| "live config.toml is not valid UTF-8".to_string())?;
-    let runtime_files = store.load_runtime_files(runtime_id)?;
-    let runtime = store.load_metadata(runtime_id)?;
+    let runtime_files = store.load_runtime_files(runtime_id).map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+    })?;
+    let runtime = store.load_metadata(runtime_id).map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+    })?;
+    let (auth_state, auth_snapshot) = LiveAuthState::load(codex_home).map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::InvalidAuthState, message)
+    })?;
+    if runtime.kind == RuntimeKind::Plus && !auth_state.is_official_chatgpt() {
+        return Err(RequestRoutePlanError::new(
+            RuntimeSwitchFailureReason::OfficialAuthRequired,
+            "切换到 ChatGPT 账号请求端需要有效的官方登录态；当前请求端未改动",
+        ));
+    }
+    let config_snapshot =
+        OptionalFileSnapshot::read(&codex_home.join("config.toml"), "live config.toml").map_err(
+            |message| {
+                RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+            },
+        )?;
+    let live_config =
+        std::str::from_utf8(config_snapshot.bytes().unwrap_or_default()).map_err(|_| {
+            RequestRoutePlanError::new(
+                RuntimeSwitchFailureReason::ConfigUnavailable,
+                "live config.toml is not valid UTF-8",
+            )
+        })?;
     let (config_kind, relay_bearer_token) = match runtime.kind {
         RuntimeKind::Plus => (RuntimeConfigKind::Account, None),
         RuntimeKind::Relay => (
             RuntimeConfigKind::Relay,
-            Some(relay_api_key_from_auth(&runtime_files.auth_json)?),
+            Some(
+                relay_api_key_from_auth(&runtime_files.auth_json).map_err(|message| {
+                    RequestRoutePlanError::new(
+                        RuntimeSwitchFailureReason::ConfigUnavailable,
+                        message,
+                    )
+                })?,
+            ),
         ),
     };
+    let data_root = store.data_root().map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::SessionViewUnavailable, message)
+    })?;
     let session_view = plan_transition(
         codex_home,
         live_config,
@@ -268,18 +498,30 @@ fn build_request_route_switch_plan(
             RuntimeKind::Plus => SessionViewTarget::Account,
             RuntimeKind::Relay => SessionViewTarget::Relay,
         },
-        &store.data_root()?,
-    )?;
+        &data_root,
+    )
+    .map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::SessionViewUnavailable, message)
+    })?;
     let config_plan = apply_sqlite_home_patch(
-        plan_runtime_config_patch(
+        plan_runtime_config_patch_with_relay_auth(
             live_config,
             &runtime_files.config_toml,
             config_kind,
             relay_bearer_token.as_deref(),
-        )?,
+            auth_state.is_official_chatgpt(),
+        )
+        .map_err(|message| {
+            RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+        })?,
         &session_view.sqlite_home_patch,
-    )?;
-    let active = store.detect_active_runtime(codex_home)?;
+    )
+    .map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+    })?;
+    let active = store.detect_active_runtime(codex_home).map_err(|message| {
+        RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
+    })?;
     let requires_change = active.active_runtime_id.as_deref() != Some(runtime_id)
         || active.confidence != RuntimeConfidence::Exact
         || !config_plan.changed_keys.is_empty()
@@ -295,28 +537,8 @@ fn build_request_route_switch_plan(
     })
 }
 
-fn load_official_auth_snapshot(codex_home: &Path) -> Result<Vec<u8>, String> {
-    let auth = fs::read(codex_home.join("auth.json"))
-        .map_err(|error| format!("failed to read official auth.json: {error}"))?;
-    let value = serde_json::from_slice::<JsonValue>(&auth)
-        .map_err(|error| format!("failed to parse official auth.json: {error}"))?;
-    if value.get("auth_mode").and_then(JsonValue::as_str) != Some("chatgpt") {
-        return Err(
-            "当前 auth.json 不是 ChatGPT 官方登录态；请求端切换已停止且不会改写登录状态"
-                .to_string(),
-        );
-    }
-    Ok(auth)
-}
-
-fn verify_auth_unchanged(codex_home: &Path, expected: &[u8]) -> Result<(), String> {
-    let observed = fs::read(codex_home.join("auth.json"))
-        .map_err(|error| format!("failed to re-read official auth.json: {error}"))?;
-    if observed == expected {
-        Ok(())
-    } else {
-        Err("official auth.json changed during request route switch".to_string())
-    }
+fn verify_auth_unchanged(codex_home: &Path, expected: &OptionalFileSnapshot) -> Result<(), String> {
+    expected.verify(&codex_home.join("auth.json"), "live auth.json")
 }
 
 fn verify_requested_runtime(
@@ -327,7 +549,6 @@ fn verify_requested_runtime(
     let verified = store.detect_active_runtime(codex_home)?;
     if verified.active_runtime_id.as_deref() == Some(runtime_id)
         && verified.confidence == RuntimeConfidence::Exact
-        && verified.auth_mode.as_deref() == Some("chatgpt")
     {
         Ok(())
     } else {
@@ -337,15 +558,10 @@ fn verify_requested_runtime(
 
 fn restore_config_and_verify_auth(
     codex_home: &Path,
-    config_snapshot: &[u8],
-    auth_snapshot: &[u8],
+    config_snapshot: &OptionalFileSnapshot,
+    auth_snapshot: &OptionalFileSnapshot,
 ) -> Result<(), String> {
-    atomic_write(&codex_home.join("config.toml"), config_snapshot)?;
-    let restored = fs::read(codex_home.join("config.toml"))
-        .map_err(|error| format!("failed to verify restored config.toml: {error}"))?;
-    if restored != config_snapshot {
-        return Err("restored config.toml did not match its snapshot".to_string());
-    }
+    config_snapshot.restore(&codex_home.join("config.toml"), "config.toml")?;
     verify_auth_unchanged(codex_home, auth_snapshot)
 }
 
@@ -354,9 +570,13 @@ fn no_op_result(
     runtime_id: &str,
     operation_id: String,
 ) -> Result<RuntimeSwitchResult, RuntimeSwitchFailure> {
-    let runtime = store
-        .load_metadata(runtime_id)
-        .map_err(|message| before_write_failure(message, &operation_id))?;
+    let runtime = store.load_metadata(runtime_id).map_err(|message| {
+        before_write_failure_with_reason(
+            message,
+            &operation_id,
+            RuntimeSwitchFailureReason::ConfigUnavailable,
+        )
+    })?;
     Ok(RuntimeSwitchResult {
         operation_id,
         changed: false,
@@ -371,10 +591,19 @@ fn no_op_result(
 }
 
 fn before_write_failure(message: String, operation_id: &str) -> RuntimeSwitchFailure {
+    before_write_failure_with_reason(message, operation_id, RuntimeSwitchFailureReason::Unknown)
+}
+
+fn before_write_failure_with_reason(
+    message: String,
+    operation_id: &str,
+    reason: RuntimeSwitchFailureReason,
+) -> RuntimeSwitchFailure {
     RuntimeSwitchFailure {
         message,
         outcome: RuntimeSwitchOutcome::FailedBeforeWrite,
         operation_id: Some(operation_id.to_string()),
+        reason,
     }
 }
 
@@ -391,7 +620,7 @@ mod tests {
     use crate::{
         runtime_session_view::inspect_session_view_database_homes,
         runtime_store::{RelayRuntimeInput, RuntimeStore, PLUS_RUNTIME_ID, RELAY_RUNTIME_ID},
-        runtime_switcher::{RuntimeSwitchOutcome, RuntimeSwitchPhase},
+        runtime_switcher::{RuntimeSwitchFailureReason, RuntimeSwitchOutcome, RuntimeSwitchPhase},
         session_storage::bounded_file::same_regular_file_identity,
     };
 
@@ -586,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn non_official_auth_fails_before_process_or_config_mutation() {
+    fn account_without_official_auth_fails_before_process_or_config_mutation() {
         let (home, _store_root, store, _) = setup();
         let config_before = fs::read(home.path().join("config.toml")).unwrap();
         fs::write(
@@ -596,13 +825,218 @@ mod tests {
         .unwrap();
 
         let error =
-            preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap_err();
+            preflight_request_route_switch(&store, PLUS_RUNTIME_ID, home.path()).unwrap_err();
 
-        assert!(error.contains("不是 ChatGPT 官方登录态"), "{error}");
+        assert!(
+            error.message.contains("需要有效的官方登录态"),
+            "{:?}",
+            error
+        );
+        assert_eq!(
+            error.reason,
+            RuntimeSwitchFailureReason::OfficialAuthRequired
+        );
         assert_eq!(
             fs::read(home.path().join("config.toml")).unwrap(),
             config_before
         );
+    }
+
+    #[test]
+    fn relay_without_auth_succeeds_without_creating_auth_json() {
+        let (home, _store_root, store, _) = setup();
+        fs::remove_file(home.path().join("auth.json")).unwrap();
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+
+        let result = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(result.changed);
+        assert!(!home.path().join("auth.json").exists());
+        assert!(fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("requires_openai_auth = false"));
+        let active = store.detect_active_runtime(home.path()).unwrap();
+        assert_eq!(active.active_runtime_id.as_deref(), Some(RELAY_RUNTIME_ID));
+        assert_eq!(
+            active.confidence,
+            crate::runtime_store::RuntimeConfidence::Exact
+        );
+        assert_eq!(active.auth_mode, None);
+    }
+
+    #[test]
+    fn completely_fresh_home_switches_to_relay_without_auth_config_or_fake_database() {
+        let home = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = RuntimeStore::new(store_root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "fresh-relay-fixture".to_string(),
+                    model: "relay-model".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        assert!(!home.path().join("auth.json").exists());
+        assert!(!home.path().join("config.toml").exists());
+        assert!(!home.path().join("state_5.sqlite").exists());
+
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let result = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(result.changed);
+        assert!(!home.path().join("auth.json").exists());
+        assert!(!home.path().join("state_5.sqlite").exists());
+        let config = fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(config.contains("model_provider = \"openai_custom\""));
+        assert!(config.contains("requires_openai_auth = false"));
+        let (account_home, relay_home) =
+            inspect_session_view_database_homes(&store.data_root().unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(account_home, home.path());
+        assert!(relay_home.is_dir());
+        assert!(!relay_home.join("state_5.sqlite").exists());
+        assert_eq!(
+            store.detect_active_runtime(home.path()).unwrap().confidence,
+            crate::runtime_store::RuntimeConfidence::Exact
+        );
+    }
+
+    #[test]
+    fn fresh_home_route_failure_rolls_back_bootstrap_config_and_directories_to_absent() {
+        let home = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = RuntimeStore::new(store_root.path().join("runtimes"));
+        store
+            .upsert_relay(
+                RelayRuntimeInput {
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "fresh-relay-fixture".to_string(),
+                    model: "relay-model".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+
+        let failure = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::AfterConfigWrite,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::RolledBack);
+        assert_eq!(
+            failure.reason,
+            RuntimeSwitchFailureReason::RouteVerificationFailed
+        );
+        assert!(!home.path().join("auth.json").exists());
+        assert!(!home.path().join("config.toml").exists());
+        assert!(!home.path().join(".codex-switch-session-views").exists());
+        assert!(
+            inspect_session_view_database_homes(&store.data_root().unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn relay_preserves_other_valid_auth_bytes_without_requiring_official_login() {
+        let (home, _store_root, store, _) = setup();
+        let auth =
+            b"{\n  \"auth_mode\": \"apikey\", \"OPENAI_API_KEY\": \"other-auth-fixture\"\n}\n";
+        fs::write(home.path().join("auth.json"), auth).unwrap();
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+
+        switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
+        assert!(fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("requires_openai_auth = false"));
+    }
+
+    #[test]
+    fn relay_rejects_malformed_auth_before_any_route_write() {
+        let (home, _store_root, store, _) = setup();
+        let config_before = fs::read(home.path().join("config.toml")).unwrap();
+        fs::write(home.path().join("auth.json"), b"{broken").unwrap();
+
+        let error =
+            preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap_err();
+
+        assert!(error.message.contains("failed to parse live auth.json"));
+        assert_eq!(error.reason, RuntimeSwitchFailureReason::InvalidAuthState);
+        assert_eq!(
+            fs::read(home.path().join("config.toml")).unwrap(),
+            config_before
+        );
+    }
+
+    #[test]
+    fn missing_config_is_created_on_success_and_restored_to_absent_on_rollback() {
+        for failure_point in [
+            RequestRouteFailurePoint::None,
+            RequestRouteFailurePoint::AfterConfigWrite,
+        ] {
+            let (home, _store_root, store, _) = setup();
+            fs::remove_file(home.path().join("config.toml")).unwrap();
+            fs::remove_file(home.path().join("auth.json")).unwrap();
+            let plan =
+                preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+
+            let result = switch_request_route_from_plan(
+                &store,
+                home.path(),
+                plan,
+                failure_point,
+                &mut || Ok(()),
+                &mut |_| {},
+            );
+
+            if failure_point == RequestRouteFailurePoint::None {
+                assert!(result.unwrap().changed);
+                assert!(home.path().join("config.toml").is_file());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().outcome,
+                    RuntimeSwitchOutcome::RolledBack
+                );
+                assert!(!home.path().join("config.toml").exists());
+            }
+            assert!(!home.path().join("auth.json").exists());
+        }
     }
 
     #[test]
@@ -656,6 +1090,41 @@ mod tests {
             config_before
         );
         assert!(phases.contains(&RuntimeSwitchPhase::RollingBack));
+    }
+
+    #[test]
+    fn rollback_never_overwrites_a_config_replaced_after_the_route_write() {
+        let (home, _store_root, store, auth) = setup();
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let external_config = b"model = \"external-edit\"\n";
+
+        let failure = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::None,
+            &mut || {
+                let config = fs::read_to_string(home.path().join("config.toml")).unwrap();
+                if config.contains("experimental_bearer_token") {
+                    fs::write(home.path().join("config.toml"), external_config).unwrap();
+                }
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::RollbackFailed);
+        assert_eq!(
+            failure.reason,
+            RuntimeSwitchFailureReason::ConfigUnavailable
+        );
+        assert!(failure.message.contains("rollback was not attempted"));
+        assert_eq!(
+            fs::read(home.path().join("config.toml")).unwrap(),
+            external_config
+        );
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
     }
 
     #[test]

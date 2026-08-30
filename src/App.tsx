@@ -386,13 +386,28 @@ function App({
   const plusRuntime = useMemo(() => runtimes?.find((runtime) => runtime.kind === 'plus') ?? null, [runtimes]);
   const relayRuntime = useMemo(() => runtimes?.find((runtime) => runtime.kind === 'relay') ?? null, [runtimes]);
 
-  const canImportAccount = Boolean(codexHome?.authJson.exists && codexHome.configToml.exists)
+  const officialAuthReady = Boolean(
+    codexHome?.authJson.exists
+      && (codexHome.authSummary?.authMode === 'chatgpt' || runtimeStatus?.authMode === 'chatgpt'),
+  );
+  const canImportAccount = officialAuthReady
+    && Boolean(codexHome?.configToml.exists)
     && data.runtimes.status === 'ready';
-  const canConfigureRelay = data.runtimes.status === 'ready'
-    && (data.codexHome.status !== 'ready' || data.codexHome.data.configToml.exists);
+  const canConfigureRelay = data.runtimes.status === 'ready';
   const canSwitchRuntime = data.runtimes.status === 'ready'
     && closeGuardStatus === 'ready'
     && !runtimeRefreshPending;
+  const canSwitchAccount = canSwitchRuntime && officialAuthReady;
+  const canSwitchRelay = canSwitchRuntime;
+  const runtimeGateHelp = closeGuardStatus === 'loading'
+    ? '正在确认本机 Codex 写入进程，请稍后重试。'
+    : closeGuardStatus === 'failed'
+      ? '无法确认本机 Codex 写入进程；为避免并发写入，当前已阻止切换。'
+    : runtimeRefreshPending
+      ? '正在刷新当前运行态。'
+      : data.runtimes.status !== 'ready'
+        ? '运行态槽位尚未加载完成。'
+        : null;
   const canSync = !sessionsStale
     && data.sessions.status === 'ready'
     && data.managedSessions.status === 'ready'
@@ -672,7 +687,8 @@ function App({
     label: string,
     trigger?: HTMLElement,
   ) {
-    if (!canSwitchRuntime || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
+    const targetAvailable = runtimeId === 'plus' ? canSwitchAccount : canSwitchRelay;
+    if (!targetAvailable || busy !== null || updateInstalling || exclusiveActionInFlight.current) return;
     switchTrigger.current = trigger ?? (
       document.activeElement instanceof HTMLElement ? document.activeElement : null
     );
@@ -768,10 +784,16 @@ function App({
   }
 
   async function handleRetryChatGptLaunch() {
+    const launch = switchFlow?.result?.chatgptLaunch;
     if (
       switchFlow?.status !== 'succeeded'
       || !switchFlow.result
-      || switchFlow.result.chatgptLaunch.status !== 'failed'
+      || launch?.status !== 'failed'
+      || !(
+        launch.reason === 'activationFailed'
+        || launch.reason === 'verificationFailed'
+        || !launch.reason
+      )
       || launchRetryInFlight.current
       || exclusiveActionInFlight.current
     ) return;
@@ -1166,8 +1188,8 @@ function App({
               <p className="eyebrow">LOCAL RUNTIME / CONTROL 01</p>
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
               <p className="runtime-intro-lede">
-            保持 ChatGPT 官方登录态不变，只切换请求端。新建 Relay 会话可在切回 Account
-            后提升到 Account 数据库视图；每一步都展示真实耗时，完成后自动回到 ChatGPT。
+                只切换请求端，不改写现有登录文件。Relay 可在未登录的全新 Codex Home 中独立启用；
+                后续登录后仍可安全切回 Account，并保留会话数据库视图。
               </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
@@ -1178,13 +1200,13 @@ function App({
             </dl>
           </header>
 
-          {codexHome && (!codexHome.authJson.exists || !codexHome.configToml.exists) ? (
-            <section className="home-setup-notice" aria-label="需要完成 ChatGPT 登录">
+          {codexHome && (!officialAuthReady || !codexHome.configToml.exists) ? (
+            <section className="home-setup-notice" aria-label="Account 尚未就绪">
               <LogIn aria-hidden="true" />
               <div>
-                <p className="eyebrow">LOGIN REQUIRED</p>
-                <h2>先打开 ChatGPT 完成登录，再回到这里刷新</h2>
-                <p>检测到账号运行态所需的 auth.json 或 config.toml 尚未就绪。</p>
+                <p className="eyebrow">ACCOUNT SETUP</p>
+                <h2>Account 需要官方登录；中转站仍可直接使用</h2>
+                <p>未检测到完整的 Account 运行态。配置或切换 Relay 不会创建、覆盖 auth.json。</p>
               </div>
               <button className="ghost-button" onClick={handleManualRefresh} disabled={exclusiveBusy}>
                 <RefreshCw className="button-icon" aria-hidden="true" />
@@ -1202,7 +1224,13 @@ function App({
               onSwitch={(trigger) => void handleSwitch('plus', '切换 ChatGPT 账号', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'plus') ? '当前为 ChatGPT 账号' : runtimeStatus?.activeRuntimeId === 'plus' ? '重新应用 ChatGPT 账号' : '切换到 ChatGPT 账号'}
               primaryDisabled={exclusiveBusy || !canImportAccount}
-              switchDisabled={exclusiveBusy || !canSwitchRuntime || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
+              primaryHelp={!canImportAccount && !exclusiveBusy ? '保存 Account 槽位需要现有官方登录与 config.toml。' : null}
+              switchDisabled={exclusiveBusy || !canSwitchAccount || !plusRuntime || isExactRuntime(runtimeStatus, 'plus')}
+              switchHelp={!plusRuntime
+                ? '先在已登录状态保存 Account 槽位。'
+                : !officialAuthReady
+                  ? '切换到 Account 前需要先在 ChatGPT 完成官方登录。'
+                  : runtimeGateHelp}
             />
             <RuntimeCard
               title="API 中转站态" kind="relay" description="Key 加密保存；激活时明文投影到当前请求配置。"
@@ -1212,7 +1240,9 @@ function App({
               onSwitch={(trigger) => void handleSwitch('relay', '切换中转站', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'relay') ? '当前为中转站' : runtimeStatus?.activeRuntimeId === 'relay' ? '重新应用中转站' : '切换到中转站'}
               primaryDisabled={exclusiveBusy || !canConfigureRelay}
-              switchDisabled={exclusiveBusy || !canSwitchRuntime || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
+              primaryHelp={!canConfigureRelay && !exclusiveBusy ? '运行态存储尚未就绪。' : null}
+              switchDisabled={exclusiveBusy || !canSwitchRelay || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
+              switchHelp={!relayRuntime ? '先配置中转站。' : runtimeGateHelp}
             />
           </section>
 
@@ -1457,7 +1487,7 @@ function InlineConfirmation({
 function RuntimeCard({
   title, kind, description, runtime, runtimeStatus, baseUrlFallback, primaryAction, switchAction,
   runtimeDomainStatus, runtimeStatusDomainStatus, onPrimary, onSwitch,
-  primaryDisabled, switchDisabled,
+  primaryDisabled, switchDisabled, primaryHelp, switchHelp,
 }: {
   title: string; kind: RuntimeKind; description: string; runtime: RuntimeMetadata | null;
   runtimeStatus: RuntimeStatus | null; baseUrlFallback: string; primaryAction: string; switchAction: string;
@@ -1465,6 +1495,7 @@ function RuntimeCard({
   runtimeStatusDomainStatus: DomainState<RuntimeStatus>['status'];
   onPrimary: () => void; onSwitch: (trigger?: HTMLElement) => void;
   primaryDisabled: boolean; switchDisabled: boolean;
+  primaryHelp?: string | null; switchHelp?: string | null;
 }) {
   const savedState = runtimeDomainStatus === 'ready'
     ? runtime ? '已保存' : '未保存'
@@ -1495,6 +1526,8 @@ function RuntimeCard({
         <button className="ghost-button inline" onClick={onPrimary} disabled={primaryDisabled}>{kind === 'plus' ? <Save className="button-icon" aria-hidden="true" /> : <Settings2 className="button-icon" aria-hidden="true" />}{primaryAction}</button>
         <button className="switch-button" onClick={(event) => onSwitch(event?.currentTarget)} disabled={switchDisabled}><ArrowLeftRight className="button-icon" aria-hidden="true" />{switchAction}</button>
       </div>
+      {primaryDisabled && primaryHelp ? <p className="runtime-action-help">{primaryHelp}</p> : null}
+      {switchDisabled && switchHelp ? <p className="runtime-action-help">{switchHelp}</p> : null}
       <p className="runtime-switch-note"><Power aria-hidden="true" />任务执行器会安全关闭，并在成功后自动打开 ChatGPT</p>
     </article>
   );

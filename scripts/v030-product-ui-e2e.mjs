@@ -24,6 +24,10 @@ import {
   writeIntegrityEvidence,
 } from "./v030-e2e-lib.mjs";
 
+const PACKAGE_VERSION = JSON.parse(
+  fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+).version;
+
 async function freePort() {
   return await new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -67,7 +71,7 @@ async function primeWebViewProfile(root, executable, workspace, environment, por
   }
 }
 
-async function initializeNativeCodexState(codexExe, codexHome, workspace, environment) {
+async function initializeNativeCodexState(codexExe, codexHome, workspace, environment, clientVersion) {
   const child = spawn(codexExe, ["app-server", "--stdio", "--disable", "plugins"], {
     cwd: workspace,
     env: { ...environment, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: codexHome },
@@ -88,7 +92,7 @@ async function initializeNativeCodexState(codexExe, codexHome, workspace, enviro
     });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
   });
-  child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "codex-switch-product-ui", version: "0.3.0" }, capabilities: { experimentalApi: false } } })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "codex-switch-product-ui", version: clientVersion }, capabilities: { experimentalApi: false } } })}\n`);
   const accepted = await acknowledged;
   if (!accepted) throw new Error("native Codex rejected schema initialization");
   child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
@@ -108,20 +112,22 @@ function options(argv) {
     const token = argv[index];
     if (token === "--dry-run") { dryRun = true; continue; }
     if (token === "--help") return { help: true };
-    if (!new Set(["--run-root", "--executable", "--codex-exe"]).has(token) || !argv[index + 1]) throw new Error(`invalid option ${token}`);
+    if (!new Set(["--run-root", "--executable", "--codex-exe", "--expected-version"]).has(token) || !argv[index + 1]) throw new Error(`invalid option ${token}`);
     values.set(token.slice(2), argv[++index]);
   }
   const executable = path.resolve(values.get("executable") ?? "");
   if (!path.isAbsolute(values.get("executable") ?? "") || !fs.statSync(executable).isFile()) throw new Error("executable must be an existing absolute file");
   const codexExe = values.has("codex-exe") ? path.resolve(values.get("codex-exe")) : undefined;
   if (codexExe && !fs.statSync(codexExe).isFile()) throw new Error("codex executable must be an existing file");
-  return { help: false, dryRun, executable, codexExe, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
+  const expectedVersion = values.get("expected-version") ?? PACKAGE_VERSION;
+  if (!/^\d+\.\d+\.\d+$/.test(expectedVersion)) throw new Error("expected version must be a three-part release version");
+  return { help: false, dryRun, executable, codexExe, expectedVersion, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
 }
 
 async function main() {
   const parsed = options(process.argv.slice(2));
   if (parsed.help) {
-    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> --codex-exe <native-codex.exe> [--dry-run]\n");
+    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> --codex-exe <native-codex.exe> [--expected-version <x.y.z>] [--dry-run]\n");
     return;
   }
   if (parsed.dryRun) {
@@ -144,7 +150,7 @@ async function main() {
     CODEX_SQLITE_HOME: codexHome,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port} --remote-allow-origins=*`,
   }, false);
-  await initializeNativeCodexState(parsed.codexExe ?? "codex.exe", codexHome, workspace, environment);
+  await initializeNativeCodexState(parsed.codexExe ?? "codex.exe", codexHome, workspace, environment, parsed.expectedVersion);
   fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture-token" } }));
   fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
   const webViewProfilePrimed = await primeWebViewProfile(parsed.runRoot, executable, workspace, environment, port);
@@ -186,7 +192,7 @@ async function main() {
     if (startupAlerts.length > 0) throw new Error(`production UI rendered visible startup alerts: ${startupAlerts.length}`);
     if (runtimeErrors.length > 0) throw new Error(`production UI emitted runtime errors: ${runtimeErrors.length}`);
     const status = await cdp.evaluate(invokeExpression("get_app_status"));
-    if (status.version !== "0.3.0" || path.resolve(status.codexHome).toLowerCase() !== codexHome.toLowerCase()) throw new Error("runtime status is not bound to the isolated v0.3.0 process");
+    if (status.version !== parsed.expectedVersion || path.resolve(status.codexHome).toLowerCase() !== codexHome.toLowerCase()) throw new Error(`runtime status is not bound to the isolated v${parsed.expectedVersion} process`);
     if (await hasListener(1420)) throw new Error("production UI opened with a Vite listener present");
 
     await cdp.call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
@@ -239,7 +245,7 @@ async function main() {
       : [];
     for (const expected of ["sessionStarted", "appReady", "exitRequested", "sessionEnded"]) if (!events.includes(expected)) throw new Error(`lifecycle evidence omitted ${expected}`);
     const payload = {
-      gate: "v0.3.0-packed-production-ui",
+      gate: `v${parsed.expectedVersion}-packed-production-ui`,
       verdict: "PASS",
       observedAt: new Date().toISOString(),
       executable: { bytes: fs.statSync(executable).size, sha256: sha256File(executable), version: status.version, byteExactReleaseCopy: true },
@@ -260,7 +266,7 @@ async function main() {
   } finally {
     cdp?.close();
     if (!exited && (await processRowsForExecutable(executable)).length > 0) {
-      try { child.kill(); } catch {}
+      await closeMainWindowExact(child.pid, executable).catch(() => {});
       await waitForNoExecutableProcess(executable, 30_000).catch(() => {});
     }
   }

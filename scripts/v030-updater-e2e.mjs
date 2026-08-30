@@ -37,6 +37,26 @@ const OLD_TAG = "v0.2.7";
 const NEW_TAG = "v0.3.0";
 const MODES = new Set(["success", "replacement-lock-rollback", "both"]);
 
+function versionFromTag(tag, label) {
+  const match = /^v(\d+\.\d+\.\d+)$/.exec(tag ?? "");
+  if (!match) throw new Error(`${label} must be a v-prefixed three-part release tag`);
+  return match[1];
+}
+
+function versionParts(version) {
+  return version.split(".").map(Number);
+}
+
+function isStrictlyNewer(oldVersion, newVersion) {
+  const oldParts = versionParts(oldVersion);
+  const newParts = versionParts(newVersion);
+  for (let index = 0; index < newParts.length; index += 1) {
+    if (newParts[index] > oldParts[index]) return true;
+    if (newParts[index] < oldParts[index]) return false;
+  }
+  return false;
+}
+
 export const UPDATER_HELP = `
 Usage:
   node scripts/v030-updater-e2e.mjs --run-root <absolute-new-directory> [options]
@@ -44,12 +64,14 @@ Usage:
 Options:
   --run-root <path>       New isolated updater evidence root.
   --repository <owner/repo>  Public release repository (default: ${DEFAULT_REPOSITORY}).
+  --old-tag <tag>         Installed public source release (default: ${OLD_TAG}).
+  --new-tag <tag>         Public Latest target release (default: ${NEW_TAG}).
   --mode <mode>           success | replacement-lock-rollback | both (default: both).
   --base-port <port>      First WebView2 debugging port (default: random high port).
   --dry-run               Validate local prerequisites only; no network, files, or EXEs.
   --help                  Show this help.
 
-The live gate downloads public v0.2.7 and v0.3.0 assets, starts v0.2.7 from its
+The live gate downloads the selected old/new public assets, starts the old release from its
 final isolated install path, invokes the production one-click updater, proves
 same-path PID/Ready/ACK transition and zero residue, then repeats with an
 external exact-target file handle to force and verify production rollback.
@@ -57,7 +79,7 @@ No updater trust bypass or production failure-injection hook is used.
 `;
 
 export function parseUpdaterOptions(argv) {
-  const { values, flags } = parseArgs(argv, new Set(["run-root", "repository", "mode", "base-port"]));
+  const { values, flags } = parseArgs(argv, new Set(["run-root", "repository", "old-tag", "new-tag", "mode", "base-port"]));
   assertOnlyFlags(flags, new Set(["help", "dry-run"]));
   if (flags.has("help")) return { help: true };
   const runRoot = requireIgnoredEvidenceRoot(values.get("run-root"), "run root");
@@ -65,9 +87,14 @@ export function parseUpdaterOptions(argv) {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error("repository is invalid");
   const mode = values.get("mode") ?? "both";
   if (!MODES.has(mode)) throw new Error("updater mode is invalid");
+  const oldTag = values.get("old-tag") ?? OLD_TAG;
+  const newTag = values.get("new-tag") ?? NEW_TAG;
+  const oldVersion = versionFromTag(oldTag, "old tag");
+  const newVersion = versionFromTag(newTag, "new tag");
+  if (!isStrictlyNewer(oldVersion, newVersion)) throw new Error("new tag must be strictly newer than old tag");
   const basePort = values.has("base-port") ? Number(values.get("base-port")) : 34_000 + Math.floor(Math.random() * 8_000);
   if (!Number.isInteger(basePort) || basePort < 10_000 || basePort > 65_000 - 1) throw new Error("base port is invalid");
-  return { help: false, dryRun: flags.has("dry-run"), runRoot, repository, mode, basePort };
+  return { help: false, dryRun: flags.has("dry-run"), runRoot, repository, oldTag, newTag, oldVersion, newVersion, mode, basePort };
 }
 
 function protectedState(root, scenario) {
@@ -216,14 +243,14 @@ async function countProcessesInside(root) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-async function runScenario(runRoot, name, port, oldRelease, newRelease) {
+async function runScenario(runRoot, name, port, oldRelease, newRelease, versions) {
   const rollback = name === "replacement-lock-rollback";
   const scenarioRoot = requireInside(runRoot, path.join(runRoot, "scenarios", name), "scenario root");
   const target = requireInside(scenarioRoot, path.join(scenarioRoot, "install", "codex-switch.exe"), "installed executable");
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const oldDownload = await downloadBoundAsset(oldRelease, target);
   const oldPe = await readPeVersion(target);
-  if (versionTriplet(oldPe.fileVersion) !== "0.2.7" || versionTriplet(oldPe.productVersion) !== "0.2.7") throw new Error("installed v0.2.7 PE version is invalid");
+  if (versionTriplet(oldPe.fileVersion) !== versions.oldVersion || versionTriplet(oldPe.productVersion) !== versions.oldVersion) throw new Error(`installed ${versions.oldTag} PE version is invalid`);
   const snapshotProtected = protectedState(scenarioRoot, name);
   const protectedBefore = snapshotProtected();
   const codexHome = path.join(scenarioRoot, "codex-home");
@@ -273,12 +300,8 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
       break;
     } catch (error) {
       if (attempt === 3) throw error;
-      try {
-        await closeMainWindowExact(observed.state.pid, target);
-        await waitForNoExecutableProcess(target, 60_000);
-      } catch {
-        try { process.kill(observed.state.pid); } catch {}
-      }
+      await closeMainWindowExact(observed.state.pid, target);
+      await waitForNoExecutableProcess(target, 60_000);
       await waitForDebugPortClosed(port, 30_000).catch(() => {});
       await sleep(3_000);
     }
@@ -311,15 +334,15 @@ async function runScenario(runRoot, name, port, oldRelease, newRelease) {
       }
       return {app,update,readyState:document.readyState,title:document.title,bodyTextLength:document.body?.innerText?.length??0};
     })()`, 120_000);
-    if (initial.app.version !== "0.2.7" || !initial.update.updateAvailable || initial.update.latestVersion !== "0.3.0" || initial.readyState !== "complete") throw new Error("v0.2.7 did not observe the public v0.3.0 update");
+    if (initial.app.version !== versions.oldVersion || !initial.update.updateAvailable || initial.update.latestVersion !== versions.newVersion || initial.readyState !== "complete") throw new Error(`${versions.oldTag} did not observe the public ${versions.newTag} update`);
     if (rollback) targetLock = await startTargetLock(target, path.join(scenarioRoot, "control"));
     const receipt = await initialCdp.evaluate(invokeExpression("install_update"), 12 * 60_000);
-    if (receipt.fromVersion !== "0.2.7" || receipt.toVersion !== "0.3.0" || receipt.sha256 !== newRelease.asset.sha256 || receipt.downloadedBytes !== newRelease.asset.bytes || !receipt.restarting) {
+    if (receipt.fromVersion !== versions.oldVersion || receipt.toVersion !== versions.newVersion || receipt.sha256 !== newRelease.asset.sha256 || receipt.downloadedBytes !== newRelease.asset.bytes || !receipt.restarting) {
       throw new Error("production updater receipt does not match the public asset");
     }
     initialCdp.close();
     initialCdp = undefined;
-    const expectedVersion = rollback ? "0.2.7" : "0.3.0";
+    const expectedVersion = rollback ? versions.oldVersion : versions.newVersion;
     const expectedNotice = rollback ? "rolledBack" : "updated";
     await waitForOriginalPidExit(target, child.pid);
     const restarted = await waitForRestartedApp(port, expectedVersion, expectedNotice);
@@ -405,24 +428,27 @@ export async function runUpdaterE2e(options) {
     return { verdict: "DRY_RUN_PASS", runRootCreated: false, networkUsed: false, executableRun: false, productionSeamAdded: false };
   }
   fs.mkdirSync(options.runRoot, { recursive: false });
+  const oldReleaseOptions = V02_RELEASE_SHA256[options.oldTag]
+    ? { expectedSha256: V02_RELEASE_SHA256[options.oldTag] }
+    : {};
   const [oldRelease, newRelease, latest] = await Promise.all([
-    resolvePublicRelease(options.repository, OLD_TAG, { expectedSha256: V02_RELEASE_SHA256[OLD_TAG] }),
-    resolvePublicRelease(options.repository, NEW_TAG),
+    resolvePublicRelease(options.repository, options.oldTag, oldReleaseOptions),
+    resolvePublicRelease(options.repository, options.newTag),
     fetchGithubJson(`https://api.github.com/repos/${options.repository}/releases/latest`),
   ]);
-  if (latest.tag_name !== NEW_TAG || latest.id !== newRelease.releaseId || latest.draft || latest.prerelease) throw new Error("GitHub Latest is not the exact public v0.3.0 Release");
-  const publicAsset = requireInside(options.runRoot, path.join(options.runRoot, "public", NEW_TAG, "codex-switch.exe"), "public asset proof");
+  if (latest.tag_name !== options.newTag || latest.id !== newRelease.releaseId || latest.draft || latest.prerelease) throw new Error(`GitHub Latest is not the exact public ${options.newTag} Release`);
+  const publicAsset = requireInside(options.runRoot, path.join(options.runRoot, "public", options.newTag, "codex-switch.exe"), "public asset proof");
   const publicDownload = await downloadBoundAsset(newRelease, publicAsset);
   const publicPe = await readPeVersion(publicAsset);
-  if (versionTriplet(publicPe.fileVersion) !== "0.3.0" || versionTriplet(publicPe.productVersion) !== "0.3.0") throw new Error("public v0.3.0 PE version is invalid");
+  if (versionTriplet(publicPe.fileVersion) !== options.newVersion || versionTriplet(publicPe.productVersion) !== options.newVersion) throw new Error(`public ${options.newTag} PE version is invalid`);
 
   const scenarioNames = options.mode === "both" ? ["success", "replacement-lock-rollback"] : [options.mode];
   const scenarios = [];
   for (const [index, name] of scenarioNames.entries()) {
-    scenarios.push(await runScenario(options.runRoot, name, options.basePort + index, oldRelease, newRelease));
+    scenarios.push(await runScenario(options.runRoot, name, options.basePort + index, oldRelease, newRelease, options));
   }
   const payload = {
-    gate: "v0.3.0-public-updater-and-rollback",
+    gate: `${options.newTag}-public-updater-and-rollback`,
     verdict: "PASS",
     generatedAt: new Date().toISOString(),
     repository: options.repository,

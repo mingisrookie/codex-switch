@@ -142,7 +142,7 @@ function dashboardData(): DashboardData {
         logsDb: { path: 'logs_2.sqlite', exists: true, bytes: 681955328 },
         codexDevDb: { path: 'sqlite/codex-dev.db', exists: true, bytes: 98304 },
         sessionsDir: { path: 'sessions', exists: true, bytes: null },
-        authSummary: { authMode: 'apikey', topLevelKeys: ['auth_mode'], hasTokensObject: false },
+        authSummary: { authMode: 'chatgpt', topLevelKeys: ['auth_mode', 'tokens'], hasTokensObject: true },
       },
     },
     sessions: {
@@ -949,6 +949,23 @@ describe('App release-hardening UI', () => {
     expect((screen.getByRole('button', { name: '会话合并与修复' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('does not offer Account save or switch for a non-official auth file', async () => {
+    const data = dashboardData();
+    if (data.codexHome.status !== 'ready') throw new Error('fixture must include Codex Home');
+    if (data.runtimeStatus.status !== 'ready') throw new Error('fixture must include runtime status');
+    data.codexHome.data.authSummary = {
+      authMode: 'apikey',
+      topLevelKeys: ['auth_mode'],
+      hasTokensObject: false,
+    };
+    data.runtimeStatus.data.authMode = 'apikey';
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    expect((await screen.findByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('keeps merge and repair disabled until the v0.3 storage migration is complete', async () => {
     const data = dashboardData();
     data.sessionStorage = { status: 'ready', data: shadowScanReport() };
@@ -958,23 +975,35 @@ describe('App release-hardening UI', () => {
     expect(screen.getByText('完成 v0.3 前台迁移后可用；旧完全同步已停用。')).toBeTruthy();
   });
 
-  it('shows the inline ChatGPT login next step when auth or config is missing', async () => {
+  it('keeps Relay configurable and switchable when Account auth and config are missing', async () => {
     const data = dashboardData();
     if (data.codexHome.status !== 'ready') throw new Error('fixture mismatch');
+    if (data.runtimeStatus.status !== 'ready') throw new Error('fixture mismatch');
     data.codexHome.data.authJson.exists = false;
     data.codexHome.data.configToml.exists = false;
+    data.codexHome.data.authSummary = null;
+    data.runtimeStatus.data = {
+      activeRuntimeId: null,
+      confidence: 'unknown',
+      authMode: null,
+      modelProvider: null,
+      detectedAtMs: 6,
+    };
 
     render(<App loadDashboard={() => Promise.resolve(data)} />);
 
-    const notice = await screen.findByRole('region', { name: '需要完成 ChatGPT 登录' });
+    const notice = await screen.findByRole('region', { name: 'Account 尚未就绪' });
     expect(within(notice).getByRole('heading', {
-      name: '先打开 ChatGPT 完成登录，再回到这里刷新',
+      name: 'Account 需要官方登录；中转站仍可直接使用',
     })).toBeTruthy();
-    expect(within(notice).queryByText(/Codex/i)).toBeNull();
+    expect(within(notice).getByText(/不会创建、覆盖 auth\.json/)).toBeTruthy();
     const safety = screen.getByRole('complementary', { name: '安全检查' });
     expect(within(safety).getByText('ChatGPT 数据文件：缺失')).toBeTruthy();
-    expect(within(safety).queryByText(/Codex/i)).toBeNull();
     expect((screen.getByRole('button', { name: '保存当前账号态' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '切换到 ChatGPT 账号' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '切换到中转站' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText('切换到 Account 前需要先在 ChatGPT 完成官方登录。')).toBeTruthy();
   });
 
   it('keeps relay configuration and backup recovery available when Codex Home itself is damaged', async () => {
@@ -2117,6 +2146,7 @@ describe('App release-hardening UI', () => {
     expect(await screen.findByText(/窗口保护初始化失败/)).toBeTruthy();
     expect((screen.getByRole('button', { name: '切换到中转站' }) as HTMLButtonElement).disabled)
       .toBe(true);
+    expect(screen.getAllByText(/无法确认本机 Codex 写入进程/)).toHaveLength(2);
     expect(apiMocks.switchRuntime).not.toHaveBeenCalled();
   });
 

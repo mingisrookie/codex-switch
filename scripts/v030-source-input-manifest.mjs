@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 import { sha256Bytes, stableJson } from "./v030-e2e-lib.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageVersion = JSON.parse(
+  fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+).version;
 
 function git(...args) {
   return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", windowsHide: true });
@@ -96,7 +99,8 @@ export function createSourceInputManifest() {
   const inputSetSha256 = sha256Bytes(stableJson(inputs));
   return {
     schemaVersion: 1,
-    gate: "v0.3.0-frozen-source-inputs",
+    gate: `v${packageVersion}-frozen-source-inputs`,
+    version: packageVersion,
     observedAt: new Date().toISOString(),
     gitHead: git("rev-parse", "HEAD").trim(),
     inputCount: inputs.length,

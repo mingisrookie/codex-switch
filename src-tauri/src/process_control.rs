@@ -1,17 +1,19 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-#[cfg(any(windows, test))]
-use std::sync::Mutex;
 #[cfg(windows)]
 use std::{
     ffi::OsString,
-    fs,
     mem::size_of,
     os::windows::{ffi::OsStringExt, fs::MetadataExt, process::CommandExt},
-    path::{Path, PathBuf},
     process::Command,
     thread,
     time::Duration,
+};
+#[cfg(any(windows, test))]
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
 };
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -34,6 +36,9 @@ use windows_sys::Win32::{
     },
 };
 
+#[cfg(any(windows, test))]
+use crate::session_storage::bounded_file::read_regular_file_bounded;
+
 #[cfg(windows)]
 const GRACEFUL_CLOSE_POLL_ATTEMPTS: usize = 80;
 #[cfg(windows)]
@@ -49,6 +54,18 @@ const TRUSTED_CHATGPT_AUMIDS: &[&str] = &[
     "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT",
     "OpenAI.Codex_2p2nqsd0c76g0!App",
 ];
+#[cfg(any(windows, test))]
+const LAUNCH_TARGET_RECORD_NAME: &str = "launch-target-v1.json";
+#[cfg(any(windows, test))]
+const MAX_LAUNCH_TARGET_RECORD_BYTES: u64 = 4 * 1024;
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedLaunchTarget {
+    schema_version: u32,
+    aumid: String,
+}
 
 #[cfg(windows)]
 static CHATGPT_LAUNCH_TARGET: Mutex<Option<String>> = Mutex::new(None);
@@ -61,11 +78,24 @@ pub enum ChatGptLaunchStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatGptLaunchFailureReason {
+    LaunchTargetMissing,
+    LaunchTargetAmbiguous,
+    ProcessInventoryUnavailable,
+    ActivationFailed,
+    VerificationFailed,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatGptLaunchResult {
     pub status: ChatGptLaunchStatus,
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ChatGptLaunchFailureReason>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -122,7 +152,10 @@ pub fn cache_chatgpt_launch_target() -> Result<(), String> {
         snapshot_processes().map_err(|_| "managed ChatGPT launch target is unavailable")?;
     let target = resolve_launch_target_with(&processes, application_user_model_id)
         .map_err(LaunchTargetError::message)?;
-    *cached = Some(target);
+    *cached = Some(target.clone());
+    if let Ok(data_root) = default_launch_target_data_root() {
+        let _ = persist_launch_target_at(&data_root, &target);
+    }
     Ok(())
 }
 
@@ -134,11 +167,12 @@ pub fn cache_chatgpt_launch_target() -> Result<(), String> {
 #[cfg(windows)]
 pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
     let target = match take_cached_launch_target_with(&CHATGPT_LAUNCH_TARGET, || {
-        discover_registered_chatgpt_launch_target()
+        discover_persisted_or_registered_chatgpt_launch_target()
     }) {
         Ok(target) => target,
-        Err(_) => {
+        Err(error) => {
             return ChatGptLaunchResult::failed(
+                error.reason(),
                 "The managed ChatGPT Windows app identity could not be discovered.",
             )
         }
@@ -155,7 +189,10 @@ pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
 
 #[cfg(not(windows))]
 pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
-    ChatGptLaunchResult::failed("ChatGPT launch is not supported on this platform.")
+    ChatGptLaunchResult::failed(
+        ChatGptLaunchFailureReason::Unsupported,
+        "ChatGPT launch is not supported on this platform.",
+    )
 }
 
 impl ChatGptLaunchResult {
@@ -164,6 +201,7 @@ impl ChatGptLaunchResult {
         Self {
             status: ChatGptLaunchStatus::Launched,
             message: None,
+            reason: None,
         }
     }
 
@@ -172,13 +210,15 @@ impl ChatGptLaunchResult {
         Self {
             status: ChatGptLaunchStatus::AlreadyRunning,
             message: None,
+            reason: None,
         }
     }
 
-    fn failed(message: impl Into<String>) -> Self {
+    fn failed(reason: ChatGptLaunchFailureReason, message: impl Into<String>) -> Self {
         Self {
             status: ChatGptLaunchStatus::Failed,
             message: Some(message.into()),
+            reason: Some(reason),
         }
     }
 }
@@ -341,6 +381,13 @@ impl LaunchTargetError {
             Self::Conflict => "managed ChatGPT launch target is ambiguous".to_string(),
         }
     }
+
+    fn reason(self) -> ChatGptLaunchFailureReason {
+        match self {
+            Self::Missing => ChatGptLaunchFailureReason::LaunchTargetMissing,
+            Self::Conflict => ChatGptLaunchFailureReason::LaunchTargetAmbiguous,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -395,6 +442,99 @@ where
 }
 
 #[cfg(any(windows, test))]
+fn persist_launch_target_at(data_root: &Path, aumid: &str) -> Result<(), String> {
+    let aumid = validate_application_user_model_id(aumid.to_string())
+        .ok_or_else(|| "managed ChatGPT launch target is not trusted".to_string())?;
+    if !data_root.is_absolute() {
+        return Err("launch target data root must be absolute".to_string());
+    }
+    let bytes = serde_json::to_vec_pretty(&PersistedLaunchTarget {
+        schema_version: 1,
+        aumid,
+    })
+    .map_err(|_| "failed to serialize managed ChatGPT launch target".to_string())?;
+    crate::file_ops::atomic_write(&data_root.join(LAUNCH_TARGET_RECORD_NAME), &bytes)
+}
+
+#[cfg(any(windows, test))]
+enum PersistedLaunchTargetState {
+    Absent,
+    Valid(String),
+    Invalid,
+}
+
+#[cfg(any(windows, test))]
+fn load_persisted_launch_target_at<Check>(
+    data_root: &Path,
+    mut is_registered: Check,
+) -> PersistedLaunchTargetState
+where
+    Check: FnMut(&str) -> bool,
+{
+    let path = data_root.join(LAUNCH_TARGET_RECORD_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PersistedLaunchTargetState::Absent
+        }
+        Err(_) => return PersistedLaunchTargetState::Invalid,
+    }
+    let record = read_regular_file_bounded(&path, MAX_LAUNCH_TARGET_RECORD_BYTES)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PersistedLaunchTarget>(&bytes).ok());
+    let Some(record) = record else {
+        return PersistedLaunchTargetState::Invalid;
+    };
+    if record.schema_version != 1 || !is_registered(&record.aumid) {
+        return PersistedLaunchTargetState::Invalid;
+    }
+    match validate_application_user_model_id(record.aumid) {
+        Some(aumid) => PersistedLaunchTargetState::Valid(aumid),
+        None => PersistedLaunchTargetState::Invalid,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_launch_target_with_persistence_at<Check>(
+    data_root: &Path,
+    mut is_registered: Check,
+) -> Result<String, LaunchTargetError>
+where
+    Check: FnMut(&str) -> bool,
+{
+    match load_persisted_launch_target_at(data_root, &mut is_registered) {
+        PersistedLaunchTargetState::Valid(target) => Ok(target),
+        PersistedLaunchTargetState::Invalid => Err(LaunchTargetError::Missing),
+        PersistedLaunchTargetState::Absent => resolve_registered_launch_target_with(is_registered),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_persisted_or_registered_launch_target_at<Check>(
+    data_root: Option<&Path>,
+    mut is_registered: Check,
+) -> Result<String, LaunchTargetError>
+where
+    Check: FnMut(&str) -> bool,
+{
+    match data_root {
+        Some(data_root) => resolve_launch_target_with_persistence_at(data_root, &mut is_registered),
+        None => resolve_registered_launch_target_with(is_registered),
+    }
+}
+
+#[cfg(windows)]
+fn default_launch_target_data_root() -> Result<PathBuf, String> {
+    let appdata = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "APPDATA is not set".to_string())?;
+    if !appdata.is_absolute() {
+        return Err("APPDATA must be absolute".to_string());
+    }
+    Ok(appdata.join("codex-switch"))
+}
+
+#[cfg(any(windows, test))]
 fn take_cached_launch_target_with<Discover>(
     cache: &Mutex<Option<String>>,
     mut discover: Discover,
@@ -425,10 +565,21 @@ fn registered_chatgpt_launch_targets() -> Result<Vec<String>, ()> {
         .collect())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn discover_registered_chatgpt_launch_target() -> Result<String, LaunchTargetError> {
     let registered = registered_chatgpt_launch_targets().map_err(|_| LaunchTargetError::Missing)?;
     resolve_registered_launch_target_with(|candidate| {
+        registered
+            .iter()
+            .any(|registered| registered.eq_ignore_ascii_case(candidate))
+    })
+}
+
+#[cfg(windows)]
+fn discover_persisted_or_registered_chatgpt_launch_target() -> Result<String, LaunchTargetError> {
+    let registered = registered_chatgpt_launch_targets().map_err(|_| LaunchTargetError::Missing)?;
+    let data_root = default_launch_target_data_root().ok();
+    resolve_persisted_or_registered_launch_target_at(data_root.as_deref(), |candidate| {
         registered
             .iter()
             .any(|registered| registered.eq_ignore_ascii_case(candidate))
@@ -516,6 +667,7 @@ where
         Ok(false) => {}
         Err(()) => {
             return ChatGptLaunchResult::failed(
+                ChatGptLaunchFailureReason::ProcessInventoryUnavailable,
                 "The managed ChatGPT process inventory could not be verified.",
             )
         }
@@ -523,6 +675,7 @@ where
 
     if activate().is_err() {
         return ChatGptLaunchResult::failed(
+            ChatGptLaunchFailureReason::ActivationFailed,
             "ChatGPT could not be activated using the captured Windows app identity.",
         );
     }
@@ -538,6 +691,7 @@ where
         }
     }
     ChatGptLaunchResult::failed(
+        ChatGptLaunchFailureReason::VerificationFailed,
         "ChatGPT activation did not produce a verified managed process before timeout.",
     )
 }
@@ -842,9 +996,12 @@ fn is_managed_app_root(image_name: &str) -> bool {
 mod tests {
     use super::{
         close_codex_processes_with, decode_process_name, launch_chatgpt_with, managed_app_roots,
-        managed_process_tree, resolve_launch_target_with, resolve_registered_launch_target_with,
-        standalone_codex_processes, take_cached_launch_target_with, ChatGptLaunchStatus,
-        CodexProcess, LaunchTargetError, TaskkillResult, TRUSTED_CHATGPT_AUMIDS,
+        managed_process_tree, persist_launch_target_at, resolve_launch_target_with,
+        resolve_launch_target_with_persistence_at,
+        resolve_persisted_or_registered_launch_target_at, resolve_registered_launch_target_with,
+        standalone_codex_processes, take_cached_launch_target_with, ChatGptLaunchFailureReason,
+        ChatGptLaunchStatus, CodexProcess, LaunchTargetError, TaskkillResult,
+        LAUNCH_TARGET_RECORD_NAME, TRUSTED_CHATGPT_AUMIDS,
     };
     #[cfg(windows)]
     use super::{
@@ -990,6 +1147,85 @@ mod tests {
     }
 
     #[test]
+    fn persisted_trusted_launch_target_resolves_dual_registration_and_tamper_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_launch_target_with_persistence_at(root.path(), |_| true),
+            Err(LaunchTargetError::Conflict)
+        );
+
+        persist_launch_target_at(root.path(), TRUSTED_CHATGPT_AUMIDS[1]).unwrap();
+        assert_eq!(
+            resolve_launch_target_with_persistence_at(root.path(), |_| true).unwrap(),
+            TRUSTED_CHATGPT_AUMIDS[1]
+        );
+
+        fs::write(root.path().join(LAUNCH_TARGET_RECORD_NAME), b"{tampered").unwrap();
+        assert_eq!(
+            resolve_launch_target_with_persistence_at(root.path(), |candidate| {
+                candidate.eq_ignore_ascii_case(TRUSTED_CHATGPT_AUMIDS[0])
+            }),
+            Err(LaunchTargetError::Missing)
+        );
+
+        persist_launch_target_at(root.path(), TRUSTED_CHATGPT_AUMIDS[1]).unwrap();
+        assert_eq!(
+            resolve_launch_target_with_persistence_at(root.path(), |candidate| {
+                candidate.eq_ignore_ascii_case(TRUSTED_CHATGPT_AUMIDS[0])
+            }),
+            Err(LaunchTargetError::Missing)
+        );
+    }
+
+    #[test]
+    fn unavailable_persistence_root_still_allows_one_unambiguous_registered_target() {
+        assert_eq!(
+            resolve_persisted_or_registered_launch_target_at(None, |candidate| {
+                candidate.eq_ignore_ascii_case(TRUSTED_CHATGPT_AUMIDS[0])
+            })
+            .unwrap(),
+            TRUSTED_CHATGPT_AUMIDS[0]
+        );
+        assert_eq!(
+            resolve_persisted_or_registered_launch_target_at(None, |_| true),
+            Err(LaunchTargetError::Conflict)
+        );
+    }
+
+    #[test]
+    fn launch_failure_reasons_serialize_as_stable_camel_case_values() {
+        let cases = [
+            (
+                ChatGptLaunchFailureReason::LaunchTargetMissing,
+                "launchTargetMissing",
+            ),
+            (
+                ChatGptLaunchFailureReason::LaunchTargetAmbiguous,
+                "launchTargetAmbiguous",
+            ),
+            (
+                ChatGptLaunchFailureReason::ProcessInventoryUnavailable,
+                "processInventoryUnavailable",
+            ),
+            (
+                ChatGptLaunchFailureReason::ActivationFailed,
+                "activationFailed",
+            ),
+            (
+                ChatGptLaunchFailureReason::VerificationFailed,
+                "verificationFailed",
+            ),
+            (ChatGptLaunchFailureReason::Unsupported, "unsupported"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
     fn cached_launch_target_is_consumed_and_discovery_results_are_not_reused() {
         let cache = Mutex::new(Some(TRUSTED_CHATGPT_AUMIDS[1].to_string()));
         let discoveries = Cell::new(0);
@@ -1073,6 +1309,7 @@ mod tests {
 
         assert_eq!(result.status, ChatGptLaunchStatus::AlreadyRunning);
         assert_eq!(result.message, None);
+        assert_eq!(result.reason, None);
         assert_eq!(*activations.borrow(), 0);
     }
 
@@ -1115,6 +1352,10 @@ mod tests {
         );
 
         assert_eq!(result.status, ChatGptLaunchStatus::Failed);
+        assert_eq!(
+            result.reason,
+            Some(ChatGptLaunchFailureReason::ActivationFailed)
+        );
         assert_eq!(
             result.message.as_deref(),
             Some("ChatGPT could not be activated using the captured Windows app identity.")

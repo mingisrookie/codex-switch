@@ -5,7 +5,9 @@ import {
   type RuntimeSwitchFlow,
 } from './RuntimeSwitchProgressPanel';
 import type {
+  ChatGptLaunchFailureReason,
   ChatGptLaunchStatus,
+  RuntimeSwitchFailureReason,
   RuntimeSwitchProgress,
   RuntimeSwitchResult,
 } from './types';
@@ -14,13 +16,15 @@ function event(
   phase: RuntimeSwitchProgress['phase'],
   timestampMs: number,
   outcome?: RuntimeSwitchProgress['outcome'],
+  reason?: RuntimeSwitchFailureReason,
 ): RuntimeSwitchProgress {
-  return { phase, timestampMs, outcome };
+  return { phase, timestampMs, outcome, reason };
 }
 
 function result(
   status: ChatGptLaunchStatus,
   message: string | null = null,
+  reason?: ChatGptLaunchFailureReason,
 ): RuntimeSwitchResult {
   return {
     operationId: 'switch-1',
@@ -46,7 +50,7 @@ function result(
     routeProvenance: { status: 'recorded' },
     relayValidation: 'verified',
     chatProcessStateRepaired: false,
-    chatgptLaunch: { status, message },
+    chatgptLaunch: { status, message, reason },
   };
 }
 
@@ -220,7 +224,7 @@ describe('RuntimeSwitchProgressPanel', () => {
         event('launchingApp', 180),
         event('complete', 210),
       ],
-      result: result('failed', 'Windows activation was rejected'),
+      result: result('failed', 'Windows activation was rejected', 'activationFailed'),
     }, onClose, onRetryLaunch);
 
     expect(screen.getAllByText('切换成功，ChatGPT 未能打开').length).toBeGreaterThan(0);
@@ -232,6 +236,21 @@ describe('RuntimeSwitchProgressPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: '稍后手动打开' }));
     expect(onRetryLaunch).toHaveBeenCalledTimes(1);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry an ambiguous launch target and explains how to establish one', () => {
+    renderPanel({
+      status: 'succeeded',
+      target: 'relay',
+      startedAtMs: 100,
+      completedAtMs: 220,
+      events: [event('launchingApp', 180), event('complete', 210)],
+      result: result('failed', 'multiple trusted app identities', 'launchTargetAmbiguous'),
+    });
+
+    expect(screen.getByRole('alert').textContent).toContain('多个可信 Windows 应用身份');
+    expect(screen.queryByRole('button', { name: '重试打开 ChatGPT' })).toBeNull();
+    expect(screen.getByRole('button', { name: '稍后手动打开' })).toBeTruthy();
   });
 
   it('keeps ChatGPT closed without a retry action after incremental rollback failure', () => {
@@ -313,7 +332,7 @@ describe('RuntimeSwitchProgressPanel', () => {
     });
 
     expect(screen.getByText('目标请求端').nextSibling?.textContent).toBe('API Relay');
-    expect(screen.getByText('官方登录态').nextSibling?.textContent).toBe('已验证保持不变');
+    expect(screen.getByText('登录文件').nextSibling?.textContent).toBe('未改写（允许不存在）');
     expect(screen.getByText('配置变更').nextSibling?.textContent).toBe('已原子应用');
     expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('已安全修复');
     expect(screen.getByText('会话视图').nextSibling?.textContent)
@@ -359,6 +378,27 @@ describe('RuntimeSwitchProgressPanel', () => {
     expect(screen.queryByRole('button', { name: /打开 ChatGPT/ })).toBeNull();
     const interrupted = screen.getByText('应用请求端配置', { selector: 'strong' }).closest('li');
     expect(interrupted?.className).toBe('failed');
+  });
+
+  it.each([
+    ['officialAuthRequired' as const, 'Account 请求端需要现有的 ChatGPT 官方登录'],
+    ['standaloneWriterActive' as const, '检测到独立 Codex CLI/工作进程仍在写入'],
+    ['sessionViewUnavailable' as const, '会话数据库视图缺失、冲突或无法证明所有权'],
+    ['mutationBusy' as const, '另一个真实写入任务正在执行'],
+  ])('renders actionable typed switch guidance for %s', (reason, guidance) => {
+    renderPanel({
+      status: 'failed',
+      target: 'relay',
+      startedAtMs: 100,
+      completedAtMs: 150,
+      failedPhase: 'applyingRuntime',
+      error: 'raw backend detail',
+      events: [event('failed', 150, 'failedBeforeWrite', reason)],
+    });
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(guidance);
+    expect(alert.textContent).toContain('raw backend detail');
   });
 
   it('allows terminal Escape dismissal and traps reverse Tab inside the dialog', () => {

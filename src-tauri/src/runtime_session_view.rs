@@ -238,10 +238,68 @@ enum ResolvedStateTransition {
 pub(crate) struct PreparedViewTransition {
     data_root: PathBuf,
     journal: Option<ViewTransitionJournal>,
+    bootstrap: Option<PreparedRelayBootstrap>,
     held_state: HeldStateTransition,
     held_global_creates: Vec<PublishedHandleCreate>,
     held_source_guards: Vec<WriteExclusionGuard>,
     receipt: IncrementalSessionSyncReceipt,
+}
+
+#[derive(Debug)]
+struct PreparedRelayBootstrap {
+    state_path: PathBuf,
+    expected_state: Vec<u8>,
+    state_created: bool,
+    relay_root: PathBuf,
+    relay_root_created: bool,
+    managed_root: PathBuf,
+    managed_root_created: bool,
+}
+
+impl PreparedRelayBootstrap {
+    fn verify(&self) -> Result<(), String> {
+        let observed = read_regular_file_bounded(&self.state_path, MAX_STATE_BYTES)
+            .map_err(|_| "failed to verify empty Relay bootstrap state".to_string())?;
+        if observed != self.expected_state {
+            return Err("empty Relay bootstrap state changed during route switch".to_string());
+        }
+        if !self.relay_root.is_dir() {
+            return Err("empty Relay bootstrap directory is missing".to_string());
+        }
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<(), String> {
+        if self.state_created {
+            self.verify()?;
+            fs::remove_file(&self.state_path).map_err(|error| {
+                format!("failed to roll back empty Relay bootstrap state: {error}")
+            })?;
+        }
+        if self.relay_root_created {
+            match fs::remove_dir(&self.relay_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to roll back empty Relay bootstrap directory: {error}"
+                    ))
+                }
+            }
+        }
+        if self.managed_root_created {
+            match fs::remove_dir(&self.managed_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to roll back managed session view directory: {error}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 type PreparedSynchronization = (
@@ -257,6 +315,7 @@ impl PreparedViewTransition {
         Self {
             data_root: plan.data_root.clone(),
             journal: None,
+            bootstrap: None,
             held_state: HeldStateTransition::None,
             held_global_creates: Vec::new(),
             held_source_guards: Vec::new(),
@@ -359,6 +418,9 @@ fn cleanup_journal_artifacts(
 }
 
 pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<(), String> {
+    if let Some(bootstrap) = prepared.bootstrap.take() {
+        bootstrap.verify()?;
+    }
     let Some(mut journal) = prepared.journal.take() else {
         return Ok(());
     };
@@ -419,6 +481,9 @@ pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<
 }
 
 pub(crate) fn rollback_transition(mut prepared: PreparedViewTransition) -> Result<(), String> {
+    if let Some(bootstrap) = prepared.bootstrap.take() {
+        bootstrap.rollback()?;
+    }
     let Some(mut journal) = prepared.journal.take() else {
         return Ok(());
     };
@@ -477,6 +542,12 @@ pub(crate) enum SessionViewTarget {
 #[derive(Debug, Clone)]
 pub(crate) enum SessionViewTransition {
     None,
+    BootstrapRelay {
+        account: CodexPaths,
+        relay: CodexPaths,
+        state: SessionViewState,
+        session_view_state_path: PathBuf,
+    },
     PrepareRelay {
         account: CodexPaths,
         relay: CodexPaths,
@@ -628,22 +699,33 @@ pub(crate) fn plan_transition(
         if current.sqlite_home != state.account_effective_sqlite_home && !using_relay_view {
             return Err("OpenAI 主目录已变化；请先执行独立 canonical 目录迁移".to_string());
         }
-        if using_relay_view && state.last_common_state_sha256.is_none() {
-            return Err(
-                "Relay 会话视图尚未建立却被设为当前数据库；为避免误用已停止切换".to_string(),
-            );
-        }
         validate_state(&state, data_root)?;
         let account =
             codex_paths_with_sqlite_home(codex_home, &state.account_effective_sqlite_home)?;
         let relay = codex_paths_with_sqlite_home(codex_home, &state.relay_sqlite_home)?;
+        let bootstrap_pending = state.last_common_state_sha256.is_none();
         let mut plan = match target {
             SessionViewTarget::Relay => Ok::<SessionViewPlan, String>(session_view_plan(
                 SqliteHomePatch::Set(state.relay_sqlite_home.to_string_lossy().to_string()),
                 if using_relay_view {
                     SessionViewTransition::None
+                } else if bootstrap_pending
+                    && !account.state_db.exists()
+                    && !relay.state_db.exists()
+                {
+                    SessionViewTransition::BootstrapRelay {
+                        account,
+                        relay,
+                        state,
+                        session_view_state_path,
+                    }
+                } else if bootstrap_pending
+                    && relay.state_db.is_file()
+                    && !account.state_db.exists()
+                {
+                    SessionViewTransition::None
                 } else {
-                    let view_established = state.last_common_state_sha256.is_some();
+                    let view_established = !bootstrap_pending;
                     SessionViewTransition::PrepareRelay {
                         account,
                         relay,
@@ -653,7 +735,7 @@ pub(crate) fn plan_transition(
                     }
                 },
             )),
-            SessionViewTarget::Account if using_relay_view => {
+            SessionViewTarget::Account if using_relay_view && relay.state_db.is_file() => {
                 Ok::<SessionViewPlan, String>(session_view_plan(
                     account_sqlite_home_patch_from_v2(&state),
                     SessionViewTransition::PublishAccount {
@@ -665,7 +747,11 @@ pub(crate) fn plan_transition(
                 ))
             }
             SessionViewTarget::Account => Ok::<SessionViewPlan, String>(session_view_plan(
-                SqliteHomePatch::Keep,
+                if using_relay_view {
+                    account_sqlite_home_patch_from_v2(&state)
+                } else {
+                    SqliteHomePatch::Keep
+                },
                 SessionViewTransition::None,
             )),
         }?;
@@ -706,6 +792,8 @@ pub(crate) fn plan_transition(
     let mut plan = match target {
         SessionViewTarget::Relay => {
             let relay_sqlite_home = managed_relay_sqlite_home(&current.sqlite_home);
+            let sqlite_home_patch =
+                SqliteHomePatch::Set(relay_sqlite_home.to_string_lossy().to_string());
             let state = SessionViewState {
                 version: STATE_VERSION,
                 account_configured_sqlite_home: configured,
@@ -717,16 +805,23 @@ pub(crate) fn plan_transition(
             let account =
                 codex_paths_with_sqlite_home(codex_home, &state.account_effective_sqlite_home)?;
             let relay = codex_paths_with_sqlite_home(codex_home, &state.relay_sqlite_home)?;
-            Ok::<SessionViewPlan, String>(session_view_plan(
-                SqliteHomePatch::Set(state.relay_sqlite_home.to_string_lossy().to_string()),
+            let transition = if account.state_db.is_file() {
                 SessionViewTransition::PrepareRelay {
                     account,
                     relay,
                     state,
                     session_view_state_path,
                     view_established: false,
-                },
-            ))
+                }
+            } else {
+                SessionViewTransition::BootstrapRelay {
+                    account,
+                    relay,
+                    state,
+                    session_view_state_path,
+                }
+            };
+            Ok::<SessionViewPlan, String>(session_view_plan(sqlite_home_patch, transition))
         }
         SessionViewTarget::Account => Ok::<SessionViewPlan, String>(session_view_plan(
             SqliteHomePatch::Keep,
@@ -745,6 +840,19 @@ pub(crate) fn prepare_transition(
     let started = Instant::now();
     match &plan.transition {
         SessionViewTransition::None => Ok(PreparedViewTransition::skipped(plan)),
+        SessionViewTransition::BootstrapRelay {
+            account,
+            relay,
+            state,
+            session_view_state_path,
+        } => prepare_empty_relay_bootstrap(
+            plan,
+            account,
+            relay,
+            state,
+            session_view_state_path,
+            started,
+        ),
         SessionViewTransition::PrepareRelay {
             account,
             relay,
@@ -782,6 +890,7 @@ pub(crate) fn prepare_transition(
             Ok(PreparedViewTransition {
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
+                bootstrap: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -824,6 +933,7 @@ pub(crate) fn prepare_transition(
             Ok(PreparedViewTransition {
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
+                bootstrap: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -869,6 +979,7 @@ pub(crate) fn prepare_transition(
             Ok(PreparedViewTransition {
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
+                bootstrap: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -876,6 +987,134 @@ pub(crate) fn prepare_transition(
             })
         }
     }
+}
+
+fn prepare_empty_relay_bootstrap(
+    plan: &SessionViewPlan,
+    account: &CodexPaths,
+    relay: &CodexPaths,
+    state: &SessionViewState,
+    session_view_state_path: &Path,
+    started: Instant,
+) -> Result<PreparedViewTransition, String> {
+    if account.state_db.exists() || relay.state_db.exists() {
+        return Err("empty Relay bootstrap found an unexpected session database".to_string());
+    }
+    for name in GLOBAL_DATABASES {
+        if account.sqlite_home.join(name).exists() || relay.sqlite_home.join(name).exists() {
+            return Err(format!(
+                "empty Relay bootstrap found an unexpected {name}; no database was changed"
+            ));
+        }
+    }
+    validate_state(state, &plan.data_root)?;
+    let managed_root = relay
+        .sqlite_home
+        .parent()
+        .ok_or_else(|| "Relay session view has no managed parent".to_string())?
+        .to_path_buf();
+    let managed_root_created = !managed_root.exists();
+    let relay_root_created = !relay.sqlite_home.exists();
+    let expected_state = serialize_state(state)?;
+    let state_preexisted = session_view_state_path.exists();
+    if state_preexisted {
+        let existing = read_regular_file_bounded(session_view_state_path, MAX_STATE_BYTES)
+            .map_err(|_| "failed to read empty Relay bootstrap state".to_string())?;
+        if existing != expected_state {
+            return Err("empty Relay bootstrap state conflicts with the planned view".to_string());
+        }
+    }
+    if let Err(error) = ensure_relay_root(&relay.sqlite_home, &account.sqlite_home, false) {
+        let cleanup = PreparedRelayBootstrap {
+            state_path: session_view_state_path.to_path_buf(),
+            expected_state: expected_state.clone(),
+            state_created: false,
+            relay_root: relay.sqlite_home.clone(),
+            relay_root_created,
+            managed_root: managed_root.clone(),
+            managed_root_created,
+        }
+        .rollback();
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; bootstrap cleanup failed: {cleanup_error}"
+            )),
+        };
+    }
+    let state_created = if state_preexisted {
+        false
+    } else {
+        match atomic_create(session_view_state_path, |output| {
+            output
+                .write_all(&expected_state)
+                .map_err(|error| format!("failed to write empty Relay bootstrap state: {error}"))
+        }) {
+            Ok(created) => created,
+            Err(error) => {
+                let cleanup = PreparedRelayBootstrap {
+                    state_path: session_view_state_path.to_path_buf(),
+                    expected_state: expected_state.clone(),
+                    state_created: false,
+                    relay_root: relay.sqlite_home.clone(),
+                    relay_root_created,
+                    managed_root: managed_root.clone(),
+                    managed_root_created,
+                }
+                .rollback();
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(format!(
+                        "{error}; bootstrap cleanup failed: {cleanup_error}"
+                    )),
+                };
+            }
+        }
+    };
+    let observed_state = read_regular_file_bounded(session_view_state_path, MAX_STATE_BYTES);
+    if observed_state.as_deref() != Ok(expected_state.as_slice()) {
+        let cleanup = PreparedRelayBootstrap {
+            state_path: session_view_state_path.to_path_buf(),
+            expected_state: expected_state.clone(),
+            state_created,
+            relay_root: relay.sqlite_home.clone(),
+            relay_root_created,
+            managed_root: managed_root.clone(),
+            managed_root_created,
+        }
+        .rollback();
+        let error = "empty Relay bootstrap state conflicts with the planned view";
+        return match cleanup {
+            Ok(()) => Err(error.to_string()),
+            Err(cleanup_error) => Err(format!(
+                "{error}; bootstrap cleanup failed: {cleanup_error}"
+            )),
+        };
+    }
+    Ok(PreparedViewTransition {
+        data_root: plan.data_root.clone(),
+        journal: None,
+        bootstrap: Some(PreparedRelayBootstrap {
+            state_path: session_view_state_path.to_path_buf(),
+            expected_state,
+            state_created,
+            relay_root: relay.sqlite_home.clone(),
+            relay_root_created,
+            managed_root,
+            managed_root_created,
+        }),
+        held_state: HeldStateTransition::None,
+        held_global_creates: Vec::new(),
+        held_source_guards: Vec::new(),
+        receipt: IncrementalSessionSyncReceipt {
+            status: IncrementalSessionSyncStatus::Unchanged,
+            detected_threads: 0,
+            synced_threads: 0,
+            projected_bytes: 0,
+            duration_ms: started.elapsed().as_millis(),
+            requires_full_sync: false,
+        },
+    })
 }
 
 fn managed_relay_sqlite_home(account_sqlite_home: &Path) -> PathBuf {
@@ -1745,12 +1984,17 @@ fn save_state(path: &Path, state: &SessionViewState) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "session view state path has no parent".to_string())?;
     validate_state(state, data_root)?;
+    let bytes = serialize_state(state)?;
+    atomic_write(path, &bytes)
+}
+
+fn serialize_state(state: &SessionViewState) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|_| "failed to serialize session view state".to_string())?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("session view state exceeded the size limit".to_string());
     }
-    atomic_write(path, &bytes)
+    Ok(bytes)
 }
 
 fn validate_state(state: &SessionViewState, data_root: &Path) -> Result<(), String> {
@@ -2369,7 +2613,7 @@ fn verify_inactive_state_view(
     view_established: bool,
 ) -> Result<(), String> {
     if !target.exists() {
-        return if view_established {
+        return if view_established && expected_digest.is_some() {
             Err("inactive session view state database is missing".to_string())
         } else {
             Ok(())
@@ -2615,9 +2859,9 @@ mod tests {
         commit_transition, load_state, load_transition_journal, logical_state_digest,
         managed_relay_sqlite_home, normalize_thread_provider, persist_transition_journal,
         plan_global_links, plan_transition, prepare_transition, projected_database_bytes,
-        recover_pending_transition, save_state, state_path, transition_journal_path,
-        PreparedViewTransition, SessionViewState, SessionViewTarget, SessionViewTransition,
-        ViewTransitionPhase, STATE_VERSION,
+        recover_pending_transition, rollback_transition, save_state, state_path,
+        transition_journal_path, PreparedViewTransition, SessionViewState, SessionViewTarget,
+        SessionViewTransition, ViewTransitionPhase, STATE_VERSION,
     };
     use crate::codex_paths::{codex_paths_with_sqlite_home, local_codex_paths};
     use crate::config_patch::SqliteHomePatch;
@@ -3409,5 +3653,197 @@ mod tests {
             logical_state_digest(&account_connection).unwrap(),
             logical_state_digest(&relay_connection).unwrap()
         );
+    }
+
+    #[test]
+    fn empty_relay_bootstrap_creates_no_fake_database_and_materializes_account_later() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let data_root = root.path().join("data");
+        fs::create_dir_all(&codex_home).unwrap();
+        let account_config = sqlite_config(&codex_home);
+        fs::write(codex_home.join("config.toml"), &account_config).unwrap();
+
+        let relay_plan = plan_transition(
+            &codex_home,
+            &account_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        assert!(matches!(
+            relay_plan.transition,
+            SessionViewTransition::BootstrapRelay { .. }
+        ));
+        let relay_home = match &relay_plan.sqlite_home_patch {
+            SqliteHomePatch::Set(path) => PathBuf::from(path),
+            other => panic!("unexpected Relay sqlite patch: {other:?}"),
+        };
+        let prepared = prepare_transition(&relay_plan, "test-empty-relay-bootstrap").unwrap();
+        assert!(state_path(&data_root).is_file());
+        assert!(relay_home.is_dir());
+        assert!(!relay_home.join("state_5.sqlite").exists());
+        commit_transition(prepared).unwrap();
+
+        write_state_database(
+            &relay_home.join("state_5.sqlite"),
+            "openai_custom",
+            &["relay-first-thread"],
+        );
+        let relay_config = sqlite_config(&relay_home);
+        fs::write(codex_home.join("config.toml"), &relay_config).unwrap();
+        let account_plan = plan_transition(
+            &codex_home,
+            &relay_config,
+            SessionViewTarget::Account,
+            &data_root,
+        )
+        .unwrap();
+        assert!(matches!(
+            account_plan.transition,
+            SessionViewTransition::PublishAccount { .. }
+        ));
+        let prepared = prepare_transition(&account_plan, "test-bootstrap-to-account").unwrap();
+        commit_transition(prepared).unwrap();
+
+        assert_eq!(
+            Connection::open(codex_home.join("state_5.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider FROM threads WHERE id = 'relay-first-thread'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "openai"
+        );
+        assert!(load_state(&state_path(&data_root), &data_root)
+            .unwrap()
+            .unwrap()
+            .last_common_state_sha256
+            .is_some());
+    }
+
+    #[test]
+    fn bootstrap_state_rejects_independent_account_and_relay_databases() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let data_root = root.path().join("data");
+        fs::create_dir_all(&codex_home).unwrap();
+        let account_config = sqlite_config(&codex_home);
+        fs::write(codex_home.join("config.toml"), &account_config).unwrap();
+
+        let bootstrap_plan = plan_transition(
+            &codex_home,
+            &account_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        let relay_home = match &bootstrap_plan.sqlite_home_patch {
+            SqliteHomePatch::Set(path) => PathBuf::from(path),
+            other => panic!("unexpected Relay sqlite patch: {other:?}"),
+        };
+        commit_transition(
+            prepare_transition(&bootstrap_plan, "test-independent-bootstrap").unwrap(),
+        )
+        .unwrap();
+
+        write_state_database(
+            &relay_home.join("state_5.sqlite"),
+            "openai_custom",
+            &["relay-thread"],
+        );
+        write_state_database(
+            &codex_home.join("state_5.sqlite"),
+            "openai",
+            &["account-thread"],
+        );
+        let relay_before = fs::read(relay_home.join("state_5.sqlite")).unwrap();
+        let account_before = fs::read(codex_home.join("state_5.sqlite")).unwrap();
+
+        let relay_plan = plan_transition(
+            &codex_home,
+            &account_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        assert!(matches!(
+            relay_plan.transition,
+            SessionViewTransition::PrepareRelay {
+                view_established: false,
+                ..
+            }
+        ));
+        let error =
+            prepare_transition(&relay_plan, "test-independent-bootstrap-conflict").unwrap_err();
+
+        assert!(error.contains("new Relay session view directory is not empty"));
+        assert_eq!(
+            fs::read(relay_home.join("state_5.sqlite")).unwrap(),
+            relay_before
+        );
+        assert_eq!(
+            fs::read(codex_home.join("state_5.sqlite")).unwrap(),
+            account_before
+        );
+    }
+
+    #[test]
+    fn empty_relay_bootstrap_rollback_restores_absent_state_and_directories() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let data_root = root.path().join("data");
+        fs::create_dir_all(&codex_home).unwrap();
+        let account_config = sqlite_config(&codex_home);
+        fs::write(codex_home.join("config.toml"), &account_config).unwrap();
+        let plan = plan_transition(
+            &codex_home,
+            &account_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        let relay_home = match &plan.sqlite_home_patch {
+            SqliteHomePatch::Set(path) => PathBuf::from(path),
+            other => panic!("unexpected Relay sqlite patch: {other:?}"),
+        };
+
+        let prepared = prepare_transition(&plan, "test-empty-relay-rollback").unwrap();
+        rollback_transition(prepared).unwrap();
+
+        assert!(!state_path(&data_root).exists());
+        assert!(!relay_home.exists());
+        assert!(!relay_home.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn empty_relay_bootstrap_conflict_does_not_leave_managed_directories() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let data_root = root.path().join("data");
+        fs::create_dir_all(&codex_home).unwrap();
+        let account_config = sqlite_config(&codex_home);
+        let plan = plan_transition(
+            &codex_home,
+            &account_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        let relay_home = match &plan.sqlite_home_patch {
+            SqliteHomePatch::Set(path) => PathBuf::from(path),
+            other => panic!("unexpected Relay sqlite patch: {other:?}"),
+        };
+        fs::create_dir_all(&data_root).unwrap();
+        fs::write(state_path(&data_root), b"{}").unwrap();
+
+        let error = prepare_transition(&plan, "test-empty-relay-conflict").unwrap_err();
+
+        assert!(error.contains("conflicts with the planned view"), "{error}");
+        assert!(!relay_home.exists());
+        assert!(!relay_home.parent().unwrap().exists());
+        assert_eq!(fs::read(state_path(&data_root)).unwrap(), b"{}");
     }
 }
