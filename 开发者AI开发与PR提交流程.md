@@ -196,7 +196,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
    公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；既有 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
 
-6. 创建 tag 后必须等待该 tag commit 对应的 Windows CI 全部通过，并从该 run 下载唯一 packed artifact。不得上传 raw EXE，也不得用本地脏工作区产物替代 tag-CI 产物：
+6. 创建 tag 后必须等待该 tag commit 对应的 Windows CI 全部通过。`release` job 只生成并上传唯一 packed artifact；仅版本 tag 会在其后进入 `publish` job，由该 job 下载同一 run 的 artifact、再次校验 release contract，并使用 GitHub Actions 的最小 `contents: write` 权限创建 Latest Release。不得从开发机上传 raw/packed EXE，也不得用本地脏工作区产物替代 tag-CI 产物：
 
    ```powershell
    $tagCommit = git rev-list -n 1 <tag>
@@ -208,9 +208,9 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
    & "<verified-upx.exe>" -t "artifacts\<tag>\codex-switch.exe"
    ```
 
-   下载后的 tag-CI artifact 必须再次满足 packed contract、`upx -t`、PE32+ x64、双版本、体积门禁，并实际启动成功。CI artifact 只能包含 packed 的裸 `codex-switch.exe`。
+   `publish` job 必须先确认 tag 与 `package.json` 版本一致、Changelog 中存在对应版本段、同名 Release 尚不存在；任一条件不满足都 fail closed。人工下载后的 tag-CI artifact 仍应满足 packed contract、`upx -t`、PE32+ x64、双版本、体积门禁，并实际启动成功。CI artifact 只能包含 packed 的裸 `codex-switch.exe`。
 
-7. 创建或更新 GitHub Release 后，必须把公开资产重新下载到独立目录验证，不能只检查网页元数据：
+7. `publish` job 创建 GitHub Release 后，必须把公开资产重新下载到独立目录验证，不能只检查网页元数据；同名 Release 已存在时工作流不得自动覆盖或替换资产：
 
    ```powershell
    gh release view <tag> --json tagName,name,url,assets

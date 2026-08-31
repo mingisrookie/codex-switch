@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.3 - 2026-08-31
+
+### Changed
+
+- 移除前端 API 中已废弃的全量 `loadDashboard` 聚合入口，避免后续代码绕过现有分域加载机制，在首屏重新触发会话、备份和检查点扫描。
+- 保留并验证正式使用的 `loadRuntimeDashboard`、`loadSessionDashboard`、`loadBackupDashboard` 按需加载路径；会话域单项失败仍不会覆盖其他域的真实状态。
+
+### Release engineering
+
+- 版本 tag 的 Windows CI 只有在前端、Rust、旧版槽位兼容和 packed EXE 门禁全部通过后，才会下载同一 workflow 中已验证的 `codex-switch.exe`，复核 release contract，并使用受限的 GitHub Actions 仓库令牌创建 Release。
+- Release 标题和说明绑定 tag、五处版本号与当前 Changelog 段落；同名 Release 已存在时拒绝覆盖，防止重跑 CI 静默替换公开资产。
+- 本版本不改变界面、账号/Relay 路由、会话、备份、恢复或更新器运行逻辑，是一次代码维护与发布链路收敛更新。
+
 ## v0.3.2 - 2026-08-30
 
 ### Fixed

@@ -162,3 +162,73 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 15
+    needs: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Download verified packed executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-switch-${{ github.sha }}
+          path: release
+
+      - name: Recheck downloaded release contract
+        run: node scripts/check-release-contract.mjs release/codex-switch.exe
+
+      - name: Publish verified GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne "v$version") {
+            throw "tag $tag does not match package version v$version"
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "GitHub Release $tag already exists; refusing to replace a published asset"
+          }
+
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $escapedTag = [Regex]::Escape($tag)
+          $pattern = "(?ms)^##\s+$escapedTag\s+-[^\r\n]*\r?\n(?<body>.*?)(?=^##\s+v|\z)"
+          $match = [Regex]::Match($changelog, $pattern)
+          if (-not $match.Success) {
+            throw "CHANGELOG.md does not contain a release section for $tag"
+          }
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [IO.File]::WriteAllText(
+            $notesPath,
+            $match.Groups['body'].Value.Trim() + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $asset = Resolve-Path 'release/codex-switch.exe'
+          $assetInfo = Get-Item -LiteralPath $asset
+          $assetSha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
+          Write-Output "RELEASE_ASSET_BYTES=$($assetInfo.Length)"
+          Write-Output "RELEASE_ASSET_SHA256=$assetSha256"
+
+          gh release create $tag $asset `
+            --verify-tag `
+            --title "ChatGPT Switch $tag" `
+            --notes-file $notesPath `
+            --latest
