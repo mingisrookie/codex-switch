@@ -43,7 +43,6 @@ import {
   launchChatgpt,
   loadBackupDashboard,
   listSkills,
-  loadDashboard,
   loadRuntimeDashboard,
   loadSessionDashboard,
   listSessionStorageConflicts,
@@ -220,54 +219,29 @@ describe('dashboard API', () => {
     });
   });
 
-  it('keeps successful domains when one dashboard scan fails', async () => {
+  it('keeps successful session domains when one session scan fails', async () => {
     invoke.mockImplementation((command: string) => {
       if (command === 'scan_managed_sessions') {
         return Promise.reject(new Error('managed scan failed'));
       }
       const values: Record<string, unknown> = {
-        scan_codex_home: { root: 'C:\\Users\\alice\\.codex' },
         scan_sessions: { threadCount: 4, sessionJsonlCount: 3 },
         get_session_storage_status: null,
-        list_runtimes: [],
-        scan_runtime_status: {
-          activeRuntimeId: null,
-          confidence: 'unknown',
-          authMode: null,
-          modelProvider: null,
-          detectedAtMs: 1,
-        },
-        list_backups: [],
-        inspect_checkpoint_storage: {
-          totalCount: 0,
-          totalBytes: 0,
-          reclaimableCount: 0,
-          reclaimableBytes: 0,
-          retainedCount: 0,
-          warnings: [],
-          lastCleanup: null,
-        },
-        list_operation_records: [],
       };
       return Promise.resolve(values[command]);
     });
 
-    const dashboard = await loadDashboard();
+    const dashboard = await loadSessionDashboard();
 
-    expect(dashboard.codexHome).toMatchObject({ status: 'ready' });
     expect(dashboard.sessions).toMatchObject({ status: 'ready' });
     expect(dashboard.managedSessions).toMatchObject({
       status: 'error',
       error: 'managed scan failed',
     });
     expect(dashboard.sessionStorage).toMatchObject({ status: 'ready', data: null });
-    expect(dashboard.runtimes).toMatchObject({ status: 'ready', data: [] });
-    expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
-    expect(dashboard.backups).toMatchObject({ status: 'ready', data: [] });
-    expect(dashboard.backupStorage).toMatchObject({ status: 'ready' });
-    expect(dashboard.operations).toMatchObject({ status: 'ready', data: [] });
-    expect(invoke).toHaveBeenCalledTimes(9);
-    expect(invoke).toHaveBeenCalledWith('list_operation_records', { limit: 20 });
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invoke).not.toHaveBeenCalledWith('list_backups');
+    expect(invoke).not.toHaveBeenCalledWith('inspect_checkpoint_storage');
   });
 
   it('refreshes runtime-facing domains without scanning sessions', async () => {

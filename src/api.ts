@@ -335,44 +335,6 @@ export function resolveSessionStorageConflict(
   });
 }
 
-export async function loadDashboard(): Promise<DashboardData> {
-  const [
-    codexHome,
-    sessions,
-    managedSessions,
-    sessionStorage,
-    runtimes,
-    runtimeStatus,
-    backups,
-    operations,
-  ] =
-    await Promise.allSettled([
-      invoke<CodexHomeStatus>('scan_codex_home'),
-      invoke<SessionInventory>('scan_sessions'),
-      invoke<ManagedSessionInventory>('scan_managed_sessions'),
-      invoke<ShadowScanReport | null>('get_session_storage_status'),
-      invoke<RuntimeMetadata[]>('list_runtimes'),
-      invoke<RuntimeStatus>('scan_runtime_status'),
-      invoke<BackupSummary[]>('list_backups'),
-      invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
-    ]);
-  const [backupStorage] = await Promise.allSettled([
-    invoke<CheckpointStorageStatus>('inspect_checkpoint_storage'),
-  ]);
-
-  return {
-    codexHome: settledDomain(codexHome),
-    sessions: settledDomain(sessions),
-    managedSessions: settledDomain(managedSessions),
-    sessionStorage: settledDomain(sessionStorage),
-    runtimes: settledDomain(runtimes),
-    runtimeStatus: settledDomain(runtimeStatus),
-    backups: settledDomain(backups),
-    backupStorage: settledDomain(backupStorage),
-    operations: settledDomain(operations),
-  };
-}
-
 export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
   const [codexHome, sessionStorage, runtimes, runtimeStatus, operations] = await Promise.allSettled([
     invoke<CodexHomeStatus>('scan_codex_home'),
