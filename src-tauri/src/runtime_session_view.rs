@@ -2805,6 +2805,18 @@ fn verify_database(connection: &Connection, name: &str) -> Result<(), String> {
     }
 }
 
+fn is_expected_unestablished_relay_entry(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    GLOBAL_DATABASES.iter().any(|database| {
+        name == *database
+            || ["-wal", "-shm", "-journal"]
+                .iter()
+                .any(|suffix| name == format!("{database}{suffix}"))
+    })
+}
+
 fn ensure_relay_root(
     path: &Path,
     account_sqlite_home: &Path,
@@ -2814,15 +2826,17 @@ fn ensure_relay_root(
         return Err("Relay session view is outside the managed canonical root".to_string());
     }
     if !view_established && path.is_dir() {
-        let mut entries = fs::read_dir(path)
-            .map_err(|error| format!("failed to inspect Relay session view: {error}"))?;
-        if entries
-            .next()
-            .transpose()
+        for entry in fs::read_dir(path)
             .map_err(|error| format!("failed to inspect Relay session view: {error}"))?
-            .is_some()
         {
-            return Err("new Relay session view directory is not empty".to_string());
+            let entry =
+                entry.map_err(|error| format!("failed to inspect Relay session view: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("failed to inspect Relay session view: {error}"))?;
+            if !file_type.is_file() || !is_expected_unestablished_relay_entry(&entry.file_name()) {
+                return Err("new Relay session view directory is not empty".to_string());
+            }
         }
     }
     let store = path
@@ -2861,7 +2875,7 @@ mod tests {
         plan_global_links, plan_transition, prepare_transition, projected_database_bytes,
         recover_pending_transition, rollback_transition, save_state, state_path,
         transition_journal_path, PreparedViewTransition, SessionViewState, SessionViewTarget,
-        SessionViewTransition, ViewTransitionPhase, STATE_VERSION,
+        SessionViewTransition, ViewTransitionPhase, GLOBAL_DATABASES, STATE_VERSION,
     };
     use crate::codex_paths::{codex_paths_with_sqlite_home, local_codex_paths};
     use crate::config_patch::SqliteHomePatch;
@@ -3430,6 +3444,71 @@ mod tests {
         fs::write(&paths.logs_db, vec![0_u8; 13]).unwrap();
 
         assert_eq!(projected_database_bytes(&paths).unwrap(), 11);
+    }
+
+    #[test]
+    fn unestablished_relay_accepts_verified_shared_global_databases() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let account_home = root.path().join("account");
+        let data_root = root.path().join("data");
+        let relay_home = managed_relay_sqlite_home(&account_home);
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(&relay_home).unwrap();
+        write_state_database(
+            &account_home.join("state_5.sqlite"),
+            "openai",
+            &["account-thread"],
+        );
+        for name in GLOBAL_DATABASES {
+            let account_path = account_home.join(name);
+            Connection::open(&account_path)
+                .unwrap()
+                .execute_batch("CREATE TABLE shared_value (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            fs::hard_link(&account_path, relay_home.join(name)).unwrap();
+        }
+        let state = SessionViewState {
+            version: STATE_VERSION,
+            account_configured_sqlite_home: Some(account_home.to_string_lossy().to_string()),
+            account_effective_sqlite_home: account_home.clone(),
+            relay_sqlite_home: relay_home.clone(),
+            last_common_state_sha256: None,
+        };
+        save_state(&state_path(&data_root), &state).unwrap();
+        let live_config = sqlite_config(&account_home);
+        fs::write(codex_home.join("config.toml"), &live_config).unwrap();
+
+        let relay_plan = plan_transition(
+            &codex_home,
+            &live_config,
+            SessionViewTarget::Relay,
+            &data_root,
+        )
+        .unwrap();
+        assert!(matches!(
+            relay_plan.transition,
+            SessionViewTransition::PrepareRelay {
+                view_established: false,
+                ..
+            }
+        ));
+
+        let prepared = prepare_transition(&relay_plan, "shared-global-bootstrap-retry").unwrap();
+        commit_transition(prepared).unwrap();
+
+        assert!(relay_home.join("state_5.sqlite").is_file());
+        assert!(load_state(&state_path(&data_root), &data_root)
+            .unwrap()
+            .unwrap()
+            .last_common_state_sha256
+            .is_some());
+        for name in GLOBAL_DATABASES {
+            assert!(
+                same_regular_file_identity(&account_home.join(name), &relay_home.join(name),)
+                    .unwrap()
+            );
+        }
     }
 
     #[test]

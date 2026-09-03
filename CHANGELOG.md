@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.4 - 2026-09-03
+
+### Fixed
+
+- 修复未完成初始化的 Relay 会话视图在目录中已经存在合法共享全局 SQLite（`logs_2.sqlite`、`goals_1.sqlite`、`memories_1.sqlite`）时，被“目录非空”检查误判并阻止切换的问题。现在会继续进入既有 file-identity / quick-check / hard-link 校验链；只有这些数据库确实属于已验证共享视图时才允许继续。
+- 未初始化 Relay 目录中的 `state_5.sqlite`、未知文件、目录、符号链接或其他非受管内容仍保持 fail-closed；独立的 Account/Relay 全局数据库也仍拒绝覆盖，避免为了恢复切换而静默丢弃数据。
+- 新增回归测试覆盖“`last_common_state_sha256` 尚未建立，但 Relay 目录已包含合法共享全局数据库”的真实恢复路径，确保可完成 Relay 物化并建立共同状态摘要。
+
+### Release engineering
+
+- 本补丁版本只收敛上述 Relay bootstrap 恢复边界，不改变 `auth.json`、Relay Key、请求路由或会话正文的既有安全合同。
+
 ## v0.3.3 - 2026-08-31
 
 ### Changed
