@@ -57,8 +57,11 @@ export function validateSbom(bom, version) {
     requireCondition(refs.has(dependency.ref) && !edges.has(dependency.ref),
       'SBOM dependency node is missing or duplicated');
     edges.add(dependency.ref);
-    requireCondition(Array.isArray(dependency.dependsOn)
-      && dependency.dependsOn.every((ref) => refs.has(ref)), 'SBOM dependency edge refers to an unknown component');
+    // CycloneDX generators omit dependsOn for dependency nodes with no listed edges.
+    // Missing is valid; malformed values and every actual unknown reference still fail.
+    const dependsOn = dependency.dependsOn === undefined ? [] : dependency.dependsOn;
+    requireCondition(Array.isArray(dependsOn)
+      && dependsOn.every((ref) => refs.has(ref)), 'SBOM dependency edge refers to an unknown component');
   }
   requireCondition(edges.has(root['bom-ref']), 'SBOM dependency graph omits the root');
   const forbidden = /(?:\bsk-[A-Za-z0-9_-]{12,}|authorization\s*[:=]\s*bearer|file:\/|(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]|\/(?:home|Users|workspace)\/)/i;

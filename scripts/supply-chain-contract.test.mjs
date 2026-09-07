@@ -121,3 +121,14 @@ test('visibility restore rechecks compatibility in its final post-backup gate', 
   assert.match(entry, /ensure_codex_still_closed/);
   assert.match(source, /final_gate\("visibility restore"\)[\s\S]*?restore_visible_in_db/);
 });
+
+
+test('CycloneDX nodes may omit dependsOn, but malformed edge values remain invalid', () => {
+  const bom = prepareSbom(fixture(), version, sourceRef);
+  delete bom.dependencies[1].dependsOn;
+  assert.equal(validateSbom(bom, version).components, 1);
+  for (const invalid of [null, 'serde', {}]) {
+    bom.dependencies[1].dependsOn = invalid;
+    assert.throws(() => validateSbom(bom, version), /dependency edge/);
+  }
+});
