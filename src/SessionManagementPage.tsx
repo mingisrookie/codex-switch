@@ -15,8 +15,16 @@ import type {
   MobileContinuityStatus,
 } from './types';
 
-type SessionFilter = 'all' | 'visible' | 'archived' | 'current' | 'shared';
-type SessionSort = 'updated-desc' | 'updated-asc' | 'title-asc' | 'title-desc';
+import {
+  createSessionIndex,
+  filterSessionIndex,
+  sessionTimestampMs,
+  sortSessionIndex,
+  type SessionScopeFilter,
+  type SessionSort,
+} from './sessionListModel';
+
+type SessionFilter = SessionScopeFilter | 'selected';
 
 type SessionManagementPageProps = {
   inventory: ManagedSessionInventory;
@@ -31,6 +39,10 @@ type SessionManagementPageProps = {
 };
 
 const numberFormat = new Intl.NumberFormat('zh-CN');
+const timeFormat = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric', month: 'numeric', day: 'numeric',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
 const pageSize = 50;
 
 export function SessionManagementPage({
@@ -60,16 +72,19 @@ export function SessionManagementPage({
     });
   }, [inventory.sessions]);
 
-  useEffect(() => setPage(1), [filter, query, sort, inventory.sessions]);
+  useEffect(() => setPage(1), [filter, query, sort]);
 
-  const filteredSessions = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase('zh-CN');
-    return inventory.sessions
-      .filter((session) => matchesFilter(session, filter))
-      .filter((session) => !needle || searchableText(session).includes(needle))
-      .slice()
-      .sort((left, right) => compareSessions(left, right, sort));
-  }, [filter, inventory.sessions, query, sort]);
+  // Build the corpus only when inventory changes; keystrokes never rebuild or re-sort it.
+  const searchIndex = useMemo(() => createSessionIndex(inventory.sessions), [inventory.sessions]);
+  const sortedIndex = useMemo(() => sortSessionIndex(searchIndex, sort), [searchIndex, sort]);
+  const matchingSessions = useMemo(
+    () => filterSessionIndex(sortedIndex, filter === 'selected' ? 'all' : filter, query),
+    [sortedIndex, filter, query],
+  );
+  const filteredSessions = useMemo(
+    () => filter === 'selected' ? matchingSessions.filter((session) => selectedIds.has(session.id)) : matchingSessions,
+    [filter, matchingSessions, selectedIds],
+  );
   const continuityByThread = useMemo(
     () => new Map(mobileContinuity?.items.map((item) => [item.threadId, item.status]) ?? []),
     [mobileContinuity?.items],
@@ -78,13 +93,20 @@ export function SessionManagementPage({
   const pageCount = Math.max(1, Math.ceil(filteredSessions.length / pageSize));
   const currentPage = Math.min(page, pageCount);
   const sessions = filteredSessions.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-  const selectedSessions = inventory.sessions.filter((session) => selectedIds.has(session.id));
+  const selectedSessions = useMemo(
+    () => inventory.sessions.filter((session) => selectedIds.has(session.id)),
+    [inventory.sessions, selectedIds],
+  );
   const selectedArchived = selectedSessions.filter((session) => session.archived).length;
   const selectedUnarchived = selectedSessions.length - selectedArchived;
   const restoreIds = selectedSessions.filter(canRestoreVisible).map((session) => session.id);
   const visibleIds = sessions.map((session) => session.id);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
   const someVisibleSelected = visibleIds.some((id) => selectedIds.has(id));
+  const offPageSelectedCount = selectedSessions.length - visibleIds.filter((id) => selectedIds.has(id)).length;
+
+  // Clamp the stored page as well: a later refresh must not resurrect an obsolete page.
+  useEffect(() => setPage((current) => Math.min(current, pageCount)), [pageCount]);
 
   useEffect(() => {
     if (selectAllRef.current) {
@@ -127,6 +149,12 @@ export function SessionManagementPage({
 
   function clearSelected() {
     setSelectedIds(new Set());
+  }
+
+  function showSelected() {
+    setQuery('');
+    setFilter('selected');
+    setPage(1);
   }
 
   function handleBulkAction(action: string) {
@@ -175,12 +203,17 @@ export function SessionManagementPage({
           <label className="session-field">
             <span>搜索</span>
             <input
+              type="search"
               aria-label="搜索会话"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="标题、ID、provider、路径"
             />
           </label>
+          <button className="ghost-button inline" onClick={() => setQuery('')} disabled={!query}>
+            <X className="button-icon" aria-hidden="true" />
+            清空搜索
+          </button>
           <label className="session-field">
             <span>排序</span>
             <select aria-label="会话排序" value={sort} onChange={(event) => setSort(event.target.value as SessionSort)}>
@@ -196,6 +229,7 @@ export function SessionManagementPage({
             <FilterButton label="已归档" active={filter === 'archived'} onClick={() => setFilter('archived')} />
             <FilterButton label="本机" active={filter === 'current'} onClick={() => setFilter('current')} />
             <FilterButton label="共享池" active={filter === 'shared'} onClick={() => setFilter('shared')} />
+            <FilterButton label="只看已选" active={filter === 'selected'} onClick={() => setFilter('selected')} />
           </div>
           <p className="safe-note">每页 50 个会话，选择状态跨页保留。</p>
         </aside>
@@ -206,6 +240,10 @@ export function SessionManagementPage({
           aria-label="会话表格，可横向滚动"
           tabIndex={0}
         >
+          <p className="session-list-summary" role="status" aria-live="polite" aria-atomic="true">
+            匹配 {numberFormat.format(filteredSessions.length)} / {numberFormat.format(inventory.sessions.length)} 个会话
+            {filteredSessions.length > 0 && ` · 本页 ${(currentPage - 1) * pageSize + 1}–${Math.min(currentPage * pageSize, filteredSessions.length)}`}
+          </p>
           <div className="session-selection-toolbar" aria-label="批量选择">
             <div className="selection-left">
               <label className="select-all-box">
@@ -233,13 +271,13 @@ export function SessionManagementPage({
                   handleBulkAction(event.target.value);
                   event.target.value = '';
                 }}
-                disabled={busy || sessions.length === 0}
+                disabled={busy || (sessions.length === 0 && selectedIds.size === 0)}
                 aria-label="选择操作"
               >
                 <option value="" disabled>批量选择</option>
-                <option value="select-visible">全选本页</option>
-                <option value="invert-visible">反选本页</option>
-                <option value="clear">清空选择</option>
+                <option value="select-visible" disabled={sessions.length === 0}>全选本页</option>
+                <option value="invert-visible" disabled={sessions.length === 0}>反选本页</option>
+                <option value="clear" disabled={selectedIds.size === 0}>清空选择</option>
               </select>
             </label>
           </div>
@@ -291,6 +329,14 @@ export function SessionManagementPage({
             <div><dt>已归档</dt><dd>{numberFormat.format(selectedArchived)}</dd></div>
             <div><dt>可恢复</dt><dd>{numberFormat.format(restoreIds.length)}</dd></div>
           </dl>
+          {offPageSelectedCount > 0 && (
+            <div className="session-selection-note">
+              <p className="safe-note" role="status">
+                另有 {numberFormat.format(offPageSelectedCount)} 个已选会话不在本页；恢复可见仍包含其中可恢复的会话。
+              </p>
+              <button className="ghost-button inline" onClick={showSelected}>查看全部已选</button>
+            </div>
+          )}
           <div className="detail-actions">
             <button onClick={() => void restoreSelected()} disabled={busy || mutationDisabled || restoreIds.length === 0}>
               <ArchiveRestore className="button-icon" aria-hidden="true" />
@@ -342,7 +388,7 @@ function SessionRow({
       <span className="session-provider" title={session.modelProvider ?? '未知'} role="cell">{session.modelProvider ?? '未知'}</span>
       <span className={`pill ${session.archived ? 'orange' : 'teal'}`} role="cell">{session.archived ? '已归档' : '未归档'}</span>
       <span role="cell">{sourceLabel(session.scope)}</span>
-      <span role="cell">{formatTime(session.updatedAtMs ?? session.updatedAt)}</span>
+      <span role="cell">{formatTime(sessionTimestampMs(session))}</span>
       <span className="session-remote-action" role="cell">
         {continuityStatus ? (
           <span className={`pill ${continuityStatus === 'remotePublished' ? 'teal' : 'orange'}`}>
@@ -382,40 +428,6 @@ function FilterButton({ label, active, onClick }: { label: string; active: boole
   return <button className={active ? 'active' : ''} onClick={onClick} aria-pressed={active}>{label}</button>;
 }
 
-function matchesFilter(session: ManagedSessionRecord, filter: SessionFilter) {
-  if (filter === 'visible') return !session.archived;
-  if (filter === 'archived') return session.archived;
-  if (filter === 'current') return session.scope === 'current' || session.scope === 'both';
-  if (filter === 'shared') return session.scope === 'shared' || session.scope === 'both';
-  return true;
-}
-
-function compareSessions(left: ManagedSessionRecord, right: ManagedSessionRecord, sort: SessionSort) {
-  const leftTitle = left.title || left.preview || '';
-  const rightTitle = right.title || right.preview || '';
-  if (sort === 'title-asc') return leftTitle.localeCompare(rightTitle, 'zh-CN') || left.id.localeCompare(right.id);
-  if (sort === 'title-desc') return rightTitle.localeCompare(leftTitle, 'zh-CN') || right.id.localeCompare(left.id);
-  const leftTime = left.updatedAtMs ?? left.updatedAt ?? 0;
-  const rightTime = right.updatedAtMs ?? right.updatedAt ?? 0;
-  return sort === 'updated-asc' ? leftTime - rightTime : rightTime - leftTime;
-}
-
-function searchableText(session: ManagedSessionRecord) {
-  return [
-    session.id,
-    session.title,
-    session.preview,
-    session.modelProvider,
-    session.current?.sessionFile,
-    session.current?.rolloutPath,
-    session.shared?.sessionFile,
-    session.shared?.rolloutPath,
-  ]
-    .filter(Boolean)
-    .join('\n')
-    .toLocaleLowerCase('zh-CN');
-}
-
 function canRestoreVisible(session: ManagedSessionRecord) {
   return Boolean(session.archived && session.current?.archived);
 }
@@ -431,8 +443,6 @@ function sourceLabel(scope: ManagedSessionRecord['scope']) {
   return '未知';
 }
 
-function formatTime(value: number | null) {
-  if (!value) return '未知';
-  const millis = value > 10_000_000_000 ? value : value * 1000;
-  return new Date(millis).toLocaleString('zh-CN', { hour12: false });
+function formatTime(millis: number | null) {
+  return millis === null ? '未知' : timeFormat.format(millis);
 }

@@ -2573,6 +2573,26 @@ span.section-icon svg {
   background: var(--surface);
 }
 
+.session-list-summary {
+  margin: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.session-selection-note {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.session-selection-note .safe-note {
+  margin: 0;
+}
+
 .session-selection-toolbar,
 .session-pagination {
   display: flex;
