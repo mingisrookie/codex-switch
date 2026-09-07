@@ -16,16 +16,40 @@ export function prepareSbom(input, version, sourceRef) {
     'SBOM source component is not the current build root');
   requireCondition(component.purl === stableRef || component.purl === `${stableRef}?download_url=file://.`,
     'SBOM source component has an unexpected package URL');
-  // Cargo records the workspace path only for this package. Remap its identity and
-  // graph edges, never remove or rewrite unknown dependency/path information.
-  const oldRef = component['bom-ref'];
+  // cargo-cyclonedx 0.5.9 also emits this crate's build targets as nested
+  // metadata components (generator.rs:create_toplevel_component). Normalize only
+  // the known crate/targets; never remove arbitrary dependency provenance.
+  const replacements = new Map([[component['bom-ref'], stableRef]]);
   component['bom-ref'] = stableRef;
   component.purl = stableRef;
+  const targets = new Map([
+    ['codex-switch', { type: 'application', source: 'src/main.rs' }],
+    ['codex_switch_lib', { type: 'library', source: 'src/lib.rs' }],
+  ]);
+  const children = component.components ?? [];
+  requireCondition(Array.isArray(children) && children.length <= targets.size,
+    'SBOM root has unexpected build target components');
+  const seenTargets = new Set();
+  children.forEach((child, index) => {
+    const target = targets.get(child.name);
+    requireCondition(target && !seenTargets.has(child.name) && child.version === version
+      && child.type === target.type && !child.components,
+      'SBOM contains an unexpected nested build target');
+    seenTargets.add(child.name);
+    const targetRef = `${stableRef}#${target.source}`;
+    requireCondition(child['bom-ref'] === `${sourceRef} bin-target-${index}` || child['bom-ref'] === targetRef,
+      'SBOM build target does not belong to the current source root');
+    requireCondition(child.purl === `${stableRef}?download_url=file://.#${target.source}` || child.purl === targetRef,
+      'SBOM build target source URL is not recognized');
+    replacements.set(child['bom-ref'], targetRef);
+    child['bom-ref'] = targetRef;
+    child.purl = targetRef;
+  });
   if (Array.isArray(bom.dependencies)) {
     for (const dependency of bom.dependencies) {
-      if (dependency.ref === oldRef) dependency.ref = stableRef;
+      dependency.ref = replacements.get(dependency.ref) ?? dependency.ref;
       if (Array.isArray(dependency.dependsOn)) {
-        dependency.dependsOn = dependency.dependsOn.map((ref) => ref === oldRef ? stableRef : ref);
+        dependency.dependsOn = dependency.dependsOn.map((ref) => replacements.get(ref) ?? ref);
       }
     }
   }
@@ -44,7 +68,7 @@ export function validateSbom(bom, version) {
   requireCondition(Array.isArray(bom.components) && bom.components.length > 0,
     'SBOM must contain dependency components');
   const refs = new Set();
-  for (const component of [root, ...bom.components]) {
+  for (const component of [root, ...(root.components ?? []), ...bom.components]) {
     requireCondition(typeof component['bom-ref'] === 'string' && component['bom-ref'].length > 0,
       'SBOM component identity is missing');
     requireCondition(!refs.has(component['bom-ref']), 'SBOM contains duplicate component identities');

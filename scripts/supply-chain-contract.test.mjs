@@ -132,3 +132,22 @@ test('CycloneDX nodes may omit dependsOn, but malformed edge values remain inval
     assert.throws(() => validateSbom(bom, version), /dependency edge/);
   }
 });
+
+
+test('crate build targets are normalized without losing identities or source subpaths', () => {
+  const bom = fixture();
+  bom.metadata.component.components = [
+    { type: 'library', name: 'codex_switch_lib', version, 'bom-ref': `${sourceRef} bin-target-0`,
+      purl: `${stableRef}?download_url=file://.#src/lib.rs` },
+    { type: 'application', name: 'codex-switch', version, 'bom-ref': `${sourceRef} bin-target-1`,
+      purl: `${stableRef}?download_url=file://.#src/main.rs` },
+  ];
+  bom.dependencies[0].dependsOn.push(`${sourceRef} bin-target-1`);
+  const normalized = prepareSbom(bom, version, sourceRef);
+  assert.equal(normalized.metadata.component.components[0].purl, `${stableRef}#src/lib.rs`);
+  assert.equal(normalized.dependencies[0].dependsOn.at(-1), `${stableRef}#src/main.rs`);
+  assert.deepEqual(prepareSbom(normalized, version, sourceRef), normalized);
+  assert.equal(bom.metadata.component.components[0]['bom-ref'], `${sourceRef} bin-target-0`);
+  bom.metadata.component.components[0].purl = `${stableRef}?download_url=file:///unrelated/private#src/lib.rs`;
+  assert.throws(() => prepareSbom(bom, version, sourceRef), /source URL/);
+});
