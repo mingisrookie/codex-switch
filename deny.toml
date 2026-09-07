@@ -1,0 +1,44 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2025-0075", reason = "transitive rust-unic component through Tauri urlpattern; advisory is maintenance-only and has no safe compatible upgrade" },
+  { id = "RUSTSEC-2025-0080", reason = "transitive rust-unic component through Tauri urlpattern; advisory is maintenance-only and has no safe compatible upgrade" },
+  { id = "RUSTSEC-2025-0081", reason = "transitive rust-unic component through Tauri urlpattern; advisory is maintenance-only and has no safe compatible upgrade" },
+  { id = "RUSTSEC-2025-0098", reason = "transitive rust-unic component through Tauri urlpattern; advisory is maintenance-only and has no safe compatible upgrade" },
+  { id = "RUSTSEC-2025-0100", reason = "transitive rust-unic component through Tauri urlpattern; advisory is maintenance-only and has no safe compatible upgrade" },
+]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSL-1.0",
+  "CC0-1.0",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

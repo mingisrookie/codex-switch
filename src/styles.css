@@ -3455,3 +3455,120 @@ span.section-icon svg {
     transition: none !important;
   }
 }
+
+
+.relay-transport-fieldset {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.relay-transport-fieldset legend {
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+.relay-transport-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.relay-transport-option.selected {
+  border-color: var(--ink);
+  background: var(--surface-muted);
+}
+
+.relay-transport-option input {
+  margin-top: 3px;
+}
+
+.relay-transport-option span {
+  display: grid;
+  gap: 4px;
+}
+
+.relay-transport-option small,
+.compatibility-detail {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.compatibility-panel {
+  margin: 18px 0 22px;
+  padding: 18px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+}
+
+.compatibility-panel.compatibility-blocked,
+.compatibility-panel.compatibility-error {
+  border-color: var(--danger);
+}
+
+.compatibility-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.compatibility-grid span {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.compatibility-grid small {
+  color: var(--muted);
+}
+
+.compatibility-issues {
+  margin: 12px 0 0;
+  padding-left: 20px;
+}
+
+.storage-compatibility-banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+}
+
+.storage-compatibility-banner.supported {
+  border-color: #82b9ad;
+  background: #f1f8f6;
+}
+
+.storage-compatibility-banner.blocked {
+  border-color: #d6a1a1;
+  background: #fff5f5;
+}
+
+.storage-compatibility-banner svg {
+  width: 20px;
+  height: 20px;
+}
+
+.storage-compatibility-banner p {
+  margin: 5px 0 0;
+}
+
+@media (max-width: 720px) {
+  .compatibility-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

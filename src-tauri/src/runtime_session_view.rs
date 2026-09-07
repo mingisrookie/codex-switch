@@ -2102,12 +2102,18 @@ fn plan_global_links(
                             "{name} is not the verified shared database view; no file was replaced"
                         ));
                     }
-                    if relay_is_active {
-                        checkpoint_database(&relay_path, name)?;
-                        checkpoint_database(&account_path, name)?;
+                    let (active_path, inactive_path) = if relay_is_active {
+                        (&relay_path, &account_path)
                     } else {
-                        checkpoint_database(&account_path, name)?;
-                        checkpoint_database(&relay_path, name)?;
+                        (&account_path, &relay_path)
+                    };
+                    ensure_sqlite_sidecars_absent(inactive_path, name)?;
+                    checkpoint_database(active_path, name)?;
+                    ensure_sqlite_sidecars_absent(inactive_path, name)?;
+                    if !same_regular_file_identity(&account_path, &relay_path).unwrap_or(false) {
+                        return Err(format!(
+                            "{name} file identity changed while preparing the shared database view"
+                        ));
                     }
                     (account_path, relay_path, true)
                 }
@@ -2262,6 +2268,7 @@ fn prepare_synchronized_session_view(
     let mut global_link_proofs = Vec::with_capacity(global_links.len());
     for link in &global_links {
         let mut guard = WriteExclusionGuard::acquire(&link.source_path)?;
+        verify_global_link_sidecars(link)?;
         let expected_sha256 = guard.verify_current_path(None)?.1;
         let expected_identity: PersistedFileIdentity = guard.identity()?.into();
         if link.target_preexisted
@@ -2336,6 +2343,7 @@ fn prepare_synchronized_session_view(
             if source_guard.identity()? != proof.expected_identity.into() {
                 return Err("shared database source identity changed".to_string());
             }
+            verify_global_link_sidecars(&link)?;
             if link.target_preexisted {
                 if !same_regular_file_identity(&link.source_path, &link.target_path)
                     .unwrap_or(false)
@@ -2368,7 +2376,11 @@ fn prepare_synchronized_session_view(
             if staged.identity_bindings()? != expected_bindings {
                 return Err("shared database create identity binding changed".to_string());
             }
+            // The staged create owns the file's write-exclusion handle. Recheck both
+            // path-specific sidecars after the source-guard handoff, before activation.
+            verify_global_link_sidecars(&link)?;
             let published = staged.publish().map_err(|(error, _)| error)?;
+            verify_global_link_sidecars(&link)?;
             held_global_creates.push(published);
         }
         journal.phase = ViewTransitionPhase::GlobalsReady;
@@ -2652,7 +2664,35 @@ fn checkpoint_database(path: &Path, name: &str) -> Result<(), String> {
     if busy != 0 {
         return Err(format!("shared database {name} is still busy"));
     }
-    verify_database(&connection, name)
+    verify_database(&connection, name)?;
+    drop(connection);
+    ensure_sqlite_sidecars_absent(path, name)
+}
+
+fn verify_global_link_sidecars(link: &GlobalLinkPlan) -> Result<(), String> {
+    ensure_sqlite_sidecars_absent(&link.source_path, "source global database")?;
+    ensure_sqlite_sidecars_absent(&link.target_path, "target global database")
+}
+
+fn ensure_sqlite_sidecars_absent(path: &Path, name: &str) -> Result<(), String> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        match fs::symlink_metadata(PathBuf::from(candidate)) {
+            Ok(_) => {
+                return Err(format!(
+                    "shared database {name} has an unverified SQLite sidecar"
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(format!(
+                    "shared database {name} sidecar status is unavailable"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn logical_state_digest(connection: &Connection) -> Result<String, String> {
@@ -2806,15 +2846,8 @@ fn verify_database(connection: &Connection, name: &str) -> Result<(), String> {
 }
 
 fn is_expected_unestablished_relay_entry(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    GLOBAL_DATABASES.iter().any(|database| {
-        name == *database
-            || ["-wal", "-shm", "-journal"]
-                .iter()
-                .any(|suffix| name == format!("{database}{suffix}"))
-    })
+    name.to_str()
+        .is_some_and(|name| GLOBAL_DATABASES.contains(&name))
 }
 
 fn ensure_relay_root(
@@ -3512,6 +3545,128 @@ mod tests {
     }
 
     #[test]
+    fn unestablished_relay_rejects_every_sqlite_sidecar() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let root = tempdir().unwrap();
+            let codex_home = root.path().join("codex-home");
+            let account_home = root.path().join("account");
+            let data_root = root.path().join("data");
+            let relay_home = managed_relay_sqlite_home(&account_home);
+            fs::create_dir_all(codex_home.join("sessions")).unwrap();
+            fs::create_dir_all(&relay_home).unwrap();
+            write_state_database(
+                &account_home.join("state_5.sqlite"),
+                "openai",
+                &["account-thread"],
+            );
+            for name in GLOBAL_DATABASES {
+                let account_path = account_home.join(name);
+                Connection::open(&account_path)
+                    .unwrap()
+                    .execute_batch("CREATE TABLE shared_value (id INTEGER PRIMARY KEY);")
+                    .unwrap();
+                fs::hard_link(&account_path, relay_home.join(name)).unwrap();
+            }
+            fs::write(relay_home.join(format!("logs_2.sqlite{suffix}")), b"stale").unwrap();
+            let state = SessionViewState {
+                version: STATE_VERSION,
+                account_configured_sqlite_home: Some(account_home.to_string_lossy().to_string()),
+                account_effective_sqlite_home: account_home.clone(),
+                relay_sqlite_home: relay_home.clone(),
+                last_common_state_sha256: None,
+            };
+            save_state(&state_path(&data_root), &state).unwrap();
+            let live_config = sqlite_config(&account_home);
+            fs::write(codex_home.join("config.toml"), &live_config).unwrap();
+            let plan = plan_transition(
+                &codex_home,
+                &live_config,
+                SessionViewTarget::Relay,
+                &data_root,
+            )
+            .unwrap();
+
+            let error = prepare_transition(&plan, &format!("sidecar-{suffix}")).unwrap_err();
+
+            assert!(
+                error.contains("new Relay session view directory is not empty"),
+                "{error}"
+            );
+            assert!(!relay_home.join("state_5.sqlite").exists());
+        }
+    }
+
+    #[test]
+    fn unestablished_relay_rejects_unknown_files_and_directories() {
+        for directory in [false, true] {
+            let root = tempdir().unwrap();
+            let codex_home = root.path().join("codex-home");
+            let account_home = root.path().join("account");
+            let data_root = root.path().join("data");
+            let relay_home = managed_relay_sqlite_home(&account_home);
+            fs::create_dir_all(codex_home.join("sessions")).unwrap();
+            fs::create_dir_all(&relay_home).unwrap();
+            write_state_database(
+                &account_home.join("state_5.sqlite"),
+                "openai",
+                &["account-thread"],
+            );
+            let unexpected = relay_home.join("unexpected");
+            if directory {
+                fs::create_dir_all(&unexpected).unwrap();
+            } else {
+                fs::write(&unexpected, b"unknown").unwrap();
+            }
+            let state = SessionViewState {
+                version: STATE_VERSION,
+                account_configured_sqlite_home: Some(account_home.to_string_lossy().to_string()),
+                account_effective_sqlite_home: account_home.clone(),
+                relay_sqlite_home: relay_home.clone(),
+                last_common_state_sha256: None,
+            };
+            save_state(&state_path(&data_root), &state).unwrap();
+            let live_config = sqlite_config(&account_home);
+            fs::write(codex_home.join("config.toml"), &live_config).unwrap();
+            let plan = plan_transition(
+                &codex_home,
+                &live_config,
+                SessionViewTarget::Relay,
+                &data_root,
+            )
+            .unwrap();
+
+            let error = prepare_transition(&plan, "unknown-entry").unwrap_err();
+
+            assert!(error.contains("new Relay session view directory is not empty"));
+        }
+    }
+
+    #[test]
+    fn established_shared_database_rejects_an_inactive_path_sidecar_before_opening_it() {
+        let root = tempdir().unwrap();
+        let account_home = root.path().join("account");
+        let relay_home = managed_relay_sqlite_home(&account_home);
+        fs::create_dir_all(&account_home).unwrap();
+        fs::create_dir_all(&relay_home).unwrap();
+        let account = codex_paths_with_sqlite_home(&account_home, &account_home).unwrap();
+        let relay = codex_paths_with_sqlite_home(&account_home, &relay_home).unwrap();
+        Connection::open(&account.logs_db)
+            .unwrap()
+            .execute_batch("CREATE TABLE account_log (id INTEGER);")
+            .unwrap();
+        fs::hard_link(&account.logs_db, &relay.logs_db).unwrap();
+        fs::write(relay_home.join("logs_2.sqlite-wal"), b"stale-inactive-wal").unwrap();
+        let before = fs::read(&account.logs_db).unwrap();
+
+        let error =
+            plan_global_links(&account, &relay, false, true, "inactive-sidecar").unwrap_err();
+
+        assert!(error.contains("unverified SQLite sidecar"), "{error}");
+        assert_eq!(fs::read(&account.logs_db).unwrap(), before);
+        assert!(same_regular_file_identity(&account.logs_db, &relay.logs_db).unwrap());
+    }
+
+    #[test]
     fn independent_global_database_is_never_replaced_or_deleted() {
         let root = tempdir().unwrap();
         let account_home = root.path().join("account");
@@ -3924,5 +4079,39 @@ mod tests {
         assert!(!relay_home.exists());
         assert!(!relay_home.parent().unwrap().exists());
         assert_eq!(fs::read(state_path(&data_root)).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn late_sidecars_after_planning_are_rejected_under_the_source_writer_barrier() {
+        for target_side in [false, true] {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let root = tempfile::tempdir().unwrap();
+                let source = root.path().join("source.sqlite");
+                let target = root.path().join("target.sqlite");
+                fs::write(&source, b"stable-main-file").unwrap();
+                fs::hard_link(&source, &target).unwrap();
+                let link = super::GlobalLinkPlan {
+                    source_path: source.clone(),
+                    target_path: target.clone(),
+                    target_preexisted: true,
+                    staging_path: root.path().join("staging"),
+                    rollback_tombstone_path: root.path().join("tombstone"),
+                };
+                super::verify_global_link_sidecars(&link).unwrap();
+                let mut sidecar = if target_side {
+                    target.clone()
+                } else {
+                    source.clone()
+                }
+                .into_os_string();
+                sidecar.push(suffix);
+                let sidecar = std::path::PathBuf::from(sidecar);
+                fs::write(&sidecar, b"late-log-must-be-kept").unwrap();
+                let _guard = super::WriteExclusionGuard::acquire(&source).unwrap();
+                assert!(super::verify_global_link_sidecars(&link).is_err());
+                assert_eq!(fs::read(&source).unwrap(), b"stable-main-file");
+                assert_eq!(fs::read(&sidecar).unwrap(), b"late-log-must-be-kept");
+            }
+        }
     }
 }

@@ -1,6 +1,5 @@
 use std::{
     fs,
-    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -15,7 +14,12 @@ use crate::{
     config_patch::MANAGED_RELAY_PROVIDER_ID,
     crypto::{protect, unprotect},
     file_ops::{atomic_copy, atomic_write},
+    provider_capability::{
+        normalize_relay_base_url, normalized_relay_origin, NormalizedRelayOrigin,
+    },
 };
+
+pub use crate::provider_capability::RelayTransport;
 
 pub const PLUS_RUNTIME_ID: &str = "plus";
 pub const RELAY_RUNTIME_ID: &str = "relay";
@@ -64,6 +68,8 @@ pub struct RuntimeMetadata {
     pub kind: RuntimeKind,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub relay_transport: RelayTransport,
     pub created_at_ms: u128,
     #[serde(default)]
     pub last_used_at_ms: Option<u128>,
@@ -79,6 +85,8 @@ pub struct RelayRuntimeInput {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub transport: RelayTransport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +100,7 @@ pub struct RelayConnection {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub transport: RelayTransport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +182,7 @@ impl RuntimeStore {
             kind: RuntimeKind::Plus,
             base_url: None,
             model: read_model_from_config(&config),
+            relay_transport: crate::provider_capability::RelayTransport::Http,
             created_at_ms,
             last_used_at_ms: None,
             last_verified_at_ms: Some(timestamp_millis()?),
@@ -209,7 +219,8 @@ impl RuntimeStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(format!("failed to read live config.toml: {error}")),
         };
-        let config_toml = relay_config_template(&base_config, &normalized_base_url, model)?;
+        let config_toml =
+            relay_config_template(&base_config, &normalized_base_url, model, input.transport)?;
         let auth = if input.api_key.trim().is_empty() {
             self.load_runtime_files(RELAY_RUNTIME_ID)
                 .map_err(|_| {
@@ -236,6 +247,7 @@ impl RuntimeStore {
             kind: RuntimeKind::Relay,
             base_url: Some(normalized_base_url),
             model: Some(model.to_string()),
+            relay_transport: input.transport,
             created_at_ms,
             last_used_at_ms: existing
                 .as_ref()
@@ -354,7 +366,7 @@ impl RuntimeStore {
     }
 
     pub fn load_relay_connection(&self) -> Result<RelayConnection, String> {
-        let (_, files) = self.load_runtime_bundle(RELAY_RUNTIME_ID)?;
+        let (metadata, files) = self.load_runtime_bundle(RELAY_RUNTIME_ID)?;
         let base_url =
             provider_config_string(&files.config_toml, MANAGED_RELAY_PROVIDER_ID, "base_url")?
                 .ok_or_else(|| "relay base URL is missing".to_string())?;
@@ -373,6 +385,7 @@ impl RuntimeStore {
             base_url,
             api_key,
             model,
+            transport: metadata.relay_transport,
         })
     }
 
@@ -835,69 +848,11 @@ pub fn default_store_root() -> Result<PathBuf, String> {
 }
 
 fn normalize_base_url(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("relay base URL is required".to_string());
-    }
-    if trimmed.contains("://")
-        && !trimmed.starts_with("http://")
-        && !trimmed.starts_with("https://")
-    {
-        return Err("invalid relay base URL".to_string());
-    }
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let mut parsed =
-        reqwest::Url::parse(&with_scheme).map_err(|_| "invalid relay base URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("invalid relay base URL".to_string());
-    }
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err("relay base URL must not contain credentials, query, or fragment".to_string());
-    }
-    if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
-        return Err("non-loopback relay URLs must use HTTPS".to_string());
-    }
-    let path = parsed.path().trim_end_matches('/');
-    let normalized_path = if path.ends_with("/v1") {
-        path.to_string()
-    } else if path.is_empty() {
-        "/v1".to_string()
-    } else {
-        format!("{path}/v1")
-    };
-    parsed.set_path(&normalized_path);
-    Ok(parsed.to_string().trim_end_matches('/').to_string())
+    normalize_relay_base_url(raw).map_err(|error| error.to_string())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct NormalizedUrlOrigin {
-    scheme: String,
-    host: String,
-    port: u16,
-}
-
-fn normalized_url_origin(value: &str) -> Result<NormalizedUrlOrigin, String> {
-    let parsed =
-        reqwest::Url::parse(value).map_err(|_| "stored relay base URL is invalid".to_string())?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "stored relay base URL is invalid".to_string())?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| "stored relay base URL is invalid".to_string())?;
-    Ok(NormalizedUrlOrigin {
-        scheme: parsed.scheme().to_ascii_lowercase(),
-        host: host.to_ascii_lowercase(),
-        port,
-    })
+fn normalized_url_origin(value: &str) -> Result<NormalizedRelayOrigin, String> {
+    normalized_relay_origin(value).map_err(|error| error.to_string())
 }
 
 fn relay_auth_json(api_key: &str) -> Result<Vec<u8>, String> {
@@ -931,7 +886,12 @@ pub(crate) fn relay_api_key_from_auth(auth: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "stored relay credentials are invalid".to_string())
 }
 
-fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Result<String, String> {
+fn relay_config_template(
+    base_config: &str,
+    base_url: &str,
+    model: &str,
+    transport: RelayTransport,
+) -> Result<String, String> {
     if !base_config.trim().is_empty() {
         DocumentMut::from_str(base_config)
             .map_err(|_| "failed to parse config.toml".to_string())?;
@@ -946,7 +906,7 @@ fn relay_config_template(base_config: &str, base_url: &str, model: &str) -> Resu
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(false);
-    provider["supports_websockets"] = value(true);
+    provider["supports_websockets"] = value(transport.supports_websockets());
     provider["request_max_retries"] = value(6);
     provider["stream_max_retries"] = value(3);
     provider["stream_idle_timeout_ms"] = value(180_000);
@@ -1036,19 +996,6 @@ fn timestamp_millis() -> Result<u128, String> {
         .map_err(|error| format!("system clock before unix epoch: {error}"))
 }
 
-pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
-    host.is_some_and(|host| {
-        let host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
-}
-
 fn auth_mode_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
     let value: JsonValue = serde_json::from_slice(bytes)
         .map_err(|error| format!("failed to parse auth.json: {error}"))?;
@@ -1095,6 +1042,7 @@ fn runtime_binding_matches(
                 MANAGED_RELAY_PROVIDER_ID,
                 &relay_api_key,
                 relay_requires_openai_auth,
+                runtime.relay_transport.supports_websockets(),
             );
             let stored_provider = document_string(&stored, "model_provider");
             Ok(stored_provider == Some(MANAGED_RELAY_PROVIDER_ID)
@@ -1134,6 +1082,7 @@ fn provider_config_fingerprint_with_bearer(
     provider: &str,
     bearer_token: &str,
     requires_openai_auth: bool,
+    supports_websockets: bool,
 ) -> Option<Vec<(String, SemanticToml)>> {
     let mut entries = provider_config_fingerprint(doc, provider)?;
     entries.retain(|(key, _)| {
@@ -1157,7 +1106,7 @@ fn provider_config_fingerprint_with_bearer(
     ));
     entries.push((
         "supports_websockets".to_string(),
-        SemanticToml::Boolean(true),
+        SemanticToml::Boolean(supports_websockets),
     ));
     entries.sort_unstable();
     Some(entries)
@@ -1241,20 +1190,23 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        RelaySwitchPreference, RuntimeConfidence, RuntimeKind, RuntimeStore, PLUS_RUNTIME_ID,
-        RELAY_RUNTIME_ID,
+        RelaySwitchPreference, RuntimeConfidence, RuntimeKind, RuntimeMetadata, RuntimeStore,
+        PLUS_RUNTIME_ID, RELAY_RUNTIME_ID,
     };
-    use crate::config_patch::{plan_runtime_config_patch, RuntimeConfigKind};
+    use crate::config_patch::{plan_runtime_config_patch_with_relay_auth, RuntimeConfigKind};
 
     fn activate_relay_route(store: &RuntimeStore, home: &std::path::Path) {
         let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
+        let metadata = store.load_metadata(RELAY_RUNTIME_ID).unwrap();
         let key = super::relay_api_key_from_auth(&files.auth_json).unwrap();
         let live = fs::read_to_string(home.join("config.toml")).unwrap();
-        let plan = plan_runtime_config_patch(
+        let plan = plan_runtime_config_patch_with_relay_auth(
             &live,
             &files.config_toml,
             RuntimeConfigKind::Relay,
             Some(&key),
+            true,
+            metadata.relay_transport.supports_websockets(),
         )
         .unwrap();
         fs::write(home.join("config.toml"), plan.patched_toml).unwrap();
@@ -1304,6 +1256,7 @@ mod tests {
         let metadata = store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "relay.example.com".to_string(),
                     api_key: "sk-fake-relay".to_string(),
                     model: "gpt-5.5".to_string(),
@@ -1335,7 +1288,7 @@ mod tests {
             .contains("[model_providers.openai_custom]"));
         assert!(files.config_toml.contains("name = \"openai_custom\""));
         assert!(files.config_toml.contains("wire_api = \"responses\""));
-        assert!(files.config_toml.contains("supports_websockets = true"));
+        assert!(files.config_toml.contains("supports_websockets = false"));
         assert!(files.config_toml.contains("request_max_retries = 6"));
         assert!(files.config_toml.contains("stream_max_retries = 3"));
         assert!(files
@@ -1352,6 +1305,56 @@ mod tests {
     }
 
     #[test]
+    fn websocket_transport_is_only_enabled_when_explicitly_selected() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
+        fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
+        let root = tempdir().unwrap();
+        let store = RuntimeStore::new(root.path().join("runtimes"));
+
+        let metadata = store
+            .upsert_relay(
+                super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Websocket,
+                    base_url: "https://relay.example.com/v1".to_string(),
+                    api_key: "sk-websocket".to_string(),
+                    model: "relay-model".to_string(),
+                },
+                home.path(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            metadata.relay_transport,
+            crate::provider_capability::RelayTransport::Websocket
+        );
+        let files = store.load_runtime_files(RELAY_RUNTIME_ID).unwrap();
+        assert!(files.config_toml.contains("supports_websockets = true"));
+        activate_relay_route(&store, home.path());
+        assert_eq!(
+            store.detect_active_runtime(home.path()).unwrap().confidence,
+            RuntimeConfidence::Exact
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_transport_defaults_to_http() {
+        let metadata: RuntimeMetadata = serde_json::from_str(
+            r#"{"id":"relay","name":"Relay","kind":"relay","baseUrl":"https://relay.example.com/v1","model":"m","createdAtMs":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            metadata.relay_transport,
+            crate::provider_capability::RelayTransport::Http
+        );
+    }
+
+    #[test]
     fn relay_update_with_blank_key_preserves_credential_for_same_origin_path_change() {
         let home = tempdir().unwrap();
         fs::write(home.path().join("config.toml"), "model = \"old\"\n").unwrap();
@@ -1360,6 +1363,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/gateway".to_string(),
                     api_key: "sk-preserved".to_string(),
                     model: "old".to_string(),
@@ -1371,6 +1375,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/edge".to_string(),
                     api_key: String::new(),
                     model: "new".to_string(),
@@ -1381,7 +1386,7 @@ mod tests {
 
         let connection = store.load_relay_connection().unwrap();
         assert_eq!(connection.api_key, "sk-preserved");
-        assert_eq!(connection.base_url, "https://relay.example.com/edge/v1");
+        assert_eq!(connection.base_url, "https://relay.example.com/edge");
         assert_eq!(
             store
                 .load_metadata(RELAY_RUNTIME_ID)
@@ -1401,6 +1406,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "relay-fixture".to_string(),
                     model: "relay-model".to_string(),
@@ -1428,6 +1434,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/gateway".to_string(),
                     api_key: "sk-preserved".to_string(),
                     model: "old".to_string(),
@@ -1442,6 +1449,7 @@ mod tests {
         let updated = store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/gateway".to_string(),
                     api_key: String::new(),
                     model: "new".to_string(),
@@ -1465,6 +1473,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-old".to_string(),
                     model: "old".to_string(),
@@ -1479,6 +1488,7 @@ mod tests {
         let updated = store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-new".to_string(),
                     model: "new".to_string(),
@@ -1499,6 +1509,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-old".to_string(),
                     model: "old".to_string(),
@@ -1525,6 +1536,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/gateway".to_string(),
                     api_key: "sk-old".to_string(),
                     model: "old".to_string(),
@@ -1539,6 +1551,7 @@ mod tests {
         let updated = store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/edge".to_string(),
                     api_key: String::new(),
                     model: "new".to_string(),
@@ -1570,6 +1583,7 @@ mod tests {
             store
                 .upsert_relay(
                     super::RelayRuntimeInput {
+                        transport: crate::provider_capability::RelayTransport::Http,
                         base_url: old_url.to_string(),
                         api_key: "sk-preserved".to_string(),
                         model: "old".to_string(),
@@ -1587,6 +1601,7 @@ mod tests {
             let error = store
                 .upsert_relay(
                     super::RelayRuntimeInput {
+                        transport: crate::provider_capability::RelayTransport::Http,
                         base_url: new_url.to_string(),
                         api_key: String::new(),
                         model: "new".to_string(),
@@ -1619,6 +1634,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://old.example.com/v1".to_string(),
                     api_key: "sk-old-relay".to_string(),
                     model: "old".to_string(),
@@ -1634,6 +1650,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://new.example.com/v1".to_string(),
                     api_key: "sk-new-relay".to_string(),
                     model: "new".to_string(),
@@ -1676,6 +1693,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-relay".to_string(),
                     model: "old".to_string(),
@@ -1708,6 +1726,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-fake-relay".to_string(),
                     model: "relay-model".to_string(),
@@ -1769,6 +1788,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "relay.example.com".to_string(),
                     api_key: "sk-test".to_string(),
                     model: "relay-model".to_string(),
@@ -1801,6 +1821,7 @@ mod tests {
             let error = store
                 .upsert_relay(
                     super::RelayRuntimeInput {
+                        transport: crate::provider_capability::RelayTransport::Http,
                         base_url: url.to_string(),
                         api_key: "sk-test".to_string(),
                         model: "gpt".to_string(),
@@ -1938,6 +1959,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/old/v1".to_string(),
                     api_key: "sk-fake-relay".to_string(),
                     model: "relay-model".to_string(),
@@ -1953,6 +1975,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/new/v1".to_string(),
                     api_key: String::new(),
                     model: "relay-model".to_string(),
@@ -1983,6 +2006,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-fake-relay".to_string(),
                     model: "relay-model".to_string(),
@@ -1999,8 +2023,8 @@ mod tests {
 
         for (from, to) in [
             ("wire_api = \"responses\"", "wire_api = \"chat\""),
-            ("supports_websockets = true", "supports_websockets = false"),
-            ("supports_websockets = true\n", ""),
+            ("supports_websockets = false", "supports_websockets = true"),
+            ("supports_websockets = false\n", ""),
             ("request_max_retries = 6", "request_max_retries = 2"),
             ("stream_max_retries = 3", "stream_max_retries = 1"),
             (
@@ -2034,6 +2058,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-fake-relay".to_string(),
                     model: "relay-model".to_string(),
@@ -2070,6 +2095,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://old.example.com/v1".to_string(),
                     api_key: "sk-old-secret".to_string(),
                     model: "old".to_string(),
@@ -2089,6 +2115,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://new.example.com/v1".to_string(),
                     api_key: "sk-new-secret".to_string(),
                     model: "new".to_string(),
@@ -2127,6 +2154,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-legacy-secret".to_string(),
                     model: "legacy-model".to_string(),
@@ -2154,6 +2182,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://old.example.com/v1".to_string(),
                     api_key: "sk-old-secret".to_string(),
                     model: "old".to_string(),
@@ -2164,6 +2193,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://new.example.com/v1".to_string(),
                     api_key: "sk-new-secret".to_string(),
                     model: "new".to_string(),
@@ -2192,6 +2222,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://old.example.com/v1".to_string(),
                     api_key: "sk-old-secret".to_string(),
                     model: "old".to_string(),
@@ -2274,6 +2305,7 @@ mod tests {
             store
                 .upsert_relay(
                     super::RelayRuntimeInput {
+                        transport: crate::provider_capability::RelayTransport::Http,
                         base_url: "https://old.example.com/v1".to_string(),
                         api_key: "sk-old-secret".to_string(),
                         model: "old".to_string(),
@@ -2304,6 +2336,7 @@ mod tests {
             let error = store
                 .upsert_relay(
                     super::RelayRuntimeInput {
+                        transport: crate::provider_capability::RelayTransport::Http,
                         base_url: "https://new.example.com/v1".to_string(),
                         api_key: "sk-new-secret".to_string(),
                         model: "new".to_string(),
@@ -2373,6 +2406,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://old.example.com/v1".to_string(),
                     api_key: "sk-old-secret".to_string(),
                     model: "old".to_string(),
@@ -2434,6 +2468,7 @@ mod tests {
         store
             .upsert_relay(
                 super::RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-old-secret".to_string(),
                     model: "relay-model".to_string(),
@@ -2477,6 +2512,7 @@ mod tests {
             kind: RuntimeKind::Relay,
             base_url: Some("https://relay.example.com/v1".to_string()),
             model: Some("new".to_string()),
+            relay_transport: crate::provider_capability::RelayTransport::Http,
             created_at_ms: 1,
             last_used_at_ms: None,
             last_verified_at_ms: None,

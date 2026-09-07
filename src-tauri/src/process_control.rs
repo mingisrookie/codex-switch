@@ -50,10 +50,7 @@ const LAUNCH_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(125);
 #[cfg(windows)]
 const MAX_APPLICATION_USER_MODEL_ID_LEN: u32 = 4_096;
 #[cfg(any(windows, test))]
-const TRUSTED_CHATGPT_AUMIDS: &[&str] = &[
-    "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT",
-    "OpenAI.Codex_2p2nqsd0c76g0!App",
-];
+use crate::managed_client::TRUSTED_CHATGPT_AUMIDS;
 #[cfg(any(windows, test))]
 const LAUNCH_TARGET_RECORD_NAME: &str = "launch-target-v1.json";
 #[cfg(any(windows, test))]

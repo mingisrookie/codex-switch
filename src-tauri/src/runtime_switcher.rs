@@ -151,6 +151,7 @@ pub enum RuntimeSwitchFailureReason {
     InvalidAuthState,
     ConfigUnavailable,
     SessionViewUnavailable,
+    CompatibilityBlocked,
     StandaloneWriterActive,
     MutationBusy,
     ProcessCloseFailed,
@@ -352,6 +353,10 @@ mod tests {
             (
                 RuntimeSwitchFailureReason::SessionViewUnavailable,
                 "sessionViewUnavailable",
+            ),
+            (
+                RuntimeSwitchFailureReason::CompatibilityBlocked,
+                "compatibilityBlocked",
             ),
             (
                 RuntimeSwitchFailureReason::StandaloneWriterActive,

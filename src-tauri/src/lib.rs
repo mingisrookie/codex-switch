@@ -2,6 +2,7 @@ pub mod backup;
 mod chat_process_state;
 pub mod codex_home;
 pub mod codex_paths;
+pub mod command_error;
 mod commands;
 #[cfg(feature = "runtime-evidence")]
 pub use commands::{
@@ -13,12 +14,16 @@ pub mod crypto;
 mod diagnostic_commands;
 pub mod diagnostics;
 pub mod file_ops;
+pub mod managed_client;
 pub mod mobile_continuity;
 pub mod operation_log;
 pub mod process_control;
+pub mod provider_capability;
 mod request_route_switcher;
+pub mod runtime_compatibility;
 mod runtime_session_view;
 pub mod runtime_store;
+mod runtime_switch_application;
 pub mod runtime_switcher;
 #[allow(dead_code)]
 pub mod session_incremental;
@@ -39,6 +44,7 @@ pub fn run() {
             commands::install_update,
             commands::get_update_startup_notice,
             commands::scan_codex_home,
+            commands::get_runtime_compatibility,
             commands::scan_sessions,
             commands::scan_managed_sessions,
             commands::get_session_storage_status,

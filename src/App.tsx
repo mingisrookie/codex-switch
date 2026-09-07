@@ -54,6 +54,7 @@ import {
   mergeAndRepairSessions,
   upsertRelayRuntime,
 } from './api';
+import type { CommandErrorCode, CommandRecoverability } from './api';
 import { OperationResultPanel, type OperationView } from './OperationResultPanel';
 import { DiagnosticExportAction, DiagnosticPanel } from './DiagnosticPanel';
 import { RelayRuntimeDialog } from './RelayRuntimeDialog';
@@ -61,6 +62,7 @@ import {
   RuntimeSwitchProgressPanel,
   type RuntimeSwitchFlow,
 } from './RuntimeSwitchProgressPanel';
+import { RuntimeCompatibilityPanel, compatibilityStatusLabel } from './RuntimeCompatibilityPanel';
 import { SessionManagementPage } from './SessionManagementPage';
 import { SessionStorageManagementPage } from './SessionStorageManagementPage';
 import { SkillsManagementPage } from './SkillsManagementPage';
@@ -119,7 +121,13 @@ type CheckpointCleanupFlow = {
   error?: string;
   operationId?: string;
 };
-type OperationFailureView = { message: string; operationId?: string };
+type OperationFailureView = {
+  message: string;
+  operationId?: string;
+  code?: CommandErrorCode;
+  phase?: string;
+  recoverability?: CommandRecoverability;
+};
 const numberFormat = new Intl.NumberFormat('zh-CN');
 
 async function defaultRegisterCloseGuard(
@@ -383,6 +391,7 @@ function App({
   const sessions = readyData(data.sessions);
   const managedSessions = readyData(data.managedSessions);
   const sessionStorage = readyData(data.sessionStorage);
+  const runtimeCompatibility = readyData(data.runtimeCompatibility);
   const runtimes = readyData(data.runtimes);
   const runtimeStatus = readyData(data.runtimeStatus);
   const plusRuntime = useMemo(() => runtimes?.find((runtime) => runtime.kind === 'plus') ?? null, [runtimes]);
@@ -395,8 +404,18 @@ function App({
   const canImportAccount = officialAuthReady
     && Boolean(codexHome?.configToml.exists)
     && data.runtimes.status === 'ready';
-  const canConfigureRelay = data.runtimes.status === 'ready';
+  const routeConfigSupported = runtimeCompatibility?.routeConfig === 'supported';
+  const sessionViewSupported = runtimeCompatibility
+    ? runtimeCompatibility.sessionView !== 'blocked'
+    : false;
+  const advancedStorageSupported = runtimeCompatibility?.advancedStorage === 'supported';
+  const canConfigureRelay = data.runtimes.status === 'ready'
+    && data.runtimeCompatibility.status === 'ready'
+    && routeConfigSupported;
   const canSwitchRuntime = data.runtimes.status === 'ready'
+    && data.runtimeCompatibility.status === 'ready'
+    && routeConfigSupported
+    && sessionViewSupported
     && closeGuardStatus === 'ready'
     && !runtimeRefreshPending;
   const canSwitchAccount = canSwitchRuntime && officialAuthReady;
@@ -409,14 +428,24 @@ function App({
       ? '正在刷新当前运行态。'
       : data.runtimes.status !== 'ready'
         ? '运行态槽位尚未加载完成。'
-        : null;
-  const canSync = !sessionsStale
+        : data.runtimeCompatibility.status === 'loading'
+          ? '正在确认当前 ChatGPT/Codex 本地结构兼容性。'
+          : data.runtimeCompatibility.status === 'error'
+            ? data.runtimeCompatibility.error
+            : !routeConfigSupported
+            ? '当前 Codex Home 无法可靠解析，已阻止请求路由写入。'
+            : !sessionViewSupported
+              ? runtimeCompatibility?.issues[0]?.message ?? '当前会话数据库结构未经支持验证，已阻止切换。'
+              : null;
+  const canSync = advancedStorageSupported
+    && !sessionsStale
     && data.sessions.status === 'ready'
     && data.managedSessions.status === 'ready'
     && Boolean(sessionStorage)
     && sessionStorage?.migrationRequired === false
     && sessionStorage.status !== 'reviewRequired';
-  const canMutateSessions = data.managedSessions.status === 'ready';
+  const canMutateSessions = advancedStorageSupported
+    && data.managedSessions.status === 'ready';
   const canRestoreBackup = !backupsStale && data.backups.status === 'ready';
   // Startup continuity initialization owns the same backend mutation guard as
   // route/config writes. Keep every mutation control disabled until that one
@@ -624,7 +653,7 @@ function App({
     label: string,
     action: () => Promise<T>,
     view: (result: T) => OperationView,
-    onFailure?: (message: string, operationId?: string) => void,
+    onFailure?: (failure: OperationFailureView) => void,
     refreshScope: RefreshScope = 'dashboard',
     onStart?: () => void,
     reportFailureGlobally = true,
@@ -641,9 +670,8 @@ function App({
         result = await action();
       } catch (reason) {
         const failure = operationFailure(reason);
-        const message = failure.message;
         if (reportFailureGlobally) setError(failure);
-        onFailure?.(message, failure.operationId);
+        onFailure?.(failure);
         refreshInBackground(refreshScope);
         return null;
       }
@@ -684,7 +712,7 @@ function App({
     setRelaySubmitError(null);
     const saved = await runAction('配置中转站', () => upsertRelayRuntime(input), (runtime) => ({
       label: 'API 中转站已保存', metrics: [`模型：${runtime.model ?? '未设置'}`],
-    }), (message, operationId) => setRelaySubmitError({ message, operationId }), 'runtime', undefined, false);
+    }), (failure) => setRelaySubmitError(failure), 'runtime', undefined, false);
     if (saved) setRelayEditorOpen(false);
   }
 
@@ -831,7 +859,11 @@ function App({
   }
 
   async function handleMobileContinuityToggle() {
-    if (!mobileContinuity || exclusiveBusy) return;
+    if (
+      !mobileContinuity
+      || exclusiveBusy
+      || (!advancedStorageSupported && !mobileContinuity.enabled)
+    ) return;
     await runAction(
       mobileContinuity.enabled ? '关闭显式加入视图' : '开启显式加入视图',
       () => setMobileContinuityEnabled(!mobileContinuity.enabled),
@@ -855,6 +887,7 @@ function App({
   }
 
   async function handlePublishMobileContinuitySession(threadId: string) {
+    if (!advancedStorageSupported) return false;
     const status = await runAction(
       '加入 Account 视图',
       () => publishMobileContinuitySession(threadId),
@@ -1011,13 +1044,13 @@ function App({
             `安全保留：${cleanup.retainedCount}`,
           ],
         }),
-        (message, operationId) => {
+        (failure) => {
           setCheckpointCleanupFlow({
             status: 'failed',
             startedAtMs,
             completedAtMs: Date.now(),
-            error: message,
-            operationId,
+            error: failure.message,
+            operationId: failure.operationId,
           });
         },
         'backup',
@@ -1080,7 +1113,7 @@ function App({
         <nav className="topbar-tabs" aria-label="主导航">
           <button disabled={exclusiveBusy} aria-current={activePage === 'runtime' ? 'page' : undefined} className={`topbar-tab ${activePage === 'runtime' ? 'active' : ''}`} onClick={() => setActivePage('runtime')}><Zap aria-hidden="true" />运行态</button>
           <button disabled={exclusiveBusy} aria-current={activePage === 'sessions' ? 'page' : undefined} className={`topbar-tab ${activePage === 'sessions' ? 'active' : ''}`} onClick={() => setActivePage('sessions')}><MessagesSquare aria-hidden="true" />会话</button>
-          <button disabled={exclusiveBusy} aria-current={activePage === 'storage' ? 'page' : undefined} className={`topbar-tab ${activePage === 'storage' ? 'active' : ''}`} onClick={() => setActivePage('storage')}><Database aria-hidden="true" />存储</button>
+          <button disabled={exclusiveBusy} aria-current={activePage === 'storage' ? 'page' : undefined} className={`topbar-tab ${activePage === 'storage' ? 'active' : ''}`} onClick={() => setActivePage('storage')}><Database aria-hidden="true" />高级存储</button>
           <button disabled={exclusiveBusy} aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}><Wrench aria-hidden="true" />技能</button>
         </nav>
         <div className="topbar-actions">
@@ -1194,8 +1227,8 @@ function App({
               <p className="eyebrow">LOCAL RUNTIME / CONTROL 01</p>
               <h1><span>ChatGPT</span><ArrowLeftRight aria-hidden="true" /><span>API Relay</span></h1>
               <p className="runtime-intro-lede">
-                只切换请求端，不改写现有登录文件。Relay 可在未登录的全新 Codex Home 中独立启用；
-                后续登录后仍可安全切回 Account，并保留会话数据库视图。
+                只切换本机请求路由，不改写现有登录文件。默认使用兼容性更高的 HTTP Responses；
+                保存或切换成功不代表中转服务、模型或 WebSocket 已连通，实际可用性由下一次请求确认。
               </p>
             </div>
             <dl className="runtime-readout" aria-label="当前扫描摘要">
@@ -1221,6 +1254,8 @@ function App({
             </section>
           ) : null}
 
+          <RuntimeCompatibilityPanel state={data.runtimeCompatibility} />
+
           <section className="runtime-grid" aria-label="运行态">
             <RuntimeCard
               title="ChatGPT 账号态" kind="plus" description="官方登录不变，使用 OpenAI 请求端。"
@@ -1239,14 +1274,14 @@ function App({
                   : runtimeGateHelp}
             />
             <RuntimeCard
-              title="API 中转站态" kind="relay" description="Key 加密保存；激活时明文投影到当前请求配置。"
+              title="API 中转站态" kind="relay" description="Bearer Key + Responses API；HTTP 默认，WSS 仅显式启用。"
               runtime={relayRuntime} runtimeStatus={runtimeStatus} baseUrlFallback="尚未配置"
               runtimeDomainStatus={data.runtimes.status} runtimeStatusDomainStatus={data.runtimeStatus.status}
               onPrimary={() => { setRelaySubmitError(null); setRelayEditorOpen(true); }} primaryAction="配置中转站"
               onSwitch={(trigger) => void handleSwitch('relay', '切换中转站', trigger)}
               switchAction={isExactRuntime(runtimeStatus, 'relay') ? '当前为中转站' : runtimeStatus?.activeRuntimeId === 'relay' ? '重新应用中转站' : '切换到中转站'}
               primaryDisabled={exclusiveBusy || !canConfigureRelay}
-              primaryHelp={!canConfigureRelay && !exclusiveBusy ? '运行态存储尚未就绪。' : null}
+              primaryHelp={!canConfigureRelay && !exclusiveBusy ? runtimeGateHelp ?? '运行态存储尚未就绪。' : null}
               switchDisabled={exclusiveBusy || !canSwitchRelay || !relayRuntime || isExactRuntime(runtimeStatus, 'relay')}
               switchHelp={!relayRuntime ? '先配置中转站。' : runtimeGateHelp}
             />
@@ -1305,10 +1340,13 @@ function App({
                   <button
                     className="ghost-button full"
                     onClick={() => void handleMobileContinuityToggle()}
-                    disabled={exclusiveBusy}
+                    disabled={exclusiveBusy || (!advancedStorageSupported && !mobileContinuity.enabled)}
                   >
                     {mobileContinuity.enabled ? '关闭显式加入' : '开启显式加入'}
                   </button>
+                  {!advancedStorageSupported && !mobileContinuity.enabled ? (
+                    <p className="runtime-action-help">当前数据库结构未通过高级写操作兼容性检查。</p>
+                  ) : null}
                 </>
               ) : <p className="continuity-copy">连续性状态读取中…</p>}
             </aside>
@@ -1352,13 +1390,14 @@ function App({
           onRestoreVisible={handleRestoreSessionsVisible}
           mobileContinuity={mobileContinuity}
           onPublishMobile={(threadId) => handlePublishMobileContinuitySession(threadId)}
-          mobilePublishDisabled={!isExactRuntime(runtimeStatus, 'plus')}
+          mobilePublishDisabled={!advancedStorageSupported || !isExactRuntime(runtimeStatus, 'plus')}
         />
       ) : activePage === 'sessions' ? <DomainPlaceholder state={data.managedSessions} /> : null}
 
       <SessionStorageManagementPage
         active={activePage === 'storage'}
         initialReport={sessionStorage ?? null}
+        compatibility={runtimeCompatibility}
         onReportChange={(report) => {
           setData((current) => ({
             ...current,
@@ -1527,6 +1566,7 @@ function RuntimeCard({
       <dl className="meta-list">
         <div><dt>Base URL</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : runtime?.baseUrl ?? baseUrlFallback}</dd></div>
         <div><dt>模型</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : runtime?.model ?? '跟随当前 ChatGPT 配置'}</dd></div>
+        {kind === 'relay' ? <div><dt>传输</dt><dd>{runtimeDetailUnavailable ? domainStatusText(runtimeDomainStatus) : relayTransportLabel(runtime?.relayTransport)}</dd></div> : null}
       </dl>
       <div className="runtime-actions">
         <button className="ghost-button inline" onClick={onPrimary} disabled={primaryDisabled}>{kind === 'plus' ? <Save className="button-icon" aria-hidden="true" /> : <Settings2 className="button-icon" aria-hidden="true" />}{primaryAction}</button>
@@ -1534,7 +1574,7 @@ function RuntimeCard({
       </div>
       {primaryDisabled && primaryHelp ? <p className="runtime-action-help">{primaryHelp}</p> : null}
       {switchDisabled && switchHelp ? <p className="runtime-action-help">{switchHelp}</p> : null}
-      <p className="runtime-switch-note"><Power aria-hidden="true" />任务执行器会安全关闭，并在成功后自动打开 ChatGPT</p>
+      <p className="runtime-switch-note"><Power aria-hidden="true" />{kind === 'relay' ? '成功仅表示本地路由已应用；服务连通性由下一次实际请求确认' : '任务执行器会安全关闭，并在成功后自动打开 ChatGPT'}</p>
     </article>
   );
 }
@@ -1553,6 +1593,7 @@ function SafetyPanel({
   const backups = readyData(data.backups);
   const latestBackup = backups?.[0];
   const storageReport = readyData(data.sessionStorage);
+  const compatibility = readyData(data.runtimeCompatibility);
   const homeFilesReady = Boolean(home?.authJson.exists && home.configToml.exists && home.stateDb.exists);
   const homeState = data.codexHome.status === 'ready' ? homeFilesReady ? '完整' : '缺失' : statusLabel(data.codexHome);
   const backupState = backupsStale
@@ -1570,6 +1611,18 @@ function SafetyPanel({
       <SafetyLine
         state={data.runtimeStatus.status === 'loading' ? 'pending' : data.runtimeStatus.status === 'error' ? 'error' : status?.confidence === 'exact' ? 'ok' : 'warning'}
         label={`运行态检测：${status?.confidence ?? statusLabel(data.runtimeStatus)}`}
+      />
+      <SafetyLine
+        state={data.runtimeCompatibility.status === 'loading'
+          ? 'pending'
+          : data.runtimeCompatibility.status === 'error'
+            ? 'error'
+            : compatibility?.status === 'supported'
+              ? 'ok'
+              : compatibility?.status === 'blocked'
+                ? 'error'
+                : 'warning'}
+        label={`客户端兼容性：${compatibility ? compatibilityStatusLabel(compatibility.status) : statusLabel(data.runtimeCompatibility)}`}
       />
       <SafetyLine
         state={backupsStale || data.backups.status === 'loading' ? 'pending' : data.backups.status === 'error' ? 'error' : latestBackup?.verified ? 'ok' : 'warning'}
@@ -1939,6 +1992,10 @@ function authStatusLabel(state: DashboardData['codexHome']) {
   return state.data.authSummary?.authMode ?? '未检测到';
 }
 
+function relayTransportLabel(transport?: RuntimeMetadata['relayTransport']) {
+  return transport === 'websocket' ? 'Responses WebSocket' : 'HTTP Responses';
+}
+
 function stateClass(label: string) {
   if (['已保存', '当前运行', '已验证'].includes(label)) return 'state-ok';
   if (['未保存', '不可用', '缺失'].includes(label)) return 'state-missing';
@@ -1967,7 +2024,7 @@ function operationStatusLabel(status: OperationRecord['status']) {
 function dashboardErrors(data: DashboardData) {
   const domains: Array<[string, DomainState<unknown>]> = [
     ['ChatGPT 本机数据', data.codexHome], ['会话扫描', data.sessions], ['会话管理', data.managedSessions],
-    ['会话存储', data.sessionStorage],
+    ['会话存储', data.sessionStorage], ['客户端兼容性', data.runtimeCompatibility],
     ['运行态列表', data.runtimes], ['当前运行态', data.runtimeStatus], ['备份列表', data.backups],
     ['操作历史', data.operations],
   ];
@@ -2103,10 +2160,30 @@ function errorMessage(reason: unknown) {
 }
 
 function operationFailure(reason: unknown): OperationFailureView {
+  const typed = reason && typeof reason === 'object' ? reason as Record<string, unknown> : null;
   return {
     message: errorMessage(reason),
     operationId: operationIdFromError(reason),
+    code: isCommandErrorCode(typed?.code) ? typed?.code : undefined,
+    phase: typeof typed?.phase === 'string' && typed.phase ? typed.phase : undefined,
+    recoverability: isCommandRecoverability(typed?.recoverability)
+      ? typed?.recoverability
+      : undefined,
   };
+}
+
+function isCommandErrorCode(value: unknown): value is CommandErrorCode {
+  return value === 'runtimeCompatibilityBlocked'
+    || value === 'runtimeCompatibilityUnavailable'
+    || value === 'providerCapabilityInvalid';
+}
+
+function isCommandRecoverability(value: unknown): value is CommandRecoverability {
+  return value === 'retry'
+    || value === 'reconfigure'
+    || value === 'closeWritersAndRetry'
+    || value === 'manualInvestigation'
+    || value === 'unsupportedClient';
 }
 
 function operationIdFromError(reason: unknown) {

@@ -73,9 +73,11 @@ async function primeWebViewProfile(root, executable, workspace, environment, por
 function options(argv) {
   const values = new Map();
   let dryRun = false;
+  let runtimeCapabilities = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--dry-run") { dryRun = true; continue; }
+    if (token === "--runtime-capabilities") { runtimeCapabilities = true; continue; }
     if (token === "--help") return { help: true };
     if (!new Set(["--run-root", "--executable", "--codex-exe", "--expected-version", "--home-mode"]).has(token) || !argv[index + 1]) throw new Error(`invalid option ${token}`);
     values.set(token.slice(2), argv[++index]);
@@ -88,13 +90,14 @@ function options(argv) {
   if (!/^\d+\.\d+\.\d+$/.test(expectedVersion)) throw new Error("expected version must be a three-part release version");
   const homeMode = values.get("home-mode") ?? "initialized";
   if (!new Set(["initialized", "fresh"]).has(homeMode)) throw new Error("home mode must be initialized or fresh");
-  return { help: false, dryRun, executable, codexExe, expectedVersion, homeMode, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
+  if (runtimeCapabilities && homeMode !== "fresh") throw new Error("runtime capabilities require a fresh isolated Home");
+  return { help: false, dryRun, runtimeCapabilities, executable, codexExe, expectedVersion, homeMode, runRoot: requireIgnoredEvidenceRoot(values.get("run-root"), "run root") };
 }
 
 async function main() {
   const parsed = options(process.argv.slice(2));
   if (parsed.help) {
-    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> [--codex-exe <native-codex.exe>] [--expected-version <x.y.z>] [--home-mode initialized|fresh] [--dry-run]\n");
+    process.stdout.write("Usage: node scripts/v030-product-ui-e2e.mjs --run-root <new-absolute-path> --executable <packed-exe> [--codex-exe <native-codex.exe>] [--expected-version <x.y.z>] [--home-mode initialized|fresh] [--runtime-capabilities] [--dry-run]\n");
     return;
   }
   if (parsed.dryRun) {
@@ -182,17 +185,23 @@ async function main() {
     }
     if (await hasListener(1420)) throw new Error("production UI opened with a Vite listener present");
 
+    let capabilityEvidence;
+    if (parsed.runtimeCapabilities) {
+      const { verifyRuntimeCapabilities } = await import("./v040-runtime-e2e.mjs");
+      capabilityEvidence = await verifyRuntimeCapabilities(cdp, codexHome);
+    }
+
     await cdp.call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
     const viewports = [];
     for (const [width, height] of [[1200, 820], [900, 640], [390, 844]]) {
       await cdp.call("Emulation.setDeviceMetricsOverride", { width, height, screenWidth: width, screenHeight: height, deviceScaleFactor: 1, mobile: false });
       await sleep(150);
-      const hit = await cdp.evaluate(`(()=>{const button=Array.from(document.querySelectorAll("button")).find(item=>item.textContent?.trim()==="存储");if(!button)return {found:false};const r=button.getBoundingClientRect();const top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);button.click();return {found:true,hit:top===button||button.contains(top),innerWidth,innerHeight,scrollWidth:document.documentElement.scrollWidth}})()`);
+      const hit = await cdp.evaluate(`(()=>{const button=Array.from(document.querySelectorAll("button")).find(item=>item.textContent?.trim()==="高级存储");if(!button)return {found:false};const r=button.getBoundingClientRect();const top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);button.click();return {found:true,hit:top===button||button.contains(top),innerWidth,innerHeight,scrollWidth:document.documentElement.scrollWidth}})()`);
       if (!hit.found || !hit.hit || hit.innerWidth !== width || hit.innerHeight !== height || hit.scrollWidth > width) throw new Error(`viewport ${width}x${height} failed navigation or hit-test`);
       let storageVisible = false;
       const storageDeadline = Date.now() + 10_000;
       while (!storageVisible && Date.now() < storageDeadline) {
-        storageVisible = await cdp.evaluate(`(()=>document.querySelector('button[aria-current="page"]')?.textContent?.trim()==="存储"&&Boolean(document.querySelector('[aria-label="会话存储管理"]:not([hidden])')))()`);
+        storageVisible = await cdp.evaluate(`(()=>document.querySelector('button[aria-current="page"]')?.textContent?.trim()==="高级存储"&&Boolean(document.querySelector('[aria-label="高级存储管理"]:not([hidden])')))()`);
         if (!storageVisible) await sleep(100);
       }
       if (!storageVisible) throw new Error(`viewport ${width}x${height} did not render the storage page`);
@@ -240,7 +249,8 @@ async function main() {
       viteListenerAbsent: true,
       isolatedRuntime: true,
       homeMode: parsed.homeMode,
-      freshHome,
+      freshHomeBeforeCapabilityFixture: freshHome,
+      capabilityEvidence,
       webViewProfilePrimed,
       reducedMotion: true,
       runtimeErrors: [],

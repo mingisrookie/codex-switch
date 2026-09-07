@@ -415,7 +415,8 @@ function SwitchSuccessResult({
         <div><dt>操作 ID</dt><dd>{result.operationId}</dd></div>
         <div><dt>目标请求端</dt><dd>{result.runtime.kind === 'plus' ? 'OpenAI 官方' : 'API Relay'}</dd></div>
         <div><dt>登录文件</dt><dd>{result.runtime.kind === 'relay' ? '未改写（允许不存在）' : '已验证保持不变'}</dd></div>
-        <div><dt>配置变更</dt><dd>{result.changed ? '已原子应用' : '无需变更'}</dd></div>
+        <div><dt>本地请求路由</dt><dd>{result.changed ? '已原子应用' : '无需变更'}</dd></div>
+        {result.runtime.kind === 'relay' ? <div><dt>服务连通性</dt><dd>未验证（由下一次实际请求确认）</dd></div> : null}
         <div>
           <dt>进程状态</dt>
           <dd>
@@ -448,7 +449,9 @@ function SwitchSuccessResult({
             ? '运行态切换已经成功，不会因启动失败而回滚。'
             : launchFailed
               ? '运行态切换已经成功；启动目标需要先按上方说明恢复，当前不会猜测应用或 EXE。'
-            : '切换回执已持久化；需要深度处理的会话保留给“会话合并与修复”。'}
+            : result.runtime.kind === 'relay'
+              ? '本地请求路由回执已持久化；这不等于中转服务、模型或 WebSocket 已验证。'
+              : '切换回执已持久化；需要深度处理的会话保留给“会话合并与修复”。'}
         </p>
         <div className="switch-task-actions">
           {launchRetryable ? (
@@ -605,7 +608,7 @@ function routeProvenanceLabel(status: RuntimeSwitchResult['routeProvenance']['st
 
 function launchTitle(result?: RuntimeSwitchResult) {
   if (!result) return '切换完成';
-  if (result.chatgptLaunch.status === 'launched') return 'ChatGPT 已打开';
+  if (result.chatgptLaunch.status === 'launched') return result.runtime.kind === 'relay' ? '本地 Relay 路由已应用，ChatGPT 已打开' : 'ChatGPT 已打开';
   if (result.chatgptLaunch.status === 'alreadyRunning') return 'ChatGPT 已在运行';
   if (result.chatgptLaunch.status === 'failed') return '切换成功，ChatGPT 未能打开';
   if (result.chatgptLaunch.status === 'blocked') return '切换成功，ChatGPT 已保持关闭';
@@ -614,7 +617,9 @@ function launchTitle(result?: RuntimeSwitchResult) {
 
 function launchDescription(result: RuntimeSwitchResult) {
   if (result.chatgptLaunch.status === 'launched') {
-    return '已通过受控的 Windows 应用入口完成启动。';
+    return result.runtime.kind === 'relay'
+      ? '已通过受控的 Windows 应用入口完成启动；中转服务连通性仍需由下一次实际请求确认。'
+      : '已通过受控的 Windows 应用入口完成启动。';
   }
   if (result.chatgptLaunch.status === 'alreadyRunning') {
     return '检测到目标应用已经运行，没有重复启动进程。';
@@ -654,6 +659,7 @@ function failureGuidance(reason: RuntimeSwitchProgress['reason']) {
   if (reason === 'invalidAuthState') return 'auth.json 存在但无法安全解析。修复或移走损坏文件后重试，应用不会代写登录态。';
   if (reason === 'configUnavailable') return '请求配置无法安全读取、写入或恢复。请检查 config.toml 权限与格式后重试。';
   if (reason === 'sessionViewUnavailable') return '会话数据库视图缺失、冲突或无法证明所有权。请保留现场并导出诊断。';
+  if (reason === 'compatibilityBlocked') return '当前 ChatGPT/Codex 数据库结构未经支持验证。仅保留请求配置或只读排查，不要强行迁移、修复或清理。';
   if (reason === 'standaloneWriterActive') return '检测到独立 Codex CLI/工作进程仍在写入。请让对应任务自然结束或自行关闭后重试；应用不会终止它。';
   if (reason === 'mutationBusy') return '另一个真实写入任务正在执行。等待该任务到达终态后重试。';
   if (reason === 'processCloseFailed') return '受管 ChatGPT 进程未能安全退出。请先保存工作并手动关闭应用后重试。';

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — v0.4.0
+
+本节描述已整合的开发版改动，不代表 v0.4.0 已发布。
+
+
+### Provider compatibility
+
+- Relay 传输改为显式能力模型：默认使用 HTTP Responses，并只在用户明确选择时启用 Responses WebSocket。旧槽位没有该字段时安全迁移为 HTTP，避免不支持 WSS 的中转站反复重连。
+- Base URL 归一化不再机械给已有网关路径追加 `/v1`；仅 origin 地址补 `/v1`。远程明文 HTTP、内嵌凭据、query 和 fragment 继续拒绝。
+- UI、回执和文档明确区分“本地请求路由已应用”和“远端服务已验证”；保存/切换仍不发送 `/models` 或探测请求。
+
+### Runtime and storage safety
+
+- 新增受管 ChatGPT/Codex 包版本只读采集，以及基于 file identity、SQLite `quick_check`、`schema_version`、关键列和稳定 Schema 指纹的能力门禁。请求配置、会话视图和高级存储分别判定；未知结构不再按旧假设写入。
+- “存储”改为“高级存储与恢复实验室”。兼容性不足时全部迁移、冲突、恢复导入、降级和离线 GC 写操作关闭，只保留安全的重新扫描和脱敏排查。
+- 收紧共享 SQLite sidecar 合同：未建立 Relay 视图不再接受 `-wal`、`-shm` 或 `-journal`；既有 hard-link 视图只 checkpoint active 路径，并在前后验证 inactive sidecar 缺失和主库 file identity 未变。
+- Provider 与兼容性失败新增稳定错误码和恢复分类，不再依赖中文/英文自由文本决定 UI 行为。
+
+### Architecture and tests
+
+- 从巨型 `commands.rs` 提取请求路由应用服务，从 `App.tsx` 提取兼容性面板，缩小命令/UI 编排边界。
+- 新增 Provider URL/transport、typed error 和进程关闭状态机的 property tests，并补齐 sidecar、未知 Schema、HTTP 默认/WSS 显式、只读降级等回归测试。
+- Rust 工具链固定为 1.94.1，Node 主版本与 direct TypeScript 类型依赖固定；新增文档链接合同检查。
+
+### Supply chain and release
+
+- CI 新增 npm 生产依赖审计、cargo-deny advisories/source/license 门、按锁定依赖生成的 Rust CycloneDX SBOM；后续 tag 发布流程将为最终 EXE 生成 GitHub/Sigstore 构建来源与 SBOM attestation，并在 Release 同时公开 `codex-switch.cdx.json` 供离线审阅。
+- 当前 Windows EXE 仍未使用商业证书完成 Authenticode。GitHub attestation、SHA-256、UPX 和 PE 合同不能替代 Authenticode 或终端防护扫描。
+
+
 ## v0.3.5 - 2026-09-07
 
 ### Changed
@@ -8,6 +38,9 @@
 - 会话列表新增匹配数量、本页范围、清空搜索、只看已选和跨页／筛选外已选项提示；搜索无结果时仍可清空已有选择。
 
 ### Fixed
+
+- 整合 v0.3.5 后补齐复合主键、SQLite 类型亲和性、writer 关闭后结构复检、全局库 sidecar 句柄交接复核以及错误信封大小限制；兼容性查询移出界面线程。
+- 修复组件清单输出名重复 `.json` 与工作区绝对路径、依赖图校验问题，文档链接检查同时支持 Windows/POSIX 和 HTML 图片；保留 v0.3.5 的搜索优化、首页和原生测试进程回收修复。
 
 - 统一旧记录的秒级时间与毫秒级时间后再排序，显示和排序使用同一时间值；无效时间排在末尾，同时间或同标题以会话 ID 稳定排序。
 - 列表刷新保留当前页，结果减少时将页码收敛到有效范围，后续刷新不会跳回已经失效的页码。

@@ -27,6 +27,16 @@
 - 完整备份是本地恢复点，不是云备份；请自己决定备份保存位置、Windows 权限和保留期限。
 - 恢复和迁移可能改动本地会话与数据库视图。执行前应创建完整备份，并确保相关程序按界面要求关闭。
 
+## 中转协议、传输与网络边界
+
+- 受管中转合同限定为 Bearer API Key + Responses API；它不是对所有“OpenAI-compatible”扩展、Azure 查询参数或自定义 Header 的通用适配器。
+- 默认写入 `supports_websockets = false`，使用 HTTP Responses。WebSocket 必须由用户显式启用；普通 HTTPS 成功不能证明 WSS 可用。
+- 保存和切换只验证本地配置合同，不发送 `/models`、探测请求或用户内容。成功回执表示本地路由已应用，不表示远端服务、Key、模型或额度已经验证。
+
+## 客户端与数据库兼容性
+
+ChatGPT/Codex 的本地包版本和 SQLite 结构属于外部、可能变化的接口。应用只读采集受管 Windows 包版本，并以数据库文件身份、`PRAGMA quick_check`、`schema_version` 和关键 `threads` 列作为实际能力门禁。缺失数据库可继续使用请求路由；未知、损坏或持续变化的数据库会阻止会话视图或高级存储写操作，同时保留只读诊断。
+
 ## 网络与第三方 API
 
 - ChatGPT Switch 不是 API 服务商，不转售账号、API Key、模型额度或请求。
@@ -52,7 +62,12 @@ Image2 和 Grok 搜索是独立的可选功能。它们的服务 URL 和 API Key
 
 - 仅支持 Windows x64，依赖当前 Windows 用户的 DPAPI。
 - 它不能阻止拥有同一 Windows 用户权限的恶意程序读取运行期间的本地文件。
-- 它不能保证第三方 API 服务的可用性、隐私或计费正确。
+- 它不能保证第三方 API 服务的可用性、WebSocket 能力、模型存在性、隐私或计费正确。
 - 它不能替代你自己的完整备份、终端防护、磁盘加密、账号安全和密钥轮换策略。
 
 如需理解实现层面的请求切换、会话、备份和更新流程，请阅读 [完整运行链路](../项目完整链路说明.md)。
+
+
+## 发布供应链边界
+
+正式 CI 对 npm 生产依赖、Rust advisories、来源和许可证执行门禁，生成 CycloneDX SBOM，并为最终 Windows EXE生成 GitHub/Sigstore 构建来源和 SBOM 证明。公开资产仍没有商业证书签发的 Windows Authenticode；GitHub attestation、SHA-256 和 UPX 完整性检查不能冒充 Authenticode，也不能替代终端防护扫描。

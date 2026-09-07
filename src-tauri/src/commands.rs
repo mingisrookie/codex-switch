@@ -1,6 +1,5 @@
 use serde::Serialize;
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -35,6 +34,9 @@ use crate::{
     codex_paths::{
         local_codex_paths, resolve_user_codex_paths, validate_absolute_root, CodexPaths,
     },
+    command_error::{
+        decode_command_failure, CommandErrorCode, CommandFailure, CommandRecoverability,
+    },
     diagnostics::platform::open_directory,
     diagnostics::{
         empty_context, global_runtime, DiagnosticEventInput, DiagnosticEventKind, DiagnosticLevel,
@@ -50,8 +52,9 @@ use crate::{
         list_codex_process_inventory as list_process_inventory,
         list_codex_processes as list_processes, CodexProcess,
     },
-    request_route_switcher::{
-        preflight_request_route_switch, switch_request_route_preflighted_with_progress,
+    runtime_compatibility::{
+        inspect_runtime_compatibility, require_advanced_storage_compatible,
+        RuntimeCompatibilityReport,
     },
     runtime_session_view::recover_pending_transition,
     runtime_store::{
@@ -132,7 +135,6 @@ use crate::{
             LedgerDatabaseSnapshot, LedgerFileSnapshot, LedgerRollbackStep, OperationLedgerStore,
             RollbackActionKind, SessionStorageOperationKind, SessionStorageOperationPhase,
         },
-        provenance::{record_or_verify_route_epoch, RouteEpochInput, RouteProvenanceReceipt},
         reference_graph::path_key,
         restore_import::{
             abort_unapplied_restore_import, cleanup_committed_restore_import_ownership_witnesses,
@@ -283,9 +285,15 @@ fn diagnostic_correlation_id(operation: Option<&DiagnosticOperation>) -> Option<
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MutationErrorEnvelope<'a> {
-    message: &'a str,
-    operation_id: &'a str,
+struct MutationErrorEnvelope {
+    message: String,
+    operation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<CommandErrorCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recoverability: Option<CommandRecoverability>,
 }
 
 fn correlate_mutation_result<T>(
@@ -300,14 +308,22 @@ fn correlate_mutation_result<T>(
 }
 
 fn encode_mutation_error(message: &str, operation_id: &str) -> Option<String> {
-    if message.len() > MAX_MUTATION_ERROR_MESSAGE_BYTES
+    let typed = decode_command_failure(message);
+    let safe_message = typed
+        .as_ref()
+        .map(|failure| failure.safe_message.as_str())
+        .unwrap_or(message);
+    if safe_message.len() > MAX_MUTATION_ERROR_MESSAGE_BYTES
         || !is_valid_mutation_correlation_id(operation_id)
     {
         return None;
     }
     let payload = serde_json::to_string(&MutationErrorEnvelope {
-        message,
-        operation_id,
+        message: safe_message.to_string(),
+        operation_id: operation_id.to_string(),
+        code: typed.as_ref().map(|failure| failure.code),
+        phase: typed.as_ref().map(|failure| failure.phase.clone()),
+        recoverability: typed.as_ref().map(|failure| failure.recoverability),
     })
     .ok()?;
     Some(format!("{MUTATION_ERROR_ENVELOPE_PREFIX}{payload}"))
@@ -1361,6 +1377,32 @@ pub fn scan_codex_home() -> Result<CodexHomeStatus, String> {
 }
 
 #[tauri::command]
+pub async fn get_runtime_compatibility() -> Result<RuntimeCompatibilityReport, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let codex_home = managed_codex_home().map_err(|_| {
+            CommandFailure::new(
+                CommandErrorCode::RuntimeCompatibilityBlocked,
+                "无法可靠解析当前 Codex Home；兼容性状态不可用。",
+                "compatibilityPreflight",
+                CommandRecoverability::ManualInvestigation,
+            )
+            .encoded()
+        })?;
+        Ok(inspect_runtime_compatibility(&codex_home))
+    })
+    .await
+    .map_err(|_| {
+        CommandFailure::new(
+            CommandErrorCode::RuntimeCompatibilityUnavailable,
+            "兼容性检查未能完成，请刷新后重试。",
+            "compatibilityPreflight",
+            CommandRecoverability::Retry,
+        )
+        .encoded()
+    })?
+}
+
+#[tauri::command]
 pub fn scan_sessions() -> Result<SessionInventory, String> {
     let result = (|| scan_session_inventory(&managed_codex_home()?))();
     record_background_result("scanSessions", "commands.scan_sessions.failed", &result);
@@ -1478,6 +1520,9 @@ pub async fn set_session_storage_automatic_cleanup(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        if enabled {
+            ensure_advanced_storage_compatibility(&codex_home)?;
+        }
         let data_root = appdata_root()?.join("codex-switch");
         set_automatic_cleanup_enabled(&data_root, enabled)?;
         let state = load_session_storage_control_state(&data_root, &codex_home)?;
@@ -1581,6 +1626,7 @@ pub async fn resolve_session_storage_conflict(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let canonical_state =
@@ -1662,7 +1708,10 @@ pub async fn resolve_session_storage_conflict(
         let report = candidate.resolution_report.as_ref().ok_or_else(|| {
             "conflict content is not reliable enough to permit overwrite".to_string()
         })?;
-        ensure_no_codex_writer_for_session_storage("resolving a session storage conflict")?;
+        ensure_compatible_storage_writers_closed(
+            &codex_home,
+            "resolving a session storage conflict",
+        )?;
         if !store.unfinished()?.is_empty() {
             return Err(
                 "another unfinished session storage operation must be recovered first".to_string(),
@@ -1710,7 +1759,8 @@ pub async fn resolve_session_storage_conflict(
         store.transition(&operation_id, SessionStorageOperationPhase::BackupVerified)?;
         store.transition(&operation_id, SessionStorageOperationPhase::PlanReady)?;
         store.transition(&operation_id, SessionStorageOperationPhase::Applying)?;
-        if let Err(error) = ensure_no_codex_writer_for_session_storage(
+        if let Err(error) = ensure_compatible_storage_writers_closed(
+            &codex_home,
             "performing the final conflict resolution write check",
         ) {
             rollback_conflict_resolution_after_failure(
@@ -1745,7 +1795,8 @@ pub async fn resolve_session_storage_conflict(
         };
         store.transition(&operation_id, SessionStorageOperationPhase::Validating)?;
         let validation = (|| {
-            ensure_no_codex_writer_for_session_storage(
+            ensure_compatible_storage_writers_closed(
+                &codex_home,
                 "validating the session storage conflict resolution",
             )?;
             let mut receipt = validate_conflict_resolution(&prepared.plan, receipt)?;
@@ -1754,7 +1805,8 @@ pub async fn resolve_session_storage_conflict(
                 &conflict_runtime_apply_plan(&prepared.plan),
                 &verifier,
             )?);
-            ensure_no_codex_writer_for_session_storage(
+            ensure_compatible_storage_writers_closed(
+                &codex_home,
                 "finishing session storage conflict runtime verification",
             )?;
             validate_conflict_resolution(&prepared.plan, receipt)
@@ -1999,6 +2051,7 @@ pub async fn preflight_session_storage_migration(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let ledger_store = OperationLedgerStore::new(&data_root);
         if !ledger_store.unfinished()?.is_empty() {
@@ -2006,7 +2059,7 @@ pub async fn preflight_session_storage_migration(
                 "an unfinished session storage operation must be recovered first".to_string(),
             );
         }
-        let active = list_managed_processes_for_closed_mutation(
+        let active = list_processes_for_compatible_storage(&codex_home,
             "preflighting the session storage migration",
         )?;
         if !active.is_empty() {
@@ -2084,6 +2137,7 @@ pub async fn create_session_storage_migration_backup(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let unfinished = store.unfinished()?;
@@ -2105,7 +2159,7 @@ pub async fn create_session_storage_migration_backup(
         {
             return Err("session storage migration ledger is not ready for backup".to_string());
         }
-        let active = list_managed_processes_for_closed_mutation(
+        let active = list_processes_for_compatible_storage(&codex_home,
             "creating the session storage migration backup",
         )?;
         if !active.is_empty() {
@@ -2167,6 +2221,7 @@ pub async fn verify_session_storage_migration_backup(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let unfinished = store.unfinished()?;
@@ -2192,7 +2247,7 @@ pub async fn verify_session_storage_migration_backup(
                     .to_string(),
             );
         }
-        let active = list_managed_processes_for_closed_mutation(
+        let active = list_processes_for_compatible_storage(&codex_home,
             "verifying the session storage migration backup",
         )?;
         if !active.is_empty() {
@@ -2293,6 +2348,7 @@ pub async fn prepare_session_storage_migration(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let unfinished = store.unfinished()?;
@@ -2317,7 +2373,7 @@ pub async fn prepare_session_storage_migration(
                 "session storage migration ledger is not ready for apply planning".to_string(),
             );
         }
-        let active = list_managed_processes_for_closed_mutation(
+        let active = list_processes_for_compatible_storage(&codex_home,
             "preparing the session storage migration apply plan",
         )?;
         if !active.is_empty() {
@@ -2492,6 +2548,7 @@ pub async fn apply_session_storage_migration(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let unfinished = store.unfinished()?;
@@ -2511,7 +2568,7 @@ pub async fn apply_session_storage_migration(
             return Err("session storage migration ledger is not ready to apply".to_string());
         }
         let active =
-            list_managed_processes_for_closed_mutation("applying the session storage migration")?;
+            list_processes_for_compatible_storage(&codex_home, "applying the session storage migration")?;
         if !active.is_empty() {
             return Err(format!(
                 "session storage migration requires every Codex writer to be closed; activeProcesses={}",
@@ -2540,19 +2597,16 @@ pub async fn apply_session_storage_migration(
             return Err("session storage migration rollback plan changed".to_string());
         }
         store.transition(&operation_id, SessionStorageOperationPhase::Applying)?;
-        let active = list_managed_processes_for_closed_mutation(
+        if let Err(error) = ensure_compatible_storage_writers_closed(
+            &codex_home,
             "performing the final session storage migration write check",
-        )?;
-        if !active.is_empty() {
+        ) {
             abort_session_storage_migration_before_apply(
                 &store,
                 &prepared.plan,
-                "writerAppearedBeforeApply",
+                "writerOrSchemaChangedBeforeApply",
             )?;
-            return Err(format!(
-                "a Codex writer appeared before migration apply; activeProcesses={}",
-                active.len()
-            ));
+            return Err(error);
         }
         if let Err(failure) = apply_prepared_migration_classified(
             &prepared.plan,
@@ -2597,18 +2651,12 @@ pub async fn apply_session_storage_migration(
         }
         store.transition(&operation_id, SessionStorageOperationPhase::Validating)?;
         let validation = (|| {
-            ensure_no_codex_writer_for_session_storage(
-                "validating the applied session storage migration",
-            )?;
+            ensure_compatible_storage_writers_closed(&codex_home, "validating the applied session storage migration")?;
             validate_applied_migration(&prepared.plan)?;
-            ensure_no_codex_writer_for_session_storage(
-                "starting post-apply Codex runtime verification",
-            )?;
+            ensure_compatible_storage_writers_closed(&codex_home, "starting post-apply Codex runtime verification")?;
             let verifier = NativeCodexBackupVerifier::discover()?;
             let runtime = verify_applied_migration_with_runtime(&prepared.plan, &verifier)?;
-            ensure_no_codex_writer_for_session_storage(
-                "finishing post-apply Codex runtime verification",
-            )?;
+            ensure_compatible_storage_writers_closed(&codex_home, "finishing post-apply Codex runtime verification")?;
             let mut receipt = validate_applied_migration(&prepared.plan)?;
             receipt.runtime_verification = Some(runtime);
             Ok(receipt)
@@ -2767,6 +2815,7 @@ fn run_session_storage_offline_gc_at_with_policy(
     ensure_no_writer: &mut dyn FnMut(&str) -> Result<(), String>,
     schedule_followup_shadow: bool,
 ) -> Result<OfflineGcReceipt, String> {
+    ensure_advanced_storage_compatibility(codex_home)?;
     let store = OperationLedgerStore::new(data_root);
     if require_automatic_cleanup_enabled {
         let automatic_cleanup_enabled =
@@ -2778,7 +2827,9 @@ fn run_session_storage_offline_gc_at_with_policy(
             );
         }
     }
-    ensure_no_writer("running offline session storage cleanup")?;
+    crate::runtime_compatibility::require_advanced_storage_after_writer_check(codex_home, || {
+        ensure_no_writer("running offline session storage cleanup")
+    })?;
     require_committed_session_storage_migration(data_root, codex_home, migration_operation_id)?;
     if !store.unfinished()?.is_empty() {
         return Err(
@@ -2861,8 +2912,17 @@ fn run_session_storage_offline_gc_at_with_policy(
         return Err(error);
     }
 
-    let receipt = match execute_offline_gc(&prepared.plan, || {
-        ensure_no_writer("performing an offline session storage deletion")
+    // Check structure before the executor pins runtime databases. Its callback
+    // then checks only writers; frozen references/hashes remain owned by the executor.
+    let checked = crate::runtime_compatibility::require_advanced_storage_after_writer_check(
+        codex_home,
+        || ensure_no_writer("performing the final offline cleanup write check"),
+    )
+    .map_err(OfflineGcFailure::LiveWriteGuard);
+    let receipt = match checked.and_then(|()| {
+        execute_offline_gc(&prepared.plan, || {
+            ensure_no_writer("performing an offline session storage deletion")
+        })
     }) {
         Ok(receipt) => receipt,
         Err(failure) => {
@@ -2876,7 +2936,10 @@ fn run_session_storage_offline_gc_at_with_policy(
     };
     store.transition(&operation_id, SessionStorageOperationPhase::Validating)?;
     let validation = (|| {
-        ensure_no_writer("validating offline session storage cleanup")?;
+        crate::runtime_compatibility::require_advanced_storage_after_writer_check(
+            codex_home,
+            || ensure_no_writer("validating offline session storage cleanup"),
+        )?;
         validate_offline_gc(&prepared.plan, receipt)
     })();
     let receipt = match validation {
@@ -3018,6 +3081,7 @@ pub async fn export_session_storage_downgrade(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         if !store.unfinished()?.is_empty() {
@@ -3025,7 +3089,7 @@ pub async fn export_session_storage_downgrade(
                 "another unfinished session storage operation must be recovered first".to_string(),
             );
         }
-        ensure_no_codex_writer_for_session_storage("exporting isolated v0.2 session storage")?;
+        ensure_compatible_storage_writers_closed(&codex_home, "exporting isolated v0.2 session storage")?;
         require_committed_session_storage_migration(
             &data_root,
             &codex_home,
@@ -3110,9 +3174,7 @@ pub async fn export_session_storage_downgrade(
             store.transition(&operation_id, phase)?;
         }
         let receipt = match execute_downgrade_export(&plan, || {
-            ensure_no_codex_writer_for_session_storage(
-                "performing an isolated v0.2 session storage export write",
-            )
+            ensure_no_codex_writer_for_session_storage("performing an isolated v0.2 session storage export write")
         }) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -3145,7 +3207,7 @@ pub async fn export_session_storage_downgrade(
         };
         store.transition(&operation_id, SessionStorageOperationPhase::Validating)?;
         let validation = (|| {
-            ensure_no_codex_writer_for_session_storage("validating the isolated v0.2 export")?;
+            ensure_compatible_storage_writers_closed(&codex_home, "validating the isolated v0.2 export")?;
             let manifest = verify_downgrade_package(&receipt.package_dir)?;
             if manifest.operation_id != operation_id || manifest.target != receipt.target {
                 return Err("downgrade export verification identity changed".to_string());
@@ -3160,9 +3222,7 @@ pub async fn export_session_storage_downgrade(
                 &isolated_root,
                 &verifier,
             )?;
-            ensure_no_codex_writer_for_session_storage(
-                "finishing isolated v0.2 export runtime verification",
-            )?;
+            ensure_compatible_storage_writers_closed(&codex_home, "finishing isolated v0.2 export runtime verification")?;
             if manifest.operation_id != operation_id || manifest.target != receipt.target {
                 return Err("downgrade runtime verification identity changed".to_string());
             }
@@ -3225,6 +3285,7 @@ pub async fn import_session_storage_downgrade(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         if !store.unfinished()?.is_empty() {
@@ -3232,7 +3293,10 @@ pub async fn import_session_storage_downgrade(
                 "another unfinished session storage operation must be recovered first".to_string(),
             );
         }
-        ensure_no_codex_writer_for_session_storage("importing an isolated v0.2 session store")?;
+        ensure_compatible_storage_writers_closed(
+            &codex_home,
+            "importing an isolated v0.2 session store",
+        )?;
         require_committed_session_storage_migration(
             &data_root,
             &codex_home,
@@ -3279,6 +3343,7 @@ pub async fn reconcile_session_storage_legacy_backups(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let backup_root = default_backup_root()?;
         fs::create_dir_all(&backup_root)
@@ -3289,7 +3354,10 @@ pub async fn reconcile_session_storage_legacy_backups(
                 "another unfinished session storage operation must be recovered first".to_string(),
             );
         }
-        ensure_no_codex_writer_for_session_storage("reconciling legacy session backups")?;
+        ensure_compatible_storage_writers_closed(
+            &codex_home,
+            "reconciling legacy session backups",
+        )?;
         let canonical_state = require_committed_session_storage_migration(
             &data_root,
             &codex_home,
@@ -3518,6 +3586,7 @@ pub async fn restore_session_storage_pending_recovery(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _mutation_guard = acquire_mutation_lock()?;
         let codex_home = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&codex_home)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         if !store.unfinished()?.is_empty() {
@@ -3525,7 +3594,7 @@ pub async fn restore_session_storage_pending_recovery(
                 "another unfinished session storage operation must be recovered first".to_string(),
             );
         }
-        ensure_no_codex_writer_for_session_storage("restoring a pending session")?;
+        ensure_compatible_storage_writers_closed(&codex_home, "restoring a pending session")?;
         require_committed_session_storage_migration(
             &data_root,
             &codex_home,
@@ -3612,7 +3681,8 @@ fn complete_prepared_restore_import(
     store.transition(operation_id, SessionStorageOperationPhase::BackupVerified)?;
     store.transition(operation_id, SessionStorageOperationPhase::PlanReady)?;
     store.transition(operation_id, SessionStorageOperationPhase::Applying)?;
-    if let Err(error) = ensure_no_codex_writer_for_session_storage(
+    if let Err(error) = ensure_compatible_storage_writers_closed(
+        codex_home,
         "performing the final restore import write check",
     ) {
         abort_restore_import_before_apply(
@@ -3660,7 +3730,7 @@ fn complete_prepared_restore_import(
     };
     store.transition(operation_id, SessionStorageOperationPhase::Validating)?;
     let validation = (|| {
-        ensure_no_codex_writer_for_session_storage("validating the restore import")?;
+        ensure_compatible_storage_writers_closed(codex_home, "validating the restore import")?;
         let mut receipt = validate_applied_restore_import(&prepared.plan, receipt)?;
         if let Some(runtime_plan) = restore_import_runtime_apply_plan(&prepared.plan)? {
             let verifier = NativeCodexBackupVerifier::discover()?;
@@ -3669,7 +3739,8 @@ fn complete_prepared_restore_import(
                 &verifier,
             )?);
         }
-        ensure_no_codex_writer_for_session_storage(
+        ensure_compatible_storage_writers_closed(
+            codex_home,
             "finishing restore import runtime verification",
         )?;
         validate_applied_restore_import(&prepared.plan, receipt)
@@ -4049,6 +4120,9 @@ pub async fn set_mobile_continuity_enabled(
         let _mutation_guard = acquire_mutation_lock()?;
         record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
         let current_home = managed_codex_home()?;
+        if enabled {
+            ensure_advanced_storage_compatibility(&current_home)?;
+        }
         let current_paths = resolve_user_codex_paths(&current_home)?;
         mobile_continuity::set_enabled(
             &default_mobile_continuity_state_path()?,
@@ -4119,6 +4193,7 @@ pub async fn publish_mobile_continuity_session(
             durable = Some((started_at_ms, operation_id));
             record_diagnostic_phase(worker_diagnostic.as_ref(), "apply");
             let current_home = managed_codex_home()?;
+            ensure_advanced_storage_compatibility(&current_home)?;
             let runtime_status =
                 RuntimeStore::from_default_root()?.detect_active_runtime(&current_home)?;
             if runtime_status.active_runtime_id.as_deref() != Some(PLUS_RUNTIME_ID) {
@@ -4133,7 +4208,10 @@ pub async fn publish_mobile_continuity_session(
             if !processes.is_empty() {
                 close_codex().map(|_| ())?;
             }
-            ensure_codex_closed("publishing a session to Remote")?;
+            ensure_compatible_storage_writers_closed(
+                &current_home,
+                "publishing a session to Remote",
+            )?;
             let publication = mobile_continuity::publish_single_account_session(
                 &default_mobile_continuity_state_path()?,
                 &current_paths,
@@ -4326,9 +4404,30 @@ pub fn upsert_relay_runtime(input: RelayRuntimeInput) -> Result<RuntimeMetadata,
         let _mutation_guard = acquire_mutation_lock()?;
         let started = timestamp_millis()?;
         let id = operation_id("save-relay")?;
-        record_diagnostic_phase(diagnostic.as_ref(), "apply");
-        let result =
-            (|| RuntimeStore::from_default_root()?.upsert_relay(input, &managed_codex_home()?))();
+        let result = (|| {
+            crate::provider_capability::normalize_relay_base_url(&input.base_url).map_err(
+                |error| {
+                    CommandFailure::new(
+                        CommandErrorCode::ProviderCapabilityInvalid,
+                        error.to_string(),
+                        "providerCapabilityPreflight",
+                        CommandRecoverability::Reconfigure,
+                    )
+                    .encoded()
+                },
+            )?;
+            if input.model.trim().is_empty() {
+                return Err(CommandFailure::new(
+                    CommandErrorCode::ProviderCapabilityInvalid,
+                    "relay model is required",
+                    "providerCapabilityPreflight",
+                    CommandRecoverability::Reconfigure,
+                )
+                .encoded());
+            }
+            record_diagnostic_phase(diagnostic.as_ref(), "apply");
+            RuntimeStore::from_default_root()?.upsert_relay(input, &managed_codex_home()?)
+        })();
         durable_recorded = record_result_with_diagnostic(
             &id,
             OperationAction::SaveRelay,
@@ -4981,158 +5080,38 @@ fn switch_runtime_blocking(
             return Err(error);
         }
     };
-    let mut failure_outcome = RuntimeSwitchOutcome::FailedBeforeWrite;
-    let mut failure_operation_id = None;
-    let failure_reason = Cell::new(RuntimeSwitchFailureReason::Unknown);
-    let target_is_account = runtime_id == PLUS_RUNTIME_ID;
     let relay_validation = relay_validation_without_network(&runtime_id);
-    let mut launch_target_captured = false;
-    emit_runtime_switch_progress_diagnostic(
-        &on_progress,
-        diagnostic.as_ref(),
-        RuntimeSwitchPhase::LoadingRuntime,
-        None,
+    let store = RuntimeStore::from_default_root()?;
+    let current_home = managed_codex_home()?;
+    let execution = crate::runtime_switch_application::execute_runtime_switch_route(
+        &store,
+        &current_home,
+        &runtime_id,
+        |phase, message| {
+            emit_runtime_switch_progress_diagnostic(
+                &on_progress,
+                diagnostic.as_ref(),
+                phase,
+                message,
+            )
+        },
     );
-    let mut result = (|| {
-        let store = RuntimeStore::from_default_root()?;
-        let current_home = managed_codex_home()?;
-        emit_runtime_switch_progress_diagnostic(
-            &on_progress,
-            diagnostic.as_ref(),
-            RuntimeSwitchPhase::ValidatingOfficialAuth,
-            None,
-        );
-        let plan = preflight_request_route_switch(&store, &runtime_id, &current_home).map_err(
-            |failure| {
-                failure_reason.set(failure.reason);
-                failure_operation_id = failure.operation_id;
-                failure_outcome = failure.outcome;
-                failure.message
-            },
-        )?;
-        if plan.requires_change() || target_is_account {
-            let close_result = close_runtime_processes_with_progress(
-                || {
-                    let (processes, standalone) = list_process_inventory()?;
-                    if !standalone.is_empty() {
-                        failure_reason.set(RuntimeSwitchFailureReason::StandaloneWriterActive);
-                        return Err(
-                            "a standalone Codex CLI is still running; close it before switching request routes"
-                                .to_string(),
-                        );
-                    }
-                    capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                        // The pre-close inventory is the only point at which the
-                        // running package identity may be captured.
-                        cache_chatgpt_launch_target().is_ok()
-                    });
-                    Ok(processes)
-                },
-                || {
-                    close_codex().map(|_| ()).inspect_err(|_| {
-                        failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
-                    })
-                },
-                |phase, message| {
-                    emit_runtime_switch_progress_diagnostic(
-                        &on_progress,
-                        diagnostic.as_ref(),
-                        phase,
-                        message,
-                    )
-                },
+    if let Some(error) = execution.provenance_error.as_deref() {
+        if let Some(diagnostic) = diagnostic.as_ref() {
+            let _ = diagnostic.branch(
+                DiagnosticLevel::Error,
+                Some("recordingProvenance"),
+                Some("commands.switch_runtime.route_provenance"),
+                Some(error),
+                empty_context(),
             );
-            if close_result.is_err() && failure_reason.get() == RuntimeSwitchFailureReason::Unknown
-            {
-                failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
-            }
-            close_result?;
-        } else {
-            // A Relay no-op does not enter the process-close gate, so retain
-            // the running package identity for the controlled launcher.
-            capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-                cache_chatgpt_launch_target().is_ok()
-            });
         }
-        match switch_request_route_preflighted_with_progress(
-            &store,
-            &current_home,
-            plan,
-            &mut || {
-                let (managed, standalone) = list_process_inventory()?;
-                if !standalone.is_empty() {
-                    failure_reason.set(RuntimeSwitchFailureReason::StandaloneWriterActive);
-                } else if !managed.is_empty() {
-                    failure_reason.set(RuntimeSwitchFailureReason::ProcessCloseFailed);
-                }
-                ensure_codex_closed_from_processes("switching request routes", managed, standalone)
-            },
-            &mut |phase| {
-                emit_runtime_switch_progress_diagnostic(
-                    &on_progress,
-                    diagnostic.as_ref(),
-                    phase,
-                    None,
-                )
-            },
-        ) {
-            Ok(mut receipt) => {
-                let provider = if runtime_id == PLUS_RUNTIME_ID {
-                    "openai"
-                } else {
-                    "openai_custom"
-                };
-                let account_slot =
-                    format!("{}:{}", receipt.runtime.id, receipt.runtime.created_at_ms);
-                // Bind provenance to the verified route cutover, not to the
-                // potentially much earlier switch preflight timestamp.
-                let provenance = timestamp_millis()
-                    .map_err(|_| "route epoch cutover timestamp is unavailable".to_string())
-                    .and_then(|effective_at_ms| {
-                        record_or_verify_route_epoch(
-                            &store.data_root()?,
-                            RouteEpochInput::new(
-                                &receipt.operation_id,
-                                effective_at_ms,
-                                &runtime_id,
-                                provider,
-                                &account_slot,
-                                receipt.runtime.model.as_deref(),
-                            ),
-                            true,
-                        )
-                    });
-                receipt.route_provenance = match provenance {
-                    Ok(provenance) => provenance,
-                    Err(error) => {
-                        if let Some(diagnostic) = diagnostic.as_ref() {
-                            let _ = diagnostic.branch(
-                                DiagnosticLevel::Error,
-                                Some("recordingProvenance"),
-                                Some("commands.switch_runtime.route_provenance"),
-                                Some(&error),
-                                empty_context(),
-                            );
-                        }
-                        let message =
-                            "会话来源账本未写入；为避免产生无来源回合，ChatGPT 已保持关闭"
-                                .to_string();
-                        receipt.warnings.push(message.clone());
-                        RouteProvenanceReceipt::failed(message)
-                    }
-                };
-                Ok(receipt)
-            }
-            Err(failure) => {
-                failure_operation_id = failure.operation_id;
-                failure_outcome = failure.outcome;
-                if failure_reason.get() != RuntimeSwitchFailureReason::StandaloneWriterActive {
-                    failure_reason.set(failure.reason);
-                }
-                Err(failure.message)
-            }
-        }
-    })();
+    }
+    let mut result = execution.result;
+    let failure_outcome = execution.failure_outcome;
+    let failure_operation_id = execution.failure_operation_id;
+    let failure_reason = execution.failure_reason;
+    let launch_target_captured = execution.launch_target_captured;
     let (id, counts) = match &result {
         Ok(receipt) => (
             receipt.operation_id.as_str(),
@@ -5245,7 +5224,7 @@ fn switch_runtime_blocking(
         diagnostic.as_ref(),
         &result,
         failure_outcome,
-        failure_reason.get(),
+        failure_reason,
     );
     if diagnostic
         .as_ref()
@@ -5266,22 +5245,12 @@ fn switch_runtime_blocking(
                 diagnostic.as_ref(),
                 runtime_switch_diagnostic_status(failure_outcome),
                 runtime_switch_diagnostic_terminal_phase(failure_outcome),
-                Some(runtime_switch_failure_reason_code(failure_reason.get())),
+                Some(runtime_switch_failure_reason_code(failure_reason)),
                 Some(error),
             ),
         }
     }
     result
-}
-
-fn capture_chatgpt_launch_target_once<Capture>(captured: &mut bool, capture: Capture)
-where
-    Capture: FnOnce() -> bool,
-{
-    if *captured {
-        return;
-    }
-    *captured = capture();
 }
 
 fn successful_switch_requests_chatgpt_launch(_changed: bool) -> bool {
@@ -5310,33 +5279,6 @@ where
     launch()
 }
 
-fn close_runtime_processes_with_progress<List, Close, Progress>(
-    mut list_managed_processes: List,
-    mut close_managed_processes: Close,
-    mut progress: Progress,
-) -> Result<bool, String>
-where
-    List: FnMut() -> Result<Vec<CodexProcess>, String>,
-    Close: FnMut() -> Result<(), String>,
-    Progress: FnMut(RuntimeSwitchPhase, Option<String>),
-{
-    progress(RuntimeSwitchPhase::DetectingApp, None);
-    let processes = list_managed_processes()?;
-    let closed_running_processes = !processes.is_empty();
-    if !processes.is_empty() {
-        progress(
-            RuntimeSwitchPhase::ClosingApp,
-            Some(format!("Closing {} ChatGPT process(es)", processes.len())),
-        );
-        close_managed_processes()?;
-    }
-    if list_managed_processes()?.is_empty() {
-        Ok(closed_running_processes)
-    } else {
-        Err("ChatGPT is still running; close it before switching request routes".to_string())
-    }
-}
-
 fn emit_runtime_switch_progress_diagnostic(
     on_progress: &Channel<RuntimeSwitchProgress>,
     diagnostic: Option<&DiagnosticOperation>,
@@ -5362,6 +5304,10 @@ fn emit_runtime_switch_progress_event_diagnostic(
     reason: Option<RuntimeSwitchFailureReason>,
 ) {
     record_diagnostic_phase(diagnostic, runtime_switch_phase_name(phase));
+    // Retain the typed envelope in the command Result for final correlation, but
+    // show only its bounded safe message in the progress surface.
+    let message = message
+        .map(|value| decode_command_failure(&value).map_or(value, |failure| failure.safe_message));
     let _ = on_progress.send(RuntimeSwitchProgress {
         phase,
         timestamp_ms: timestamp_millis().unwrap_or_default(),
@@ -5490,6 +5436,9 @@ fn runtime_switch_failure_reason_code(reason: RuntimeSwitchFailureReason) -> &'s
         RuntimeSwitchFailureReason::SessionViewUnavailable => {
             "commands.switch_runtime.session_view_unavailable"
         }
+        RuntimeSwitchFailureReason::CompatibilityBlocked => {
+            "commands.switch_runtime.compatibility_blocked"
+        }
         RuntimeSwitchFailureReason::StandaloneWriterActive => {
             "commands.switch_runtime.standalone_writer_active"
         }
@@ -5580,6 +5529,7 @@ fn merge_and_repair_sessions_blocking(
     let mut apply_started = false;
     let result = (|| {
         let canonical_root = managed_codex_home()?;
+        ensure_advanced_storage_compatibility(&canonical_root)?;
         let data_root = appdata_root()?.join("codex-switch");
         let store = OperationLedgerStore::new(&data_root);
         let backup_destination =
@@ -5614,7 +5564,10 @@ fn merge_and_repair_sessions_blocking(
             close_codex()?;
             closed_running_processes = true;
         }
-        ensure_no_codex_writer_for_session_storage("merging and repairing canonical sessions")?;
+        ensure_compatible_storage_writers_closed(
+            &canonical_root,
+            "merging and repairing canonical sessions",
+        )?;
 
         let report = run_migration_preflight(
             &canonical_root,
@@ -5664,7 +5617,8 @@ fn merge_and_repair_sessions_blocking(
             migration_persistent_session_bytes_added(&prepared.plan)?;
         store.transition(&operation_id, SessionStorageOperationPhase::Applying)?;
         apply_started = true;
-        if let Err(error) = ensure_no_codex_writer_for_session_storage(
+        if let Err(error) = ensure_compatible_storage_writers_closed(
+            &canonical_root,
             "performing the final session merge write check",
         ) {
             abort_session_storage_migration_before_apply(
@@ -5717,10 +5671,14 @@ fn merge_and_repair_sessions_blocking(
             return Err(error);
         }
         let validation = (|| {
-            ensure_no_codex_writer_for_session_storage("validating the applied session merge")?;
+            ensure_compatible_storage_writers_closed(
+                &canonical_root,
+                "validating the applied session merge",
+            )?;
             validate_applied_migration(&prepared.plan)?;
             let runtime = verify_applied_migration_with_runtime(&prepared.plan, &verifier)?;
-            ensure_no_codex_writer_for_session_storage(
+            ensure_compatible_storage_writers_closed(
+                &canonical_root,
                 "finishing post-merge Codex runtime verification",
             )?;
             let mut receipt = validate_applied_migration(&prepared.plan)?;
@@ -6276,9 +6234,10 @@ fn legacy_provider_full_sync_for_migration_fixture(
         let shared_paths = local_codex_paths(&shared_home);
         let processes =
             list_managed_processes_for_closed_mutation("completely syncing active sessions")?;
-        capture_chatgpt_launch_target_once(&mut launch_target_captured, || {
-            cache_chatgpt_launch_target().is_ok()
-        });
+        crate::runtime_switch_application::capture_launch_target_once(
+            &mut launch_target_captured,
+            || cache_chatgpt_launch_target().is_ok(),
+        );
         if !processes.is_empty() {
             emit_session_sync_progress_diagnostic(
                 &on_progress,
@@ -6626,8 +6585,12 @@ pub fn restore_sessions_visible(ids: Vec<String>) -> Result<SessionMutationRecei
             let backup_root = default_backup_root()?;
             checkpoint_root = Some(backup_root.clone());
             let current_home = managed_codex_home()?;
+            ensure_advanced_storage_compatibility(&current_home)?;
             match restore_visible(&current_home, &backup_root, &ids, &operation_id, || {
-                ensure_codex_closed("restoring session visibility")
+                ensure_compatible_storage_writers_closed(
+                    &current_home,
+                    "restoring session visibility",
+                )
             }) {
                 Ok(result) => Ok(result),
                 Err(failure) => {
@@ -7513,6 +7476,12 @@ fn appdata_root() -> Result<PathBuf, String> {
     validate_absolute_root(&root, "APPDATA")
 }
 
+fn ensure_advanced_storage_compatibility(codex_home: &Path) -> Result<(), String> {
+    require_advanced_storage_compatible(codex_home)
+        .map(|_| ())
+        .map_err(|failure| failure.encoded())
+}
+
 fn default_backup_root() -> Result<PathBuf, String> {
     Ok(appdata_root()?.join("codex-switch").join("backups"))
 }
@@ -7636,6 +7605,23 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
             format!("failed to acquire the ChatGPT Switch mutation lock: {error}")
         }
     })
+}
+
+fn ensure_compatible_storage_writers_closed(codex_home: &Path, action: &str) -> Result<(), String> {
+    crate::runtime_compatibility::require_advanced_storage_after_writer_check(codex_home, || {
+        ensure_no_codex_writer_for_session_storage(action)
+    })
+}
+
+fn list_processes_for_compatible_storage(
+    codex_home: &Path,
+    action: &str,
+) -> Result<Vec<CodexProcess>, String> {
+    let active = list_managed_processes_for_closed_mutation(action)?;
+    if active.is_empty() {
+        ensure_compatible_storage_writers_closed(codex_home, action)?;
+    }
+    Ok(active)
 }
 
 fn ensure_codex_closed(action: &str) -> Result<(), String> {
@@ -8482,6 +8468,10 @@ mod tests {
     use tauri::ipc::{Channel, InvokeResponseBody};
     use tempfile::tempdir;
 
+    use crate::runtime_switch_application::{
+        capture_launch_target_once as capture_chatgpt_launch_target_once,
+        close_runtime_processes_with_progress,
+    };
     use crate::{
         backup::{
             create_backup, create_runtime_state_backup_with_paths,
@@ -8511,10 +8501,9 @@ mod tests {
     use super::{
         acquire_mutation_lock_at, acquire_writer_free_mutation_lock_with, after_capacity_preflight,
         append_operation_record_to, automatic_gc_decision, automatic_gc_error_is_transient,
-        capture_chatgpt_launch_target_once, checkpoint_cleanup_counts,
-        checkpoint_cleanup_diagnostic_status, checkpoint_cleanup_terminal,
-        classify_failed_commit_transition, cleanup_automatic_checkpoints, close_codex_processes,
-        close_runtime_processes_with_progress, collect_session_conflict_candidates,
+        checkpoint_cleanup_counts, checkpoint_cleanup_diagnostic_status,
+        checkpoint_cleanup_terminal, classify_failed_commit_transition,
+        cleanup_automatic_checkpoints, close_codex_processes, collect_session_conflict_candidates,
         correlate_mutation_result, create_full_backup, default_codex_home_from_env, delete_backup,
         delete_backup_at, diagnostic_status_for_command_error, diagnostic_terminal_status,
         emit_runtime_switch_progress_diagnostic, emit_runtime_switch_terminal,
@@ -8594,6 +8583,50 @@ mod tests {
             value["operationId"],
             "install-skill-attempt-1780000000000-42-1"
         );
+    }
+
+    #[test]
+    fn compatibility_switch_error_preserves_wire_metadata_but_not_json_in_progress() {
+        let failure = crate::command_error::CommandFailure::new(
+            crate::command_error::CommandErrorCode::RuntimeCompatibilityBlocked,
+            "当前结构不受支持",
+            "compatibilityPreflight",
+            crate::command_error::CommandRecoverability::UnsupportedClient,
+        );
+        let encoded = failure.encoded();
+        let correlated = encode_mutation_error(&encoded, "attempt-compatibility").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(
+            correlated
+                .strip_prefix(MUTATION_ERROR_ENVELOPE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["code"], "runtimeCompatibilityBlocked");
+        assert_eq!(payload["phase"], "compatibilityPreflight");
+        assert_eq!(payload["recoverability"], "unsupportedClient");
+        assert_eq!(payload["message"], failure.safe_message);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let channel = Channel::<RuntimeSwitchProgress>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("expected JSON progress");
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            Ok(())
+        });
+        emit_runtime_switch_terminal_diagnostic_with_reason(
+            &channel,
+            None,
+            &Err::<(), _>(encoded),
+            RuntimeSwitchOutcome::FailedBeforeWrite,
+            RuntimeSwitchFailureReason::CompatibilityBlocked,
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events[0]["message"], failure.safe_message);
+        assert_eq!(events[0]["reason"], "compatibilityBlocked");
     }
 
     #[test]

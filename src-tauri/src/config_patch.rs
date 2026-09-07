@@ -161,6 +161,7 @@ pub fn plan_runtime_config_patch(
         kind,
         relay_bearer_token,
         true,
+        false,
     )
 }
 
@@ -170,6 +171,7 @@ pub fn plan_runtime_config_patch_with_relay_auth(
     kind: RuntimeConfigKind,
     relay_bearer_token: Option<&str>,
     relay_requires_openai_auth: bool,
+    relay_supports_websockets: bool,
 ) -> Result<ConfigPatchPlan, String> {
     let mut live = DocumentMut::from_str(live_toml)
         .map_err(|_| "failed to parse live config.toml".to_string())?;
@@ -245,7 +247,7 @@ pub fn plan_runtime_config_patch_with_relay_auth(
             }
             target_table["experimental_bearer_token"] = value(relay_bearer_token);
             target_table["requires_openai_auth"] = value(relay_requires_openai_auth);
-            target_table["supports_websockets"] = value(true);
+            target_table["supports_websockets"] = value(relay_supports_websockets);
             if target_table.to_string() != previous_table {
                 changed_keys.push(format!("model_providers.{provider}"));
             }
@@ -442,8 +444,8 @@ supports_websockets = false
             .patched_toml
             .contains("experimental_bearer_token = \"sk-relay-secret\""));
         assert!(plan.patched_toml.contains("requires_openai_auth = true"));
-        assert!(plan.patched_toml.contains("supports_websockets = true"));
-        assert!(!plan.patched_toml.contains("supports_websockets = false"));
+        assert!(plan.patched_toml.contains("supports_websockets = false"));
+        assert!(!plan.patched_toml.contains("supports_websockets = true"));
     }
 
     #[test]
@@ -480,7 +482,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn relay_runtime_patch_adds_websocket_support_when_the_saved_field_is_missing() {
+    fn relay_runtime_patch_defaults_to_http_when_the_saved_field_is_missing() {
         let plan = plan_runtime_config_patch(
             "model = \"account\"\n",
             "model = \"relay\"\nmodel_provider = \"openai_custom\"\n\
@@ -499,7 +501,7 @@ wire_api = "responses"
                 .and_then(toml_edit::Item::as_table)
                 .and_then(|provider| provider.get("supports_websockets"))
                 .and_then(toml_edit::Item::as_bool),
-            Some(true)
+            Some(false)
         );
     }
 
@@ -545,6 +547,30 @@ wire_api = "responses"
     }
 
     #[test]
+    fn relay_websocket_transport_is_only_enabled_by_an_explicit_plan() {
+        let runtime = r#"
+model = "relay"
+model_provider = "openai_custom"
+
+[model_providers.openai_custom]
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+"#;
+        let plan = plan_runtime_config_patch_with_relay_auth(
+            "",
+            runtime,
+            RuntimeConfigKind::Relay,
+            Some("relay-fixture"),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(plan.patched_toml.contains("supports_websockets = true"));
+        assert!(!plan.patched_toml.contains("supports_websockets = false"));
+    }
+
+    #[test]
     fn relay_auth_policy_overrides_legacy_saved_templates_and_is_idempotent() {
         let runtime = "model = \"relay\"\nmodel_provider = \"openai_custom\"\n\
             [model_providers.openai_custom]\nbase_url = \"https://relay.example.com/v1\"\n\
@@ -555,6 +581,7 @@ wire_api = "responses"
             RuntimeConfigKind::Relay,
             Some("relay-fixture"),
             false,
+            false,
         )
         .unwrap();
         assert!(first.patched_toml.contains("requires_openai_auth = false"));
@@ -563,6 +590,7 @@ wire_api = "responses"
             runtime,
             RuntimeConfigKind::Relay,
             Some("relay-fixture"),
+            false,
             false,
         )
         .unwrap();

@@ -15,6 +15,50 @@ struct FileStamp {
     created: Option<SystemTime>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StableRegularFileObservation {
+    pub bytes: u64,
+    stamp: FileStamp,
+    identity: (u64, u64),
+}
+
+impl StableRegularFileObservation {
+    pub(crate) fn same_file_identity(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+pub(crate) fn observe_regular_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<StableRegularFileObservation, ()> {
+    if max_bytes == 0 {
+        return Err(());
+    }
+    let before_path = fs::symlink_metadata(path).map_err(|_| ())?;
+    validate_metadata(&before_path, max_bytes)?;
+    let file = open_without_following_reparse(path).map_err(|_| ())?;
+    let before_handle = file.metadata().map_err(|_| ())?;
+    validate_metadata(&before_handle, max_bytes)?;
+    let identity = file_identity(&file, &before_handle).ok_or(())?;
+
+    let after_path = fs::symlink_metadata(path).map_err(|_| ())?;
+    validate_metadata(&after_path, max_bytes)?;
+    let reopened = open_without_following_reparse(path).map_err(|_| ())?;
+    let after_handle = reopened.metadata().map_err(|_| ())?;
+    validate_metadata(&after_handle, max_bytes)?;
+    if file_identity(&reopened, &after_handle).as_ref() != Some(&identity) {
+        return Err(());
+    }
+    let stamp = file_stamp(&after_handle);
+
+    Ok(StableRegularFileObservation {
+        bytes: stamp.bytes,
+        stamp,
+        identity,
+    })
+}
+
 pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ()> {
     if max_bytes == 0 {
         return Err(());
@@ -173,7 +217,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{read_regular_file_bounded, same_regular_file_identity};
+    use super::{observe_regular_file, read_regular_file_bounded, same_regular_file_identity};
 
     #[test]
     fn reads_only_nonempty_regular_files_within_the_limit() {
@@ -187,6 +231,36 @@ mod tests {
         fs::write(&path, b"").unwrap();
         assert!(read_regular_file_bounded(&path, 3).is_err());
         assert!(read_regular_file_bounded(root.path(), 3).is_err());
+    }
+
+    #[test]
+    fn observes_only_a_stable_regular_file_identity() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        fs::write(&path, b"sqlite").unwrap();
+
+        let first = observe_regular_file(&path, 64).unwrap();
+        let second = observe_regular_file(&path, 64).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.bytes, 6);
+        assert!(observe_regular_file(&path, 5).is_err());
+        assert!(observe_regular_file(root.path(), 64).is_err());
+    }
+
+    #[test]
+    fn in_place_changes_preserve_identity_without_claiming_unchanged_content() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        fs::write(&path, b"sqlite-one").unwrap();
+        let before = observe_regular_file(&path, 64).unwrap();
+
+        fs::write(&path, b"sqlite-two-longer").unwrap();
+        let after = observe_regular_file(&path, 64).unwrap();
+
+        assert!(before.same_file_identity(&after));
+        assert_ne!(before, after);
+        assert_eq!(after.bytes, 17);
     }
 
     #[test]

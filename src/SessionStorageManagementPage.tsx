@@ -51,6 +51,7 @@ import type {
   PendingRecoveryList,
   PendingRecoverySummary,
   RestoreImportReceipt,
+  RuntimeCompatibilityReport,
   SessionConflictList,
   SessionConflictSummary,
   SessionStorageControlState,
@@ -120,6 +121,7 @@ const defaultDependencies: SessionStorageManagementDependencies = {
 type SessionStorageManagementPageProps = {
   active: boolean;
   initialReport: ShadowScanReport | null;
+  compatibility: RuntimeCompatibilityReport | null;
   onReportChange?: (report: ShadowScanReport) => void;
   onBusyChange?: (label: string | null) => void;
   dependencies?: SessionStorageManagementDependencies;
@@ -156,6 +158,7 @@ const investigationIssueCodes = new Set<ShadowScanIssueCode>([
 export function SessionStorageManagementPage({
   active,
   initialReport,
+  compatibility,
   onReportChange = () => undefined,
   onBusyChange = () => undefined,
   dependencies = defaultDependencies,
@@ -243,10 +246,14 @@ export function SessionStorageManagementPage({
     };
   }, [active, dependencies]);
 
+  const advancedStorageEnabled = compatibility?.advancedStorage === 'supported';
+  const advancedStorageReason = compatibility?.issues[0]?.message
+    ?? '当前 ChatGPT/Codex 本地存储结构尚未通过高级写操作兼容性检查。';
   const migrationOperationId = preflight?.operationId ?? control?.migrationOperationId;
   const migrationReady = Boolean(control?.canonicalReady && migrationOperationId);
   const backupVerified = backup?.status === 'runtimeVerified';
-  const canApply = Boolean(preparation && backupVerified && writersClosed && preflight);
+  const canApply = advancedStorageEnabled
+    && Boolean(preparation && backupVerified && writersClosed && preflight);
   const investigationRequired = Boolean(report?.issues.some(
     (issue) => issue.count > 0 && investigationIssueCodes.has(issue.code),
   ));
@@ -264,7 +271,7 @@ export function SessionStorageManagementPage({
 
   useEffect(() => {
     if (!active) return;
-    if (!migrationReady || !migrationOperationId) {
+    if (!advancedStorageEnabled || !migrationReady || !migrationOperationId) {
       setConflicts(null);
       return;
     }
@@ -283,11 +290,11 @@ export function SessionStorageManagementPage({
     return () => {
       cancelled = true;
     };
-  }, [active, dependencies, migrationOperationId, migrationReady]);
+  }, [active, advancedStorageEnabled, dependencies, migrationOperationId, migrationReady]);
 
   useEffect(() => {
     if (!active) return;
-    if (!migrationReady || !migrationOperationId) {
+    if (!advancedStorageEnabled || !migrationReady || !migrationOperationId) {
       setPendingRecovery(null);
       return;
     }
@@ -306,7 +313,7 @@ export function SessionStorageManagementPage({
     return () => {
       cancelled = true;
     };
-  }, [active, dependencies, migrationOperationId, migrationReady]);
+  }, [active, advancedStorageEnabled, dependencies, migrationOperationId, migrationReady]);
 
   async function runAction<T>(
     label: string,
@@ -327,6 +334,13 @@ export function SessionStorageManagementPage({
       setBusy(null);
       onBusyChange(null);
     }
+  }
+
+  function requireAdvancedStorage() {
+    if (advancedStorageEnabled) return true;
+    setError(advancedStorageReason);
+    setNotice(null);
+    return false;
   }
 
   function clearShadowJoinTimers() {
@@ -439,6 +453,7 @@ export function SessionStorageManagementPage({
   }
 
   function handlePreflight() {
+    if (!requireAdvancedStorage()) return;
     const destination = backupDestination.trim();
     if (!destination) {
       setError('请先填写完整备份目录。');
@@ -454,6 +469,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleCreateBackup() {
+    if (!requireAdvancedStorage()) return;
     if (!preflight) return;
     void runAction('创建完整迁移备份', () => dependencies.createBackup(preflight.operationId), (next) => {
       setBackup(next as MigrationBackupManifest);
@@ -462,6 +478,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleVerifyBackup() {
+    if (!requireAdvancedStorage()) return;
     if (!preflight) return;
     void runAction('验证完整迁移备份', () => dependencies.verifyBackup(preflight.operationId), (next) => {
       setBackup(next as MigrationBackupManifest);
@@ -470,6 +487,7 @@ export function SessionStorageManagementPage({
   }
 
   function handlePrepareMigration() {
+    if (!requireAdvancedStorage()) return;
     if (!preflight) return;
     void runAction('生成迁移计划', () => dependencies.prepareMigration(preflight.operationId), (next) => {
       setPreparation(next as MigrationPreparationReceipt);
@@ -491,6 +509,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleApplyMigration() {
+    if (!requireAdvancedStorage()) return;
     if (!preflight || !canApply) return;
     const previousScanId = report?.scanId ?? null;
     void runAction('提交会话存储迁移', () => dependencies.applyMigration(preflight.operationId), (next) => {
@@ -501,6 +520,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleAutomaticCleanup(enabled: boolean) {
+    if (enabled && !requireAdvancedStorage()) return;
     const previousScanId = report?.scanId ?? null;
     void runAction('更新自动清理设置', () => dependencies.setAutomaticCleanup(enabled), (next) => {
       setControl(next as SessionStorageControlState);
@@ -512,6 +532,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleOfflineGc() {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId || !writersClosed) return;
     const previousScanId = report?.scanId ?? null;
     void runAction('执行离线会话清理', () => dependencies.runOfflineGc(migrationOperationId), (next) => {
@@ -522,6 +543,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleResolveConflict(conflict: SessionConflictSummary, action: ConflictResolutionAction) {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId) return;
     const previousScanId = report?.scanId ?? null;
     void runAction(action === 'defer' ? '暂不覆盖冲突' : '切换冲突主版本', () => (
@@ -545,6 +567,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleExportDowngrade() {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId || !writersClosed) return;
     const destination = downgradeDestination.trim();
     if (!destination) {
@@ -564,6 +587,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleImportDowngrade() {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId || !writersClosed) return;
     const packageDir = downgradePackage.trim();
     if (!packageDir) {
@@ -591,6 +615,7 @@ export function SessionStorageManagementPage({
   }
 
   function handleReconcileLegacyBackups() {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId || !writersClosed || !legacyReconciliationConfirmOpen) return;
     const previousScanId = report?.scanId ?? null;
     void runAction('整理旧版完整备份', () => (
@@ -610,6 +635,7 @@ export function SessionStorageManagementPage({
   }
 
   function handlePendingRecovery(entry: PendingRecoverySummary, action: 'restore' | 'defer') {
+    if (!requireAdvancedStorage()) return;
     if (!migrationOperationId) return;
     if (action === 'defer') {
       void runAction('暂不恢复旧备份会话', () => (
@@ -637,12 +663,12 @@ export function SessionStorageManagementPage({
   }
 
   return (
-    <section className="storage-management-page" hidden={!active} aria-label="会话存储管理">
+    <section className="storage-management-page" hidden={!active} aria-label="高级存储管理">
       <header className="storage-management-hero">
         <div>
-          <p className="eyebrow">CANONICAL STORAGE / CONTROL 03</p>
-          <h1>一份正文，所有账号共用视图</h1>
-          <p>迁移、冲突、离线清理和降级都在本机执行；列表可见不会上传会话正文。</p>
+          <p className="eyebrow">ADVANCED STORAGE / CONTROL 03</p>
+          <h1>高级存储与恢复实验室</h1>
+          <p>扫描与排查保持只读；迁移、冲突、离线清理和降级仅在当前客户端结构通过兼容性检查后开放。</p>
         </div>
         <div className="storage-hero-actions">
           <button className="ghost-button" onClick={handleScan} disabled={Boolean(busy)}>
@@ -657,6 +683,23 @@ export function SessionStorageManagementPage({
       {busy ? <p className="busy-banner" role="status"><LoaderCircle className="spin" aria-hidden="true" />{busy}</p> : null}
       {error ? <p className="error-banner" role="alert"><strong>存储操作：</strong>{error}</p> : null}
       {notice ? <p className="storage-notice" role="status"><Check aria-hidden="true" />{notice}</p> : null}
+
+      {compatibility ? (
+        <section className={`storage-compatibility-banner ${advancedStorageEnabled ? 'supported' : 'blocked'}`} aria-label="高级存储兼容性">
+          {advancedStorageEnabled ? <ShieldCheck aria-hidden="true" /> : <CircleAlert aria-hidden="true" />}
+          <div>
+            <strong>{advancedStorageEnabled ? '高级存储写操作已通过结构检查' : '高级存储写操作已停用'}</strong>
+            <p>{advancedStorageEnabled
+              ? '当前 threads 表具备受支持的关键列；写操作仍会在执行前重新检查 writer、文件身份和数据库状态。'
+              : advancedStorageReason}</p>
+          </div>
+        </section>
+      ) : (
+        <section className="storage-compatibility-banner blocked" aria-label="高级存储兼容性">
+          <CircleAlert aria-hidden="true" />
+          <div><strong>兼容性状态尚未就绪</strong><p>当前只允许重新扫描和生成只读排查任务。</p></div>
+        </section>
+      )}
 
       <section className="storage-status-grid" aria-label="存储摘要">
         <StorageMetric label="存储状态" value={controlLoading ? '读取中' : control?.canonicalReady ? 'Canonical 已就绪' : '等待迁移'} />
@@ -710,10 +753,10 @@ export function SessionStorageManagementPage({
                 value={backupDestination}
                 onChange={(event) => setBackupDestination(event.target.value)}
                 placeholder="例如 E:\\CodexSwitchBackups"
-                disabled={Boolean(busy || preflight)}
+                disabled={Boolean(busy || preflight || !advancedStorageEnabled)}
               />
               <div className="storage-action-row">
-                <button className="primary-button" onClick={handlePreflight} disabled={Boolean(busy || preflight || !backupDestination.trim())}>开始只读预检</button>
+                <button className="primary-button" onClick={handlePreflight} disabled={Boolean(busy || preflight || !backupDestination.trim() || !advancedStorageEnabled)}>开始只读预检</button>
                 {preflight ? <button className="ghost-button" onClick={handleCancelMigration} disabled={Boolean(busy)}>取消迁移</button> : null}
               </div>
             </>
@@ -721,14 +764,14 @@ export function SessionStorageManagementPage({
           {preflight ? <MigrationPreflightDetails report={preflight} /> : null}
           {preflight && !control?.canonicalReady ? (
             <div className="storage-action-stack">
-              <button className="ghost-button" onClick={handleCreateBackup} disabled={Boolean(busy || backup || !preflight.readyForBackup)}><HardDrive className="button-icon" aria-hidden="true" />创建完整备份</button>
-              <button className="ghost-button" onClick={handleVerifyBackup} disabled={Boolean(busy || !backup || backupVerified)}><ShieldCheck className="button-icon" aria-hidden="true" />真实恢复验证</button>
-              <button className="ghost-button" onClick={handlePrepareMigration} disabled={Boolean(busy || !backupVerified || preparation)}><Database className="button-icon" aria-hidden="true" />生成原子计划</button>
+              <button className="ghost-button" onClick={handleCreateBackup} disabled={Boolean(busy || backup || !preflight.readyForBackup || !advancedStorageEnabled)}><HardDrive className="button-icon" aria-hidden="true" />创建完整备份</button>
+              <button className="ghost-button" onClick={handleVerifyBackup} disabled={Boolean(busy || !backup || backupVerified || !advancedStorageEnabled)}><ShieldCheck className="button-icon" aria-hidden="true" />真实恢复验证</button>
+              <button className="ghost-button" onClick={handlePrepareMigration} disabled={Boolean(busy || !backupVerified || preparation || !advancedStorageEnabled)}><Database className="button-icon" aria-hidden="true" />生成原子计划</button>
               <label className="storage-check-row">
-                <input type="checkbox" checked={writersClosed} onChange={(event) => setWritersClosed(event.target.checked)} disabled={Boolean(busy)} />
+                <input type="checkbox" checked={writersClosed} onChange={(event) => setWritersClosed(event.target.checked)} disabled={Boolean(busy || !advancedStorageEnabled)} />
                 我已关闭 Codex Desktop、CLI 和其他会话写入进程
               </label>
-              <button className="warm-button" onClick={handleApplyMigration} disabled={Boolean(busy || !canApply)}>提交迁移并验证</button>
+              <button className="warm-button" onClick={handleApplyMigration} disabled={Boolean(busy || !canApply || !advancedStorageEnabled)}>提交迁移并验证</button>
             </div>
           ) : null}
         </section>
@@ -741,15 +784,15 @@ export function SessionStorageManagementPage({
               type="checkbox"
               checked={control?.automaticCleanupEnabled ?? false}
               onChange={(event) => handleAutomaticCleanup(event.target.checked)}
-              disabled={Boolean(busy || !control)}
+              disabled={Boolean(busy || !control || (!advancedStorageEnabled && !control?.automaticCleanupEnabled))}
             />
           </label>
           <p className="storage-safe-copy"><ShieldCheck aria-hidden="true" />在线阶段固定只扫描；系统会等待所有 writer 关闭后自动执行离线删除，并重新检查全局引用、hash、句柄和写入状态。下方按钮仅用于立即手动触发同一安全流程；该开关不影响 7 天隐私日志与冲突/恢复包生命周期。</p>
           <label className="storage-check-row">
-            <input type="checkbox" checked={writersClosed} onChange={(event) => setWritersClosed(event.target.checked)} disabled={Boolean(busy)} />
+            <input type="checkbox" checked={writersClosed} onChange={(event) => setWritersClosed(event.target.checked)} disabled={Boolean(busy || !advancedStorageEnabled)} />
             所有 Codex 写入进程已关闭
           </label>
-          <button className="ghost-button full" onClick={handleOfflineGc} disabled={Boolean(busy || !migrationReady || !writersClosed || !control)}><Trash2 className="button-icon" aria-hidden="true" />执行离线安全清理</button>
+          <button className="ghost-button full" onClick={handleOfflineGc} disabled={Boolean(busy || !migrationReady || !writersClosed || !control || !advancedStorageEnabled)}><Trash2 className="button-icon" aria-hidden="true" />执行离线安全清理</button>
         </section>
 
         <section className="storage-workflow-card storage-conflict-card" aria-label="冲突处理">
@@ -760,7 +803,7 @@ export function SessionStorageManagementPage({
                 <ConflictCard
                   key={conflict.conflictId}
                   conflict={conflict}
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy || !advancedStorageEnabled)}
                   onAction={(action) => handleResolveConflict(conflict, action)}
                 />
               ))}
@@ -772,15 +815,15 @@ export function SessionStorageManagementPage({
           <CardHeading icon={<Download aria-hidden="true" />} eyebrow="EXPLICIT DOWNGRADE" title="v0.2.x 隔离降级" />
           <p className="storage-warning-copy"><CircleAlert aria-hidden="true" />降级包包含完整会话正文和本地凭据，只能保存在你选择的本地目录。请直接选择最终位置，生成后不要移动；如需换盘请重新生成。</p>
           <label className="field-label" htmlFor="downgrade-version">目标旧版本</label>
-          <select id="downgrade-version" value={downgradeVersion} onChange={(event) => setDowngradeVersion(event.target.value)} disabled={Boolean(busy)}>
+          <select id="downgrade-version" value={downgradeVersion} onChange={(event) => setDowngradeVersion(event.target.value)} disabled={Boolean(busy || !advancedStorageEnabled)}>
             {versionOptions.map((version) => <option key={version}>{version}</option>)}
           </select>
           <label className="field-label" htmlFor="downgrade-destination">隔离包目标目录</label>
-          <input id="downgrade-destination" value={downgradeDestination} onChange={(event) => setDowngradeDestination(event.target.value)} placeholder="例如 E:\\CodexSwitchDowngrade" disabled={Boolean(busy)} />
-          <button className="ghost-button full" onClick={handleExportDowngrade} disabled={Boolean(busy || !migrationReady || !writersClosed || !downgradeDestination.trim())}><Download className="button-icon" aria-hidden="true" />生成隔离降级包</button>
+          <input id="downgrade-destination" value={downgradeDestination} onChange={(event) => setDowngradeDestination(event.target.value)} placeholder="例如 E:\\CodexSwitchDowngrade" disabled={Boolean(busy || !advancedStorageEnabled)} />
+          <button className="ghost-button full" onClick={handleExportDowngrade} disabled={Boolean(busy || !migrationReady || !writersClosed || !downgradeDestination.trim() || !advancedStorageEnabled)}><Download className="button-icon" aria-hidden="true" />生成隔离降级包</button>
           <label className="field-label" htmlFor="downgrade-package">使用过的降级包目录</label>
-          <input id="downgrade-package" value={downgradePackage} onChange={(event) => setDowngradePackage(event.target.value)} placeholder="选择再次升级时要导入的包" disabled={Boolean(busy)} />
-          <button className="ghost-button full" onClick={handleImportDowngrade} disabled={Boolean(busy || !migrationReady || !writersClosed || !downgradePackage.trim())}><ArchiveRestore className="button-icon" aria-hidden="true" />导入旧版本新增会话</button>
+          <input id="downgrade-package" value={downgradePackage} onChange={(event) => setDowngradePackage(event.target.value)} placeholder="选择再次升级时要导入的包" disabled={Boolean(busy || !advancedStorageEnabled)} />
+          <button className="ghost-button full" onClick={handleImportDowngrade} disabled={Boolean(busy || !migrationReady || !writersClosed || !downgradePackage.trim() || !advancedStorageEnabled)}><ArchiveRestore className="button-icon" aria-hidden="true" />导入旧版本新增会话</button>
         </section>
 
         <section className="storage-workflow-card" aria-label="待恢复会话">
@@ -791,7 +834,7 @@ export function SessionStorageManagementPage({
             ref={legacyReconciliationTriggerRef}
             className="ghost-button full"
             onClick={() => setLegacyReconciliationConfirmOpen(true)}
-            disabled={Boolean(busy || !migrationReady || !writersClosed || legacyReconciliationConfirmOpen)}
+            disabled={Boolean(busy || !migrationReady || !writersClosed || legacyReconciliationConfirmOpen || !advancedStorageEnabled)}
           >
             <ArchiveRestore className="button-icon" aria-hidden="true" />验证并整理旧备份
           </button>
@@ -811,7 +854,7 @@ export function SessionStorageManagementPage({
               </div>
               <div className="confirmation-actions">
                 <button className="ghost-button" onClick={closeLegacyReconciliationConfirmation} disabled={Boolean(busy)}>取消</button>
-                <button className="ghost-button danger" onClick={handleReconcileLegacyBackups} disabled={Boolean(busy || !writersClosed)}>
+                <button className="ghost-button danger" onClick={handleReconcileLegacyBackups} disabled={Boolean(busy || !writersClosed || !advancedStorageEnabled)}>
                   <Trash2 className="button-icon" aria-hidden="true" />确认提取并删除可安全整理的旧备份
                 </button>
               </div>
@@ -823,7 +866,7 @@ export function SessionStorageManagementPage({
                 <PendingRecoveryCard
                   key={entry.entryId}
                   entry={entry}
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy || !advancedStorageEnabled)}
                   writersClosed={writersClosed}
                   onAction={(action) => handlePendingRecovery(entry, action)}
                 />

@@ -194,7 +194,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
 
    该脚本必须冻结并复核 raw hash，对 raw 与 packed 分别运行 release contract，仅在 staging 副本上执行 `upx --ultra-brute --lzma`，并对 packed 文件执行 `upx -t`。v0.3 关闭 Tauri runtime Brotli asset feature，仅保留 `wry` / Windows `common-controls-v6`，因此必须由最终固定 UPX 层压缩并做 custom-protocol 启动验证。packed 必须保持 PE32+ x64，`ProductVersion` / `FileVersion` 必须与目标 tag 一致，体积必须小于 3 MB 并满足 3,000,000 bytes 硬门禁。发布前还必须实际启动 `release/codex-switch.exe`，分别在 initialized Home 与完全 fresh Home 验证主窗口、版本、基本切换入口和零状态读取；fresh Home 中 `auth.json`、`config.toml`、`state_5.sqlite` 必须保持缺失。只验证 raw EXE 或预填充 Home 不算发布验证完成。
 
-   公开 UI 和窗口标题可以使用 ChatGPT Switch，但 Release 资产必须继续唯一命名为 `codex-switch.exe`；既有 updater 固定校验该名称，不能直接改为 `chatgpt-switch.exe`。
+   公开 UI 和窗口标题可以使用 ChatGPT Switch；Release 必须只有一个可执行资产且继续命名为 `codex-switch.exe`，同时发布只读 `codex-switch.cdx.json`。既有 updater 固定选择该 EXE 名称，不能直接改为 `chatgpt-switch.exe`。
 
 6. 创建 tag 后必须等待该 tag commit 对应的 Windows CI 全部通过。`release` job 只生成并上传唯一 packed artifact；仅版本 tag 会在其后进入 `publish` job，由该 job 下载同一 run 的 artifact、再次校验 release contract，并使用 GitHub Actions 的最小 `contents: write` 权限创建 Latest Release。不得从开发机上传 raw/packed EXE，也不得用本地脏工作区产物替代 tag-CI 产物：
 
@@ -208,7 +208,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
    & "<verified-upx.exe>" -t "artifacts\<tag>\codex-switch.exe"
    ```
 
-   `publish` job 必须先确认 tag 与 `package.json` 版本一致、Changelog 中存在对应版本段、同名 Release 尚不存在；任一条件不满足都 fail closed。人工下载后的 tag-CI artifact 仍应满足 packed contract、`upx -t`、PE32+ x64、双版本、体积门禁，并实际启动成功。CI artifact 只能包含 packed 的裸 `codex-switch.exe`。
+   `publish` job 必须先确认 tag 与 `package.json` 版本一致、Changelog 中存在对应版本段、同名 Release 尚不存在；任一条件不满足都 fail closed。人工下载后的 tag-CI EXE artifact 仍应满足 packed contract、`upx -t`、PE32+ x64、双版本、体积门禁，并实际启动成功。EXE artifact 只能包含 packed 的裸 `codex-switch.exe`；SBOM 使用独立 artifact，并在 publish job 中与 EXE 一起复核后公开。tag-CI 还必须完成 npm/Rust dependency-policy 门、CycloneDX SBOM，并为最终 EXE生成 GitHub Artifact Attestation 的 build provenance 与 SBOM binding；attestation 失败阻断 Release。
 
 7. `publish` job 创建 GitHub Release 后，必须把公开资产重新下载到独立目录验证，不能只检查网页元数据；同名 Release 已存在时工作流不得自动覆盖或替换资产：
 
@@ -225,7 +225,7 @@ gh pr view <PR_NUMBER> --json number,title,baseRefName,headRefName,state,isDraft
    Get-FileHash -Algorithm SHA256 "release-verification\<tag>\codex-switch.exe"
    ```
 
-   回下载文件的 SHA-256 和字节数必须与 tag-CI artifact 完全一致，并重新通过 packed contract、`upx -t`、体积门禁和实际启动验证；网页显示存在同名资产不能代替二进制回下载校验。
+   回下载文件的 SHA-256 和字节数必须与 tag-CI artifact 完全一致，并重新通过 packed contract、`upx -t`、体积门禁和实际启动验证；网页显示存在同名资产不能代替二进制回下载校验。 当前没有商业 Authenticode 证书时，必须在 Release Notes 明确 `NotSigned`；GitHub attestation、digest、UPX 和 PE 合同不得冒充 Windows 代码签名或终端防护扫描。
 
    `gh release view --json` 不支持 `isLatest` 字段；必须把 `gh api .../releases/latest` 返回的 tag 与目标 `<tag>` 对比，不能仅凭 release 列表顺序推断 latest。
 

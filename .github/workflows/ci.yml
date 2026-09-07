@@ -42,8 +42,11 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Verify tracked documentation links
+        run: npm run check:docs
+
       - name: Verify release harness safety contracts
-        run: node --test scripts/v030-release-harness.test.mjs
+        run: node --test scripts/v030-release-harness.test.mjs scripts/supply-chain-contract.test.mjs
 
       - name: Check Rust formatting
         working-directory: src-tauri
@@ -56,6 +59,82 @@ jobs:
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test --locked --all-targets --features runtime-evidence
+
+  supply-chain:
+    name: Dependency, license and SBOM gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Audit production npm dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit Rust advisories, sources, bans and licenses
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 / cargo-deny 0.20.2
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check
+          arguments: --all-features
+          command-arguments: advisories bans licenses sources
+          rust-version: 1.94.1
+
+      - name: Install verified CycloneDX generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-cyclonedx-0.5.9-linux.tar.xz"
+          extract_root="$RUNNER_TEMP/cargo-cyclonedx-0.5.9-linux"
+          curl --fail --location --silent --show-error \
+            'https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz' \
+            --output "$archive"
+          echo 'fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8  '"$archive" | sha256sum --check --strict
+          mkdir -p "$extract_root"
+          tar -xJf "$archive" -C "$extract_root"
+          install -m 0755 \
+            "$extract_root/cargo-cyclonedx-x86_64-unknown-linux-gnu/cargo-cyclonedx" \
+            "$HOME/.cargo/bin/cargo-cyclonedx"
+          cargo cyclonedx --version
+
+      - name: Generate locked Rust CycloneDX SBOM
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --target x86_64-pc-windows-msvc \
+            --override-filename codex-switch.cdx
+
+      - name: Normalize workspace identity and validate SBOM
+        run: |
+          node scripts/check-sbom.mjs --prepare src-tauri/codex-switch.cdx.json
+          node scripts/check-sbom.mjs src-tauri/codex-switch.cdx.json
+
+      - name: Upload validated SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-switch-sbom-${{ github.sha }}
+          path: src-tauri/codex-switch.cdx.json
+          if-no-files-found: error
+          retention-days: 14
 
   old-saved-slot-gate:
     name: v0.2.7 saved-slot apply gate
@@ -100,7 +179,11 @@ jobs:
     name: Portable release build
     runs-on: windows-latest
     timeout-minutes: 60
-    needs: [quality, old-saved-slot-gate]
+    needs: [quality, supply-chain, old-saved-slot-gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     steps:
       - name: Check out repository
@@ -156,6 +239,25 @@ jobs:
             -SourceExe 'src-tauri/target/release/codex-switch.exe' `
             -OutputExe 'release/codex-switch.exe'
 
+      - name: Download validated SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-switch-sbom-${{ github.sha }}
+          path: supply-chain
+
+      - name: Attest executable build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/codex-switch.exe
+
+      - name: Bind validated SBOM to executable
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/codex-switch.exe
+          sbom-path: supply-chain/codex-switch.cdx.json
+
       - name: Upload verified packed executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -189,8 +291,16 @@ jobs:
           name: codex-switch-${{ github.sha }}
           path: release
 
-      - name: Recheck downloaded release contract
-        run: node scripts/check-release-contract.mjs release/codex-switch.exe
+      - name: Download validated SBOM for publication
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-switch-sbom-${{ github.sha }}
+          path: release
+
+      - name: Recheck downloaded release contracts
+        run: |
+          node scripts/check-release-contract.mjs release/codex-switch.exe
+          node scripts/check-sbom.mjs release/codex-switch.cdx.json
 
       - name: Publish verified GitHub Release
         shell: pwsh
@@ -224,12 +334,15 @@ jobs:
           )
 
           $asset = Resolve-Path 'release/codex-switch.exe'
+          $sbom = Resolve-Path 'release/codex-switch.cdx.json'
           $assetInfo = Get-Item -LiteralPath $asset
           $assetSha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
+          $sbomSha256 = (Get-FileHash -LiteralPath $sbom -Algorithm SHA256).Hash
           Write-Output "RELEASE_ASSET_BYTES=$($assetInfo.Length)"
           Write-Output "RELEASE_ASSET_SHA256=$assetSha256"
+          Write-Output "RELEASE_SBOM_SHA256=$sbomSha256"
 
-          gh release create $tag $asset `
+          gh release create $tag $asset $sbom `
             --verify-tag `
             --title "ChatGPT Switch $tag" `
             --notes-file $notesPath `

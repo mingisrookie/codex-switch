@@ -10,9 +10,23 @@ import type {
   MigrationPreflightReport,
   PendingRecoveryList,
   SessionConflictList,
+  RuntimeCompatibilityReport,
   SessionStorageControlState,
   ShadowScanReport,
 } from './types';
+
+
+const supportedCompatibility: RuntimeCompatibilityReport = {
+  status: 'supported',
+  routeConfig: 'supported',
+  sessionView: 'supported',
+  advancedStorage: 'supported',
+  stateDatabase: 'compatible',
+  schemaFingerprint: 'a'.repeat(64),
+  sqliteSchemaVersion: 7,
+  managedClients: [],
+  issues: [],
+};
 
 const report: ShadowScanReport = {
   schemaVersion: 1,
@@ -135,6 +149,7 @@ describe('SessionStorageManagementPage', () => {
     render(
       <SessionStorageManagementPage
         active
+        compatibility={supportedCompatibility}
         initialReport={investigationReport}
         dependencies={deps}
       />,
@@ -186,7 +201,7 @@ describe('SessionStorageManagementPage', () => {
       },
     };
     const deps = dependencies({ preflight: vi.fn(async () => preflight) });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     fireEvent.change(screen.getByLabelText('完整备份目录'), { target: { value: 'E:\\backup' } });
     fireEvent.click(screen.getByRole('button', { name: '开始只读预检' }));
@@ -207,7 +222,7 @@ describe('SessionStorageManagementPage', () => {
       getControlState: vi.fn(async () => committedControl),
       setAutomaticCleanup,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     const toggle = await screen.findByRole('checkbox', { name: /自动清理/ });
     expect((toggle as HTMLInputElement).checked).toBe(true);
@@ -238,7 +253,7 @@ describe('SessionStorageManagementPage', () => {
       getControlState: vi.fn(async () => disabledControl),
       runOfflineGc,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     await screen.findByText('Canonical 已就绪');
     fireEvent.click(screen.getByRole('checkbox', { name: '所有 Codex 写入进程已关闭' }));
@@ -284,6 +299,7 @@ describe('SessionStorageManagementPage', () => {
     render(
       <SessionStorageManagementPage
         active
+        compatibility={supportedCompatibility}
         initialReport={report}
         dependencies={deps}
         onBusyChange={onBusyChange}
@@ -323,7 +339,7 @@ describe('SessionStorageManagementPage', () => {
     });
     const getStatus = vi.fn(async () => freshReport);
     const deps = dependencies({ scan, getStatus });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     fireEvent.click(screen.getByRole('button', { name: '重新扫描' }));
 
@@ -395,7 +411,7 @@ describe('SessionStorageManagementPage', () => {
       listPendingRecovery,
       resolveConflict,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     const overwrite = await screen.findByRole('button', { name: '使用较新版本覆盖' });
     expect(screen.getByText('已回收')).not.toBeNull();
@@ -457,7 +473,7 @@ describe('SessionStorageManagementPage', () => {
       resolveConflict,
     });
     const firstRender = render(
-      <SessionStorageManagementPage active initialReport={report} dependencies={deps} />,
+      <SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />,
     );
 
     fireEvent.click(await screen.findByRole('button', { name: '暂不覆盖' }));
@@ -473,7 +489,7 @@ describe('SessionStorageManagementPage', () => {
     expect(screen.getByText(/已持久化“暂不覆盖”/)).not.toBeNull();
 
     firstRender.unmount();
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     const persistedButton = await screen.findByRole('button', { name: '已暂不覆盖' });
     expect((persistedButton as HTMLButtonElement).disabled).toBe(true);
@@ -562,6 +578,7 @@ describe('SessionStorageManagementPage', () => {
     render(
       <SessionStorageManagementPage
         active
+        compatibility={supportedCompatibility}
         initialReport={report}
         dependencies={deps}
         onBusyChange={onBusyChange}
@@ -631,7 +648,7 @@ describe('SessionStorageManagementPage', () => {
         stagingDiscarded: true,
       })),
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     fireEvent.change(screen.getByLabelText('完整备份目录'), { target: { value: 'E:\\backup' } });
     fireEvent.click(screen.getByRole('button', { name: '开始只读预检' }));
@@ -711,7 +728,7 @@ describe('SessionStorageManagementPage', () => {
       listPendingRecovery: vi.fn(async () => pending),
       restorePendingRecovery,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     expect(await screen.findByText('主库缺失')).not.toBeNull();
     expect(screen.getByText('真实分叉')).not.toBeNull();
@@ -761,7 +778,7 @@ describe('SessionStorageManagementPage', () => {
       listPendingRecovery,
       reconcileLegacyBackups,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     const reconcileButton = await screen.findByRole('button', { name: '验证并整理旧备份' });
     expect((reconcileButton as HTMLButtonElement).disabled).toBe(true);
@@ -812,7 +829,7 @@ describe('SessionStorageManagementPage', () => {
       getControlState: vi.fn(async () => committedControl),
       importDowngrade,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     await screen.findByText('Canonical 已就绪');
     fireEvent.click(screen.getByRole('checkbox', { name: '所有 Codex 写入进程已关闭' }));
@@ -835,6 +852,87 @@ describe('SessionStorageManagementPage', () => {
     expect(screen.getAllByText('[absolute path omitted]').length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText(/C:\\private\\payload-must-not-render/)).toBeNull();
     expect(screen.queryByText(/C:\\private\\package-must-not-render/)).toBeNull();
+  });
+
+  it('keeps read-only scan available while compatibility blocks every advanced storage mutation', async () => {
+    const scan = vi.fn(async () => report);
+    const preflight = vi.fn();
+    const deps = dependencies({ scan, preflight });
+    const blockedCompatibility: RuntimeCompatibilityReport = {
+      ...supportedCompatibility,
+      status: 'unknown',
+      sessionView: 'blocked',
+      advancedStorage: 'blocked',
+      stateDatabase: 'unsupportedSchema',
+      issues: [{ code: 'modelProviderColumnMissing', message: 'threads 表缺少 model_provider 列。' }],
+    };
+    render(
+      <SessionStorageManagementPage
+        active
+        compatibility={blockedCompatibility}
+        initialReport={report}
+        dependencies={deps}
+      />,
+    );
+
+    expect(await screen.findByText('高级存储写操作已停用')).toBeTruthy();
+    const scanButton = screen.getByRole('button', { name: '重新扫描' }) as HTMLButtonElement;
+    const preflightButton = screen.getByRole('button', { name: '开始只读预检' }) as HTMLButtonElement;
+    expect(scanButton.disabled).toBe(false);
+    expect(preflightButton.disabled).toBe(true);
+    fireEvent.click(scanButton);
+    await waitFor(() => expect(scan).toHaveBeenCalledTimes(1));
+    expect(preflight).not.toHaveBeenCalled();
+  });
+
+  it('allows an already-enabled automatic cleanup setting to be disabled while blocking a new enable', async () => {
+    const setAutomaticCleanup = vi.fn(async (enabled: boolean) => ({
+      ...pendingControl,
+      automaticCleanupEnabled: enabled,
+    }));
+    const blockedCompatibility: RuntimeCompatibilityReport = {
+      ...supportedCompatibility,
+      status: 'unknown',
+      sessionView: 'blocked',
+      advancedStorage: 'blocked',
+      stateDatabase: 'unsupportedSchema',
+      issues: [{ code: 'modelProviderColumnMissing', message: 'threads 表缺少 model_provider 列。' }],
+    };
+    const enabledDeps = dependencies({ setAutomaticCleanup });
+    const { unmount } = render(
+      <SessionStorageManagementPage
+        active
+        compatibility={blockedCompatibility}
+        initialReport={report}
+        dependencies={enabledDeps}
+      />,
+    );
+    const enabledToggle = await screen.findByRole('checkbox', { name: /自动清理/ }) as HTMLInputElement;
+    expect(enabledToggle.checked).toBe(true);
+    expect(enabledToggle.disabled).toBe(false);
+    fireEvent.click(enabledToggle);
+    await waitFor(() => expect(setAutomaticCleanup).toHaveBeenCalledWith(false));
+    unmount();
+
+    setAutomaticCleanup.mockClear();
+    const disabledControl = { ...pendingControl, automaticCleanupEnabled: false };
+    const disabledDeps = dependencies({
+      getControlState: vi.fn(async () => disabledControl),
+      setAutomaticCleanup,
+    });
+    render(
+      <SessionStorageManagementPage
+        active
+        compatibility={blockedCompatibility}
+        initialReport={report}
+        dependencies={disabledDeps}
+      />,
+    );
+    const disabledToggle = await screen.findByRole('checkbox', { name: /自动清理/ }) as HTMLInputElement;
+    expect(disabledToggle.checked).toBe(false);
+    expect(disabledToggle.disabled).toBe(true);
+    fireEvent.click(disabledToggle);
+    expect(setAutomaticCleanup).not.toHaveBeenCalled();
   });
 
   it('exports only after the offline gate and distinguishes native from target-old runtime verification', async () => {
@@ -863,7 +961,7 @@ describe('SessionStorageManagementPage', () => {
       getControlState: vi.fn(async () => committedControl),
       exportDowngrade,
     });
-    render(<SessionStorageManagementPage active initialReport={report} dependencies={deps} />);
+    render(<SessionStorageManagementPage active compatibility={supportedCompatibility} initialReport={report} dependencies={deps} />);
 
     const exportButton = await screen.findByRole('button', { name: '生成隔离降级包' });
     fireEvent.change(screen.getByLabelText('目标旧版本'), { target: { value: 'v0.2.0' } });

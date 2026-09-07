@@ -35,6 +35,7 @@ function result(
       kind: 'relay',
       baseUrl: 'https://relay.example.com/v1',
       model: 'gpt-5.5',
+      relayTransport: 'http',
       createdAtMs: 1,
       lastUsedAtMs: 2,
       lastVerifiedAtMs: 3,
@@ -189,7 +190,7 @@ describe('RuntimeSwitchProgressPanel', () => {
   });
 
   it.each([
-    ['launched' as const, 'ChatGPT 已打开'],
+    ['launched' as const, '本地 Relay 路由已应用，ChatGPT 已打开'],
     ['alreadyRunning' as const, 'ChatGPT 已在运行'],
   ])('renders the %s launch receipt without a duplicate result surface', (status, label) => {
     renderPanel({
@@ -333,12 +334,31 @@ describe('RuntimeSwitchProgressPanel', () => {
 
     expect(screen.getByText('目标请求端').nextSibling?.textContent).toBe('API Relay');
     expect(screen.getByText('登录文件').nextSibling?.textContent).toBe('未改写（允许不存在）');
-    expect(screen.getByText('配置变更').nextSibling?.textContent).toBe('已原子应用');
+    expect(screen.getByText('本地请求路由').nextSibling?.textContent).toBe('已原子应用');
+    expect(screen.getByText('服务连通性').nextSibling?.textContent).toContain('未验证');
     expect(screen.getByText('进程状态').nextSibling?.textContent).toBe('已安全修复');
     expect(screen.getByText('会话视图').nextSibling?.textContent)
       .toContain('已准备 2 条会话索引 · 0.5s');
     expect(screen.getByText('回合来源').nextSibling?.textContent)
       .toBe('已记录当前 provider、模型与账号槽位');
+  });
+
+  it('shows typed compatibility guidance and does not suggest forcing an unsupported client', () => {
+    renderPanel({
+      status: 'failed',
+      target: 'relay',
+      startedAtMs: 100,
+      completedAtMs: 180,
+      events: [
+        event('loadingRuntime', 100),
+        { ...event('failed', 170), reason: 'compatibilityBlocked', message: 'schema unsupported' },
+      ],
+      error: 'schema unsupported',
+    });
+
+    expect(screen.getByText(/数据库结构未经支持验证/)).toBeTruthy();
+    expect(screen.getByText(/不要强行迁移/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /强制|强行/ })).toBeNull();
   });
 
   it('does not claim process state was checked for an exact no-op', () => {

@@ -2107,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_fixed_single_asset_with_github_digest() {
+    fn accepts_only_the_fixed_single_executable_with_github_digest() {
         let digest = "a".repeat(64);
         let validated = select_update_asset(&release(vec![asset(
             10,
@@ -2115,6 +2115,29 @@ mod tests {
             "https://github.com/mingisrookie/codex-switch/releases/download/v0.1.7/codex-switch.exe",
         )]))
         .unwrap();
+        assert_eq!(validated.sha256, digest);
+        assert_eq!(validated.size, 10);
+    }
+
+    #[test]
+    fn ignores_a_read_only_sbom_asset_while_requiring_exactly_one_executable() {
+        let digest = "a".repeat(64);
+        let executable = asset(
+            10,
+            Some(format!("sha256:{digest}")),
+            "https://github.com/mingisrookie/codex-switch/releases/download/v0.1.7/codex-switch.exe",
+        );
+        let sbom = GithubAsset {
+            name: "codex-switch.cdx.json".to_string(),
+            size: 1_024,
+            digest: Some(format!("sha256:{}", "b".repeat(64))),
+            browser_download_url:
+                "https://github.com/mingisrookie/codex-switch/releases/download/v0.1.7/codex-switch.cdx.json"
+                    .to_string(),
+        };
+
+        let validated = select_update_asset(&release(vec![sbom, executable])).unwrap();
+
         assert_eq!(validated.sha256, digest);
         assert_eq!(validated.size, 10);
     }

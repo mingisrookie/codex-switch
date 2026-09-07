@@ -28,3 +28,7 @@ docs/superpowers/
 # DXM:START
 .dxm/
 # DXM:END
+
+# Generated Rust component inventories (CI artifacts, not source)
+/src-tauri/codex-switch.cdx.json
+/src-tauri/codex-switch.cdx.json.json

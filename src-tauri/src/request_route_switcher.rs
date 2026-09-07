@@ -10,6 +10,7 @@ use crate::{
     },
     file_ops::atomic_write,
     operation_log::operation_id,
+    runtime_compatibility::require_session_view_compatible,
     runtime_session_view::{
         commit_transition, plan_transition, prepare_transition, rollback_transition,
         PreparedViewTransition, SessionViewPlan, SessionViewTarget, SessionViewTransition,
@@ -491,6 +492,12 @@ fn build_request_route_switch_plan(
     let data_root = store.data_root().map_err(|message| {
         RequestRoutePlanError::new(RuntimeSwitchFailureReason::SessionViewUnavailable, message)
     })?;
+    require_session_view_compatible(codex_home).map_err(|failure| {
+        RequestRoutePlanError::new(
+            RuntimeSwitchFailureReason::CompatibilityBlocked,
+            failure.encoded(),
+        )
+    })?;
     let session_view = plan_transition(
         codex_home,
         live_config,
@@ -510,6 +517,7 @@ fn build_request_route_switch_plan(
             config_kind,
             relay_bearer_token.as_deref(),
             auth_state.is_official_chatgpt(),
+            runtime.relay_transport.supports_websockets(),
         )
         .map_err(|message| {
             RequestRoutePlanError::new(RuntimeSwitchFailureReason::ConfigUnavailable, message)
@@ -682,6 +690,7 @@ mod tests {
         store
             .upsert_relay(
                 RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "sk-relay-secret".to_string(),
                     model: "relay-model".to_string(),
@@ -744,7 +753,7 @@ mod tests {
                 .and_then(toml_edit::Item::as_table)
                 .and_then(|provider| provider.get("supports_websockets"))
                 .and_then(toml_edit::Item::as_bool),
-            Some(true)
+            Some(false)
         );
         let relay_sqlite_home = relay_doc
             .get("sqlite_home")
@@ -880,6 +889,7 @@ mod tests {
         store
             .upsert_relay(
                 RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "fresh-relay-fixture".to_string(),
                     model: "relay-model".to_string(),
@@ -929,6 +939,7 @@ mod tests {
         store
             .upsert_relay(
                 RelayRuntimeInput {
+                    transport: crate::provider_capability::RelayTransport::Http,
                     base_url: "https://relay.example.com/v1".to_string(),
                     api_key: "fresh-relay-fixture".to_string(),
                     model: "relay-model".to_string(),
@@ -1330,5 +1341,39 @@ mod tests {
         assert!(!fs::read_to_string(home.path().join("config.toml"))
             .unwrap()
             .contains("sqlite_home"));
+    }
+
+    #[test]
+    fn incompatible_schema_preflight_preserves_typed_failure_without_route_writes() {
+        let (home, _store_root, store, auth) = setup();
+        let db = home.path().join("state_5.sqlite");
+        Connection::open(&db).unwrap().execute_batch(
+            "DROP TABLE threads; CREATE TABLE threads (id TEXT, branch TEXT, model_provider TEXT, PRIMARY KEY(id, branch));"
+        ).unwrap();
+        let before_db = fs::read(&db).unwrap();
+        let before_config = fs::read(home.path().join("config.toml")).unwrap();
+        let failure =
+            preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap_err();
+        assert_eq!(
+            failure.reason,
+            RuntimeSwitchFailureReason::CompatibilityBlocked
+        );
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::FailedBeforeWrite);
+        let typed = crate::command_error::decode_command_failure(&failure.message).unwrap();
+        assert_eq!(
+            typed.code,
+            crate::command_error::CommandErrorCode::RuntimeCompatibilityBlocked
+        );
+        assert_eq!(typed.phase, "compatibilityPreflight");
+        assert_eq!(
+            typed.recoverability,
+            crate::command_error::CommandRecoverability::UnsupportedClient
+        );
+        assert_eq!(fs::read(&db).unwrap(), before_db);
+        assert_eq!(
+            fs::read(home.path().join("config.toml")).unwrap(),
+            before_config
+        );
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
     }
 }

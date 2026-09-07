@@ -93,12 +93,14 @@ describe('dashboard API', () => {
       baseUrl: 'https://relay.example.com/v1',
       model: 'example-model',
       apiKey: 'placeholder-key',
+      transport: 'http',
     })).rejects.toEqual(relayFailure);
     expect(invoke).toHaveBeenCalledWith('upsert_relay_runtime', {
       input: {
         baseUrl: 'https://relay.example.com/v1',
         model: 'example-model',
         apiKey: 'placeholder-key',
+        transport: 'http',
       },
     });
 
@@ -117,6 +119,30 @@ describe('dashboard API', () => {
     });
   });
 
+  it('decodes typed provider and compatibility failures without parsing message text', async () => {
+    const typed = {
+      code: 'providerCapabilityInvalid',
+      safeMessage: 'relay base URL is invalid',
+      phase: 'providerCapabilityPreflight',
+      recoverability: 'reconfigure',
+    };
+    invoke.mockRejectedValueOnce(
+      `__CHATGPT_SWITCH_COMMAND_ERROR_V1__${JSON.stringify(typed)}`,
+    );
+
+    await expect(upsertRelayRuntime({
+      baseUrl: 'https://relay.example.com/v1',
+      model: 'example-model',
+      apiKey: 'placeholder-key',
+      transport: 'http',
+    })).rejects.toEqual({
+      message: typed.safeMessage,
+      code: typed.code,
+      phase: typed.phase,
+      recoverability: typed.recoverability,
+    });
+  });
+
   it('preserves bare and malformed mutation rejection strings for compatibility', async () => {
     const legacy = 'legacy backend failure';
     invoke.mockRejectedValueOnce(legacy);
@@ -124,6 +150,7 @@ describe('dashboard API', () => {
       baseUrl: 'https://relay.example.com/v1',
       model: 'example-model',
       apiKey: 'placeholder-key',
+      transport: 'http',
     })).rejects.toBe(legacy);
 
     const malformed = `__CHATGPT_SWITCH_MUTATION_ERROR_V1__${JSON.stringify({
@@ -244,9 +271,49 @@ describe('dashboard API', () => {
     expect(invoke).not.toHaveBeenCalledWith('inspect_checkpoint_storage');
   });
 
+  it('decodes a typed compatibility query failure before exposing the dashboard domain error', async () => {
+    const typed = {
+      code: 'runtimeCompatibilityBlocked',
+      safeMessage: '当前 Codex Home 无法可靠解析。',
+      phase: 'compatibilityPreflight',
+      recoverability: 'manualInvestigation',
+    };
+    invoke.mockImplementation((command: string) => {
+      if (command === 'get_runtime_compatibility') {
+        return Promise.reject(`__CHATGPT_SWITCH_COMMAND_ERROR_V1__${JSON.stringify(typed)}`);
+      }
+      return Promise.resolve({
+        scan_codex_home: {},
+        get_session_storage_status: null,
+        list_runtimes: [],
+        scan_runtime_status: {},
+        list_operation_records: [],
+      }[command]);
+    });
+
+    const dashboard = await loadRuntimeDashboard();
+
+    expect(dashboard.runtimeCompatibility).toEqual({
+      status: 'error',
+      error: typed.safeMessage,
+    });
+    expect(JSON.stringify(dashboard)).not.toContain('__CHATGPT_SWITCH_COMMAND_ERROR_V1__');
+  });
+
   it('refreshes runtime-facing domains without scanning sessions', async () => {
     invoke.mockImplementation((command: string) => Promise.resolve({
       get_session_storage_status: null,
+      get_runtime_compatibility: {
+        status: 'supported',
+        routeConfig: 'supported',
+        sessionView: 'supported',
+        advancedStorage: 'supported',
+        stateDatabase: 'compatible',
+        schemaFingerprint: 'a'.repeat(64),
+        sqliteSchemaVersion: 7,
+        managedClients: [],
+        issues: [],
+      },
       list_runtimes: [],
       scan_runtime_status: {
         activeRuntimeId: 'relay',
@@ -262,7 +329,8 @@ describe('dashboard API', () => {
 
     expect(dashboard.runtimeStatus).toMatchObject({ status: 'ready' });
     expect(dashboard.sessionStorage).toMatchObject({ status: 'ready', data: null });
-    expect(invoke).toHaveBeenCalledTimes(5);
+    expect(dashboard.runtimeCompatibility).toMatchObject({ status: 'ready' });
+    expect(invoke).toHaveBeenCalledTimes(6);
     expect(invoke).not.toHaveBeenCalledWith('scan_sessions');
     expect(invoke).not.toHaveBeenCalledWith('scan_managed_sessions');
     expect(invoke).not.toHaveBeenCalledWith('list_backups');

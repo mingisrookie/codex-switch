@@ -497,7 +497,12 @@ where
         operation_id,
         preflight_visibility_backup_capacity,
         prepare,
-        ensure_codex_still_closed,
+        |action| {
+            crate::runtime_compatibility::require_advanced_storage_after_writer_check(
+                codex_home,
+                || ensure_codex_still_closed(action),
+            )
+        },
     )
 }
 

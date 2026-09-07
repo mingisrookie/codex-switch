@@ -166,15 +166,32 @@ function dashboardData(): DashboardData {
       },
     },
     sessionStorage: { status: 'ready', data: canonicalReadyShadowScanReport() },
+    runtimeCompatibility: {
+      status: 'ready',
+      data: {
+        status: 'supported',
+        routeConfig: 'supported',
+        sessionView: 'supported',
+        advancedStorage: 'supported',
+        stateDatabase: 'compatible',
+        schemaFingerprint: 'a'.repeat(64),
+        sqliteSchemaVersion: 7,
+        managedClients: [{
+          aumid: 'OpenAI.Codex_test!App', packageName: 'OpenAI.Codex',
+          packageFamilyName: 'OpenAI.Codex_test', version: '1.2.3.4',
+        }],
+        issues: [],
+      },
+    },
     runtimes: {
       status: 'ready',
       data: [
         {
-          id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+          id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5', relayTransport: 'http',
           createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
         },
         {
-          id: 'relay', name: 'API 中转站', kind: 'relay', baseUrl: 'https://relay.example.com/v1', model: 'gpt-5.5',
+          id: 'relay', name: 'API 中转站', kind: 'relay', baseUrl: 'https://relay.example.com/v1', model: 'gpt-5.5', relayTransport: 'http',
           createdAtMs: 2, lastUsedAtMs: 3, lastVerifiedAtMs: 4,
         },
       ],
@@ -271,6 +288,7 @@ describe('App release-hardening UI', () => {
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: initial.codexHome,
       sessionStorage: initial.sessionStorage,
+      runtimeCompatibility: initial.runtimeCompatibility,
       runtimes: initial.runtimes,
       runtimeStatus: initial.runtimeStatus,
       operations: initial.operations,
@@ -305,11 +323,11 @@ describe('App release-hardening UI', () => {
       checkedAtMs: 10,
     });
     apiMocks.importPlusRuntime.mockResolvedValue({
-      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5', relayTransport: 'http',
       createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
     });
     apiMocks.upsertRelayRuntime.mockResolvedValue({
-      id: 'relay', name: 'API 中转站', kind: 'relay', baseUrl: 'https://new.example.com/v1', model: 'gpt-5.5-mini',
+      id: 'relay', name: 'API 中转站', kind: 'relay', baseUrl: 'https://new.example.com/v1', model: 'gpt-5.5-mini', relayTransport: 'http',
       createdAtMs: 2, lastUsedAtMs: null, lastVerifiedAtMs: null,
     });
     apiMocks.createFullBackup.mockResolvedValue({
@@ -553,7 +571,7 @@ describe('App release-hardening UI', () => {
       releaseNotes: null, checkedAtMs: 10,
     });
     const pending = deferred<{
-      id: string; name: string; kind: 'plus'; baseUrl: null; model: string;
+      id: string; name: string; kind: 'plus'; baseUrl: null; model: string; relayTransport: 'http';
       createdAtMs: number; lastUsedAtMs: null; lastVerifiedAtMs: null;
     }>();
     apiMocks.importPlusRuntime.mockReturnValue(pending.promise);
@@ -568,7 +586,7 @@ describe('App release-hardening UI', () => {
     expect(apiMocks.installUpdate).not.toHaveBeenCalled();
 
     pending.resolve({
-      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5',
+      id: 'plus', name: 'ChatGPT 账号', kind: 'plus', baseUrl: null, model: 'gpt-5.5', relayTransport: 'http',
       createdAtMs: 1, lastUsedAtMs: null, lastVerifiedAtMs: null,
     });
     await waitFor(() => expect(install.disabled).toBe(false));
@@ -633,7 +651,8 @@ describe('App release-hardening UI', () => {
     expect(within(relay).getByText('当前运行')).toBeTruthy();
     expect(within(relay).queryByText('已验证')).toBeNull();
     expect((within(relay).getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getAllByText(/任务执行器会安全关闭，并在成功后自动打开 ChatGPT/)).toHaveLength(2);
+    expect(screen.getAllByText(/任务执行器会安全关闭，并在成功后自动打开 ChatGPT/)).toHaveLength(1);
+    expect(within(relay).getByText(/成功仅表示本地路由已应用/)).toBeTruthy();
   });
 
   it('loads the independent skills page only after the user opens its tab', async () => {
@@ -734,6 +753,62 @@ describe('App release-hardening UI', () => {
     expect(JSON.stringify(apiMocks.recordFrontendDiagnostic.mock.calls)).not.toContain('alice');
   });
 
+  it('blocks unknown session schemas while keeping relay configuration and read-only storage scanning available', async () => {
+    const data = dashboardData();
+    if (data.runtimeCompatibility.status !== 'ready') throw new Error('fixture must include compatibility');
+    data.runtimeCompatibility.data = {
+      ...data.runtimeCompatibility.data,
+      status: 'unknown',
+      sessionView: 'blocked',
+      advancedStorage: 'blocked',
+      stateDatabase: 'unsupportedSchema',
+      issues: [{ code: 'modelProviderColumnMissing', message: 'threads 表缺少 model_provider 列。' }],
+    };
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const relay = await screen.findByRole('article', { name: 'API 中转站态' });
+    expect((within(relay).getByRole('button', { name: '当前为中转站' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(relay).getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getAllByText('threads 表缺少 model_provider 列。').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: '高级存储' }));
+    expect(await screen.findByText('高级存储写操作已停用')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '重新扫描' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '开始只读预检' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('keeps disabling an existing mobile view available but blocks enabling it for an unknown schema', async () => {
+    apiMocks.getMobileContinuityStatus.mockResolvedValue({
+      enabled: false,
+      noticePending: false,
+      initializedAtMs: 1,
+      queued: 0,
+      publishing: 0,
+      remotePublished: 0,
+      partial: 0,
+      conflict: 0,
+      needsManual: 0,
+      items: [],
+    });
+    const data = dashboardData();
+    if (data.runtimeCompatibility.status !== 'ready') throw new Error('fixture must include compatibility');
+    data.runtimeCompatibility.data = {
+      ...data.runtimeCompatibility.data,
+      status: 'unknown',
+      sessionView: 'blocked',
+      advancedStorage: 'blocked',
+      stateDatabase: 'unsupportedSchema',
+      issues: [{ code: 'modelProviderColumnMissing', message: 'threads 表缺少 model_provider 列。' }],
+    };
+    render(<App loadDashboard={() => Promise.resolve(data)} />);
+
+    const enable = await screen.findByRole('button', { name: '开启显式加入' }) as HTMLButtonElement;
+    expect(enable.disabled).toBe(true);
+    expect(screen.getAllByText('threads 表缺少 model_provider 列。').length).toBeGreaterThan(0);
+    fireEvent.click(enable);
+    expect(apiMocks.setMobileContinuityEnabled).not.toHaveBeenCalled();
+  });
+
   it('does not disable a switch when the backend only has a mode-level match', async () => {
     const data = dashboardData();
     if (data.runtimeStatus.status !== 'ready') throw new Error('fixture must include runtime status');
@@ -764,11 +839,30 @@ describe('App release-hardening UI', () => {
     fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
 
     await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith({
-      baseUrl: 'https://new.example.com/v1', model: 'gpt-5.5-mini', apiKey: 'sk-secret',
+      baseUrl: 'https://new.example.com/v1', model: 'gpt-5.5-mini', apiKey: 'sk-secret', transport: 'http',
     }));
     expect(prompt).not.toHaveBeenCalled();
     expect(screen.queryByText('sk-secret')).toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('defaults relays to HTTP Responses and requires an explicit WebSocket choice', async () => {
+    render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
+    fireEvent.click(await screen.findByRole('button', { name: '配置中转站' }));
+    const panel = screen.getByRole('region', { name: '配置 API 中转站' });
+    const radios = within(panel).getAllByRole('radio') as HTMLInputElement[];
+    const http = radios.find((radio) => radio.value === 'http')!;
+    const websocket = radios.find((radio) => radio.value === 'websocket')!;
+
+    expect(http.checked).toBe(true);
+    expect(websocket.checked).toBe(false);
+    fireEvent.click(websocket);
+    expect(websocket.checked).toBe(true);
+    fireEvent.click(within(panel).getByRole('button', { name: '保存中转站' }));
+
+    await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith({
+      baseUrl: 'https://relay.example.com/v1', model: 'gpt-5.5', apiKey: '', transport: 'websocket',
+    }));
   });
 
   it('restores relay configuration focus after inline cancellation', async () => {
@@ -794,7 +888,7 @@ describe('App release-hardening UI', () => {
       .getByRole('button', { name: '保存中转站' }));
 
     await waitFor(() => expect(apiMocks.upsertRelayRuntime).toHaveBeenCalledWith({
-      baseUrl: 'https://relay.example.com/v1', model: 'gpt-5.5', apiKey: '',
+      baseUrl: 'https://relay.example.com/v1', model: 'gpt-5.5', apiKey: '', transport: 'http',
     }));
   });
 
@@ -886,6 +980,9 @@ describe('App release-hardening UI', () => {
     apiMocks.upsertRelayRuntime.mockRejectedValue({
       message: 'relay store unavailable',
       operationId: 'save-relay-1780000000000-42-2',
+      code: 'providerCapabilityInvalid',
+      phase: 'providerCapabilityPreflight',
+      recoverability: 'reconfigure',
     });
     apiMocks.loadRuntimeDashboard.mockReturnValueOnce(pendingRefresh.promise);
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
@@ -897,6 +994,7 @@ describe('App release-hardening UI', () => {
 
     expect(await within(panel).findByText('relay store unavailable')).toBeTruthy();
     expect(screen.getAllByText('relay store unavailable')).toHaveLength(1);
+    expect(within(panel).getByText(/请按受支持合同重新填写/)).toBeTruthy();
     fireEvent.click(within(panel).getByRole('button', { name: '导出本次诊断' }));
     await waitFor(() => expect(apiMocks.exportDiagnostics)
       .toHaveBeenCalledWith('save-relay-1780000000000-42-2'));
@@ -1692,6 +1790,7 @@ describe('App release-hardening UI', () => {
     apiMocks.loadRuntimeDashboard.mockResolvedValueOnce({
       codexHome: failed.codexHome,
       sessionStorage: failed.sessionStorage,
+      runtimeCompatibility: failed.runtimeCompatibility,
       runtimes: failed.runtimes,
       runtimeStatus: failed.runtimeStatus,
       operations: failed.operations,
@@ -1811,6 +1910,7 @@ describe('App release-hardening UI', () => {
     runtimeRefresh.resolve({
       codexHome: refreshed.codexHome,
       sessionStorage: refreshed.sessionStorage,
+      runtimeCompatibility: refreshed.runtimeCompatibility,
       runtimes: refreshed.runtimes,
       runtimeStatus: refreshed.runtimeStatus,
       operations: refreshed.operations,
@@ -1994,6 +2094,7 @@ describe('App release-hardening UI', () => {
     apiMocks.loadRuntimeDashboard.mockResolvedValue({
       codexHome: plusDashboard.codexHome,
       sessionStorage: plusDashboard.sessionStorage,
+      runtimeCompatibility: plusDashboard.runtimeCompatibility,
       runtimes: plusDashboard.runtimes,
       runtimeStatus: plusDashboard.runtimeStatus,
       operations: plusDashboard.operations,

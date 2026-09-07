@@ -45,6 +45,7 @@ import type {
   SessionSyncProgress,
   SessionSyncResult,
   OperationRecord,
+  RuntimeCompatibilityReport,
   RuntimeDashboardData,
   RuntimeKind,
   RuntimeSwitchProgress,
@@ -59,17 +60,32 @@ import type {
 } from './types';
 
 const mutationErrorEnvelopePrefix = '__CHATGPT_SWITCH_MUTATION_ERROR_V1__';
+const commandErrorEnvelopePrefix = '__CHATGPT_SWITCH_COMMAND_ERROR_V1__';
 const maxMutationErrorMessageBytes = 16 * 1024;
 const maxMutationErrorEnvelopeChars = 128 * 1024;
 const maxMutationCorrelationIdLength = 160;
 const mutationCorrelationIdPattern = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
 
+export type CommandErrorCode =
+  | 'runtimeCompatibilityBlocked'
+  | 'runtimeCompatibilityUnavailable'
+  | 'providerCapabilityInvalid';
+export type CommandRecoverability =
+  | 'retry'
+  | 'reconfigure'
+  | 'closeWritersAndRetry'
+  | 'manualInvestigation'
+  | 'unsupportedClient';
+
 export type MutationFailure = Readonly<{
   message: string;
-  operationId: string;
+  operationId?: string;
+  code?: CommandErrorCode;
+  phase?: string;
+  recoverability?: CommandRecoverability;
 }>;
 
-async function invokeMutation<T>(command: string, args?: Record<string, unknown>) {
+async function invokeTyped<T>(command: string, args?: Record<string, unknown>) {
   try {
     return args === undefined
       ? await invoke<T>(command)
@@ -79,21 +95,32 @@ async function invokeMutation<T>(command: string, args?: Record<string, unknown>
   }
 }
 
+function invokeMutation<T>(command: string, args?: Record<string, unknown>) {
+  return invokeTyped<T>(command, args);
+}
+
 function decodeMutationFailure(reason: unknown): MutationFailure | null {
   const encoded = typeof reason === 'string'
     ? reason
     : reason instanceof Error
       ? reason.message
       : null;
-  if (!encoded?.startsWith(mutationErrorEnvelopePrefix)) return null;
+  if (!encoded) return null;
+  if (encoded.startsWith(commandErrorEnvelopePrefix)) {
+    return decodeTypedCommandFailure(encoded.slice(commandErrorEnvelopePrefix.length));
+  }
+  if (!encoded.startsWith(mutationErrorEnvelopePrefix)) return null;
   const payload = encoded.slice(mutationErrorEnvelopePrefix.length);
   if (!payload || payload.length > maxMutationErrorEnvelopeChars) return null;
   try {
     const candidate = JSON.parse(payload) as unknown;
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
     const fields = candidate as Record<string, unknown>;
+    const allowed = new Set(['message', 'operationId', 'code', 'phase', 'recoverability']);
     const keys = Object.keys(fields);
-    if (keys.length !== 2 || !keys.includes('message') || !keys.includes('operationId')) return null;
+    if (!keys.includes('message') || !keys.includes('operationId') || keys.some((key) => !allowed.has(key))) {
+      return null;
+    }
     if (typeof fields.message !== 'string'
       || new TextEncoder().encode(fields.message).length > maxMutationErrorMessageBytes
       || typeof fields.operationId !== 'string'
@@ -101,10 +128,73 @@ function decodeMutationFailure(reason: unknown): MutationFailure | null {
       || !mutationCorrelationIdPattern.test(fields.operationId)) {
       return null;
     }
-    return { message: fields.message, operationId: fields.operationId };
+    const typed = decodeOptionalCommandFields(fields);
+    if (typed === null) return null;
+    return { message: fields.message, operationId: fields.operationId, ...typed };
   } catch {
     return null;
   }
+}
+
+const commandErrorCodes = new Set<CommandErrorCode>([
+  'runtimeCompatibilityBlocked',
+  'runtimeCompatibilityUnavailable',
+  'providerCapabilityInvalid',
+]);
+const commandRecoverabilities = new Set<CommandRecoverability>([
+  'retry',
+  'reconfigure',
+  'closeWritersAndRetry',
+  'manualInvestigation',
+  'unsupportedClient',
+]);
+
+function decodeTypedCommandFailure(payload: string): MutationFailure | null {
+  if (!payload || payload.length > maxMutationErrorEnvelopeChars) return null;
+  try {
+    const candidate = JSON.parse(payload) as unknown;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const fields = candidate as Record<string, unknown>;
+    const keys = Object.keys(fields);
+    const allowed = new Set(['code', 'safeMessage', 'phase', 'recoverability']);
+    if (keys.length !== 4 || keys.some((key) => !allowed.has(key))) return null;
+    if (typeof fields.safeMessage !== 'string'
+      || new TextEncoder().encode(fields.safeMessage).length > maxMutationErrorMessageBytes) {
+      return null;
+    }
+    const typed = decodeRequiredCommandFields(fields);
+    return typed ? { message: fields.safeMessage, ...typed } : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeOptionalCommandFields(fields: Record<string, unknown>) {
+  const present = ['code', 'phase', 'recoverability'].filter((key) => fields[key] !== undefined);
+  if (present.length === 0) return {};
+  if (present.length !== 3) return null;
+  return decodeRequiredCommandFields(fields);
+}
+
+function decodeRequiredCommandFields(fields: Record<string, unknown>) {
+  if (typeof fields.code !== 'string'
+    || !commandErrorCodes.has(fields.code as CommandErrorCode)
+    || typeof fields.phase !== 'string'
+    || !fields.phase
+    || fields.phase.length > 128
+    || typeof fields.recoverability !== 'string'
+    || !commandRecoverabilities.has(fields.recoverability as CommandRecoverability)) {
+    return null;
+  }
+  return {
+    code: fields.code as CommandErrorCode,
+    phase: fields.phase,
+    recoverability: fields.recoverability as CommandRecoverability,
+  };
+}
+
+export function getRuntimeCompatibility() {
+  return invokeTyped<RuntimeCompatibilityReport>('get_runtime_compatibility');
 }
 
 export function getAppStatus() {
@@ -336,9 +426,10 @@ export function resolveSessionStorageConflict(
 }
 
 export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
-  const [codexHome, sessionStorage, runtimes, runtimeStatus, operations] = await Promise.allSettled([
+  const [codexHome, sessionStorage, runtimeCompatibility, runtimes, runtimeStatus, operations] = await Promise.allSettled([
     invoke<CodexHomeStatus>('scan_codex_home'),
     invoke<ShadowScanReport | null>('get_session_storage_status'),
+    getRuntimeCompatibility(),
     invoke<RuntimeMetadata[]>('list_runtimes'),
     invoke<RuntimeStatus>('scan_runtime_status'),
     invoke<OperationRecord[]>('list_operation_records', { limit: 20 }),
@@ -347,6 +438,7 @@ export async function loadRuntimeDashboard(): Promise<RuntimeDashboardData> {
   return {
     codexHome: settledDomain(codexHome),
     sessionStorage: settledDomain(sessionStorage),
+    runtimeCompatibility: settledDomain(runtimeCompatibility),
     runtimes: settledDomain(runtimes),
     runtimeStatus: settledDomain(runtimeStatus),
     operations: settledDomain(operations),
@@ -388,6 +480,7 @@ export function loadingDashboard(): DashboardData {
     sessions: { status: 'loading' },
     managedSessions: { status: 'loading' },
     sessionStorage: { status: 'loading' },
+    runtimeCompatibility: { status: 'loading' },
     runtimes: { status: 'loading' },
     runtimeStatus: { status: 'loading' },
     backups: { status: 'loading' },
@@ -487,6 +580,15 @@ function settledDomain<T>(result: PromiseSettledResult<T>) {
   }
   return {
     status: 'error' as const,
-    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+    error: backendFailureMessage(result.reason),
   };
+}
+
+function backendFailureMessage(reason: unknown) {
+  if (reason instanceof Error && reason.message.trim()) return reason.message;
+  if (reason && typeof reason === 'object') {
+    const message = (reason as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) return message;
+  }
+  return String(reason);
 }

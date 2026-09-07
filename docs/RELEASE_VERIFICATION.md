@@ -9,6 +9,18 @@ README 只提供下载入口。具体版本、文件大小、SHA-256、构建来
 3. 下载发布页列出的唯一 Windows 文件 `codex-switch.exe`。
 4. 如需人工校验，使用该 Release 页面或 GitHub 提供的校验信息核对文件，而不是引用旧 README 的历史值。
 
+
+## 构建来源与 SBOM 证明
+
+从 v0.4.0 起，GitHub Release 固定包含唯一可执行资产 `codex-switch.exe` 和只读供应链清单 `codex-switch.cdx.json`。tag CI 为最终 EXE 生成 GitHub Artifact Attestation：一份 SLSA/in-toto 构建来源证明，以及一份绑定该 CycloneDX SBOM 的证明。安装 GitHub CLI 后可验证公开下载文件：
+
+```powershell
+gh attestation verify .\codex-switch.exe --repo mingisrookie/codex-switch
+node ..\scripts\check-sbom.mjs .\codex-switch.cdx.json
+```
+
+该证明用于确认文件与 GitHub Actions 发布身份及摘要的绑定关系。当前 EXE 仍未使用商业代码签名证书完成 Windows Authenticode；attestation、Release digest、UPX `-t` 和 PE 版本检查均不能替代 Authenticode 或杀毒软件扫描。
+
 ## 应用内更新
 
 应用内“检查更新”只面向 GitHub 最新正式 Release。发现更新后，应用会在用户点击“立即更新”后下载并替换 Windows 文件；网络或校验失败不应改变当前已安装版本的模式配置。

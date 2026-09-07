@@ -104,6 +104,7 @@ Trellis 是中大型任务记忆层，不替代 DXM。
 ### 1.2 模块边界
 
 - 新功能优先沿现有分层接入，不能把逻辑重新堆回主入口、大文件或无关模块。
+- `commands.rs` 只保留 Tauri boundary、诊断/终态和跨用例协调；请求路由、迁移、恢复等独立用例逐步提取为 application service。`App.tsx` 只保留 app shell/跨功能状态，独立展示组件不得继续内嵌。
 - 横切能力（日志、观察、导出、审计、缓存、重试、配置）应放在清晰的公共层或独立模块中，不能借某个业务开关隐式控制。
 - 兼容型薄包装允许存在，但必须有明确目的；没有意义的旧分支应在后续重构中清理。
 - 不为“看起来整洁”做无关重写、全文件格式化或大范围重命名。
@@ -192,11 +193,13 @@ preflight -> plan -> capacity -> backup -> apply -> verify -> persist terminal -
 
 本项目当前运行态是固定的 `plus`（ChatGPT 账号内部兼容 ID）和 `relay` 两槽位。扩展为任意账号池属于产品范围变化，必须先更新 PRD，不能仅通过循环 UI 或复用 legacy profile command 偷渡。
 
-Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；只接受无内嵌凭据/query/fragment 的 HTTPS Base URL，HTTP 仅允许 loopback。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文，scheme/host/port 改变必须输入新 Key。Key 不得回填或回显。槽位中只存 DPAPI 密文；受管 Relay provider ID 必须由单一常量定义，当前只接受 `openai_custom`。激活 Relay 时允许且仅允许把解密值写入 live `config.toml` 的受管 `experimental_bearer_token`，并必须把同一表中的 `supports_websockets` 权威设为 `true`；切回 Account 必须按同一来源删除整个受管 provider 表。任何 TOML 解析错误、日志、回执或 UI 都不得包含 Key。生产版没有独立 Relay 连接验证、`/models` 探测或 Validate/Direct 选择；旧 `validate/direct` metadata 只做兼容读取，不得驱动切换行为。运行态 `exact` 判定必须比较所有影响请求路由的 provider 字段，包括 Base URL、bearer、目标感知的认证策略与 WebSocket 开关；`supports_websockets` 为 `false` 或缺失时不得报告 exact。
+Relay 连接必须同时在前端做即时体验校验、在后端做权威校验；当前合同限定为无内嵌凭据/query/fragment 的 Base URL、Bearer API Key、Responses API 和显式传输能力。HTTP 仅允许 loopback，远程必须 HTTPS。origin-only 地址补 `/v1`，用户已填写的非空网关路径必须保留。API Key 只能通过 password 表单进入，首次必填；后续只有规范化 URL 的 origin 不变时才允许空值保留旧密文。Key 不得回填或回显。槽位中只存 DPAPI 密文；受管 provider ID 固定为 `openai_custom`。传输默认 `Http` / `supports_websockets = false`；只有用户明确选择 `Websocket` 才写为 `true`，不得从 HTTPS、服务名或“OpenAI-compatible”描述推断。生产版没有独立网络探测；本地成功回执不得宣传为服务/Key/模型/WSS 已验证。运行态 `exact` 必须比较 Base URL、bearer、认证策略和槽位 transport。
 
 手机连续性必须使用独立版本化 cutover/queue；首次初始化只读取 SQLite thread ID，不扫描或上传旧 JSONL。队列只保存 thread ID、source fingerprint、typed 状态和脱敏失败分类，不保存正文、路径内容或凭据。自动领取只允许 cutover 后全新、未归档、受管 Relay 会话；单批最多 8 thread/8 MiB，切回 Account 最多 4 批且总预算 30 秒，仍 deferred 必须保持 Relay route、不得先切回再隐藏会话。canonical 就绪后发布只更新 Account/Remote 数据库视图并继续同一正文；若原生兼容必须生成 provider-specific header，只允许操作期临时适配且结束归零。分叉必须保留多个 branch 并返回 conflict，禁止 last-write-wins。没有手机侧证据时 UI 只能写“本机 Remote 已发布”或“已提交到手机同步”。
 
-Relay 会话可见性必须通过独立 SQLite 视图保证：已有 `state_5.sqlite` 时使用 Online Backup 生成 provider-normalized sibling view，三个全局 SQLite 只在 WAL checkpoint、同卷 hard-link、相同 file identity 和 `quick_check` 通过时共享；完全新建 Home 只创建受管空视图目录和状态，不伪造数据库。不得批量改写 Account 原库、复制全局库或原 JSONL。Relay route 必须同时写入受管 `sqlite_home`、`experimental_bearer_token` 与 `supports_websockets = true`；`requires_openai_auth` 由只读 auth 快照决定：官方 `chatgpt` auth 存在时写 `true` 以维持 Desktop 账户识别，auth 缺失或为可解析非官方状态时写 `false`，实际 Relay 请求始终使用受管 bearer。
+Relay 会话可见性必须通过独立 SQLite 视图保证：已有 `state_5.sqlite` 时使用 Online Backup 生成 provider-normalized sibling view，三个全局 SQLite 只在同卷 hard-link、相同 file identity、active 路径 WAL checkpoint、inactive 路径 sidecar 前后均缺失和 `quick_check` 通过时共享；完全新建 Home 只创建受管空视图目录和状态，不伪造数据库。不得批量改写 Account 原库、复制全局库或原 JSONL。Relay route 必须同时写入受管 `sqlite_home`、`experimental_bearer_token` 与槽位显式 transport 对应的 `supports_websockets`；`requires_openai_auth` 由只读 auth 快照决定：官方 `chatgpt` auth 存在时写 `true` 以维持 Desktop 账户识别，auth 缺失或为可解析非官方状态时写 `false`，实际 Relay 请求始终使用受管 bearer。
+
+ChatGPT/Codex 包版本只作为诊断信息，不作为写入白名单。实际能力必须由 canonical Codex Home 解析、regular/non-reparse file identity、bounded 前后观测、SQLite `quick_check`、`schema_version`、关键 `threads` 列和稳定 Schema 指纹判定，并分别建模为 request config / session view / advanced storage。数据库缺失允许 fresh-home 路由；未知、损坏或持续变化的结构只阻止依赖它的写操作。Provider/兼容性失败必须使用稳定 code、phase 和 recoverability，UI 不得从 message 文本反解析。
 
 Relay 切换不得发送 `/models` 或其他独立网络探测，也不得以外部链接状态阻断本地请求路由切换；只执行本地 URL/凭据、auth 缺失或可解析状态、可选 config 快照、受管配置写入和写后 route exact 校验。Account 切换仍必须要求官方 `chatgpt` auth。请求路由 mutation 禁止进入大会话 planning/capacity/checkpoint/GC 链路；成功 terminal 后只允许后台排队 coalesced Shadow，不得调用 legacy 增量/完全同步正文物化。
 
@@ -209,7 +212,7 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - Dashboard 数据必须按领域建模为 `loading | ready | error`；某个 Tauri command 失败时保留该域错误，禁止替换成空数组、零计数或绿色安全状态。
 - 应用首屏只加载 runtime 必需域；会话扫描、managed inventory 和备份 payload 哈希等昂贵域必须按需加载。请求路由结果始终刷新 runtime 域；只有 typed incremental `applied` 才标记 session stale，apply `failed/deferred` 可标记 backup stale。禁止为了“看起来同步”触发全量扫描。
 - v0.3 存储卡首屏只读取最近一次 Shadow 报告；显式扫描使用 blocking worker，切换成功后的扫描必须在 durable terminal 之外后台排队。进程内请求必须 single-flight/coalescing，多个 Switch 进程还必须竞争固定根 Windows 独占 scan lease，不得并发写 cache/report，也不得增加普通账号切换延迟。UI 必须明确展示在线仅扫描、不删除，不能把 potential reclaim bytes 写成已回收空间。
-- “存储”页必须把 control state 与 Shadow report 分开：显示 canonical 会话、安全副本、冲突、真实已回收 bytes 和安全窗口状态，并明确在线始终只扫描；未迁移时迁移入口可用而合并/GC/冲突/降级 apply 按合同禁用。迁移 UI 显示只读预检、完整备份、真实恢复验证、原子计划、提交验证五步；高风险提交必须要求 writer-closed 明示，冲突默认 defer，时间不可靠时不显示“较新”推荐。
+- “高级存储”页必须把运行时兼容能力、control state 与 Shadow report 分开：显示 canonical 会话、安全副本、冲突、真实已回收 bytes 和安全窗口状态，并明确在线始终只扫描；只有 `runtime_compatibility.advancedStorage = supported` 时才开放迁移/GC/冲突/降级/恢复写操作；未知结构始终只读扫描和排查。迁移 UI 显示只读预检、完整备份、真实恢复验证、原子计划、提交验证五步；高风险提交必须要求 writer-closed 明示，冲突默认 defer，时间不可靠时不显示“较新”推荐。
 - 备份域按需加载时应把可恢复 full backup 与检查点空间状态作为独立 `DomainState` 返回；先完成会执行 legacy 迁移的备份列表读取，再调用持 mutation guard 的检查点 inspect，禁止两个 guard 入口并发。空间状态必须区分总占用、严格证据可回收项、安全保留项、警告和最近清理结果。手工清理没有后端 typed 子阶段时，只能通过当前页面展示单一 indeterminate 运行态，并按 `attemptedCount` / `failedCount` 区分成功、成功但有保留说明和真实 partial；不使用确认弹窗、伪造分步进度、伪造百分比或模糊“已优化”文案。
 - 备份域刷新若已有 Promise 执行中，新的 mutation 后刷新请求必须标记 queued，并在旧请求 settle 后至少补跑一次最新扫描；不得永久复用 mutation 前快照或在成功回执旁继续显示旧可回收数值。
 - 写操作门禁必须依赖真实文件/SQLite/运行态域，而不是“页面加载完成”或“文件路径存在”。
@@ -239,7 +242,7 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - 固定仓库更新检查属于外部只读集成：后端固定 endpoint，设置超时/响应上限、禁止元数据重定向、验证稳定 SemVer，错误不得回显响应正文；前端不得传任意仓库或下载 URL。
 - 启动更新检查必须与 runtime/session/backup 数据域解耦并保持非阻塞；应用不是常驻工具，不新增后台服务或运行中轮询。
 - Windows 单文件自更新必须只接受唯一固定名称的 Release EXE，要求 GitHub SHA-256 digest，按元数据大小和全量流式 hash 双重验证；下载 URL 从固定仓库和已验证 tag 推导，只允许 HTTPS GitHub Release 资产重定向。v0.2.1 下载连接超时为 30 秒、总下载超时为 10 分钟；helper readiness 超时必须 kill + wait，staging 清理必须有界重试。当前 EXE 复制为同版本 helper，父进程只能在 helper 完成计划/路径/hash/进程句柄预检并写入 readiness 后退出。
-- 公开 UI 和窗口标题使用 ChatGPT Switch，但 GitHub Release 资产必须继续唯一命名为 `codex-switch.exe`；v0.1.9 updater 固定校验该名称，未经兼容迁移不得改为 `chatgpt-switch.exe`。
+- 公开 UI 和窗口标题使用 ChatGPT Switch；GitHub Release 必须只有一个可执行资产且继续命名为 `codex-switch.exe`，允许另附只读 `codex-switch.cdx.json`。v0.1.9 updater 固定选择该 EXE 名称，未经兼容迁移不得改为 `chatgpt-switch.exe`。
 - EXE 替换必须在目标目录同卷完成：先写 replacement 并复核 hash，再备份旧 EXE、激活 replacement。新进程必须在 Tauri `RunEvent::Ready` 后写入绑定受控 plan、状态与目标 hash 的 ACK；helper 在 ACK 前保留 backup，早退/超时必须终止新进程并恢复旧 EXE。staging 名必须来自 Windows CSPRNG，目录按当前 token 是否 elevated 施加只允许 SYSTEM/Administrators 或 SYSTEM/owner 的受限 DACL，并在准备和 helper 执行期间持有目录句柄。replacement 的每个不可逆阶段必须先后持久化并校验 journal，重入时按 journal 和旧/新 hash 决定继续或回滚。debug 和非 Windows 构建必须明确拒绝真实安装。
 - Release 型 Trellis 任务必须遵守不可倒置的收口顺序：最终 `check.md` 先满足 PASS 门并保持任务 active；随后提交、推送、创建 tag，完成 tag-CI、公开 Release 回下载和 updater 成功/回滚证据；只有这些公开入口证据都绑定到精确发布 commit 后，才允许依次执行 `task.py finish`、`task.py archive <task> --no-commit` 并生成/校验 schema v2 completion receipt。不得在 public/updater 证据之前归档任务或写一个宣称完成的 receipt。
 
@@ -257,6 +260,8 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 - 改 Python：至少对修改过的 Python 文件运行 `python -m py_compile <file>`，若项目有 `pytest`、`unittest`、`ruff`、`mypy` 或 CI 入口，以项目真实命令为准。
 - 改 Go / Rust / Java / 其他语言：运行该语言和本项目真实使用的最小语法、类型、测试或构建检查，例如 `go test ./...`、`cargo test`、`mvn test`；不可硬套 Node/JS 规则。
 - 改核心逻辑：运行项目当前真实回归命令；如果清单、README、长期文档、CI 配置和实际可运行命令冲突，以当前实际可运行命令为准，并说明证据。
+- 工具链固定：本地和 CI 使用 `rust-toolchain.toml` 的 Rust 1.94.1；Node CI 固定 22，direct npm dependency 必须精确版本。改依赖或发布链时同时运行 npm production audit、cargo-deny advisories/sources/licenses 和 CycloneDX SBOM 合同。
+- 核心状态机、URL/路径归一化、typed error round-trip 和恢复幂等优先增加 property/model/fault-injection 测试；仅堆手写 happy-path 用例不构成状态空间覆盖。
 - 改文档-only：至少做文档内容、链接和乱码检查。
 - 测试失败时不得提交；除非用户明确要求保留失败状态用于排查，否则必须先修复。
 
@@ -285,7 +290,7 @@ npm run check:release
 - `.github/workflows/ci.yml` 必须在 `windows-latest` 上覆盖前端测试/类型/构建、Rust fmt/clippy/test、raw Tauri release 编译/合同、固定官方 UPX ZIP/EXE 双 hash、copy-only packing、`upx -t`、packed 合同/3,000,000 bytes 上限，以及只留存 packed artifact；CI 文件存在不等于本轮已通过。
 - 备份、切换、迁移、冲突、离线 GC、降级、删除和恢复等高风险变化必须有临时目录或临时 `CODEX_HOME` 测试，至少覆盖幂等、故障注入、并发 TOCTOU 和回滚终态。真实主库破坏性测试只能使用本机隔离副本，最终真实主库只做只读 preflight。
 - 既有备份测试必须覆盖 v4 scope/binding/role、Full/Sessions active+archived、manual Full/restore safety、损坏候选和局部点排除；旧 hard-delete scope 只能作为 v0.2.x test fixture 覆盖，并必须另行断言 v0.3 production command registry 与 UI 均无会话 hard-delete。请求端切换不会创建 backup/checkpoint。v0.3 迁移备份另测未加密 manifest、SQLite Online Backup、空间/根冲突、实际隔离恢复、真实 Codex runtime verify、损坏/sidecar/长路径与无 `runtimeVerified` 禁止 Apply；不得把两套备份合同混为一谈。
-- 请求端切换测试必须覆盖真实 phase（含 `validatingOfficialAuth` 兼容 phase、`syncingIncrementalSessions`、`repairingAppState`、`launchingApp`）、Account 缺失/非官方 auth 写前失败、Relay 缺失 auth/config 成功且不创建 auth、可解析非官方 auth 原字节保持、损坏 auth 写前失败、Account↔Relay 前后 auth bytes/mtime 或缺失状态不变、Relay bearer/目标感知 `requires_openai_auth`/`supports_websockets = true`/隔离 `sqlite_home` 写入与 Account 清除恢复、完全新建 Home 不伪造数据库且失败回到全缺失、bootstrap 未建立共同基线时 Account/Relay 双库冲突 fail closed、旧槽位 WebSocket 缺失或 `false` 的纠正、live WebSocket/认证策略漂移降级为 mode、Relay 副本 provider 归一且 Account 原库不变、Account 发布 deferred 时 route 不写、配置写后失败只回滚 config 且不覆盖写后外部替换、进程重启阻断恢复、自动 GC writer-before-lock 双检、零全量 JSONL scan/checkpoint/route-triggered GC、runtime refresh pending、typed reason 的 Rust→Tauri→TS→UI 映射、单一错误面和按需域不失效；AUMID 测试还必须覆盖可信持久记录、双注册、持久根不可用时的唯一注册回退、篡改/失效 fail closed。所有成功切换只在 durable terminal 后启动 ChatGPT，launch failed 不回滚；只有 activation/verification 类失败可重试，目标缺失/歧义只给修复指导。
+- 请求端切换测试必须覆盖真实 phase（含 `validatingOfficialAuth` 兼容 phase、`syncingIncrementalSessions`、`repairingAppState`、`launchingApp`）、Account 缺失/非官方 auth 写前失败、Relay 缺失 auth/config 成功且不创建 auth、可解析非官方 auth 原字节保持、损坏 auth 写前失败、Account↔Relay 前后 auth bytes/mtime 或缺失状态不变、Relay bearer/目标感知 `requires_openai_auth`/HTTP 默认与显式 WebSocket transport/隔离 `sqlite_home` 写入与 Account 清除恢复、完全新建 Home 不伪造数据库且失败回到全缺失、bootstrap 未建立共同基线时 Account/Relay 双库冲突 fail closed、旧槽位缺失 transport 安全迁移为 HTTP、显式 WebSocket 与 live transport/认证策略漂移降级为 mode、Relay 副本 provider 归一且 Account 原库不变、Account 发布 deferred 时 route 不写、配置写后失败只回滚 config 且不覆盖写后外部替换、进程重启阻断恢复、自动 GC writer-before-lock 双检、零全量 JSONL scan/checkpoint/route-triggered GC、runtime refresh pending、typed reason 的 Rust→Tauri→TS→UI 映射、单一错误面和按需域不失效；AUMID 测试还必须覆盖可信持久记录、双注册、持久根不可用时的唯一注册回退、篡改/失效 fail closed。所有成功切换只在 durable terminal 后启动 ChatGPT，launch failed 不回滚；只有 activation/verification 类失败可重试，目标缺失/歧义只给修复指导。
 - legacy 会话同步测试继续覆盖 source 尾/session ID/len/hash 漂移、抢先 Create、完整 import、provider marker/slot 幂等、divergence 与旧文件 byte/hash/mtime；同时必须有 reachability 测试证明这些 provider materializer 不从 v0.3 普通 route/merge command 调用。连续切换 100 次必须保持永久 provider 正文新增为 0。
 - v0.3 canonical 对抗矩阵必须覆盖：Equal/EqualExceptProvider/双向 Prefix/双尾、消息乱序、缺失工具结果、非法 JSONL、marker 缺失/伪造/hash 漂移、三份以上同 ID、文件名时间反向；主库/Account/Relay/Shared/legacy/backup/WAL 引用；扫描后新增引用、删除前引用变化；Desktop/CLI append、双进程分叉、扫描中再次切换、hash 间变化、数据库提交竞争；每个迁移阶段崩溃、强杀/重启、磁盘满、占用、权限/SQLite 写失败、恢复包损坏、回滚中断；迁移/GC/降级重试幂等。任一有效消息丢失、工具关系损坏、引用中文件删除、分叉误合并或并发误删都阻断发布。
 - 备份前端测试必须覆盖旧扫描 pending 时 queued rerun 的最终状态、按需列表不再裁成 5 项、Full 删除二次确认/回执，以及恢复点删除后刷新显示更旧候选；不得只验证 invoke 次数。

@@ -1,3 +1,44 @@
+export type CompatibilityLevel = 'supported' | 'warning' | 'unknown' | 'blocked';
+export type CapabilityAvailability = 'supported' | 'unavailable' | 'blocked';
+export type StateDatabaseCompatibility =
+  | 'absent'
+  | 'compatible'
+  | 'unsupportedSchema'
+  | 'unavailable';
+export type RuntimeCompatibilityIssueCode =
+  | 'stateDatabaseAbsent'
+  | 'runtimePathUnavailable'
+  | 'stateDatabaseUnsafe'
+  | 'stateDatabaseChanged'
+  | 'stateDatabaseUnreadable'
+  | 'stateDatabaseIntegrityFailed'
+  | 'threadsTableMissing'
+  | 'threadIdColumnMissing'
+  | 'threadIdColumnIncompatible'
+  | 'modelProviderColumnMissing'
+  | 'modelProviderColumnIncompatible'
+  | 'rolloutPathColumnMissing'
+  | 'rolloutPathColumnIncompatible';
+
+export type ManagedClientPackage = {
+  aumid: string;
+  packageName: string | null;
+  packageFamilyName: string | null;
+  version: string | null;
+};
+
+export type RuntimeCompatibilityReport = {
+  status: CompatibilityLevel;
+  routeConfig: CapabilityAvailability;
+  sessionView: CapabilityAvailability;
+  advancedStorage: CapabilityAvailability;
+  stateDatabase: StateDatabaseCompatibility;
+  schemaFingerprint: string | null;
+  sqliteSchemaVersion: number | null;
+  managedClients: ManagedClientPackage[];
+  issues: Array<{ code: RuntimeCompatibilityIssueCode; message: string }>;
+};
+
 export type FileStatus = {
   path: string;
   exists: boolean;
@@ -503,6 +544,7 @@ export type DashboardData = {
   sessions: DomainState<SessionInventory>;
   managedSessions: DomainState<ManagedSessionInventory>;
   sessionStorage: DomainState<ShadowScanReport | null>;
+  runtimeCompatibility: DomainState<RuntimeCompatibilityReport>;
   runtimes: DomainState<RuntimeMetadata[]>;
   runtimeStatus: DomainState<RuntimeStatus>;
   backups: DomainState<BackupSummary[]>;
@@ -512,7 +554,7 @@ export type DashboardData = {
 
 export type RuntimeDashboardData = Pick<
   DashboardData,
-  'codexHome' | 'sessionStorage' | 'runtimes' | 'runtimeStatus' | 'operations'
+  'codexHome' | 'sessionStorage' | 'runtimeCompatibility' | 'runtimes' | 'runtimeStatus' | 'operations'
 >;
 
 export type SessionDashboardData = Pick<
@@ -642,6 +684,7 @@ export type SessionMutationResult = {
 };
 
 export type RuntimeKind = 'plus' | 'relay';
+export type RelayTransport = 'http' | 'websocket';
 export type RelaySwitchPreference = 'validate' | 'direct';
 
 export type RuntimeMetadata = {
@@ -650,6 +693,7 @@ export type RuntimeMetadata = {
   kind: RuntimeKind;
   baseUrl: string | null;
   model: string | null;
+  relayTransport: RelayTransport;
   createdAtMs: number;
   lastUsedAtMs: number | null;
   lastVerifiedAtMs: number | null;
@@ -676,6 +720,7 @@ export type RelayRuntimeInput = {
   baseUrl: string;
   apiKey: string;
   model: string;
+  transport: RelayTransport;
 };
 
 export type SkillId = 'image2' | 'grokSearch';
@@ -961,6 +1006,7 @@ export type RuntimeSwitchFailureReason =
   | 'invalidAuthState'
   | 'configUnavailable'
   | 'sessionViewUnavailable'
+  | 'compatibilityBlocked'
   | 'standaloneWriterActive'
   | 'mutationBusy'
   | 'processCloseFailed'
