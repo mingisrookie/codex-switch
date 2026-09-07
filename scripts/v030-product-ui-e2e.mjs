@@ -3,8 +3,7 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import readline from "node:readline";
-import { spawn } from "node:child_process";
+import { initializeNativeCodexState } from "./v030-native-state.mjs";
 import {
   CdpClient,
   assertEvidenceHasNoAbsoluteWindowsPath,
@@ -69,40 +68,6 @@ async function primeWebViewProfile(root, executable, workspace, environment, por
       await waitForNoExecutableProcess(executable, 30_000).catch(() => {});
     }
   }
-}
-
-async function initializeNativeCodexState(codexExe, codexHome, workspace, environment, clientVersion) {
-  const child = spawn(codexExe, ["app-server", "--stdio", "--disable", "plugins"], {
-    cwd: workspace,
-    env: { ...environment, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: codexHome },
-    windowsHide: true,
-    stdio: ["pipe", "pipe", "ignore"],
-  });
-  const lines = readline.createInterface({ input: child.stdout });
-  const acknowledged = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("native Codex schema initialization timed out")), 30_000);
-    lines.on("line", (line) => {
-      try {
-        const message = JSON.parse(line);
-        if (message.id === 1) {
-          clearTimeout(timer);
-          resolve(Boolean(message.result));
-        }
-      } catch {}
-    });
-    child.once("error", (error) => { clearTimeout(timer); reject(error); });
-  });
-  child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "codex-switch-product-ui", version: clientVersion }, capabilities: { experimentalApi: false } } })}\n`);
-  const accepted = await acknowledged;
-  if (!accepted) throw new Error("native Codex rejected schema initialization");
-  child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
-  child.stdin.end();
-  const status = await new Promise((resolve, reject) => {
-    child.once("exit", (code, signal) => resolve({ code, signal }));
-    child.once("error", reject);
-  });
-  lines.close();
-  if (status.code !== 0 || !fs.statSync(path.join(codexHome, "state_5.sqlite")).isFile()) throw new Error("native Codex did not create the product UI state database");
 }
 
 function options(argv) {

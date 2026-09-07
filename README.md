@@ -1,172 +1,132 @@
-# ChatGPT Switch
+<h1 align="center">ChatGPT Switch</h1>
 
-在 **Windows** 上，一键在 **ChatGPT 官方模式** 和 **API 模式**之间切换。API 模式使用你自己配置的 OpenAI-compatible API（也常被称为 API 中转站）。
+<p align="center"><strong>在 Windows 上切换官方账号与自有 API，让本机会话继续留在手边。</strong></p>
+<p align="center">无需反复退出登录，也不用每次手工编辑配置。切换、会话、备份与诊断，在一个桌面工具里完成。</p>
 
-无需反复退出官方 ChatGPT 登录，也无需手工修改本地配置。ChatGPT Switch 会协助关闭 ChatGPT Desktop、切换请求配置、检查结果并重新打开应用；还提供本机会话管理、完整备份、诊断导出和应用内更新。
+<p align="center">
+  <a href="https://github.com/mingisrookie/codex-switch/releases/latest"><img src="https://img.shields.io/github/v/release/mingisrookie/codex-switch?label=Release" alt="最新正式版本" /></a>
+  <a href="https://github.com/mingisrookie/codex-switch/actions/workflows/ci.yml"><img src="https://github.com/mingisrookie/codex-switch/actions/workflows/ci.yml/badge.svg?branch=main" alt="Windows CI 状态" /></a>
+  <img src="https://img.shields.io/badge/Windows-x64-0078D4" alt="Windows x64" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-555" alt="MIT License" /></a>
+</p>
 
-[下载最新版](https://github.com/mingisrookie/codex-switch/releases/latest) · [快速开始](#快速开始) · [安全与数据](#安全与数据) · [问题反馈](https://github.com/mingisrookie/codex-switch/issues)
+<p align="center">
+  <a href="https://github.com/mingisrookie/codex-switch/releases/latest/download/codex-switch.exe"><strong>下载 Windows 版</strong></a>
+  · <a href="https://github.com/mingisrookie/codex-switch/releases/tag/v0.3.5">v0.3.5 更新说明</a>
+  · <a href="#快速开始">快速开始</a>
+  · <a href="docs/USER_GUIDE.md">使用指南</a>
+  · <a href="https://github.com/mingisrookie/codex-switch/issues">反馈问题</a>
+</p>
 
-> **先知道这些：**
-> - ChatGPT Switch **不是 API 中转服务**，不会提供 ChatGPT 账号、API Key、模型额度或第三方接口。
-> - 当前只支持 **Windows x64**；你需要自行安装 ChatGPT Desktop。只使用 API 模式时无需先登录官方账号，切回官方模式时才需要有效官方登录。
-> - 这是独立开源项目，**不是 OpenAI 官方产品**，与 OpenAI 没有隶属或授权关系。
-
-## 下载最新版
-
-1. 打开 [GitHub Releases](https://github.com/mingisrookie/codex-switch/releases/latest)。
-2. 下载唯一的 Windows 文件：`codex-switch.exe`。
-3. 双击运行；可以直接配置 API 中转站。需要使用官方模式时，再让 ChatGPT Desktop 完成官方登录。
-
-Release 页面是稳定版、版本说明和文件校验信息的唯一来源。`main` 分支可能包含正在开发的下一版本功能；日常使用请优先下载 Release，而不是自行使用仓库源码构建产物。
+> **独立开源项目，非 OpenAI 官方产品。** 本工具不提供账号、API Key 或模型额度，也不是 API 中转服务。使用前需自行安装兼容的 ChatGPT Desktop，并准备有权使用的 API 服务；只使用 API 模式时无需先登录官方账号。
 
 ## 界面预览
 
-<img src="docs/assets/screenshot.png" alt="ChatGPT Switch 的运行态页面示例" width="920" />
+<img src="docs/assets/runtime-v0.3.5.png" alt="ChatGPT Switch v0.3.5 运行态页：官方账号与 API 中转站配置入口" width="1100" />
 
-**首次使用主要看三个区域：**左侧是官方模式，右侧是 API 模式，底部可进入会话、备份和诊断功能。截图来自早期界面，实际按钮和布局会随版本小幅调整。
+**运行态：**官方账号与 API 中转站分开配置，保存状态与当前激活状态分开显示。切换时展示实际执行阶段，失败时提供对应的处理提示。
 
-## 适合谁
+<img src="docs/assets/sessions-v0.3.5.png" alt="ChatGPT Switch v0.3.5 会话页：搜索、匹配数量、只看已选和跨页选择提示" width="1100" />
 
-- 在同一台 Windows 电脑上交替使用官方 ChatGPT 与自有 OpenAI-compatible API 的用户。
-- 不想每次切换都手动编辑 `.codex` 配置、关闭应用或重新登录的人。
-- 希望在本机查看会话、创建恢复点、导出脱敏诊断信息的用户。
+**会话管理：**搜索、筛选、排序和跨页选择集中在同一页。截图由 v0.3.5 桌面程序在隔离测试环境中实际截取，会话为示例数据，不包含真实账号、密钥或聊天内容。
 
-不适合：需要 API 托管、多人共享密钥、跨平台客户端，或没有权限使用目标 API 的场景。
+## 它解决什么问题
 
-## 它能做什么
-
-| 功能 | 你得到什么 |
+| 你要做的事 | ChatGPT Switch 的处理方式 |
 | --- | --- |
-| 一键切换 | 在官方模式与 API 模式间切换，不必反复手改配置。 |
-| 保留官方登录 | 切换请求方式，不替换或退出你的官方 ChatGPT 登录。 |
-| 自动重开应用 | 切换前关闭受管的 ChatGPT Desktop，完成后尝试重新打开。 |
-| 本机会话管理 | 查看、搜索、筛选、排序会话；可把归档会话恢复为可见。 |
-| 会话合并与修复 | 在支持该功能的版本中，保守整理可安全合并的本机会话；冲突不会直接覆盖。 |
-| 完整备份与恢复 | 手动创建恢复点，在需要时恢复本地受管数据。 |
-| 诊断与更新 | 导出脱敏诊断包，并在应用内检查和安装正式版更新。 |
+| 在官方账号和自有 API 之间切换 | 管理两种请求配置，协助关闭受管应用，检查切换结果，再尝试重新打开。 |
+| 切换时保留官方登录 | 官方 `auth.json` 只读，不替换、不伪造；切回官方模式需要有效官方登录。 |
+| 从大量会话中找到目标 | 按标题、ID、provider 或路径搜索，配合来源、归档状态及更新时间筛选和排序。 |
+| 核对批量操作范围 | 每页 50 条，跨页保留选择；“只看已选”和页外选择提示帮助确认处理范围。 |
+| 恢复归档会话或整理本机数据 | 显式执行“恢复可见”及符合前置条件的“会话合并与修复”；冲突保留，不猜测覆盖。 |
+| 留下恢复点、排查问题或更新 | 手动完整备份与恢复、脱敏诊断导出、应用内正式版更新。 |
+
+## v0.3.5 更新重点
+
+搜索索引和排序结果现在可以复用，减少重复计算；列表刷新不再把你送回第一页。新增匹配数量、本页范围、清空搜索、只看已选以及页外选择提示，同时修正历史时间单位混用导致的排序问题。
+
+本版还修复了发布流水线的 GitHub CLI 认证遗漏。详细变化见 [更新日志](CHANGELOG.md#v035---2026-09-07)。
 
 ## 快速开始
 
-1. 下载并运行 `codex-switch.exe`。
-2. 确认 ChatGPT Desktop 已安装。只使用 API 模式时不需要先登录官方账号。
-3. 在右侧点击 **“配置 API 中转站”**，填写 Base URL、模型名和 API Key；这就是 README 所说的**API 模式**。
-4. 点击 **“切换到中转站”**，等待切换进度窗口完成并重新打开 ChatGPT Desktop。
-5. 需要使用官方模式时，先在 ChatGPT Desktop 完成官方登录，再在左侧保存当前账号态并点击 **“切换到 ChatGPT 账号”**。
+### 1. 下载并打开
 
-切换时，工具会关闭 ChatGPT Desktop、切换本地请求配置、检查结果并重新打开应用。界面中的旧按钮名称会保留兼容性；本文统一把它们称为“官方模式”和“API 模式”。
+下载 [最新正式版 `codex-switch.exe`](https://github.com/mingisrookie/codex-switch/releases/latest/download/codex-switch.exe)，放到便于查找的目录后运行。当前只发布 **Windows x64 便携版**，无需 Node.js 或 Rust 开发环境。
 
-## 官方模式和 API 模式
+已安装旧版的用户，可在应用顶部选择 **“检查更新”**。下载、版本说明和校验信息统一以 [GitHub Releases](https://github.com/mingisrookie/codex-switch/releases/latest) 为准；`main` 中的提交不等于已经发布的安装文件。
 
-| 模式 | 适用情况 | 工具做什么 |
-| --- | --- | --- |
-| 官方模式 | 你已登录官方 ChatGPT，并要继续使用官方请求方式 | 校验有效官方登录，恢复受管请求配置，并移除受管 API 模式配置。 |
-| API 模式 | 你要通过自己有权使用的 OpenAI-compatible API 请求模型；可不登录官方账号 | 使用你填写的 Base URL、模型名和 API Key 写入受管请求配置，不伪造或创建官方登录文件。 |
+### 2. 配置 API 模式
 
-API 模式只负责把本机 ChatGPT 的请求指向你提供的服务，不会替你验证服务商的计费、模型可用性、数据政策或账号权限。切换前请确认该 API 的来源可信且你有使用授权。
+在“运行态”页点击 **“配置中转站”**，填写 Base URL、模型名和 API Key，保存后点击 **“切换到中转站”**。等待进度窗口完成，再在重新打开的应用中使用。
 
-## 本机会话与同步
+远程 API 地址需要 HTTPS；仅本机回环地址允许 HTTP。工具检查本地配置，不会在切换前探测 `/models`；服务是否支持当前客户端、模型和传输协议，需要由实际请求确认。
 
-- ChatGPT Switch 不会默认把旧聊天记录批量上传到任何服务。
-- API 模式下的新会话可由版本提供的本地会话功能继续管理；需要时可使用 **“会话合并与修复”** 或 **“同步此会话”** 等界面操作。
-- 已归档会话默认不参与自动处理；可先在会话管理中选择 **“恢复可见”**。
-- 同一会话出现内容冲突或无法可靠判断时，工具保留原内容并停止覆盖，而不是猜测哪个副本正确。
-- 会话合并与修复不是长期备份。执行同步、迁移、恢复或清理前，建议先创建**完整备份**。
+### 3. 需要时切回官方账号
 
-如果你启用了手机连续性或其他跨端能力，界面显示“已提交”只说明本机操作已完成；最终是否能在目标服务或设备中看到结果，仍取决于该服务和网络状态。
+先在 ChatGPT Desktop 完成官方登录，再回到本工具点击 **“保存当前账号态”** 和 **“切换到 ChatGPT 账号”**。API 模式可以在尚未登录官方账号时单独使用，但不能替代官方登录。
 
-## 安全与数据
+切换前先结束正在进行的任务。独立 Codex CLI 或其他写入进程可能阻止安全切换；工具不会为了通过检查而结束无关 CLI 进程。
 
-- **官方登录：**官方模式会读取并核对登录状态；API 模式允许登录文件不存在。无论哪种模式，工具都不会替换、写回或伪造官方登录文件。
-- **API Key：**保存到工具槽位时会使用当前 Windows 用户的 DPAPI 加密；页面不会把 Key 回填出来。
-- **运行期间：**API 模式生效时，当前实现需要把 API Key 以 bearer token 形式写入本地受管的 `config.toml`，供 ChatGPT Desktop 发起请求；切回官方模式会删除这段受管 API 配置和其中的 Key。
-- **本地数据：**切换会修改受管请求配置；你主动执行会话迁移、备份、恢复或删除恢复点时，才会处理相应的本地会话和备份数据。
-- **诊断包：**导出前会做脱敏处理，不应包含 API Key、登录 token、聊天正文或请求/响应正文；分享前仍建议自行检查文件。
-- **网络边界：**工具不会主动上传历史聊天；但在 API 模式下，你发出的新请求会发送给你配置的 API 服务，其数据处理规则由该服务决定。
+## 数据与安全边界
 
-详细边界见 [安全与数据说明](docs/SECURITY.md)。
+**API Key 的保存与使用是两件事。** 保存到工具槽位时使用当前 Windows 用户的 DPAPI 加密，界面不回填 Key。API 模式激活后，为供客户端发起请求，Key 会以 bearer token 形式出现在本机受管的 `config.toml` 中；切回官方模式会移除这段受管配置。不要公开分享该文件。
 
-## 当前限制
+**历史会话不会被默认批量上传。** API 模式下发出的请求会交给你配置的服务处理，请自行确认服务商的数据政策、权限和费用。会话迁移、恢复和清理是独立的本地操作；执行高风险维护前应先创建完整备份。
 
-- 仅支持 Windows x64；暂不支持 macOS 或 Linux。
-- 当前固定管理 **一个官方模式** 和 **一个 API 模式**，不是多账号或多 API 配置管理器。
-- 切换需要 ChatGPT Desktop 处于可安全关闭的状态；正在运行的相关写入任务可能让操作暂停或拒绝执行。
-- 本地会话迁移、合并与修复会因版本和数据状态而显示不同的前置条件；请以当前 Release Notes 和界面提示为准。
-- API 服务的稳定性、计费、模型能力、数据保留和合规性不由本项目控制。
+**诊断只在你主动导出后分享。** 导出会进行脱敏，但发送前仍应检查；不要把凭据、聊天正文或未检查的诊断文件提交到公开 Issue。详细说明见 [安全与数据](docs/SECURITY.md)。
 
-## 常见问题
+## 当前支持范围
 
-### 为什么项目叫 ChatGPT Switch，下载文件却叫 `codex-switch.exe`？
+- **Windows x64，一个官方账号槽位和一个 API 槽位。** 暂不提供多账号池、多 API 配置池、macOS 或 Linux 版本。
+- API 可用性取决于本机客户端与目标服务的兼容性；本版本不提供 HTTP／WebSocket 传输方式选择。
+- 会话合并、迁移和清理需要满足界面提示的前置条件，不应代替长期备份；“本机已提交”也不等于手机或远端服务已收到。
 
-ChatGPT Switch 是面向用户的产品名称；`codex-switch.exe` 是用于保持历史更新兼容性的发布文件名。下载时以 Release 页面中的唯一文件为准。
+<details>
+<summary><strong>常见问题</strong></summary>
 
-### 它会让我退出 ChatGPT 官方账号吗？
+### 为什么下载文件叫 codex-switch.exe？
 
-不会。工具切换的是本地请求配置，不会替换或写回官方登录文件。
+ChatGPT Switch 是产品名称。`codex-switch.exe` 是历史发布文件名，保持不变是为了兼容已有的一键更新流程。
 
-### 没有登录官方账号，可以使用 API 模式吗？
+### 切换失败后应该做什么？
 
-可以。先配置 API 中转站再切换即可；工具不会为了 API 模式创建假的 `auth.json`。之后若要切回官方模式，需要先完成有效的官方登录。
+先查看进度窗口中的具体原因。登录、配置、会话视图、独立写入进程以及应用启动失败，需要不同的处理方式。结果不明确时不要反复重试或手工覆盖文件，先导出诊断信息并保留现状。
 
-### 它会上传我的历史聊天记录吗？
+### 会话搜索和筛选会修改聊天内容吗？
 
-不会默认上传旧历史。API 模式下的新请求会发送给你配置的服务；可选的会话操作由你在界面中明确触发。
+不会。搜索索引只在内存中使用。恢复可见、合并和其他维护操作需要通过各自的按钮明确发起。
 
-### 支持多个官方账号或多个 API 配置吗？
+### “恢复可见”会处理搜索结果之外的选择吗？
 
-当前不支持账号池或 API 配置池：一次管理一个官方模式和一个 API 模式。
+会处理全部已选项中符合条件的本机归档会话，不限于当前页。页外选择提示和“查看全部已选”用于帮助你核对范围；清空搜索不会取消选择。
 
-### 切换失败后会发生什么？
+### 必须安装 Image2 或 Grok 搜索吗？
 
-工具会停止后续操作，并在能安全恢复的地方保留或恢复原配置。切换进度窗口会区分登录、配置、会话视图、独立写入进程、并发任务、关闭、写后验证和启动目标等原因；按提示排除阻断后再重试，必要时导出诊断包。
+不需要。它们位于“技能”页，与核心切换功能独立；来源、配置与隐私边界见 [可选技能说明](docs/SKILLS.md)。
 
-### 为什么切换时 ChatGPT Desktop 会被关闭？
+</details>
 
-这是为了避免应用运行时覆盖配置或继续使用旧请求方式。切换完成后，工具会尝试重新打开它。
+## 文档与开发
 
-### API Key 保存在哪里？
+| 文档 | 内容 |
+| --- | --- |
+| [使用指南](docs/USER_GUIDE.md) | 会话、备份、恢复、诊断与更新的具体操作。 |
+| [安全与数据](docs/SECURITY.md) | 凭据、本地文件、第三方 API 和诊断包的边界。 |
+| [版本验证](docs/RELEASE_VERIFICATION.md) | 核验版本、下载文件和发布流程。 |
+| [完整运行链路](项目完整链路说明.md) | 请求切换、会话存储、备份和更新的实现说明。 |
+| [更新日志](CHANGELOG.md) | 各版本变化与兼容性说明。 |
 
-保存到工具槽位时使用 Windows DPAPI 加密。API 模式正在运行时，Key 会临时作为受管 `config.toml` 配置的一部分存在于本机；切回官方模式会删除该受管配置。
-
-### 会话合并与修复和完整备份有什么区别？
-
-前者用于整理或修复可安全判断的本机会话关系；后者是可恢复的完整本地恢复点。两者不能互相替代。
-
-### 支持 macOS 或 Linux 吗？
-
-暂不支持。目前发布和测试目标是 Windows x64。
-
-### 这是 OpenAI 官方工具吗？
-
-不是。它是独立开源项目，不代表 OpenAI，也不提供 OpenAI 账号或服务。
-
-## 可选扩展
-
-**Image2** 和 **Grok 搜索**位于应用的“技能”页面，和官方模式/API 模式切换彼此独立。**不安装它们不会影响核心切换功能。**
-
-安装来源、配置方式和隐私边界见 [可选技能说明](docs/SKILLS.md)。
-
-## 技术文档
-
-- [用户操作指南](docs/USER_GUIDE.md)：会话、备份、恢复、诊断和更新的操作说明。
-- [安全与数据说明](docs/SECURITY.md)：本地文件、API Key、会话和诊断包的边界。
-- [Release 验证说明](docs/RELEASE_VERIFICATION.md)：如何从 Release 页面确认版本和校验信息。
-- [完整运行链路](项目完整链路说明.md)：请求切换、会话、备份和更新的技术说明。
-- [更新日志](CHANGELOG.md)：各正式版本的用户可见变更。
-
-## 开发和构建
-
-需要 Node.js、Rust 和 Windows 开发环境。常用检查：
+从源码开发需要 Node.js、Rust 与 Windows C++／SDK 工具链：
 
 ```powershell
 npm ci
-npm run typecheck
 npm test -- --run
-npm run build
-npm run tauri -- build
+npm run typecheck
+npm run tauri -- dev
 ```
 
-发布流程和完整质量门见 [开发者 AI 开发与 PR 流程](开发者AI开发与PR提交流程.md) 与 [Release 验证说明](docs/RELEASE_VERIFICATION.md)。
+完整构建、测试和发布步骤见 [开发与发布流程](开发者AI开发与PR提交流程.md)。正式 EXE 由 GitHub Actions 的版本 tag 流水线构建并发布，不从开发工作区直接上传。
 
-## License / Disclaimer
+---
 
-本项目采用 [MIT License](LICENSE)。使用 API 模式前，请自行确认 API 服务、账号、数据处理和费用符合你的需求；请勿把 API Key、登录 token、聊天正文或诊断包中的敏感内容提交到公开 Issue。
+[MIT License](LICENSE) · 独立开源项目，与 OpenAI 无隶属或授权关系。

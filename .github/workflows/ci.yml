@@ -82,6 +82,8 @@ jobs:
 
       - name: Verify v0.2.7 saved runtime slot apply on isolated runner
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: node scripts/v030-old-saved-slot-ci.mjs (Join-Path $env:RUNNER_TEMP 'v030-old-saved-slot')
 
       - name: Upload old saved-slot apply evidence

@@ -262,6 +262,10 @@ Skill 的服务 URL 与 Key 属于用户配置而不是包内容。URL 在前后
 
 ### 3.3 本项目发布门禁
 
+验证用 app-server 初始化器必须同时处理初始化拒绝、子进程提前退出、无响应和 EOF 后不退出；所有路径都有界等待并回收本次 ChildProcess 句柄。禁止靠全局进程名清理，也不得把生成了空数据库当作 RPC 初始化成功。桌面产品窗口仍通过原生安全退出流程关闭。
+
+CI 中调用 GitHub CLI 下载公开旧版资产的步骤必须显式注入 `GH_TOKEN: ${{ github.token }}`，保持工作流默认 `contents: read`，只在 publish job 授予 `contents: write`。令牌限定在需要联网读取 GitHub 的步骤，不向被测应用的隔离环境传递；认证失败必须阻断，禁止跳过兼容性检查。
+
 当前 Windows release 至少执行：
 
 ```powershell

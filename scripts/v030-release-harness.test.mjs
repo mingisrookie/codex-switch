@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { initializeNativeCodexState } from "./v030-native-state.mjs";
 import test from "node:test";
 
 import {
@@ -357,3 +358,58 @@ test("source-input manifest covers release inputs and excludes generated artifac
     assert.ok(input.bytes > 0, input.path);
   }
 });
+
+
+test("old saved-slot CI gate authenticates gh with a step-scoped read-only workflow token", () => {
+  const workflow = fs.readFileSync(".github/workflows/ci.yml", "utf8");
+  assert.match(workflow, /^permissions:\r?\n  contents: read/m);
+  const job = workflow.split("  old-saved-slot-gate:")[1]?.split("\n  release:")[0];
+  assert.ok(job, "old saved-slot job must remain present");
+  assert.doesNotMatch(job, /contents: write|write-all|secrets\./);
+  const step = job.split("      - name: Verify v0.2.7 saved runtime slot apply on isolated runner")[1]?.split("\n      - name:")[0];
+  assert.ok(step, "old saved-slot execution step must remain present");
+  assert.match(step, /env:\r?\n          GH_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(step, /run: node scripts\/v030-old-saved-slot-ci\.mjs/);
+  assert.doesNotMatch(step, /continue-on-error|\|\| true/);
+});
+
+
+for (const scenario of ["success", "early-exit", "timeout", "rejected", "missing-db", "exit-timeout"]) {
+  test(`native schema initializer owns and reaps its child: ${scenario}`, async () => {
+    await withTemporaryParent(async (parent) => {
+      const fixture = path.join(parent, "native-schema-fixture.mjs");
+      fs.writeFileSync(fixture, `
+        import fs from 'node:fs'; import path from 'node:path'; import readline from 'node:readline';
+        const mode=${JSON.stringify(scenario)};
+        if(mode==='early-exit') process.exit(7);
+        const lines=readline.createInterface({input:process.stdin});
+        if(mode==='timeout'||mode==='exit-timeout') setInterval(()=>{},1000);
+        lines.on('line',line=>{
+          const request=JSON.parse(line);
+          if(request.method==='initialize'&&mode!=='timeout'){
+            if(mode!=='missing-db')fs.writeFileSync(path.join(process.env.CODEX_HOME,'state_5.sqlite'),'fixture');
+            process.stdout.write(JSON.stringify(mode==='rejected'?{id:1,error:{code:-32602}}:{id:1,result:{userAgent:'fixture'}})+String.fromCharCode(10));
+          }
+        });
+      `);
+      let child;
+      const operation = initializeNativeCodexState(process.execPath, parent, parent, process.env, "0.3.5", {
+        timeoutMs: 1500, shutdownTimeoutMs: 1000,
+        spawnProcess: (_exe, args, options) => {
+          assert.deepEqual(args, ["app-server", "--stdio", "--disable", "plugins"]);
+          child = spawn(process.execPath, [fixture], options);
+          return child;
+        },
+      });
+      if (scenario === "success") await operation;
+      else await assert.rejects(operation, {
+        "early-exit": /exited before initialize/,
+        timeout: /initialization timed out/,
+        rejected: /rejected schema initialization/,
+        "missing-db": /did not create/,
+        "exit-timeout": /did not exit after EOF/,
+      }[scenario]);
+      assert.ok(child.exitCode !== null || child.signalCode !== null, "owned fixture child was reaped");
+    });
+  });
+}
