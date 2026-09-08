@@ -151,3 +151,28 @@ test('crate build targets are normalized without losing identities or source sub
   bom.metadata.component.components[0].purl = `${stableRef}?download_url=file:///unrelated/private#src/lib.rs`;
   assert.throws(() => prepareSbom(bom, version, sourceRef), /source URL/);
 });
+
+
+test('SBOM preparation supplies the serialNumber required by the pinned GitHub attestation parser', () => {
+  const input = fixture();
+  const prepared = prepareSbom(input, version, sourceRef);
+  assert.match(prepared.serialNumber, /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(input.serialNumber, undefined);
+  assert.deepEqual(prepareSbom(prepared, version, sourceRef), prepared);
+  assert.ok(prepared.bomFormat && prepared.serialNumber && prepared.specVersion);
+});
+
+test('SBOM preparation preserves a valid existing serialNumber', () => {
+  const input = fixture();
+  input.serialNumber = 'urn:uuid:12345678-1234-4123-8123-123456789abc';
+  assert.equal(prepareSbom(input, version, sourceRef).serialNumber, input.serialNumber);
+});
+
+test('SBOM validation rejects omitted or malformed serial numbers before signing', () => {
+  for (const serial of [undefined, null, '', 'not-a-uuid', 42, 'urn:uuid:../escape']) {
+    const input = prepareSbom(fixture(), version, sourceRef);
+    input.serialNumber = serial;
+    assert.throws(() => validateSbom(input, version), /serialNumber/);
+    if (serial !== undefined) assert.throws(() => prepareSbom(input, version, sourceRef), /serialNumber/);
+  }
+});

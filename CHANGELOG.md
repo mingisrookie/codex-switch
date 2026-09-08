@@ -28,6 +28,8 @@
 
 ### Supply chain and release
 
+- 为生成的 CycloneDX 组件清单补齐 GitHub SBOM 证明所需的 UUID serialNumber；已有合法标识保持不变，非法标识在签名前拒绝。
+
 - CI 新增 npm 生产依赖审计、cargo-deny advisories/source/license 门、按锁定依赖生成的 Rust CycloneDX SBOM；tag 发布流程为最终 EXE 生成 GitHub/Sigstore 构建来源与 SBOM attestation，并在 Release 同时公开 `codex-switch.cdx.json` 供离线审阅。
 - Windows EXE 的 Authenticode 状态为 **NotSigned**，尚未使用商业代码签名证书。GitHub attestation、SHA-256、UPX 和 PE 合同不能替代 Authenticode 或终端防护扫描。
 

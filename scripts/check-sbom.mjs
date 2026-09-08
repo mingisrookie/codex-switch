@@ -1,9 +1,17 @@
+import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 function requireCondition(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+const serialNumberPattern = /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function requireSerialNumber(bom) {
+  requireCondition(typeof bom.serialNumber === 'string' && serialNumberPattern.test(bom.serialNumber),
+    'CycloneDX serialNumber must be a UUID URN for GitHub SBOM attestation');
 }
 
 export function prepareSbom(input, version, sourceRef) {
@@ -53,6 +61,10 @@ export function prepareSbom(input, version, sourceRef) {
       }
     }
   }
+  // cargo-cyclonedx may omit this optional standard field, but our pinned
+  // actions/attest parser requires it. Preserve valid IDs and never overwrite
+  // malformed metadata to make a document appear valid.
+  if (bom.serialNumber === undefined) bom.serialNumber = `urn:uuid:${randomUUID()}`;
   validateSbom(bom, version);
   return bom;
 }
@@ -60,6 +72,7 @@ export function prepareSbom(input, version, sourceRef) {
 export function validateSbom(bom, version) {
   requireCondition(bom?.bomFormat === 'CycloneDX', 'SBOM bomFormat must be CycloneDX');
   requireCondition(['1.4', '1.5', '1.6'].includes(bom.specVersion), 'Unsupported CycloneDX schema version');
+  requireSerialNumber(bom);
   const root = bom.metadata?.component;
   requireCondition(root?.name === 'codex-switch' && root.version === version,
     'SBOM root component must match the current codex-switch version');
