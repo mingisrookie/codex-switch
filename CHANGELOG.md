@@ -1,9 +1,6 @@
 # Changelog
 
-## Unreleased — v0.4.0
-
-本节描述已整合的开发版改动，不代表 v0.4.0 已发布。
-
+## v0.4.0 - 2026-09-08
 
 ### Provider compatibility
 
@@ -24,11 +21,21 @@
 - 新增 Provider URL/transport、typed error 和进程关闭状态机的 property tests，并补齐 sidecar、未知 Schema、HTTP 默认/WSS 显式、只读降级等回归测试。
 - Rust 工具链固定为 1.94.1，Node 主版本与 direct TypeScript 类型依赖固定；新增文档链接合同检查。
 
+### Integration fixes
+
+- 整合 v0.3.5 后补齐复合主键、SQLite 类型亲和性、writer 关闭后结构复检、全局库 sidecar 句柄交接复核以及错误信封大小限制；兼容性查询移出界面线程。
+- 修复组件清单输出名重复 `.json` 与工作区绝对路径、依赖图校验问题，文档链接检查同时支持 Windows/POSIX 和 HTML 图片；保留 v0.3.5 的搜索优化、首页和原生测试进程回收修复。
+
 ### Supply chain and release
 
-- CI 新增 npm 生产依赖审计、cargo-deny advisories/source/license 门、按锁定依赖生成的 Rust CycloneDX SBOM；后续 tag 发布流程将为最终 EXE 生成 GitHub/Sigstore 构建来源与 SBOM attestation，并在 Release 同时公开 `codex-switch.cdx.json` 供离线审阅。
-- 当前 Windows EXE 仍未使用商业证书完成 Authenticode。GitHub attestation、SHA-256、UPX 和 PE 合同不能替代 Authenticode 或终端防护扫描。
+- CI 新增 npm 生产依赖审计、cargo-deny advisories/source/license 门、按锁定依赖生成的 Rust CycloneDX SBOM；tag 发布流程为最终 EXE 生成 GitHub/Sigstore 构建来源与 SBOM attestation，并在 Release 同时公开 `codex-switch.cdx.json` 供离线审阅。
+- Windows EXE 的 Authenticode 状态为 **NotSigned**，尚未使用商业代码签名证书。GitHub attestation、SHA-256、UPX 和 PE 合同不能替代 Authenticode 或终端防护扫描。
 
+### Upgrade and validation
+
+- v0.3.5 用户可通过应用内“检查更新”升级；没有保存 transport 的旧槽位按 HTTP Responses 读取，已明确选择 WebSocket 的槽位保留该选择。工具只应用本地配置，不承诺第三方服务已经连通。
+- 保留 v0.3.5 的会话搜索、稳定分页、跨页选择、备份格式和更新器固定 EXE 文件名。Release 附带的 JSON 组件清单不是安装包。
+- 发布检查覆盖前端测试／类型／生产构建、Rust fmt／Clippy／runtime-evidence 测试、文档与发布脚本检查、依赖和许可证检查、最终 EXE 原生验证，以及公开 v0.3.5 到 v0.4.0 的升级和替换失败回滚。构建与发布结果以本版本 GitHub Actions、公开资产及验证记录为准。
 
 ## v0.3.5 - 2026-09-07
 
@@ -38,9 +45,6 @@
 - 会话列表新增匹配数量、本页范围、清空搜索、只看已选和跨页／筛选外已选项提示；搜索无结果时仍可清空已有选择。
 
 ### Fixed
-
-- 整合 v0.3.5 后补齐复合主键、SQLite 类型亲和性、writer 关闭后结构复检、全局库 sidecar 句柄交接复核以及错误信封大小限制；兼容性查询移出界面线程。
-- 修复组件清单输出名重复 `.json` 与工作区绝对路径、依赖图校验问题，文档链接检查同时支持 Windows/POSIX 和 HTML 图片；保留 v0.3.5 的搜索优化、首页和原生测试进程回收修复。
 
 - 统一旧记录的秒级时间与毫秒级时间后再排序，显示和排序使用同一时间值；无效时间排在末尾，同时间或同标题以会话 ID 稳定排序。
 - 列表刷新保留当前页，结果减少时将页码收敛到有效范围，后续刷新不会跳回已经失效的页码。

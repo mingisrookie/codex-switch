@@ -52,4 +52,4 @@ CI 固定 Node/Rust/direct dependencies，执行前端和 Rust 全量质量门�
 
 共享数据库在取得既有 write-exclusion handle 后复核 source/target 的 WAL、SHM、journal；创建硬链接在句柄移交、发布前后复检。它不把“主文件 identity 未变化”单独当作无日志证明。错误信封对消息、phase 和编码后总大小分别限长，不因 Unicode 或 JSON 转义退化成无界消息。
 
-组件清单只将当前工作区包的本地身份替换为稳定 cargo PURL，并同步图引用；未知依赖路径仍拒绝。文档检查覆盖 Windows/POSIX 路径包含关系以及首页 HTML 图片，生成 SBOM 不进入 Git。main 的 0.4.0 是开发版本；公开发布、签名证明和更新器验收在后续发版时另行执行。
+组件清单只将当前工作区包的本地身份替换为稳定 cargo PURL，并同步图引用；未知依赖路径仍拒绝。文档检查覆盖 Windows/POSIX 路径包含关系以及首页 HTML 图片，生成 SBOM 不进入 Git。正式发布以版本标签的 CI、GitHub Release/Latest 和公开回下载结果为准；构建来源、SBOM 绑定以及旧版升级／回滚必须针对最终公开 EXE 单独验证。
