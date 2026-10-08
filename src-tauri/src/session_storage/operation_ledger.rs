@@ -805,14 +805,14 @@ fn delete_verified_pending_ledger(path: &Path, expected_sha256: &str) -> Result<
 // The explicit cfg return makes each platform implementation self-contained.
 #[allow(clippy::needless_return)]
 fn pending_ledger_has_expected_storage_format(path: &Path) -> bool {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         return read_regular_file_bounded(path, MAX_ENCRYPTED_LEDGER_BYTES).is_ok_and(|bytes| {
             bytes.starts_with(LEDGER_CIPHERTEXT_MAGIC)
                 && bytes.len() > LEDGER_CIPHERTEXT_MAGIC.len()
         });
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         true
@@ -1109,7 +1109,7 @@ fn write_ledger(path: &Path, ledger: &SessionStorageOperationLedger) -> Result<(
     if bytes.len() as u64 > MAX_LEDGER_BYTES {
         return Err("session storage ledger reached its size limit".to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let bytes = {
         let ciphertext = crate::crypto::protect(&bytes)
             .map_err(|_| "failed to protect session storage ledger".to_string())?;

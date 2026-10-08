@@ -1,3 +1,10 @@
+#[cfg(target_os = "macos")]
+#[path = "crypto_macos.rs"]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::{protect, unprotect};
+
 #[cfg(windows)]
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr::null_mut;
@@ -86,12 +93,12 @@ fn dpapi_blob_len(len: usize) -> Result<u32, String> {
         .map_err(|_| "credential data exceeds the Windows DPAPI size limit".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Err("credential encryption is not supported on this platform".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     Err("credential encryption is not supported on this platform".to_string())
 }
@@ -100,6 +107,7 @@ pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     #[cfg(windows)]
     use super::dpapi_blob_len;
+    #[cfg(not(target_os = "macos"))]
     use super::{protect, unprotect};
 
     #[test]
@@ -126,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn rejects_credentials_without_a_platform_keystore() {
         assert!(protect(b"secret").unwrap_err().contains("not supported"));
         assert!(unprotect(b"ciphertext")

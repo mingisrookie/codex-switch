@@ -12,12 +12,12 @@
 
 ## API Key 与本地配置
 
-- 保存 API 模式时，API Key 会使用当前 Windows 用户的 DPAPI 加密保存；界面不会回填或展示已保存 Key。
+- 保存 API 模式时，Windows 使用当前用户的 DPAPI，macOS 使用钥匙串主密钥和 AES-256-GCM 加密；界面不会回填或展示已保存 Key。两平台密文不能直接互换。
 - API 模式运行期间，ChatGPT Desktop 需要能读取该凭据。当前实现会把 bearer token 写入本机受管 `config.toml` 的 API 模式配置中，因此它会以明文存在于当前 Windows 用户可读的运行配置内。
 - 切回官方模式时，工具会删除该受管 API 模式配置及其中的 bearer token。
 - 不要把 `config.toml`、诊断包、屏幕截图或日志未经检查地发给他人；也不要将它们提交到公开 Issue。
 
-这项运行期明文边界无法仅靠“加密保存”抵消。请使用受信任的 Windows 用户账户，限制其他用户读取你的本地配置，并在不需要 API 模式时切回官方模式。
+这项运行期明文边界无法仅靠“加密保存”抵消。请使用受信任的操作系统用户账户，限制其他用户读取你的本地配置，并在不需要 API 模式时切回官方模式。
 
 ## 本机会话、备份与恢复
 
@@ -60,7 +60,7 @@ Image2 和 Grok 搜索是独立的可选功能。它们的服务 URL 和 API Key
 
 ## 已知边界
 
-- 仅支持 Windows x64，依赖当前 Windows 用户的 DPAPI。
+- Windows x64 稳定版依赖当前用户的 DPAPI；macOS 预览版依赖当前用户钥匙串。Mac 的高级存储维护和完整备份恢复尚未开放，具体限制见 [macOS 预览版说明](MACOS_PREVIEW.md)。
 - 它不能阻止拥有同一 Windows 用户权限的恶意程序读取运行期间的本地文件。
 - 它不能保证第三方 API 服务的可用性、WebSocket 能力、模型存在性、隐私或计费正确。
 - 它不能替代你自己的完整备份、终端防护、磁盘加密、账号安全和密钥轮换策略。
@@ -71,3 +71,5 @@ Image2 和 Grok 搜索是独立的可选功能。它们的服务 URL 和 API Key
 ## 发布供应链边界
 
 正式 CI 对 npm 生产依赖、Rust advisories、来源和许可证执行门禁，生成 CycloneDX SBOM，并为最终 Windows EXE生成 GitHub/Sigstore 构建来源和 SBOM 证明。公开资产仍没有商业证书签发的 Windows Authenticode；GitHub attestation、SHA-256 和 UPX 完整性检查不能冒充 Authenticode，也不能替代终端防护扫描。
+
+macOS 预览版使用独立双架构原生构建与产物检查。DMG 内 App 仅为 ad-hoc 签名，未获 Apple Developer ID 签名及公证；CI 的签名完整性检查只确认打包内容未被改动。钥匙串主密钥丢失或访问被拒绝时不会自动替换旧密钥，错误应保留供排查。新写入私有文件使用 0600，私有目录使用 0700；这不能防止同一用户权限的恶意程序读取已经激活的运行配置。

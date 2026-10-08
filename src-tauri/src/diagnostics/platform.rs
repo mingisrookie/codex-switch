@@ -30,12 +30,12 @@ pub fn validate_downloads_dir(path: PathBuf) -> Result<PathBuf, String> {
             .components()
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
-        return Err("the Windows Downloads directory is unsafe".to_string());
+        return Err("the Downloads directory is unsafe".to_string());
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|_| "the Windows Downloads directory is unavailable".to_string())?;
+    let canonical =
+        fs::canonicalize(path).map_err(|_| "the Downloads directory is unavailable".to_string())?;
     if !canonical.is_dir() {
-        return Err("the Windows Downloads directory is unavailable".to_string());
+        return Err("the Downloads directory is unavailable".to_string());
     }
     Ok(canonical)
 }
@@ -162,7 +162,7 @@ fn downloads_dir_platform() -> Result<PathBuf, String> {
     Ok(PathBuf::from(OsString::from_wide(wide)))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn downloads_dir_platform() -> Result<PathBuf, String> {
     Err("diagnostic export is only supported on Windows".to_string())
 }
@@ -208,7 +208,7 @@ fn local_export_time_platform() -> Result<LocalExportTime, String> {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn local_export_time_platform() -> Result<LocalExportTime, String> {
     Err("diagnostic export is only supported on Windows".to_string())
 }
@@ -321,14 +321,77 @@ fn windows_explorer_path() -> Result<PathBuf, String> {
     Ok(explorer)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_in_explorer(_exported: &Path) -> Result<(), String> {
     Err("opening diagnostic exports is only supported on Windows".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_directory_in_explorer(_directory: &Path) -> Result<(), String> {
     Err("opening diagnostic directories is only supported on Windows".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn downloads_dir_platform() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "the macOS home directory is unavailable".to_string())?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err("the macOS home directory is invalid".to_string());
+    }
+    Ok(home.join("Downloads"))
+}
+
+#[cfg(target_os = "macos")]
+fn local_export_time_platform() -> Result<LocalExportTime, String> {
+    let mut now = std::mem::MaybeUninit::<libc::timeval>::uninit();
+    // Both native functions initialize the provided structures on success.
+    if unsafe { libc::gettimeofday(now.as_mut_ptr(), std::ptr::null_mut()) } != 0 {
+        return Err("the local clock is unavailable".to_string());
+    }
+    let now = unsafe { now.assume_init() };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    if unsafe { libc::localtime_r(&now.tv_sec, local.as_mut_ptr()) }.is_null() {
+        return Err("the local time zone is unavailable".to_string());
+    }
+    let local = unsafe { local.assume_init() };
+    format_local_export_time(
+        (local.tm_year + 1900) as u16,
+        (local.tm_mon + 1) as u16,
+        local.tm_mday as u16,
+        local.tm_hour as u16,
+        local.tm_min as u16,
+        local.tm_sec as u16,
+        (now.tv_usec / 1000) as u16,
+        (local.tm_gmtoff / 60) as i32,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_explorer(exported: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(exported)
+        .status()
+        .map_err(|_| "failed to reveal the diagnostic export in Finder".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Finder could not reveal the diagnostic export".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_in_explorer(directory: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(directory)
+        .status()
+        .map_err(|_| "failed to open the diagnostic directory in Finder".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Finder could not open the diagnostic directory".to_string())
+    }
 }
 
 #[cfg(windows)]

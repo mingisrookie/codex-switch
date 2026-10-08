@@ -297,6 +297,37 @@ fn switch_request_route_from_plan(
     };
     let incremental_session_sync = prepared_view.receipt().clone();
 
+    #[cfg(target_os = "macos")]
+    {
+        // SQLite view preparation can take time. Recheck the writer inventory
+        // and the captured config/auth immediately before publishing the route.
+        let gate = verify_processes_closed()
+            .and_then(|_| {
+                closed_plan
+                    .config_snapshot
+                    .verify(&codex_home.join("config.toml"), "live config.toml")
+            })
+            .and_then(|_| verify_auth_unchanged(codex_home, &closed_plan.auth_snapshot));
+        if let Err(error) = gate {
+            let rollback = rollback_transition(prepared_view);
+            return Err(RuntimeSwitchFailure {
+                message: match &rollback {
+                    Ok(()) => error,
+                    Err(recovery) => {
+                        format!("{error}; macOS view recovery is required: {recovery}")
+                    }
+                },
+                outcome: if rollback.is_ok() {
+                    RuntimeSwitchOutcome::RolledBack
+                } else {
+                    RuntimeSwitchOutcome::RollbackFailed
+                },
+                operation_id: Some(operation_id),
+                reason: RuntimeSwitchFailureReason::SessionViewUnavailable,
+            });
+        }
+    }
+
     on_progress(RuntimeSwitchPhase::ApplyingRuntime);
     let config_write_error = atomic_write(
         &codex_home.join("config.toml"),
@@ -1139,6 +1170,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_writer_resuming_before_config_publication_preserves_the_active_route() {
+        let (home, _store_root, store, auth) = setup();
+        let before = fs::read(home.path().join("config.toml")).unwrap();
+        let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let mut gate_calls = 0;
+        let failure = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            plan,
+            RequestRouteFailurePoint::None,
+            &mut || {
+                gate_calls += 1;
+                if gate_calls == 3 {
+                    Err("injected writer resumed during SQLite view preparation".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(failure.outcome, RuntimeSwitchOutcome::RolledBack);
+        assert_eq!(fs::read(home.path().join("config.toml")).unwrap(), before);
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
+        assert!(!store
+            .data_root()
+            .unwrap()
+            .join("macos-session-view-transition-v1.json")
+            .exists());
+
+        // A retained, verified inactive view must allow the following attempt.
+        let retry = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
+        let result = switch_request_route_from_plan(
+            &store,
+            home.path(),
+            retry,
+            RequestRouteFailurePoint::None,
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(result.changed);
+        assert_eq!(count_jsonl_recursively(home.path()), 1);
+        assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
     fn resumed_activity_after_config_write_preserves_journal_for_next_transition_recovery() {
         let (home, _store_root, store, _auth) = setup();
         let plan = preflight_request_route_switch(&store, RELAY_RUNTIME_ID, home.path()).unwrap();
@@ -1151,7 +1230,8 @@ mod tests {
             RequestRouteFailurePoint::AfterConfigWrite,
             &mut || {
                 gate_calls += 1;
-                if gate_calls == 3 {
+                let rollback_gate = if cfg!(target_os = "macos") { 4 } else { 3 };
+                if gate_calls == rollback_gate {
                     Err("injected resumed writer".to_string())
                 } else {
                     Ok(())
@@ -1165,7 +1245,11 @@ mod tests {
         let journal_path = store
             .data_root()
             .unwrap()
-            .join("request-route-session-view-transition-v2.json");
+            .join(if cfg!(target_os = "macos") {
+                "macos-session-view-transition-v1.json"
+            } else {
+                "request-route-session-view-transition-v2.json"
+            });
         assert!(journal_path.is_file());
         assert!(fs::read_to_string(home.path().join("config.toml"))
             .unwrap()

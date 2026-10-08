@@ -159,6 +159,12 @@ pub(crate) fn repair_after_shutdown(
         );
     }
 
+    // The Windows repair contract relies on mandatory sharing/namespace locks.
+    // A macOS advisory lock cannot provide that guarantee for this client file.
+    if cfg!(target_os = "macos") {
+        return Err("此 macOS 预览版不会自动修复损坏的 ChatGPT 进程状态文件；原文件已保留，请先关闭客户端并排查。".to_string());
+    }
+
     let Some(current) = read_snapshot(codex_home)? else {
         return Err("ChatGPT process state changed before repair".to_string());
     };
@@ -363,6 +369,7 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn nul_filled_process_state_is_replaced_with_an_empty_array() {
         let home = tempdir().unwrap();
@@ -373,6 +380,19 @@ mod tests {
 
         assert!(repair_after_shutdown(home.path(), Some(&original)).unwrap());
         assert_eq!(fs::read(path).unwrap(), b"[]");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_damaged_process_state_is_preserved_without_windows_repair() {
+        let home = tempdir().unwrap();
+        let path = home.path().join(CHAT_PROCESS_STATE_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for original in [Vec::new(), vec![0_u8; 1024], b" \n\t".to_vec()] {
+            fs::write(&path, &original).unwrap();
+            assert!(repair_after_shutdown(home.path(), Some(&original)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
     }
 
     #[test]

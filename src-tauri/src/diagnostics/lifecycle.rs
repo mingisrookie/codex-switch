@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    env,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -202,7 +201,7 @@ pub fn initialize_global(appdata: &Path) -> &'static DiagnosticRuntime {
 }
 
 pub fn initialize_global_from_environment() -> Option<&'static DiagnosticRuntime> {
-    let appdata = env::var_os("APPDATA").map(std::path::PathBuf::from)?;
+    let appdata = crate::platform_paths::appdata_root().ok()?;
     appdata.is_absolute().then(|| initialize_global(&appdata))
 }
 

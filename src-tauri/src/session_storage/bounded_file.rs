@@ -28,6 +28,7 @@ impl StableRegularFileObservation {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn observe_regular_file(
     path: &Path,
     max_bytes: u64,
@@ -52,6 +53,37 @@ pub(crate) fn observe_regular_file(
     }
     let stamp = file_stamp(&after_handle);
 
+    Ok(StableRegularFileObservation {
+        bytes: stamp.bytes,
+        stamp,
+        identity,
+    })
+}
+
+/// Metadata-only observation must never open a live SQLite file on macOS.
+/// Closing an unrelated descriptor would release this process's SQLite POSIX
+/// locks, even when a different thread still owns the SQLite connection.
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_regular_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<StableRegularFileObservation, ()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if max_bytes == 0 {
+        return Err(());
+    }
+    let before = fs::symlink_metadata(path).map_err(|_| ())?;
+    validate_metadata(&before, max_bytes)?;
+    let after = fs::symlink_metadata(path).map_err(|_| ())?;
+    validate_metadata(&after, max_bytes)?;
+    let identity = (before.dev(), before.ino());
+    if identity != (after.dev(), after.ino()) || before.created().ok() != after.created().ok() {
+        return Err(());
+    }
+    // This observation proves identity, not stable contents. SQLite/WAL writes
+    // may legitimately change size or mtime; callers decide which stamp to use.
+    let stamp = file_stamp(&after);
     Ok(StableRegularFileObservation {
         bytes: stamp.bytes,
         stamp,
@@ -106,6 +138,7 @@ pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<V
     Ok(bytes)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn same_regular_file_identity(left: &Path, right: &Path) -> Result<bool, ()> {
     let left_path = fs::symlink_metadata(left).map_err(|_| ())?;
     let right_path = fs::symlink_metadata(right).map_err(|_| ())?;
@@ -129,6 +162,22 @@ pub(crate) fn same_regular_file_identity(left: &Path, right: &Path) -> Result<bo
         (Some(left), Some(right)) => Ok(left == right),
         _ => Err(()),
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn same_regular_file_identity(left: &Path, right: &Path) -> Result<bool, ()> {
+    // Stat both aliases again after the pair was observed, so a pathname
+    // replacement during comparison is rejected without opening either inode.
+    let left_before = observe_regular_file(left, u64::MAX)?;
+    let right_before = observe_regular_file(right, u64::MAX)?;
+    let left_after = observe_regular_file(left, u64::MAX)?;
+    let right_after = observe_regular_file(right, u64::MAX)?;
+    if !left_before.same_file_identity(&left_after)
+        || !right_before.same_file_identity(&right_after)
+    {
+        return Err(());
+    }
+    Ok(left_after.same_file_identity(&right_after))
 }
 
 fn validate_metadata(metadata: &Metadata, max_bytes: u64) -> Result<(), ()> {
@@ -275,6 +324,23 @@ mod tests {
 
         assert!(same_regular_file_identity(&source, &linked).unwrap());
         assert!(!same_regular_file_identity(&source, &copied).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_only_observers_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("target.sqlite");
+        let link = root.path().join("link.sqlite");
+        fs::write(&target, b"sqlite").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(observe_regular_file(&link, 64).is_err());
+        assert!(same_regular_file_identity(&target, &link).is_err());
+        assert!(same_regular_file_identity(&link, &target).is_err());
+        assert!(read_regular_file_bounded(&link, 64).is_err());
     }
 
     #[cfg(windows)]

@@ -1,3 +1,7 @@
+#[cfg(any(target_os = "macos", test))]
+#[path = "runtime_session_view_macos.rs"]
+mod macos;
+
 use std::{
     fs::{self, File},
     io::Write,
@@ -236,6 +240,8 @@ enum ResolvedStateTransition {
 
 #[derive(Debug)]
 pub(crate) struct PreparedViewTransition {
+    #[cfg(any(target_os = "macos", test))]
+    macos: Option<macos::PreparedTransaction>,
     data_root: PathBuf,
     journal: Option<ViewTransitionJournal>,
     bootstrap: Option<PreparedRelayBootstrap>,
@@ -316,6 +322,8 @@ impl PreparedViewTransition {
             data_root: plan.data_root.clone(),
             journal: None,
             bootstrap: None,
+            #[cfg(any(target_os = "macos", test))]
+            macos: None,
             held_state: HeldStateTransition::None,
             held_global_creates: Vec::new(),
             held_source_guards: Vec::new(),
@@ -418,6 +426,10 @@ fn cleanup_journal_artifacts(
 }
 
 pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", test))]
+    if let Some(transaction) = prepared.macos.take() {
+        return transaction.commit();
+    }
     if let Some(bootstrap) = prepared.bootstrap.take() {
         bootstrap.verify()?;
     }
@@ -481,6 +493,10 @@ pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<
 }
 
 pub(crate) fn rollback_transition(mut prepared: PreparedViewTransition) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", test))]
+    if let Some(transaction) = prepared.macos.take() {
+        return transaction.rollback();
+    }
     if let Some(bootstrap) = prepared.bootstrap.take() {
         bootstrap.rollback()?;
     }
@@ -628,6 +644,15 @@ pub(crate) fn plan_transition(
     target: SessionViewTarget,
     data_root: &Path,
 ) -> Result<SessionViewPlan, String> {
+    #[cfg(target_os = "macos")]
+    if macos::has_pending(data_root)? {
+        return Ok(SessionViewPlan {
+            sqlite_home_patch: SqliteHomePatch::Keep,
+            transition: SessionViewTransition::None,
+            data_root: data_root.to_path_buf(),
+            pending_recovery: true,
+        });
+    }
     if load_transition_journal(data_root)?.is_some() {
         return Ok(SessionViewPlan {
             sqlite_home_patch: SqliteHomePatch::Keep,
@@ -832,6 +857,10 @@ pub(crate) fn plan_transition(
     Ok(plan)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::prepare_transition;
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_transition(
     plan: &SessionViewPlan,
     operation_id: &str,
@@ -891,6 +920,9 @@ pub(crate) fn prepare_transition(
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
                 bootstrap: None,
+
+                #[cfg(any(target_os = "macos", test))]
+                macos: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -934,6 +966,9 @@ pub(crate) fn prepare_transition(
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
                 bootstrap: None,
+
+                #[cfg(any(target_os = "macos", test))]
+                macos: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -980,6 +1015,9 @@ pub(crate) fn prepare_transition(
                 data_root: data_root.clone(),
                 journal: Some(prepared.1),
                 bootstrap: None,
+
+                #[cfg(any(target_os = "macos", test))]
+                macos: None,
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -1094,6 +1132,8 @@ fn prepare_empty_relay_bootstrap(
     Ok(PreparedViewTransition {
         data_root: plan.data_root.clone(),
         journal: None,
+        #[cfg(any(target_os = "macos", test))]
+        macos: None,
         bootstrap: Some(PreparedRelayBootstrap {
             state_path: session_view_state_path.to_path_buf(),
             expected_state,
@@ -1170,7 +1210,7 @@ fn validate_operation_id(value: &str) -> Result<(), String> {
 }
 
 fn protect_transition_journal(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = crate::crypto::protect(plaintext)
             .map_err(|_| "failed to protect session view transition journal".to_string())?;
@@ -1179,14 +1219,14 @@ fn protect_transition_journal(plaintext: &[u8]) -> Result<Vec<u8>, String> {
         protected.extend_from_slice(&ciphertext);
         Ok(protected)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(plaintext.to_vec())
     }
 }
 
 fn unprotect_transition_journal(protected: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = protected
             .strip_prefix(TRANSITION_JOURNAL_MAGIC)
@@ -1194,7 +1234,7 @@ fn unprotect_transition_journal(protected: &[u8]) -> Result<Vec<u8>, String> {
         crate::crypto::unprotect(ciphertext)
             .map_err(|_| "session view transition journal is unreadable".to_string())
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(protected.to_vec())
     }
@@ -1734,6 +1774,10 @@ pub(crate) fn recover_pending_transition(
     codex_home: &Path,
     data_root: &Path,
 ) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    if macos::has_pending(data_root)? {
+        return macos::recover(codex_home, data_root);
+    }
     let Some(mut journal) = load_transition_journal(data_root)? else {
         return Ok(false);
     };
@@ -2903,12 +2947,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        commit_transition, load_state, load_transition_journal, logical_state_digest,
-        managed_relay_sqlite_home, normalize_thread_provider, persist_transition_journal,
-        plan_global_links, plan_transition, prepare_transition, projected_database_bytes,
-        recover_pending_transition, rollback_transition, save_state, state_path,
-        transition_journal_path, PreparedViewTransition, SessionViewState, SessionViewTarget,
-        SessionViewTransition, ViewTransitionPhase, GLOBAL_DATABASES, STATE_VERSION,
+        commit_transition, load_state, logical_state_digest, managed_relay_sqlite_home,
+        normalize_thread_provider, plan_global_links, plan_transition, prepare_transition,
+        projected_database_bytes, rollback_transition, save_state, state_path, SessionViewState,
+        SessionViewTarget, SessionViewTransition, GLOBAL_DATABASES, STATE_VERSION,
+    };
+    // These tests exercise the Windows handle-bound rename/delete journal.
+    // macos::tests verifies the SQLite transaction/recovery contract separately.
+    #[cfg(windows)]
+    use super::{
+        load_transition_journal, persist_transition_journal, recover_pending_transition,
+        transition_journal_path, PreparedViewTransition, ViewTransitionPhase,
     };
     use crate::codex_paths::{codex_paths_with_sqlite_home, local_codex_paths};
     use crate::config_patch::SqliteHomePatch;
@@ -2951,6 +3000,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(windows)]
     fn prepared_relay_crash_fixture(
         operation_id: &str,
     ) -> (
@@ -2994,6 +3044,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn crash_windows_before_config_commit_restore_the_source_route_idempotently() {
         for (index, phase) in [
             ViewTransitionPhase::Planned,
@@ -3024,6 +3075,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn crash_after_config_write_commits_the_prepared_view_idempotently() {
         let (_root, account_home, data_root, relay_home, prepared) =
             prepared_relay_crash_fixture("crash-after-config");
@@ -3043,6 +3095,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn equal_bytes_replaced_at_the_target_name_fail_identity_bound_recovery() {
         let (_root, account_home, data_root, relay_home, prepared) =
             prepared_relay_crash_fixture("delete-contender");
@@ -3060,6 +3113,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn late_writer_on_published_state_fails_closed_without_overwrite() {
         let (_root, account_home, data_root, relay_home, prepared) =
             prepared_relay_crash_fixture("late-writer");
@@ -3080,6 +3134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn legacy_active_relay_returns_to_account_and_seeds_uninitialized_v2_state() {
         let root = tempdir().unwrap();
         let codex_home = root.path().join("codex-home");
@@ -3402,6 +3457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn legacy_relay_missing_an_account_thread_is_never_published() {
         let root = tempdir().unwrap();
         let codex_home = root.path().join("codex-home");
@@ -4082,6 +4138,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn late_sidecars_after_planning_are_rejected_under_the_source_writer_barrier() {
         for target_side in [false, true] {
             for suffix in ["-wal", "-shm", "-journal"] {

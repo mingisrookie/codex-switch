@@ -1,5 +1,7 @@
 # ChatGPT Switch 用户操作指南
 
+> **macOS 用户：**请先阅读 [macOS 预览版说明](MACOS_PREVIEW.md)。本页的高级会话维护、完整备份恢复、内置技能和 EXE 自更新仅适用于 Windows；Mac 预览版通过界面和后端能力门禁限制这些操作。
+
 > 本文使用“官方模式”和“API 模式”描述功能。当前界面为兼容旧版本，部分按钮仍显示“账号态”或“中转站”。以界面实际按钮和 [Release Notes](https://github.com/mingisrookie/codex-switch/releases/latest) 为准。
 
 ## 1. 开始前
@@ -9,7 +11,7 @@
 3. 关闭不需要的 ChatGPT Desktop 窗口；如果某项本地数据操作要求关闭相关写入程序，请按界面提示处理。
 4. 首次使用会话迁移、合并、恢复或清理前，先在应用内创建完整备份。
 
-项目只支持 Windows x64。Release 页面提供稳定版；仓库 `main` 的开发中功能不等于已发布功能。
+Windows x64 使用 Latest 稳定版；macOS Apple Silicon / Intel 使用单独的预发布 DMG。仓库分支中的开发功能不等于已发布功能。
 
 ## 2. 配置官方模式
 

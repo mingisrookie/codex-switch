@@ -253,7 +253,14 @@ impl DiagnosticStore {
 
         self.prune_locked(state, encoded_bytes)?;
         let segment = self.select_segment(state, encoded_bytes)?;
-        let mut output = match OpenOptions::new().append(true).open(&segment) {
+        let mut options = OpenOptions::new();
+        options.append(true);
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut output = match options.open(&segment) {
             Ok(output) => output,
             Err(error) => {
                 state.current_segment = None;
@@ -315,7 +322,14 @@ impl DiagnosticStore {
                 self.inner.session_id
             );
             let path = self.inner.root.join(name);
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(file) => {
                     if let Err(error) = file.sync_all() {
                         state.current_segment = None;
@@ -453,10 +467,18 @@ impl DiagnosticStore {
     }
 
     fn ensure_root(&self) -> Result<(), String> {
-        validate_existing_directory_chain(&self.inner.root)?;
-        fs::create_dir_all(&self.inner.root)
-            .map_err(|error| format!("failed to create diagnostic storage: {error}"))?;
-        validate_existing_directory_chain(&self.inner.root)
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform_paths::ensure_private_directory(&self.inner.root)?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            validate_existing_directory_chain(&self.inner.root)?;
+            fs::create_dir_all(&self.inner.root)
+                .map_err(|error| format!("failed to create diagnostic storage: {error}"))?;
+            validate_existing_directory_chain(&self.inner.root)
+        }
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, StoreState>, String> {
@@ -471,9 +493,15 @@ impl DiagnosticStore {
         RootOperationGuard::acquire(&self.inner.mutex_name, timeout)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     fn acquire_root_lock(&self, timeout: Duration) -> Result<RootOperationGuard<'static>, String> {
         RootOperationGuard::acquire(timeout)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn acquire_root_lock(&self, timeout: Duration) -> Result<MacRootOperationGuard, String> {
+        let directory = crate::platform_paths::ensure_private_directory(&self.inner.root)?;
+        MacRootOperationGuard::acquire(&directory, timeout)
     }
 }
 
@@ -679,6 +707,35 @@ fn system_time_millis(time: SystemTime) -> Option<u128> {
         .map(|duration| duration.as_millis())
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacRootOperationGuard {
+    _file: File,
+}
+
+#[cfg(target_os = "macos")]
+impl MacRootOperationGuard {
+    fn acquire(directory: &File, timeout: Duration) -> Result<Self, String> {
+        let file = crate::platform_paths::open_private_lock_file(
+            directory,
+            std::ffi::OsStr::new("store.lock"),
+        )
+        .map_err(|_| "diagnostic store lock is unavailable or unsafe".to_string())?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if !timeout.is_zero() && started.elapsed() < timeout =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return Err("diagnostic store is busy or unavailable".to_string()),
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn diagnostic_mutex_name(root: &Path) -> String {
     let absolute = if root.is_absolute() {
@@ -748,16 +805,16 @@ impl Drop for RootOperationGuard {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 static PROCESS_STORE_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[derive(Debug)]
 struct RootOperationGuard<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 impl RootOperationGuard<'static> {
     fn acquire(timeout: Duration) -> Result<Self, String> {
         let started = std::time::Instant::now();
@@ -1325,5 +1382,45 @@ mod tests {
     #[cfg(not(any(unix, windows)))]
     fn create_directory_symlink(_target: &std::path::Path, _link: &std::path::Path) -> bool {
         false
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_storage_and_files_are_private_from_first_append() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.join("codex-switch/logs/diagnostics");
+        let store = store(&root, DiagnosticStoreConfig::default());
+        store.append(&event(1, "private fixture")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        for entry in std::fs::read_dir(&root).unwrap() {
+            assert_eq!(
+                entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(store.read_events().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_lock_excludes_separate_store_instances() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("diagnostics");
+        let first = store(&root, DiagnosticStoreConfig::default());
+        let second = store(&root, DiagnosticStoreConfig::default());
+        let guard = first.acquire_root_lock(Duration::ZERO).unwrap();
+        assert!(!second.try_append_best_effort(&event(1, "blocked fixture")));
+        drop(guard);
+        assert!(second.try_append_best_effort(&event(2, "released fixture")));
+        assert_eq!(first.read_events().unwrap().len(), 1);
     }
 }

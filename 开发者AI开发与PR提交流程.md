@@ -36,6 +36,8 @@ git remote -v
 
 ## 适用场景
 
+macOS 预发布使用 [macOS 说明](docs/MACOS_PREVIEW.md) 和独立双架构工作流：Mac 原生核心行为与最终 App/DMG 验证、Windows 回归、供应链检查均通过后才能发布；只生成安装包或 Windows 测试通过不能替代原生证据。Mac 预发布不得标记 Latest，不替换 Windows EXE 正式资产；签名、公证、真实账号/服务验证状态须如实披露。
+
 本文适用于：
 
 - 发起新的 PR。

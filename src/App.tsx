@@ -171,6 +171,7 @@ function App({
   const [sessionRevision, setSessionRevision] = useState(0);
   const [activePage, setActivePage] = useState<'runtime' | 'sessions' | 'storage' | 'skills'>('runtime');
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [isMacOS, setIsMacOS] = useState(false);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
@@ -256,7 +257,11 @@ function App({
     if (startupCheckStarted.current) return;
     startupCheckStarted.current = true;
     void defaultGetAppStatus()
-      .then((status) => setAppVersion(status.version))
+      .then((status) => {
+        setAppVersion(status.version);
+        setIsMacOS(status.platform === 'macos');
+        if (status.platform !== 'macos') void runUpdateCheck(false);
+      })
       .catch(() => undefined);
     void defaultGetUpdateStartupNotice()
       .then((notice) => {
@@ -264,7 +269,6 @@ function App({
         if (notice?.status === 'rolledBack') setStartupUpdateError('更新启动失败，已恢复并重新启动旧版本。');
       })
       .catch(() => undefined);
-    void runUpdateCheck(false);
     void getMobileContinuityStatus()
       .then(setMobileContinuity)
       .catch((reason: unknown) => {
@@ -446,7 +450,7 @@ function App({
     && sessionStorage.status !== 'reviewRequired';
   const canMutateSessions = advancedStorageSupported
     && data.managedSessions.status === 'ready';
-  const canRestoreBackup = !backupsStale && data.backups.status === 'ready';
+  const canRestoreBackup = !isMacOS && !backupsStale && data.backups.status === 'ready';
   // Startup continuity initialization owns the same backend mutation guard as
   // route/config writes. Keep every mutation control disabled until that one
   // background mutation settles so an immediate click cannot lose a try-lock
@@ -1114,13 +1118,13 @@ function App({
           <button disabled={exclusiveBusy} aria-current={activePage === 'runtime' ? 'page' : undefined} className={`topbar-tab ${activePage === 'runtime' ? 'active' : ''}`} onClick={() => setActivePage('runtime')}><Zap aria-hidden="true" />运行态</button>
           <button disabled={exclusiveBusy} aria-current={activePage === 'sessions' ? 'page' : undefined} className={`topbar-tab ${activePage === 'sessions' ? 'active' : ''}`} onClick={() => setActivePage('sessions')}><MessagesSquare aria-hidden="true" />会话</button>
           <button disabled={exclusiveBusy} aria-current={activePage === 'storage' ? 'page' : undefined} className={`topbar-tab ${activePage === 'storage' ? 'active' : ''}`} onClick={() => setActivePage('storage')}><Database aria-hidden="true" />高级存储</button>
-          <button disabled={exclusiveBusy} aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}><Wrench aria-hidden="true" />技能</button>
+          <button disabled={exclusiveBusy || isMacOS} title={isMacOS ? '内置技能的 macOS 运行支持尚未开放' : undefined} aria-current={activePage === 'skills' ? 'page' : undefined} className={`topbar-tab ${activePage === 'skills' ? 'active' : ''}`} onClick={() => setActivePage('skills')}><Wrench aria-hidden="true" />技能</button>
         </nav>
         <div className="topbar-actions">
           <span className="topbar-version" aria-live="polite">{versionStatus}</span>
-          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking || exclusiveBusy}>
+          <button className="ghost-button" onClick={() => void runUpdateCheck(true)} disabled={updateChecking || exclusiveBusy || isMacOS}>
             {updateChecking ? <LoaderCircle className="button-icon spin" aria-hidden="true" /> : <Download className="button-icon" aria-hidden="true" />}
-            {updateChecking ? '检查中' : updateInstalling ? '更新中' : '检查更新'}
+            {isMacOS ? '通过安装包更新' : updateChecking ? '检查中' : updateInstalling ? '更新中' : '检查更新'}
           </button>
           <button
             className="ghost-button"
@@ -1156,9 +1160,9 @@ function App({
             {updateResult.releaseNotes ? <p className="update-notes">{updateResult.releaseNotes}</p> : null}
           </div>
           <div className="update-actions">
-            <button className="warm-button" onClick={() => void handleInstallUpdate()} disabled={exclusiveBusy}>
+            <button className="warm-button" onClick={() => void handleInstallUpdate()} disabled={exclusiveBusy || isMacOS}>
               <Download className="button-icon" aria-hidden="true" />
-              {updateInstalling ? '正在下载并安装…' : '立即更新'}
+              {isMacOS ? 'macOS 请下载新安装包更新' : updateInstalling ? '正在下载并安装…' : '立即更新'}
             </button>
             <button
               className="icon-button"
@@ -1255,6 +1259,16 @@ function App({
           ) : null}
 
           <RuntimeCompatibilityPanel state={data.runtimeCompatibility} />
+          {isMacOS ? (
+            <section className="home-setup-notice" aria-label="macOS 预览版说明">
+              <ShieldCheck aria-hidden="true" />
+              <div>
+                <h2>macOS 预览版</h2>
+                <p>凭据由 macOS 钥匙串保护。支持 Account / Relay 切换和会话查看；高级迁移、清理、完整备份恢复及内置技能暂未开放。</p>
+                <p>更新请从 GitHub Release 下载对应芯片的安装包。</p>
+              </div>
+            </section>
+          ) : null}
 
           <section className="runtime-grid" aria-label="运行态">
             <RuntimeCard
@@ -1361,10 +1375,10 @@ function App({
               state={data.backups}
               storage={data.backupStorage}
               stale={backupsStale}
-              disabled={exclusiveBusy || backupLoading || !canRestoreBackup}
-              loadDisabled={exclusiveBusy || backupLoading}
-              createDisabled={exclusiveBusy || backupLoading}
-              cleanupDisabled={exclusiveBusy || backupLoading}
+              disabled={exclusiveBusy || backupLoading || isMacOS || !canRestoreBackup}
+              loadDisabled={exclusiveBusy || backupLoading || isMacOS}
+              createDisabled={exclusiveBusy || backupLoading || isMacOS}
+              cleanupDisabled={exclusiveBusy || backupLoading || isMacOS}
               creating={busy === '创建完整备份'}
               cleanupFlow={checkpointCleanupFlow}
               onLoad={handleLoadBackups}

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.0-macos.1 - 2026-10-08
+
+### macOS preview
+
+- 新增 Apple Silicon 和 Intel 原生 DMG；保持为非 Latest 预发布，Windows v0.4.0 稳定更新通道不变。
+- 新增 macOS 钥匙串主密钥及 AES-256-GCM 凭据封套、Application Support 数据目录、当前用户私有文件权限与跨进程锁。
+- 支持标准目录下经过 OpenAI 签名验证的 Codex/ChatGPT App 识别、正常退出和重新启动；独立 CLI、身份变化及退出超时均保持阻断。
+- 为 Account/Relay 会话视图提供 SQLite 事务锁、Online Backup、持久恢复日志与失败回滚，保留官方 auth.json 只读和会话正文不复制的边界。
+- UI 与后端明确关闭 Mac 尚未支持的高级存储写入、完整备份恢复、内置技能与 Windows EXE 自更新；启动不执行 Windows 高级存储恢复或清理。
+- 新增双架构原生构建、Mac 专项行为测试、安装包与生产 App 启动合同、Windows 回归及供应链检查。安装包仅使用 ad-hoc 签名，无 Developer ID 或 Apple 公证。
+- 测试使用隔离目录、临时钥匙串和合成会话；不以本地切换成功代表第三方服务可用，不声称已验证真实账号或所有客户端版本。详见 [macOS 预览版说明](docs/MACOS_PREVIEW.md)。
+
 ## v0.4.0 - 2026-09-08
 
 ### Provider compatibility

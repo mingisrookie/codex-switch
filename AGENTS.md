@@ -4,7 +4,7 @@
 
 <!-- DXM-CONTRACT:2 -->
 
-本目录已启用 DXM。`AGENTS.md` 是 always 必读入口；详细开发、验收、文档同步和完成门集中在 `项目开发规范（AI协作）.md`。
+本目录已启用 DXM。`AGENTS.md` 是 always 必读入口；详细开发、验收、文档同步和完成门集中在 `项目开发规范（AI协作）.md`。涉及 macOS 时同时核对 `docs/MACOS_PREVIEW.md` 的平台能力边界和独立 Mac 发布合同，不能把 Windows 或模拟测试结果表述为原生 Mac/真实账号证据。
 
 ## 四模式状态机
 

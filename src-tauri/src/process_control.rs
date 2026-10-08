@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, test))]
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::{
@@ -105,6 +106,36 @@ pub struct CodexProcess {
     pub(crate) creation_time_100ns: Option<u64>,
 }
 
+#[cfg(target_os = "macos")]
+pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    crate::process_control_macos::list_codex_process_inventory().map(|(managed, _)| managed)
+}
+
+#[cfg(target_os = "macos")]
+pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    crate::process_control_macos::list_codex_process_inventory().map(|(_, standalone)| standalone)
+}
+
+#[cfg(target_os = "macos")]
+pub fn list_codex_process_inventory() -> Result<(Vec<CodexProcess>, Vec<CodexProcess>), String> {
+    crate::process_control_macos::list_codex_process_inventory()
+}
+
+#[cfg(target_os = "macos")]
+pub fn cache_chatgpt_launch_target() -> Result<(), String> {
+    crate::process_control_macos::cache_chatgpt_launch_target()
+}
+
+#[cfg(target_os = "macos")]
+pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
+    crate::process_control_macos::launch_cached_chatgpt()
+}
+
+#[cfg(target_os = "macos")]
+pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
+    crate::process_control_macos::close_codex_processes()
+}
+
 #[cfg(windows)]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
     list_codex_process_inventory().map(|(managed, _)| managed)
@@ -124,17 +155,17 @@ pub fn list_codex_process_inventory() -> Result<(Vec<CodexProcess>, Vec<CodexPro
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn list_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn list_standalone_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn list_codex_process_inventory() -> Result<(Vec<CodexProcess>, Vec<CodexProcess>), String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
 }
@@ -156,7 +187,7 @@ pub fn cache_chatgpt_launch_target() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn cache_chatgpt_launch_target() -> Result<(), String> {
     Err("ChatGPT launch is not supported on this platform".to_string())
 }
@@ -184,7 +215,7 @@ pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn launch_cached_chatgpt() -> ChatGptLaunchResult {
     ChatGptLaunchResult::failed(
         ChatGptLaunchFailureReason::Unsupported,
@@ -211,6 +242,7 @@ impl ChatGptLaunchResult {
         }
     }
 
+    #[cfg(any(not(target_os = "macos"), test))]
     fn failed(reason: ChatGptLaunchFailureReason, message: impl Into<String>) -> Self {
         Self {
             status: ChatGptLaunchStatus::Failed,
@@ -783,7 +815,7 @@ fn system_tool_path(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn close_codex_processes() -> Result<Vec<CodexProcess>, String> {
     Err("ChatGPT process control is not supported on this platform".to_string())
 }
@@ -875,6 +907,7 @@ where
     ))
 }
 
+#[cfg(any(windows, test))]
 fn managed_survivors(
     snapshot: &[CodexProcess],
     managed_processes: &mut HashMap<u32, CodexProcess>,
@@ -909,6 +942,7 @@ fn format_pids(pids: impl IntoIterator<Item = u32>) -> String {
         .join(", ")
 }
 
+#[cfg(any(windows, test))]
 fn managed_process_tree(processes: &[CodexProcess]) -> Vec<CodexProcess> {
     let mut managed_pids = processes
         .iter()
@@ -960,6 +994,7 @@ fn managed_app_roots(processes: &[CodexProcess]) -> Vec<CodexProcess> {
         .collect()
 }
 
+#[cfg(any(windows, test))]
 fn standalone_codex_processes(processes: &[CodexProcess]) -> Vec<CodexProcess> {
     let managed_pids = managed_process_tree(processes)
         .into_iter()
@@ -984,6 +1019,7 @@ fn decode_process_name(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+#[cfg(any(windows, test))]
 fn is_managed_app_root(image_name: &str) -> bool {
     let lower = image_name.to_ascii_lowercase();
     matches!(lower.as_str(), "chatgpt.exe" | "openai.codex.exe")

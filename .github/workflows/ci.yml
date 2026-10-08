@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    # The preview workflow owns equivalent quality gates for this branch and tag.
+    branches: ['**', '!feat/macos-release']
+    tags: ['v*', '!v*-macos.*']
   pull_request:
   # Manual runs let a maintainer re-check a gate without spending a commit on it.
   workflow_dispatch:
@@ -12,6 +15,7 @@ permissions:
 jobs:
   quality:
     name: Windows quality gate
+    if: github.head_ref != 'feat/macos-release'
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -62,6 +66,7 @@ jobs:
 
   supply-chain:
     name: Dependency, license and SBOM gate
+    if: github.head_ref != 'feat/macos-release'
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -138,6 +143,7 @@ jobs:
 
   old-saved-slot-gate:
     name: v0.2.7 saved-slot apply gate
+    if: github.head_ref != 'feat/macos-release'
     # Runs beside the quality gate instead of behind it: a gate that only exercises
     # the shipped v0.2.7 binary must not wait on a full clippy and test sweep.
     runs-on: windows-latest
@@ -177,6 +183,8 @@ jobs:
 
   release:
     name: Portable release build
+    # macOS previews use macos-release.yml; never run the Windows release lane.
+    if: github.ref != 'refs/heads/feat/macos-release' && github.head_ref != 'feat/macos-release' && !contains(github.ref, '-macos.')
     runs-on: windows-latest
     timeout-minutes: 60
     needs: [quality, supply-chain, old-saved-slot-gate]
@@ -269,7 +277,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-macos.')
     runs-on: windows-latest
     timeout-minutes: 15
     needs: release
@@ -312,6 +320,9 @@ jobs:
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($tag -ne "v$version") {
             throw "tag $tag does not match package version v$version"
+          }
+          if ($version.Contains('-')) {
+            throw 'The Windows Latest publisher only accepts stable release versions'
           }
 
           gh release view $tag *> $null

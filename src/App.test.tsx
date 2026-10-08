@@ -363,6 +363,26 @@ describe('App release-hardening UI', () => {
     vi.restoreAllMocks();
   });
 
+  it('keeps macOS preview core routing available while blocking Windows-only actions', async () => {
+    apiMocks.getAppStatus.mockResolvedValue({
+      appName: 'ChatGPT Switch', version: '0.5.0-macos.1', phase: 'hardened-mvp',
+      platform: 'macos', codexHome: '/Users/test/.codex',
+    });
+    const dashboard = dashboardData();
+    if (dashboard.runtimeCompatibility.status === 'ready') {
+      dashboard.runtimeCompatibility.data.advancedStorage = 'blocked';
+    }
+    render(<App loadDashboard={() => Promise.resolve(dashboard)} />);
+
+    expect(await screen.findByRole('region', { name: 'macOS 预览版说明' })).toBeTruthy();
+    expect((screen.getByRole('button', { name: '通过安装包更新' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '技能' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '创建完整备份' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '配置中转站' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(apiMocks.checkForUpdates).not.toHaveBeenCalled();
+    expect(apiMocks.installUpdate).not.toHaveBeenCalled();
+  });
+
   it('checks once on startup without blocking the dashboard', async () => {
     render(<App loadDashboard={() => Promise.resolve(dashboardData())} />);
 

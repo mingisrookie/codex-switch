@@ -4030,11 +4030,11 @@ fn load_conflict_replacement_phases(
         crate::crypto::unprotect(ciphertext)
             .map_err(|_| "conflict replacement phase record is unreadable".to_string())?
     } else {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             return Err("conflict replacement phase record is not protected".to_string());
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             protected
         }
@@ -4093,7 +4093,7 @@ fn write_conflict_replacement_phases(
     if plaintext.len() as u64 > MAX_CONFLICT_REPLACEMENT_PHASE_BYTES {
         return Err("conflict replacement phase record reached its size limit".to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let bytes = {
         let ciphertext = crate::crypto::protect(&plaintext)
             .map_err(|_| "failed to protect conflict replacement phase".to_string())?;
@@ -4104,7 +4104,7 @@ fn write_conflict_replacement_phases(
         protected.extend_from_slice(&ciphertext);
         protected
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let bytes = plaintext;
     atomic_write(&conflict_replacement_phase_path(plan)?, &bytes)
 }

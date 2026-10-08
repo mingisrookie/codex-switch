@@ -1,6 +1,6 @@
 <h1 align="center">ChatGPT Switch</h1>
 
-<p align="center"><strong>在 Windows 上切换官方账号与自有 API，让本机会话继续留在手边。</strong></p>
+<p align="center"><strong>切换官方账号与自有 API，让本机会话继续留在手边。Windows 稳定版与 macOS 预览版。</strong></p>
 <p align="center">无需反复退出登录，也不用每次手工编辑配置。切换、会话、备份与诊断，在一个桌面工具里完成。</p>
 
 <p align="center">
@@ -13,6 +13,7 @@
 <p align="center">
   <a href="https://github.com/mingisrookie/codex-switch/releases/latest/download/codex-switch.exe"><strong>下载 Windows 版</strong></a>
   · <a href="https://github.com/mingisrookie/codex-switch/releases/tag/v0.4.0">v0.4.0 更新说明</a>
+  · <a href="https://github.com/mingisrookie/codex-switch/releases/tag/v0.5.0-macos.1"><strong>下载 macOS 预览版</strong></a>
   · <a href="#快速开始">快速开始</a>
   · <a href="docs/USER_GUIDE.md">使用指南</a>
   · <a href="https://github.com/mingisrookie/codex-switch/issues">反馈问题</a>
@@ -41,6 +42,12 @@
 | 恢复归档会话或整理本机数据 | 显式执行“恢复可见”及符合前置条件的“会话合并与修复”；冲突保留，不猜测覆盖。 |
 | 留下恢复点、排查问题或更新 | 手动完整备份与恢复、脱敏诊断导出、应用内正式版更新。 |
 
+## macOS 预览版
+
+新增 [v0.5.0-macos.1 预发布](https://github.com/mingisrookie/codex-switch/releases/tag/v0.5.0-macos.1)：分别提供 Apple Silicon 与 Intel 原生 DMG，支持 Account/Relay 请求切换、本机会话查看和脱敏诊断。凭据使用 macOS 钥匙串主密钥保护。
+
+该预览版未开放高级迁移、清理、完整备份恢复及内置技能，更新采用手动下载 DMG。安装包仅有 ad-hoc 签名，尚无 Apple Developer ID 签名或公证。安装方法、客户端要求与数据边界请先阅读 [macOS 预览版说明](docs/MACOS_PREVIEW.md)。Windows Latest 仍保持 v0.4.0。
+
 ## v0.4.0 更新重点
 
 **中转站默认使用 HTTP Responses，需要 WebSocket 时再显式启用。** 自定义 API 网关路径会原样保留，不再自动多加一层 `/v1`。保存或切换成功只代表本地请求配置已应用，不能替代真实服务连接验证。
@@ -53,7 +60,7 @@
 
 ### 1. 下载并打开
 
-下载 [最新正式版 `codex-switch.exe`](https://github.com/mingisrookie/codex-switch/releases/latest/download/codex-switch.exe)，放到便于查找的目录后运行。当前只发布 **Windows x64 便携版**，无需 Node.js 或 Rust 开发环境。
+Windows 用户下载 [最新正式版 `codex-switch.exe`](https://github.com/mingisrookie/codex-switch/releases/latest/download/codex-switch.exe)，放到便于查找的目录后运行。Mac 用户下载对应芯片的 [预览版 DMG](https://github.com/mingisrookie/codex-switch/releases/tag/v0.5.0-macos.1)，将 App 拖入“应用程序”。运行安装包无需 Node.js 或 Rust 开发环境。
 
 已安装旧版的用户，可在应用顶部选择 **“检查更新”**。下载、版本说明和校验信息统一以 [GitHub Releases](https://github.com/mingisrookie/codex-switch/releases/latest) 为准；`main` 中的提交不等于已经发布的安装文件。
 
@@ -71,7 +78,7 @@
 
 ## 数据与安全边界
 
-**API Key 的保存与使用是两件事。** 保存到工具槽位时使用当前 Windows 用户的 DPAPI 加密，界面不回填 Key。API 模式激活后，为供客户端发起请求，Key 会以 bearer token 形式出现在本机受管的 `config.toml` 中；切回官方模式会移除这段受管配置。不要公开分享该文件。
+**API Key 的保存与使用是两件事。** Windows 槽位使用当前用户的 DPAPI 加密，macOS 槽位使用钥匙串主密钥与 AES-256-GCM 加密，界面不回填 Key。API 模式激活后，为供客户端发起请求，Key 会以 bearer token 形式出现在本机受管的 `config.toml` 中；切回官方模式会移除这段受管配置。不要公开分享该文件。
 
 **历史会话不会被默认批量上传。** API 模式下发出的请求会交给你配置的服务处理，请自行确认服务商的数据政策、权限和费用。会话迁移、恢复和清理是独立的本地操作；执行高风险维护前应先创建完整备份。
 
@@ -79,7 +86,7 @@
 
 ## 当前支持范围
 
-- **Windows x64，一个官方账号槽位和一个 API 槽位。** 暂不提供多账号池、多 API 配置池、macOS 或 Linux 版本。
+- **Windows x64 稳定版，macOS Apple Silicon / Intel 预览版；一个官方账号槽位和一个 API 槽位。** 暂不提供多账号池、多 API 配置池或 Linux 版本。Mac 的功能范围见预览版说明。
 - API 可用性取决于本机客户端与目标服务的兼容性；默认使用 HTTP Responses，服务商明确支持时可选择 Responses WebSocket。
 - 会话合并、迁移和清理需要满足界面提示的前置条件，不应代替长期备份；“本机已提交”也不等于手机或远端服务已收到。
 
@@ -113,6 +120,7 @@ ChatGPT Switch 是产品名称。`codex-switch.exe` 是历史发布文件名，�
 | 文档 | 内容 |
 | --- | --- |
 | [使用指南](docs/USER_GUIDE.md) | 会话、备份、恢复、诊断与更新的具体操作。 |
+| [macOS 预览版](docs/MACOS_PREVIEW.md) | Mac 安装、功能范围、签名、钥匙串与客户端要求。 |
 | [安全与数据](docs/SECURITY.md) | 凭据、本地文件、第三方 API 和诊断包的边界。 |
 | [版本验证](docs/RELEASE_VERIFICATION.md) | 核验版本、下载文件和发布流程。 |
 | [完整运行链路](项目完整链路说明.md) | 请求切换、会话存储、备份和更新的实现说明。 |

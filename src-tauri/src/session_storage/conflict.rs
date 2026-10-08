@@ -1064,7 +1064,7 @@ fn deferred_conflict_registry_digest(
 }
 
 fn protect_deferred_conflict_registry(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = crate::crypto::protect(plaintext)
             .map_err(|_| "failed to protect deferred conflict registry".to_string())?;
@@ -1074,14 +1074,14 @@ fn protect_deferred_conflict_registry(plaintext: &[u8]) -> Result<Vec<u8>, Strin
         protected.extend_from_slice(&ciphertext);
         Ok(protected)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(plaintext.to_vec())
     }
 }
 
 fn unprotect_deferred_conflict_registry(protected: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = protected
             .strip_prefix(DEFERRED_CONFLICT_CIPHERTEXT_MAGIC)
@@ -1093,7 +1093,7 @@ fn unprotect_deferred_conflict_registry(protected: &[u8]) -> Result<Vec<u8>, Str
         }
         Ok(plaintext)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         if protected.len() as u64 > MAX_DEFERRED_CONFLICT_BYTES {
             return Err("deferred conflict registry reached its size limit".to_string());
@@ -1494,7 +1494,7 @@ mod tests {
 
         let path = data.join("session-storage-v1/deferred-conflicts-v1.dpapi");
         let protected = fs::read(&path).unwrap();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             assert!(protected.starts_with(super::DEFERRED_CONFLICT_CIPHERTEXT_MAGIC));
             assert!(!protected

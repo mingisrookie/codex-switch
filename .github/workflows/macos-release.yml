@@ -1,0 +1,291 @@
+name: macOS preview release
+
+on:
+  push:
+    branches: [main, feat/macos-release]
+    tags: ['v0.5.0-macos.1']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+  MACOS_PREVIEW_VERSION: 0.5.0-macos.1
+
+jobs:
+  native:
+    name: Native macOS (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            architecture: aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up pinned native Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Verify source versions and install dependencies
+        run: |
+          node scripts/publish-macos-release.mjs --check-version
+          npm ci
+      - name: Check frontend and release contracts
+        run: |
+          npm test -- --run
+          npm run typecheck
+          npm run build
+          npm run check:docs
+          node --test scripts/macos-release-contract.test.mjs scripts/supply-chain-contract.test.mjs
+      - name: Check Rust formatting and native lints
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Test macOS paths, encryption, routes and process safety
+        run: |
+          set -euo pipefail
+          # Fresh Keychains avoid cross-binary ACL prompts without weakening production ACLs.
+          for group in crypto process_control managed_client request_route_switcher \
+            runtime_store runtime_session_view file_ops runtime_compatibility \
+            platform_paths diagnostics chat_process_state macos; do
+            python3 scripts/macos-ci-keychain.py -- cargo test --locked \
+              --manifest-path src-tauri/Cargo.toml --lib "$group" -- --test-threads=1
+          done
+          python3 scripts/macos-ci-keychain.py -- cargo test --locked \
+            --manifest-path src-tauri/Cargo.toml --test macos_platform_contract -- --test-threads=1
+      - name: Build the native app and ad-hoc signed DMG
+        run: |
+          npm run tauri -- build --target "${{ matrix.target }}" \
+            --config src-tauri/tauri.macos.conf.json --bundles app,dmg
+          git diff --exit-code -- package.json package-lock.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json src-tauri/tauri.macos.conf.json src-tauri/Info.macos.plist
+      - name: Verify final DMG and prove isolated startup of its mounted app
+        run: |
+          python3 scripts/macos-ci-keychain.py -- python3 scripts/check-macos-bundle.py \
+            --architecture "${{ matrix.architecture }}" \
+            --target-root src-tauri/target --output release \
+            --version "$MACOS_PREVIEW_VERSION" --commit "$GITHUB_SHA"
+      - name: Upload optional owned-window UI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-ui-${{ matrix.architecture }}-${{ github.sha }}
+          path: macos-ui-evidence/*
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload verified native release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-release-${{ matrix.architecture }}-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  windows-regression:
+    name: Windows full regression and saved-slot gate
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+        with:
+          components: rustfmt, clippy
+      - name: Verify source versions and install dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node scripts/publish-macos-release.mjs --check-version
+          npm ci
+      - name: Run Windows frontend and release harness regression
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm test -- --run
+          npm run typecheck
+          npm run build
+          npm run check:docs
+          node --test scripts/v030-release-harness.test.mjs scripts/supply-chain-contract.test.mjs scripts/macos-release-contract.test.mjs
+      - name: Run Windows Rust regression
+        working-directory: src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets --features runtime-evidence
+      - name: Verify v0.2.7 saved runtime slot apply on isolated runner
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/v030-old-saved-slot-ci.mjs (Join-Path $env:RUNNER_TEMP 'v030-old-saved-slot')
+      - name: Upload old saved-slot apply evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-windows-regression-${{ github.sha }}
+          path: ${{ runner.temp }}/v030-old-saved-slot/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  supply-chain:
+    name: Darwin dependency, license and SBOM gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Verify source versions and npm dependencies
+        run: |
+          node scripts/publish-macos-release.mjs --check-version
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Audit Rust advisories, sources, bans and licenses
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 / cargo-deny 0.20.2
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check
+          arguments: --all-features
+          command-arguments: advisories bans licenses sources
+          rust-version: 1.94.1
+      - name: Install the verified CycloneDX generator
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-cyclonedx-0.5.9-linux.tar.xz"
+          extract_root="$RUNNER_TEMP/cargo-cyclonedx-0.5.9-linux"
+          curl --fail --location --silent --show-error \
+            'https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz' \
+            --output "$archive"
+          echo 'fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8  '"$archive" | sha256sum --check --strict
+          mkdir -p "$extract_root"
+          tar -xJf "$archive" -C "$extract_root"
+          install -m 0755 "$extract_root/cargo-cyclonedx-x86_64-unknown-linux-gnu/cargo-cyclonedx" \
+            "$HOME/.cargo/bin/cargo-cyclonedx"
+          cargo cyclonedx --version
+      - name: Generate and verify the two locked Darwin SBOMs
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          mkdir -p release
+          for entry in aarch64:aarch64-apple-darwin x64:x86_64-apple-darwin; do
+            architecture="${entry%%:*}"
+            target="${entry#*:}"
+            basename="codex-switch_macos_${architecture}.cdx"
+            (cd src-tauri && cargo cyclonedx --format json --spec-version 1.5 \
+              --target "$target" --override-filename "$basename")
+            node scripts/check-sbom.mjs --prepare "src-tauri/$basename.json"
+            node scripts/check-sbom.mjs "src-tauri/$basename.json"
+            cp "src-tauri/$basename.json" "release/$basename.json"
+          done
+          git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock
+      - name: Upload validated Darwin SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-release-sbom-${{ github.sha }}
+          path: release/*.cdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified non-Latest macOS prerelease
+    if: github.event_name == 'push' && github.ref == 'refs/tags/v0.5.0-macos.1'
+    needs: [native, windows-regression, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Download the validated assets from this workflow run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-release-*-${{ github.sha }}
+          path: release
+          merge-multiple: true
+      - name: Recheck all downloaded bytes and source identities
+        run: node scripts/publish-macos-release.mjs --check-assets release
+      - name: Attest DMG build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/*.dmg
+      - name: Bind the Apple Silicon SBOM to its DMG
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/codex-switch_0.5.0-macos.1_aarch64.dmg
+          sbom-path: release/codex-switch_macos_aarch64.cdx.json
+      - name: Bind the Intel SBOM to its DMG
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/codex-switch_0.5.0-macos.1_x64.dmg
+          sbom-path: release/codex-switch_macos_x64.cdx.json
+      - name: Publish prerelease and verify public readback and Windows Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-macos-release.mjs --publish release
+      - name: Retain publication readback evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-publication-${{ github.sha }}
+          path: publication-evidence.json
+          if-no-files-found: error
+          retention-days: 30

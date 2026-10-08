@@ -191,9 +191,14 @@ pub fn walk_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn create_new(path: &Path) -> Result<File, String> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
         .open(path)
         .map_err(|error| format!("failed to create temporary file: {error}"))
 }

@@ -1,7 +1,7 @@
 {
   "name": "codex-switch",
-  "version": "0.4.0",
-  "description": "Windows desktop tool for switching ChatGPT account/API runtime states and syncing local sessions.",
+  "version": "0.5.0-macos.1",
+  "description": "Desktop tool for switching ChatGPT account/API runtime states, with Windows support and a macOS preview.",
   "license": "MIT",
   "type": "module",
   "scripts": {

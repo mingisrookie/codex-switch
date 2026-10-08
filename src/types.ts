@@ -18,7 +18,8 @@ export type RuntimeCompatibilityIssueCode =
   | 'modelProviderColumnMissing'
   | 'modelProviderColumnIncompatible'
   | 'rolloutPathColumnMissing'
-  | 'rolloutPathColumnIncompatible';
+  | 'rolloutPathColumnIncompatible'
+  | 'platformFeatureUnavailable';
 
 export type ManagedClientPackage = {
   aumid: string;
@@ -569,6 +570,7 @@ export type AppStatus = {
   version: string;
   phase: string;
   codexHome: string;
+  platform?: string;
 };
 
 export type DiagnosticStatus = {

@@ -843,8 +843,7 @@ fn validate_runtime_id(runtime_id: &str) -> Result<(), String> {
 }
 
 pub fn default_store_root() -> Result<PathBuf, String> {
-    let appdata = std::env::var_os("APPDATA").ok_or_else(|| "APPDATA is not set".to_string())?;
-    Ok(PathBuf::from(appdata).join("codex-switch"))
+    crate::platform_paths::store_root()
 }
 
 fn normalize_base_url(raw: &str) -> Result<String, String> {

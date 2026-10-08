@@ -726,13 +726,25 @@ pub(crate) fn schedule_session_storage_startup_recovery() {
                     "commands.session_storage_startup_retention.failed",
                     &retention,
                 );
-                allow_automatic_gc = retention.is_ok();
+                allow_automatic_gc = retention.is_ok() && !cfg!(target_os = "macos");
             }
         }
         // A failed recovery/retention pass must not suppress the read-only
         // Shadow report, but it must suppress every automatic deletion path.
         schedule_cleanup_for_current_roots(allow_automatic_gc);
     }));
+}
+
+// The macOS preview owns its route-view recovery, but must never mutate a legacy
+// Windows advanced-storage ledger, certificate, or recovery package at startup.
+fn run_legacy_storage_maintenance<T: Default>(
+    maintenance: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if cfg!(target_os = "macos") {
+        Ok(T::default())
+    } else {
+        maintenance()
+    }
 }
 
 fn recover_session_storage_and_pending_view_at_startup() -> Result<usize, String> {
@@ -748,6 +760,10 @@ fn recover_session_storage_and_pending_view_at_startup() -> Result<usize, String
 }
 
 fn reconcile_committed_session_storage_reclaim_metrics() -> Result<usize, String> {
+    run_legacy_storage_maintenance(reconcile_committed_session_storage_reclaim_metrics_supported)
+}
+
+fn reconcile_committed_session_storage_reclaim_metrics_supported() -> Result<usize, String> {
     let _mutation_guard = acquire_mutation_lock()?;
     let data_root = appdata_root()?.join("codex-switch");
     if !data_root.exists() {
@@ -813,6 +829,11 @@ fn run_automatic_session_storage_retention(
 
 fn run_session_storage_retention_with_lock_held(
 ) -> Result<Option<SessionStorageRetentionReceipt>, String> {
+    run_legacy_storage_maintenance(run_session_storage_retention_supported)
+}
+
+fn run_session_storage_retention_supported(
+) -> Result<Option<SessionStorageRetentionReceipt>, String> {
     let appdata = appdata_root()?;
     let data_root = appdata.join("codex-switch");
     if !data_root.exists() {
@@ -846,6 +867,10 @@ fn run_session_storage_retention_with_lock_held(
 }
 
 fn recover_session_storage_operations_at_startup() -> Result<usize, String> {
+    run_legacy_storage_maintenance(recover_session_storage_operations_at_startup_supported)
+}
+
+fn recover_session_storage_operations_at_startup_supported() -> Result<usize, String> {
     let _mutation_guard = acquire_mutation_lock()?;
     let data_root = appdata_root()?.join("codex-switch");
     let store = OperationLedgerStore::new(&data_root);
@@ -1133,6 +1158,7 @@ pub struct AppStatus {
     pub version: &'static str,
     pub phase: &'static str,
     pub codex_home: PathBuf,
+    pub platform: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1268,6 +1294,7 @@ pub fn get_app_status() -> AppStatus {
         version: env!("CARGO_PKG_VERSION"),
         phase: "hardened-mvp",
         codex_home: default_codex_home(),
+        platform: std::env::consts::OS,
     }
 }
 
@@ -4708,6 +4735,9 @@ fn request_background_automatic_gc(
     data_root: PathBuf,
     baseline_scan_id: Option<String>,
 ) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
     let generation = AUTOMATIC_GC_GENERATION
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
@@ -6653,6 +6683,7 @@ fn load_session_merge_backup_destination(
 
 #[tauri::command]
 pub async fn list_backups() -> Result<Vec<BackupSummary>, String> {
+    require_windows_storage_feature()?;
     let result = match tauri::async_runtime::spawn_blocking(list_backups_blocking).await {
         Ok(result) => result,
         Err(_) => Err("backup list worker failed".to_string()),
@@ -6662,6 +6693,7 @@ pub async fn list_backups() -> Result<Vec<BackupSummary>, String> {
 }
 
 fn list_backups_blocking() -> Result<Vec<BackupSummary>, String> {
+    require_windows_storage_feature()?;
     let backup_root = default_backup_root()?;
     {
         let _migration_guard = acquire_mutation_lock()?;
@@ -6676,6 +6708,7 @@ fn list_backups_at(backup_root: &Path) -> Result<Vec<BackupSummary>, String> {
 
 #[tauri::command]
 pub async fn inspect_checkpoint_storage() -> Result<CheckpointStorageStatus, String> {
+    require_windows_storage_feature()?;
     let result =
         match tauri::async_runtime::spawn_blocking(inspect_checkpoint_storage_blocking).await {
             Ok(result) => result,
@@ -6690,6 +6723,7 @@ pub async fn inspect_checkpoint_storage() -> Result<CheckpointStorageStatus, Str
 }
 
 fn inspect_checkpoint_storage_blocking() -> Result<CheckpointStorageStatus, String> {
+    require_windows_storage_feature()?;
     let _mutation_guard = acquire_mutation_lock()?;
     let records = operation_log()?.list_all_strict()?;
     inspect_checkpoint_storage_at(&default_backup_root()?, &records)
@@ -6697,6 +6731,7 @@ fn inspect_checkpoint_storage_blocking() -> Result<CheckpointStorageStatus, Stri
 
 #[tauri::command]
 pub async fn cleanup_automatic_checkpoints() -> Result<CheckpointCleanupReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("cleanupCheckpoints");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let worker_diagnostic = diagnostic.clone();
@@ -6724,6 +6759,7 @@ pub async fn cleanup_automatic_checkpoints() -> Result<CheckpointCleanupReceipt,
 fn cleanup_automatic_checkpoints_blocking(
     diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<CheckpointCleanupReceipt, String> {
+    require_windows_storage_feature()?;
     let mut durable_recorded = false;
     let result = (|| {
         let _mutation_guard = acquire_mutation_lock()?;
@@ -6831,6 +6867,7 @@ fn checkpoint_cleanup_diagnostic_status(
 
 #[tauri::command]
 pub async fn create_full_backup() -> Result<CreateFullBackupReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("createBackup");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let worker_diagnostic = diagnostic.clone();
@@ -6876,6 +6913,7 @@ pub async fn create_full_backup() -> Result<CreateFullBackupReceipt, String> {
 fn create_full_backup_blocking(
     diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<CreateFullBackupReceipt, String> {
+    require_windows_storage_feature()?;
     let _mutation_guard = acquire_mutation_lock()?;
     record_diagnostic_phase(diagnostic, "backup");
     let started = timestamp_millis()?;
@@ -6987,6 +7025,7 @@ pub async fn delete_backup(
     backup_dir: PathBuf,
     confirmed: bool,
 ) -> Result<BackupDeleteReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("deleteBackup");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let worker_diagnostic = diagnostic.clone();
@@ -7034,6 +7073,7 @@ fn delete_backup_blocking(
     confirmed: bool,
     diagnostic: Option<&DiagnosticOperation>,
 ) -> Result<BackupDeleteReceipt, String> {
+    require_windows_storage_feature()?;
     let _mutation_guard = acquire_mutation_lock()?;
     record_diagnostic_phase(diagnostic, "apply");
     let backup_root = default_backup_root()?;
@@ -7174,6 +7214,7 @@ fn append_delete_backup_record(
 
 #[tauri::command]
 pub fn restore_backup(backup_dir: String) -> Result<RestoreBackupReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("restoreBackup");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
@@ -7335,6 +7376,7 @@ pub fn list_operation_records(limit: Option<usize>) -> Result<Vec<OperationRecor
 
 #[tauri::command]
 pub fn list_skills() -> Result<Vec<SkillStatus>, String> {
+    require_windows_storage_feature()?;
     let result = (|| list_skills_at(&skill_codex_home()?, &appdata_root()?))();
     record_background_result("listSkills", "commands.list_skills.failed", &result);
     result
@@ -7345,6 +7387,7 @@ pub fn install_skill(
     skill_id: SkillId,
     confirm_replace: bool,
 ) -> Result<SkillMutationReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("installSkill");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
@@ -7392,6 +7435,7 @@ pub fn install_skill(
 
 #[tauri::command]
 pub fn save_skill_config(input: SkillConfigInput) -> Result<SkillMutationReceipt, String> {
+    require_windows_storage_feature()?;
     let diagnostic = begin_command_diagnostic("configureSkill");
     record_diagnostic_phase(diagnostic.as_ref(), "preflight");
     let result = (|| {
@@ -7470,10 +7514,17 @@ fn non_empty_os(value: Option<OsString>) -> Option<OsString> {
 }
 
 fn appdata_root() -> Result<PathBuf, String> {
-    let root = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA is not set".to_string())?;
-    validate_absolute_root(&root, "APPDATA")
+    crate::platform_paths::appdata_root()
+}
+
+fn require_windows_storage_feature() -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        return Err(
+            "此 macOS 预览版尚未开放备份恢复、检查点清理及内置技能；账号与中转站切换可正常使用。"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn ensure_advanced_storage_compatibility(codex_home: &Path) -> Result<(), String> {
@@ -7590,21 +7641,41 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
     let parent = lock_path
         .parent()
         .ok_or_else(|| "mutation lock path has no parent directory".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create mutation lock directory: {error}"))?;
 
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(windows)]
-    options.share_mode(0);
+    #[cfg(target_os = "macos")]
+    let file = {
+        let directory = crate::platform_paths::ensure_private_directory(parent)?;
+        let name = lock_path
+            .file_name()
+            .ok_or_else(|| "mutation lock path has no filename".to_string())?;
+        crate::platform_paths::open_private_lock_file(&directory, name)?
+    };
 
-    options.open(lock_path).map_err(|error| {
-        if matches!(error.raw_os_error(), Some(32 | 33)) {
-            "another ChatGPT Switch mutation is already in progress".to_string()
-        } else {
+    #[cfg(not(target_os = "macos"))]
+    let file = {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create mutation lock directory: {error}"))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        options.share_mode(0);
+        options.open(lock_path).map_err(|error| {
+            if matches!(error.raw_os_error(), Some(32 | 33)) {
+                "another ChatGPT Switch mutation is already in progress".to_string()
+            } else {
+                format!("failed to acquire the ChatGPT Switch mutation lock: {error}")
+            }
+        })?
+    };
+
+    #[cfg(target_os = "macos")]
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => mutation_busy_error(),
+        std::fs::TryLockError::Error(error) => {
             format!("failed to acquire the ChatGPT Switch mutation lock: {error}")
         }
-    })
+    })?;
+    Ok(file)
 }
 
 fn ensure_compatible_storage_writers_closed(codex_home: &Path, action: &str) -> Result<(), String> {
@@ -10745,5 +10816,65 @@ mod tests {
         );
         assert!(validate_backup_selection(root.path(), &nested).is_err());
         assert!(validate_backup_selection(root.path(), outside.path()).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_storage_maintenance_never_mutates_existing_state() {
+        let root = tempdir().unwrap();
+        let legacy_state = root.path().join("legacy-storage-state.json");
+        fs::write(&legacy_state, b"preserve legacy storage fixture").unwrap();
+        for _phase in ["recovery", "reclaim metrics", "retention"] {
+            let result: usize = super::run_legacy_storage_maintenance(|| {
+                fs::remove_file(&legacy_state).unwrap();
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(
+                fs::read(&legacy_state).unwrap(),
+                b"preserve legacy storage fixture"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mutation_lock_is_exclusive_private_and_released_with_its_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let app = root.path().canonicalize().unwrap().join("codex-switch");
+        let lock_path = app.join("mutation.lock");
+        let first = super::open_mutation_lock_file(&lock_path).unwrap();
+        let error = super::open_mutation_lock_file(&lock_path).unwrap_err();
+        assert!(error.contains("already in progress"), "{error}");
+        assert_eq!(
+            first.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&app).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(first);
+        assert!(super::open_mutation_lock_file(&lock_path).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mutation_lock_rejects_linked_parent_before_creating_or_chmod() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let target = root.join("unrelated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("linked");
+        symlink(&target, &link).unwrap();
+        assert!(super::open_mutation_lock_file(&link.join("mutation.lock")).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
     }
 }

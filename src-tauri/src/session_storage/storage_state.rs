@@ -228,6 +228,11 @@ pub fn load_committed_canonical_storage_state(
     data_root: &Path,
     canonical_root: &Path,
 ) -> Result<Option<CanonicalStorageState>, String> {
+    // The macOS preview uses its route-view journal, not Windows advanced storage.
+    // Reads must not finalize prepared certificates or upgrade legacy v1 files.
+    if cfg!(target_os = "macos") {
+        return Ok(None);
+    }
     validate_data_root(data_root)?;
     let Some(loaded) = read_canonical_state(data_root)? else {
         return Ok(None);
@@ -579,11 +584,11 @@ fn read_canonical_state(data_root: &Path) -> Result<Option<LoadedCanonicalStorag
         return Err("canonical storage state reached its size limit".to_string());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         parse_v1_envelope(&bytes).map(Some)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         match parse_v2_envelope(&bytes) {
             Ok(record) => Ok(Some(record)),
@@ -632,7 +637,7 @@ fn persist_canonical_record(
     if plaintext.len() as u64 > MAX_CANONICAL_STATE_BYTES {
         return Err("canonical storage state reached its size limit".to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let bytes = {
         let ciphertext = crate::crypto::protect(&plaintext)
             .map_err(|_| "failed to protect canonical storage state".to_string())?;
@@ -642,7 +647,7 @@ fn persist_canonical_record(
         protected.extend_from_slice(&ciphertext);
         protected
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let bytes = plaintext;
     if bytes.len() as u64 > MAX_ENCRYPTED_STATE_BYTES {
         return Err("canonical storage state reached its size limit".to_string());
@@ -846,7 +851,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use super::CANONICAL_STATE_CIPHERTEXT_MAGIC;
     use super::{
         canonical_state_path, digest, finalize_canonical_storage_state,
@@ -946,7 +951,7 @@ mod tests {
         assert_eq!(state.schema_version, 2);
         assert!(state.committed_at_ms >= state.prepared_at_ms);
         assert_eq!(state.backup_destination, backup_destination);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let persisted = fs::read(canonical_state_path(&data)).unwrap();
             assert!(persisted.starts_with(CANONICAL_STATE_CIPHERTEXT_MAGIC));
@@ -1036,7 +1041,7 @@ mod tests {
             .unwrap();
         assert_eq!(upgraded.schema_version, 2);
         assert_eq!(upgraded.migration_operation_id, operation_id);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         assert!(fs::read(canonical_state_path(&data))
             .unwrap()
             .starts_with(CANONICAL_STATE_CIPHERTEXT_MAGIC));
@@ -1128,5 +1133,51 @@ mod tests {
                 .reclaimed_bytes,
             4096
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_control_state_preserves_legacy_canonical_file_without_upgrading_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().join("data");
+        let canonical_root = root.path().join("home");
+        let state = super::LegacyCanonicalStorageStateV1 {
+            schema_version: super::LEGACY_CANONICAL_STATE_SCHEMA_VERSION,
+            migration_operation_id: "legacy-fixture".to_string(),
+            canonical_root: canonical_root.clone(),
+            inventory_fingerprint: "a".repeat(64),
+            prepared_at_ms: 1,
+        };
+        let envelope = super::LegacyCanonicalStorageStateEnvelopeV1 {
+            integrity_sha256: super::digest(&state).unwrap(),
+            state,
+        };
+        let original = serde_json::to_vec(&envelope).unwrap();
+        let path = super::canonical_state_path(&data_root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let control =
+            super::load_session_storage_control_state(&data_root, &canonical_root).unwrap();
+        assert!(!control.canonical_ready);
+        assert_eq!(control.migration_operation_id, None);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(!canonical_root.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_control_state_inspection_does_not_create_application_or_user_data() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().join("absent-data");
+        let canonical_root = root.path().join("absent-home");
+        let control =
+            super::load_session_storage_control_state(&data_root, &canonical_root).unwrap();
+        assert!(!control.canonical_ready);
+        assert!(!data_root.exists());
+        assert!(!canonical_root.exists());
     }
 }

@@ -200,7 +200,7 @@ fn open_shadow_scan_lock_file(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_shadow_scan_lock_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -220,9 +220,32 @@ fn shadow_scan_lock_is_busy(error: &std::io::Error) -> bool {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn shadow_scan_lock_is_busy(_error: &std::io::Error) -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+fn open_shadow_scan_lock_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn shadow_scan_lock_is_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
 }
 
 fn drain_pending_scans(pending: &AtomicBool, mut scan: impl FnMut()) {

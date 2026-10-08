@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.4.0"
+version = "0.5.0-macos.1"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT"
@@ -35,6 +35,16 @@ thiserror = "=2.0.18"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.61.3", features = ["ApplicationModel", "Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.186"
+core-foundation = "=0.10.1"
+plist = "=1.10.0"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSRunningApplication", "libc"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSDate"] }
+security-framework = "=3.7.0"
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

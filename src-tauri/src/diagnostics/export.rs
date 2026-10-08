@@ -365,7 +365,7 @@ fn build_entries(inputs: &ExportInputs) -> Result<BTreeMap<String, Vec<u8>>, Str
         exported_at: metadata.exported_at,
         timezone_offset_minutes: metadata.timezone_offset_minutes,
         timestamp_unit: "unixEpochMilliseconds".to_string(),
-        platform: "windows".to_string(),
+        platform: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
         redaction_policy_version: metadata.redaction_policy_version,
         selection: metadata.selection,
@@ -781,7 +781,14 @@ fn create_staging_file(directory: &Path) -> Result<StagingFile, String> {
             std::process::id(),
             sequence
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => {
                 drop(file);
                 return Ok(StagingFile { path });
@@ -891,12 +898,36 @@ fn zip_bytes(entries: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
 }
 
 fn write_prepared_archive(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(not(target_os = "macos"))]
+    options.truncate(true);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
         .open(path)
         .map_err(|_| "failed to open diagnostic export staging".to_string())?;
-    let mut file = file;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = file
+            .metadata()
+            .map_err(|_| "failed to inspect diagnostic export staging".to_string())?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err("diagnostic export staging is not a private regular file".into());
+        }
+        // Check the opened inode before any truncation or permission change.
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| "failed to secure diagnostic export staging".to_string())?;
+        file.set_len(0)
+            .map_err(|_| "failed to initialize diagnostic export staging".to_string())?;
+    }
     file.write_all(bytes)
         .map_err(|_| "failed to write diagnostic export staging".to_string())?;
     file.sync_all()
@@ -1509,5 +1540,58 @@ mod tests {
         let mut wrong = BTreeMap::new();
         wrong.insert("unexpected".to_string(), Vec::new());
         assert!(self_check_archive(&path, &wrong, &inputs().redaction).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_export_and_staging_are_private_without_changing_downloads() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let directory = root.path().canonicalize().unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let staging = super::create_staging_file(&directory).unwrap();
+        assert_eq!(
+            std::fs::metadata(&staging.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(staging);
+        let receipt = export_to_directory_at(inputs(), &directory, "20260809-153012-004").unwrap();
+        assert_eq!(
+            std::fs::metadata(&receipt.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_export_write_rejects_linked_files_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let target = root.join("unrelated.txt");
+        std::fs::write(&target, b"unrelated fixture").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let symbolic = root.join("symbolic.tmp");
+        let hard = root.join("hard.tmp");
+        symlink(&target, &symbolic).unwrap();
+        std::fs::hard_link(&target, &hard).unwrap();
+        assert!(super::write_prepared_archive(&symbolic, b"must not be written").is_err());
+        assert!(super::write_prepared_archive(&hard, b"must not be written").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated fixture");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }

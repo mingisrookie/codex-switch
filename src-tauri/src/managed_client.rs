@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "macos")]
+#[path = "managed_client_macos.rs"]
+pub(crate) mod macos;
+
 pub const TRUSTED_CHATGPT_AUMIDS: &[&str] = &[
     "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT",
     "OpenAI.Codex_2p2nqsd0c76g0!App",
@@ -58,7 +62,12 @@ pub fn inspect_managed_client_packages() -> Vec<ManagedClientPackage> {
         .collect()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn inspect_managed_client_packages() -> Vec<ManagedClientPackage> {
+    macos::inspect_packages()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn inspect_managed_client_packages() -> Vec<ManagedClientPackage> {
     Vec::new()
 }

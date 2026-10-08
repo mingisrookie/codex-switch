@@ -57,6 +57,7 @@ pub enum RuntimeCompatibilityIssueCode {
     ModelProviderColumnIncompatible,
     RolloutPathColumnMissing,
     RolloutPathColumnIncompatible,
+    PlatformFeatureUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,7 +115,26 @@ struct DatabaseInspectionFailure {
 }
 
 pub fn inspect_runtime_compatibility(codex_home: &Path) -> RuntimeCompatibilityReport {
-    inspect_runtime_compatibility_with_clients(codex_home, inspect_managed_client_packages())
+    apply_platform_capabilities(inspect_runtime_compatibility_with_clients(
+        codex_home,
+        inspect_managed_client_packages(),
+    ))
+}
+
+fn apply_platform_capabilities(
+    mut report: RuntimeCompatibilityReport,
+) -> RuntimeCompatibilityReport {
+    if cfg!(target_os = "macos") {
+        report.advanced_storage = CapabilityAvailability::Blocked;
+        if report.status == CompatibilityLevel::Supported {
+            report.status = CompatibilityLevel::Warning;
+        }
+        report.issues.push(issue(
+            RuntimeCompatibilityIssueCode::PlatformFeatureUnavailable,
+            "此 macOS 预览版支持账号与中转站切换；高级迁移、清理和恢复尚未开放。",
+        ));
+    }
+    report
 }
 
 fn inspect_runtime_compatibility_with_clients(
@@ -429,7 +449,8 @@ where
     F: FnMut() -> Result<(), String>,
 {
     ensure_writers_closed()?;
-    let report = inspect_runtime_capabilities(codex_home, Vec::new(), false);
+    let report =
+        apply_platform_capabilities(inspect_runtime_capabilities(codex_home, Vec::new(), false));
     if !report.advanced_storage_supported() {
         return Err(compatibility_failure(&report, true).encoded());
     }
@@ -442,7 +463,16 @@ fn compatibility_failure(report: &RuntimeCompatibilityReport, advanced: bool) ->
     } else {
         report.session_view == CapabilityAvailability::Unavailable
     };
-    let issue_code = report.issues.first().map(|issue| issue.code);
+    let selected_issue = if advanced {
+        report
+            .issues
+            .iter()
+            .find(|issue| issue.code == RuntimeCompatibilityIssueCode::PlatformFeatureUnavailable)
+            .or_else(|| report.issues.first())
+    } else {
+        report.issues.first()
+    };
+    let issue_code = selected_issue.map(|issue| issue.code);
     let recoverability = match issue_code {
         Some(RuntimeCompatibilityIssueCode::StateDatabaseChanged) => {
             CommandRecoverability::CloseWritersAndRetry
@@ -462,9 +492,7 @@ fn compatibility_failure(report: &RuntimeCompatibilityReport, advanced: bool) ->
         } else {
             CommandErrorCode::RuntimeCompatibilityBlocked
         },
-        report
-            .issues
-            .first()
+        selected_issue
             .map(|issue| issue.message.as_str())
             .unwrap_or("当前 ChatGPT/Codex 本地存储结构未经支持验证；未执行写操作。"),
         "compatibilityPreflight",
@@ -622,15 +650,33 @@ mod tests {
         assert_eq!(report.status, CompatibilityLevel::Warning);
         assert_eq!(report.route_config, CapabilityAvailability::Supported);
         assert_eq!(report.session_view, CapabilityAvailability::Unavailable);
-        assert_eq!(report.advanced_storage, CapabilityAvailability::Unavailable);
+        assert_eq!(
+            report.advanced_storage,
+            if cfg!(target_os = "macos") {
+                CapabilityAvailability::Blocked
+            } else {
+                CapabilityAvailability::Unavailable
+            }
+        );
         assert_eq!(report.state_database, StateDatabaseCompatibility::Absent);
         assert!(require_session_view_compatible(home.path()).is_ok());
         let failure = require_advanced_storage_compatible(home.path()).unwrap_err();
         assert_eq!(
             failure.code,
-            CommandErrorCode::RuntimeCompatibilityUnavailable
+            if cfg!(target_os = "macos") {
+                CommandErrorCode::RuntimeCompatibilityBlocked
+            } else {
+                CommandErrorCode::RuntimeCompatibilityUnavailable
+            }
         );
-        assert_eq!(failure.recoverability, CommandRecoverability::Retry);
+        assert_eq!(
+            failure.recoverability,
+            if cfg!(target_os = "macos") {
+                CommandRecoverability::UnsupportedClient
+            } else {
+                CommandRecoverability::Retry
+            }
+        );
         assert!(!home.path().join("state_5.sqlite").exists());
     }
 
@@ -651,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_schema_enables_session_view_and_advanced_storage() {
+    fn supported_schema_enables_session_view_and_platform_permitted_storage() {
         let home = tempdir().unwrap();
         Connection::open(home.path().join("state_5.sqlite"))
             .unwrap()
@@ -667,9 +713,23 @@ mod tests {
 
         let report = inspect_runtime_compatibility(home.path());
 
-        assert_eq!(report.status, CompatibilityLevel::Supported);
+        assert_eq!(
+            report.status,
+            if cfg!(target_os = "macos") {
+                CompatibilityLevel::Warning
+            } else {
+                CompatibilityLevel::Supported
+            }
+        );
         assert_eq!(report.session_view, CapabilityAvailability::Supported);
-        assert_eq!(report.advanced_storage, CapabilityAvailability::Supported);
+        assert_eq!(
+            report.advanced_storage,
+            if cfg!(target_os = "macos") {
+                CapabilityAvailability::Blocked
+            } else {
+                CapabilityAvailability::Supported
+            }
+        );
         assert_eq!(
             report.state_database,
             StateDatabaseCompatibility::Compatible
@@ -679,7 +739,10 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.len() == 64));
         assert!(require_session_view_compatible(home.path()).is_ok());
-        assert!(require_advanced_storage_compatible(home.path()).is_ok());
+        assert_eq!(
+            require_advanced_storage_compatible(home.path()).is_ok(),
+            !cfg!(target_os = "macos")
+        );
     }
 
     #[test]
@@ -738,7 +801,11 @@ mod tests {
         assert_eq!(corrupt_report.status, CompatibilityLevel::Blocked);
         assert_eq!(
             compatibility_failure(&corrupt_report, true).recoverability,
-            CommandRecoverability::ManualInvestigation
+            if cfg!(target_os = "macos") {
+                CommandRecoverability::UnsupportedClient
+            } else {
+                CommandRecoverability::ManualInvestigation
+            }
         );
 
         let directory = tempdir().unwrap();
@@ -848,6 +915,7 @@ mod tests {
                 == RuntimeCompatibilityIssueCode::ModelProviderColumnIncompatible));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn schema_change_during_writer_shutdown_invalidates_the_earlier_preflight() {
         let home = tempdir().unwrap();
@@ -871,6 +939,7 @@ mod tests {
         assert_eq!(failure.code, CommandErrorCode::RuntimeCompatibilityBlocked);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn writer_appearing_during_schema_inspection_blocks_the_final_write_guard() {
         let home = tempdir().unwrap();
@@ -890,6 +959,32 @@ mod tests {
         assert_eq!(result.unwrap_err(), "writer appeared");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_storage_gate_blocks_even_after_writers_close() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        Connection::open(&path).unwrap().execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, rollout_path TEXT);"
+        ).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut checks = 0;
+        let failure = super::require_advanced_storage_after_writer_check(home.path(), || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(checks, 1);
+        let failure = crate::command_error::decode_command_failure(&failure).unwrap();
+        assert_eq!(failure.code, CommandErrorCode::RuntimeCompatibilityBlocked);
+        assert_eq!(
+            failure.recoverability,
+            CommandRecoverability::UnsupportedClient
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn schema_recheck_respects_an_existing_executor_write_barrier() {
         for wal in [false, true] {

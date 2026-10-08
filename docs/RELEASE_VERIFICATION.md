@@ -1,5 +1,15 @@
 # Release 验证说明
 
+## macOS 预发布验证
+
+Mac 安装包位于 [v0.5.0-macos.1 预发布](https://github.com/mingisrookie/codex-switch/releases/tag/v0.5.0-macos.1)，不进入 Windows Latest 更新通道。按芯片选择 aarch64 或 x64 DMG，并下载同名 SHA-256 文件，在同目录执行 `shasum -a 256 -c <下载的.sha256文件名>` 核对。构建来源可用 `gh attestation verify <下载的.dmg文件名> --repo mingisrookie/codex-switch` 验证。
+
+[macOS 工作流](../.github/workflows/macos-release.yml) 从相同 tag 原生构建两架构，发布前要求 Windows 回归、依赖检查、Mac 专项行为测试、生产 App 隔离启动/正常退出，以及 DMG 内外 App 一致性、Mach-O 架构、版本和签名完整性验证。Release 附带各架构验证 JSON 与 Rust CycloneDX 清单。原生验证不使用真实账号或第三方 API 请求。
+
+仅有 ad-hoc 签名，不等于 Apple Developer ID 或公证；安装方法及限制见 [macOS 预览版](MACOS_PREVIEW.md)。以下 Windows 正式版合同继续适用于 EXE 通道。
+
+Mac 版本映射遵守 Apple bundle 元数据格式：Release tag 为 `v0.5.0-macos.1`，Cargo/npm、应用内显示与安装包文件名保留 `0.5.0-macos.1`；Info.plist 的 `CFBundleShortVersionString` 和 `CFBundleVersion` 使用数字版本 `0.5.0`。发布脚本同时校验完整发行版号及这个明确映射，不以 Finder 的数字版本代替预发布身份。
+
 README 只提供下载入口。具体版本、文件大小、SHA-256、构建来源和更新验证证据应以对应 GitHub Release 为准，而不是长期固定在首页。
 
 ## 下载前确认

@@ -17,7 +17,10 @@ pub mod file_ops;
 pub mod managed_client;
 pub mod mobile_continuity;
 pub mod operation_log;
+pub mod platform_paths;
 pub mod process_control;
+#[cfg(target_os = "macos")]
+mod process_control_macos;
 pub mod provider_capability;
 mod request_route_switcher;
 pub mod runtime_compatibility;

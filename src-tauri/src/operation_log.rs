@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 
@@ -223,7 +223,7 @@ fn parse_operation_records_strict(payload: &[u8]) -> Result<Vec<OperationRecord>
 fn encode_operation_record(record: &OperationRecord) -> Result<Vec<u8>, String> {
     let plaintext = serde_json::to_vec(record)
         .map_err(|error| format!("failed to serialize operation record: {error}"))?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = crate::crypto::protect(&plaintext)
             .map_err(|_| "failed to protect operation record".to_string())?;
@@ -232,7 +232,7 @@ fn encode_operation_record(record: &OperationRecord) -> Result<Vec<u8>, String> 
         output.extend_from_slice(BASE64.encode(ciphertext).as_bytes());
         Ok(output)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(plaintext)
     }
@@ -240,7 +240,7 @@ fn encode_operation_record(record: &OperationRecord) -> Result<Vec<u8>, String> 
 
 fn decode_operation_record(line: &[u8]) -> Result<OperationRecord, String> {
     let plaintext = if let Some(encoded) = line.strip_prefix(PROTECTED_RECORD_PREFIX) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let ciphertext = BASE64.decode(encoded).map_err(|_| {
                 "failed to parse operation record: protected payload is invalid".to_string()
@@ -249,7 +249,7 @@ fn decode_operation_record(line: &[u8]) -> Result<OperationRecord, String> {
                 "failed to parse operation record: protected payload is unreadable".to_string()
             })?
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             return Err(
                 "failed to parse operation record: protected payload is unsupported".to_string(),
@@ -387,7 +387,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn append_and_zero_removal_retention_reprotect_legacy_plaintext_records() {
         let root = tempdir().unwrap();
@@ -408,7 +408,7 @@ mod tests {
         assert_operation_log_is_fully_protected(&path, 1);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn assert_operation_log_is_fully_protected(path: &std::path::Path, expected_lines: usize) {
         let payload = fs::read(path).unwrap();
         let lines = payload

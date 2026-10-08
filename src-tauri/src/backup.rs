@@ -4248,7 +4248,7 @@ fn encode_backup_restore_journal(journal: &BackupRestoreJournal) -> Result<Vec<u
     if plaintext.len() as u64 > BACKUP_RESTORE_MAX_JOURNAL_BYTES {
         return Err("backup restore journal reached its size limit".to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = protect(&plaintext)
             .map_err(|_| "failed to protect backup restore journal".to_string())?;
@@ -4260,24 +4260,24 @@ fn encode_backup_restore_journal(journal: &BackupRestoreJournal) -> Result<Vec<u
         }
         Ok(encoded)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(plaintext)
     }
 }
 
 fn decode_backup_restore_journal_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let ciphertext = bytes
             .strip_prefix(BACKUP_RESTORE_JOURNAL_MAGIC)
-            .ok_or_else(|| "backup restore journal is not DPAPI protected".to_string())?;
+            .ok_or_else(|| "backup restore journal is not encrypted".to_string())?;
         if ciphertext.is_empty() {
             return Err("backup restore journal is invalid".to_string());
         }
         unprotect(ciphertext).map_err(|_| "backup restore journal is unreadable".to_string())
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = BACKUP_RESTORE_JOURNAL_MAGIC;
         Ok(bytes.to_vec())
@@ -6249,7 +6249,7 @@ mod tests {
 
         let journal_path = super::create_backup_restore_journal(&data_root, &journal).unwrap();
         let encoded = fs::read(&journal_path).unwrap();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             assert!(encoded.starts_with(BACKUP_RESTORE_JOURNAL_MAGIC));
             assert!(!encoded
