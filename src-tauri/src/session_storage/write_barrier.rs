@@ -619,7 +619,7 @@ impl WriteExclusionGuard {
     /// Compatibility entry point. New durable callers should use
     /// `stage_handle_replace`, persist `identity_bindings()`, then call
     /// `StagedHandleReplace::prepare`.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn prepare_handle_replace(
         self,
         source: &Path,
@@ -694,7 +694,7 @@ impl WriteExclusionGuard {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn prepare_handle_hardlink_replace(
         self,
         source: &Path,
@@ -774,7 +774,7 @@ impl PreparedHandleReplace {
         &self.paths
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn recovery_path(&self) -> &Path {
         &self.paths.recovery_path
     }
@@ -830,7 +830,7 @@ impl PublishedHandleReplace {
         &self.paths
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn recovery_path(&self) -> &Path {
         &self.paths.recovery_path
     }
@@ -945,7 +945,7 @@ impl ResolvedHandleReplace {
 /// Builds an operation-owned file at a deterministic persisted sibling name.
 /// The target must be absent. The returned token pins both the parent namespace
 /// and exact staged identity until the caller publishes or restores it.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn stage_handle_create(
     source: &Path,
     expected_source_sha256: &str,

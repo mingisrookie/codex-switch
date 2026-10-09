@@ -6246,16 +6246,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(windows)]
-    use super::WriteExclusionGuard;
     use super::{
-        build_restore_import_replacement, build_restore_import_replacements,
-        cleanup_committed_restore_import_ownership_witnesses, create_safe_directory,
-        execute_restore_import, operation_root, prepare_restore_import, read_semantic_session,
-        recover_interrupted_restore_import, rollback_restore_import,
-        rollback_restore_import_replacement, write_work_marker, HandleReplacePaths,
-        RestoreImportRecoveryStatus, RestoreImportReplacementKind, RestoreImportReplacementPhase,
+        build_restore_import_replacement, rollback_restore_import_replacement, HandleReplacePaths,
         RestoreImportReplacementPhaseEntry, RestoreImportReplacementPhaseRecord,
-        RestoreImportReplacementPlan, RestoreImportSessionAction,
+        WriteExclusionGuard,
+    };
+    use super::{
+        build_restore_import_replacements, cleanup_committed_restore_import_ownership_witnesses,
+        create_safe_directory, execute_restore_import, operation_root, prepare_restore_import,
+        read_semantic_session, recover_interrupted_restore_import, rollback_restore_import,
+        write_work_marker, RestoreImportRecoveryStatus, RestoreImportReplacementKind,
+        RestoreImportReplacementPhase, RestoreImportReplacementPlan, RestoreImportSessionAction,
     };
     use crate::file_ops::ownership_witness_path;
     use crate::session_storage::bounded_file::same_regular_file_identity;
@@ -6283,6 +6284,7 @@ mod tests {
         package: std::path::PathBuf,
     }
 
+    #[cfg(windows)]
     fn raw_replacement(
         root: &Path,
         _operation_id: &str,
@@ -6309,6 +6311,7 @@ mod tests {
         (replacement, before, after)
     }
 
+    #[cfg(windows)]
     fn typed_replacement_paths(replacement: &RestoreImportReplacementPlan) -> HandleReplacePaths {
         HandleReplacePaths::from_persisted_plan(
             replacement.target_path.clone(),
@@ -6319,6 +6322,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(windows)]
     fn create_replacement_witness(replacement: &RestoreImportReplacementPlan) {
         fs::copy(
             &replacement.source_path,
@@ -6327,6 +6331,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(windows)]
     fn assert_replacement_artifacts_absent(replacement: &RestoreImportReplacementPlan) {
         for path in [
             &replacement.original_witness_path,
@@ -6339,6 +6344,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn rollback_raw_replacement(
         replacement: &RestoreImportReplacementPlan,
         phase: RestoreImportReplacementPhase,

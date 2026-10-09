@@ -721,7 +721,7 @@ fn required_capacity_with_reserve(peak_without_reserve: u64) -> Result<u64, ()> 
     peak_without_reserve.checked_add(reserve).ok_or(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn existing_capacity_ancestor(path: &Path) -> Result<PathBuf, String> {
     let mut candidate = if path.is_absolute() {
         path.to_path_buf()

@@ -192,7 +192,7 @@ fn snapshot_once() -> Result<Vec<Process>, String> {
     let bytes = unsafe {
         libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity_bytes)
     };
-    if bytes <= 0 || bytes >= capacity_bytes || bytes as usize % size_of::<i32>() != 0 {
+    if bytes <= 0 || bytes >= capacity_bytes || !(bytes as usize).is_multiple_of(size_of::<i32>()) {
         return Err("the macOS process inventory is unavailable or exceeds its limit".to_string());
     }
     pids.truncate(bytes as usize / size_of::<i32>());

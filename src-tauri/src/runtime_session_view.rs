@@ -23,16 +23,19 @@ use crate::{
     session_storage::{
         bounded_file::{read_regular_file_bounded, same_regular_file_identity},
         write_barrier::{
-            parent_directory_identity_at_path, recover_handle_create,
-            recover_handle_hardlink_create, recover_handle_replace, regular_file_identity_at_path,
-            same_persisted_regular_file_identity, stage_handle_hardlink_create,
+            recover_handle_create, recover_handle_hardlink_create, recover_handle_replace,
+            regular_file_identity_at_path, same_persisted_regular_file_identity,
             DestructiveFileGuard, HandleCreateIdentityBindings, HandleCreatePaths,
             HandleCreateRecoveryDecision, HandleReplaceIdentityBindings, HandleReplacePaths,
             HandleReplaceRecoveryDecision, HardlinkSourceGuard, PublishedHandleCreate,
-            PublishedHandleReplace, RegularFileIdentity, ResolvedHandleCreate,
-            ResolvedHandleReplace, WriteExclusionGuard,
+            RegularFileIdentity, ResolvedHandleCreate, ResolvedHandleReplace, WriteExclusionGuard,
         },
     },
+};
+
+#[cfg(not(target_os = "macos"))]
+use crate::session_storage::write_barrier::{
+    parent_directory_identity_at_path, stage_handle_hardlink_create, PublishedHandleReplace,
 };
 
 const STATE_VERSION: u32 = 2;
@@ -224,6 +227,7 @@ struct ViewTransitionJournalEnvelope {
     integrity_sha256: String,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug)]
 enum HeldStateTransition {
     None,
@@ -231,6 +235,7 @@ enum HeldStateTransition {
     Replaced { replacement: PublishedHandleReplace },
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug)]
 enum ResolvedStateTransition {
     None,
@@ -245,6 +250,7 @@ pub(crate) struct PreparedViewTransition {
     data_root: PathBuf,
     journal: Option<ViewTransitionJournal>,
     bootstrap: Option<PreparedRelayBootstrap>,
+    #[cfg(not(target_os = "macos"))]
     held_state: HeldStateTransition,
     held_global_creates: Vec<PublishedHandleCreate>,
     held_source_guards: Vec<WriteExclusionGuard>,
@@ -308,6 +314,7 @@ impl PreparedRelayBootstrap {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 type PreparedSynchronization = (
     usize,
     ViewTransitionJournal,
@@ -324,6 +331,7 @@ impl PreparedViewTransition {
             bootstrap: None,
             #[cfg(any(target_os = "macos", test))]
             macos: None,
+            #[cfg(not(target_os = "macos"))]
             held_state: HeldStateTransition::None,
             held_global_creates: Vec::new(),
             held_source_guards: Vec::new(),
@@ -438,6 +446,7 @@ pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<
     };
     journal.phase = ViewTransitionPhase::Committing;
     persist_transition_journal(&prepared.data_root, &journal)?;
+    #[cfg(not(target_os = "macos"))]
     let resolved = match prepared.held_state {
         HeldStateTransition::None => ResolvedStateTransition::None,
         HeldStateTransition::Created(created) => ResolvedStateTransition::Created(
@@ -464,6 +473,7 @@ pub(crate) fn commit_transition(mut prepared: PreparedViewTransition) -> Result<
     journal.phase = ViewTransitionPhase::Committed;
     persist_transition_journal(&prepared.data_root, &journal)?;
     drop(prepared.held_source_guards);
+    #[cfg(not(target_os = "macos"))]
     match resolved {
         ResolvedStateTransition::None => {}
         ResolvedStateTransition::Created(resolved) => {
@@ -505,6 +515,7 @@ pub(crate) fn rollback_transition(mut prepared: PreparedViewTransition) -> Resul
     };
     journal.phase = ViewTransitionPhase::RollingBack;
     persist_transition_journal(&prepared.data_root, &journal)?;
+    #[cfg(not(target_os = "macos"))]
     let resolved = match prepared.held_state {
         HeldStateTransition::None => ResolvedStateTransition::None,
         HeldStateTransition::Created(created) => {
@@ -522,6 +533,7 @@ pub(crate) fn rollback_transition(mut prepared: PreparedViewTransition) -> Resul
     journal.phase = ViewTransitionPhase::RolledBack;
     persist_transition_journal(&prepared.data_root, &journal)?;
     drop(prepared.held_source_guards);
+    #[cfg(not(target_os = "macos"))]
     match resolved {
         ResolvedStateTransition::None => {}
         ResolvedStateTransition::Created(resolved) => {
@@ -568,6 +580,7 @@ pub(crate) enum SessionViewTransition {
         account: CodexPaths,
         relay: CodexPaths,
         state: SessionViewState,
+        #[cfg(not(target_os = "macos"))]
         session_view_state_path: PathBuf,
         view_established: bool,
     },
@@ -575,12 +588,17 @@ pub(crate) enum SessionViewTransition {
         relay: CodexPaths,
         account: CodexPaths,
         state: SessionViewState,
+        #[cfg(not(target_os = "macos"))]
         session_view_state_path: PathBuf,
     },
     PublishLegacyAccount {
+        #[cfg(not(target_os = "macos"))]
         relay: CodexPaths,
+        #[cfg(not(target_os = "macos"))]
         account: CodexPaths,
+        #[cfg(not(target_os = "macos"))]
         state: SessionViewState,
+        #[cfg(not(target_os = "macos"))]
         session_view_state_path: PathBuf,
     },
 }
@@ -686,7 +704,7 @@ pub(crate) fn plan_transition(
         let legacy = legacy_state
             .as_ref()
             .expect("legacy Relay identity was checked above");
-        let state = match saved_state {
+        let _state = match saved_state {
             Some(state) if state.last_common_state_sha256.is_none() => state,
             Some(_) => {
                 return Err(
@@ -701,16 +719,20 @@ pub(crate) fn plan_transition(
                 SessionViewTransition::None,
             )),
             SessionViewTarget::Account => {
-                let account = codex_paths_with_sqlite_home(
+                let _account = codex_paths_with_sqlite_home(
                     codex_home,
                     &legacy.account_effective_sqlite_home,
                 )?;
                 Ok::<SessionViewPlan, String>(session_view_plan(
                     account_sqlite_home_patch(legacy),
                     SessionViewTransition::PublishLegacyAccount {
+                        #[cfg(not(target_os = "macos"))]
                         relay: current,
-                        account,
-                        state,
+                        #[cfg(not(target_os = "macos"))]
+                        account: _account,
+                        #[cfg(not(target_os = "macos"))]
+                        state: _state,
+                        #[cfg(not(target_os = "macos"))]
                         session_view_state_path,
                     },
                 ))
@@ -755,6 +777,7 @@ pub(crate) fn plan_transition(
                         account,
                         relay,
                         state,
+                        #[cfg(not(target_os = "macos"))]
                         session_view_state_path,
                         view_established,
                     }
@@ -767,6 +790,7 @@ pub(crate) fn plan_transition(
                         relay: current,
                         account,
                         state,
+                        #[cfg(not(target_os = "macos"))]
                         session_view_state_path,
                     },
                 ))
@@ -800,6 +824,7 @@ pub(crate) fn plan_transition(
                         account,
                         relay,
                         state,
+                        #[cfg(not(target_os = "macos"))]
                         session_view_state_path,
                         view_established: false,
                     },
@@ -835,6 +860,7 @@ pub(crate) fn plan_transition(
                     account,
                     relay,
                     state,
+                    #[cfg(not(target_os = "macos"))]
                     session_view_state_path,
                     view_established: false,
                 }
@@ -923,6 +949,7 @@ pub(crate) fn prepare_transition(
 
                 #[cfg(any(target_os = "macos", test))]
                 macos: None,
+                #[cfg(not(target_os = "macos"))]
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -969,6 +996,7 @@ pub(crate) fn prepare_transition(
 
                 #[cfg(any(target_os = "macos", test))]
                 macos: None,
+                #[cfg(not(target_os = "macos"))]
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -1018,6 +1046,7 @@ pub(crate) fn prepare_transition(
 
                 #[cfg(any(target_os = "macos", test))]
                 macos: None,
+                #[cfg(not(target_os = "macos"))]
                 held_state: prepared.2,
                 held_global_creates: prepared.3,
                 held_source_guards: prepared.4,
@@ -1143,6 +1172,7 @@ fn prepare_empty_relay_bootstrap(
             managed_root,
             managed_root_created,
         }),
+        #[cfg(not(target_os = "macos"))]
         held_state: HeldStateTransition::None,
         held_global_creates: Vec::new(),
         held_source_guards: Vec::new(),
@@ -1486,6 +1516,7 @@ fn load_transition_journal(data_root: &Path) -> Result<Option<ViewTransitionJour
     decode_transition_journal(&protected, data_root).map(Some)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn create_transition_journal(
     data_root: &Path,
     journal: &ViewTransitionJournal,
@@ -2075,6 +2106,7 @@ fn validate_state(state: &SessionViewState, data_root: &Path) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn projected_database_bytes(paths: &CodexPaths) -> Result<u64, String> {
     if !paths.state_db.is_file() {
         return Ok(0);
@@ -2090,6 +2122,7 @@ fn sanitized_operation_suffix(operation_id: &str) -> Result<String, String> {
     Ok(digest[..24].to_string())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn transition_artifact_path(target: &Path, suffix: &str, kind: &str) -> Result<PathBuf, String> {
     let name = target
         .file_name()
@@ -2126,6 +2159,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn plan_global_links(
     account: &CodexPaths,
     relay: &CodexPaths,
@@ -2201,6 +2235,7 @@ fn plan_global_links(
 // These arguments are the persisted transition contract. Grouping them into a
 // mutable options bag would make omission/defaulting easier during recovery.
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_os = "macos"))]
 fn prepare_synchronized_session_view(
     source_paths: &CodexPaths,
     target_paths: &CodexPaths,
@@ -2589,6 +2624,7 @@ fn prepare_synchronized_session_view(
     prepare_result
 }
 
+#[cfg(not(target_os = "macos"))]
 fn checkpoint_state_database_for_transition(path: &Path) -> Result<String, String> {
     let connection = Connection::open(path)
         .map_err(|error| format!("failed to open state database for session view: {error}"))?;
@@ -2623,6 +2659,7 @@ fn ensure_state_database_sidecars_absent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn state_database_digest(path: &Path) -> Result<String, String> {
     let connection = Connection::open_with_flags(
         path,
@@ -2633,6 +2670,7 @@ fn state_database_digest(path: &Path) -> Result<String, String> {
     logical_state_digest(&connection)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn ensure_legacy_relay_preserves_account_threads(
     relay: &Path,
     account: &Path,
@@ -2663,6 +2701,7 @@ fn ensure_legacy_relay_preserves_account_threads(
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn verify_inactive_state_view(
     target: &Path,
     expected_digest: Option<&str>,
@@ -2694,6 +2733,7 @@ fn verify_inactive_state_view(
     Ok(())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn checkpoint_database(path: &Path, name: &str) -> Result<(), String> {
     let connection = Connection::open(path)
         .map_err(|error| format!("failed to open shared database {name}: {error}"))?;
@@ -2713,6 +2753,7 @@ fn checkpoint_database(path: &Path, name: &str) -> Result<(), String> {
     ensure_sqlite_sidecars_absent(path, name)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn verify_global_link_sidecars(link: &GlobalLinkPlan) -> Result<(), String> {
     ensure_sqlite_sidecars_absent(&link.source_path, "source global database")?;
     ensure_sqlite_sidecars_absent(&link.target_path, "target global database")
