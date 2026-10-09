@@ -343,8 +343,10 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[cfg(not(target_os = "macos"))]
+    use super::read_snapshot;
     use super::{
-        backup_source, read_snapshot, repair_after_shutdown, CHAT_PROCESS_STATE_RELATIVE_PATH,
+        backup_source, repair_after_shutdown, CHAT_PROCESS_STATE_RELATIVE_PATH,
         MAX_CHAT_PROCESS_STATE_BYTES,
     };
 
@@ -457,6 +459,7 @@ mod tests {
         assert!(error.contains("safety limit"), "unexpected error: {error}");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn empty_process_state_is_repaired_as_known_corruption() {
         let home = tempdir().unwrap();

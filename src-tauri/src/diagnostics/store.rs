@@ -1019,17 +1019,28 @@ mod tests {
         let first_thread = thread::spawn(move || {
             first_barrier.wait();
             for sequence in 1..=20 {
-                first.append(&event(sequence, &"a".repeat(180))).unwrap();
+                first
+                    .append(&event(sequence, &"a".repeat(180)))
+                    .map_err(|error| format!("first writer event {sequence}: {error}"))?;
             }
+            Ok::<_, String>(())
         });
         let second_thread = thread::spawn(move || {
             barrier.wait();
             for sequence in 21..=40 {
-                second.append(&event(sequence, &"b".repeat(180))).unwrap();
+                second
+                    .append(&event(sequence, &"b".repeat(180)))
+                    .map_err(|error| format!("second writer event {sequence}: {error}"))?;
             }
+            Ok::<_, String>(())
         });
-        first_thread.join().unwrap();
-        second_thread.join().unwrap();
+        // Join both before any assertion can drop their shared TempDir.
+        let first_result = first_thread.join();
+        let second_result = second_thread.join();
+        assert!(
+            matches!(&first_result, Ok(Ok(()))) && matches!(&second_result, Ok(Ok(()))),
+            "first: {first_result:?}; second: {second_result:?}"
+        );
 
         let verifier = store(
             temp.path(),
@@ -1437,6 +1448,70 @@ mod tests {
         assert!(second.try_append_best_effort(&event(2, "released fixture")));
         assert_eq!(first.read_events().unwrap().len(), 1);
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_simultaneous_first_locks_use_the_same_file() {
+        use std::{
+            os::unix::fs::MetadataExt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        fn identity(metadata: std::io::Result<fs::Metadata>) -> Result<(u64, u64, u64), String> {
+            metadata
+                .map(|metadata| (metadata.dev(), metadata.ino(), metadata.nlink()))
+                .map_err(|error| format!("{:?}: {error}", error.kind()))
+        }
+
+        let temp = tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        for iteration in 0..16 {
+            let root = parent.join(format!("first-lock-{iteration}"));
+            let first_directory = crate::platform_paths::ensure_private_directory(&root).unwrap();
+            let second_directory = crate::platform_paths::ensure_private_directory(&root).unwrap();
+            assert!(!root.join("store.lock").exists());
+            let barrier = Arc::new(Barrier::new(2));
+            let active = Arc::new(AtomicUsize::new(0));
+            let spawn = |directory: File| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                let active = active.clone();
+                thread::spawn(move || {
+                    let before = identity(directory.metadata());
+                    barrier.wait();
+                    let guard = MacRootOperationGuard::acquire(&directory, STORE_LOCK_TIMEOUT)
+                        .map_err(|error| {
+                            format!(
+                                "{error}; directory before={before:?}, after={:?}, root={:?}, lock={:?}",
+                                identity(directory.metadata()),
+                                identity(fs::symlink_metadata(&root)),
+                                identity(fs::symlink_metadata(root.join("store.lock")))
+                            )
+                        })?;
+                    let lock_identity = identity(guard._file.metadata())?;
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    thread::sleep(Duration::from_millis(1));
+                    assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    Ok::<_, String>(lock_identity)
+                })
+            };
+            let first_thread = spawn(first_directory);
+            let second_thread = spawn(second_directory);
+            let first_result = first_thread.join();
+            let second_result = second_thread.join();
+            assert!(
+                matches!(&first_result, Ok(Ok(_))) && matches!(&second_result, Ok(Ok(_))),
+                "iteration {iteration}: first={first_result:?}, second={second_result:?}"
+            );
+            let first_identity = first_result.unwrap().unwrap();
+            assert_eq!(first_identity, second_result.unwrap().unwrap());
+            assert_eq!(first_identity.2, 1);
+            assert_eq!(
+                first_identity,
+                identity(fs::symlink_metadata(root.join("store.lock"))).unwrap()
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_diagnostic_append_waits_for_another_store_then_persists() {

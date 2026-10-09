@@ -168,21 +168,35 @@ mod macos_private {
         })?;
         // O_NONBLOCK bounds both advisory-lock contention and substituted FIFOs.
         // O_EXLOCK, when requested, holds the lock throughout fstat and fchmod.
-        let descriptor = unsafe {
+        let flags =
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | lock_flags;
+        // Give simultaneous first creators one exclusive winner. An existing
+        // lock is opened separately, without permission to recreate it if its
+        // directory entry disappears between these calls.
+        let mut descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK
-                    | lock_flags,
+                flags | libc::O_CREAT | libc::O_EXCL,
                 0o600,
             )
         };
         if descriptor < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("exclusive private lock creation failed: {error}"),
+                ));
+            }
+            descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if descriptor < 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("existing private lock open failed: {error}"),
+                ));
+            }
         }
         // The descriptor is owned by this call and transferred exactly once.
         let file = unsafe { File::from_raw_fd(descriptor) };
