@@ -911,17 +911,20 @@ mod tests {
         assert_eq!(context.archive.sha256(), expected_hash);
         assert!(registry.take(&retained, now).is_none());
 
+        // Advance the injected clock: backdating can underflow on a fresh Windows runner.
+        let expired_at = now + PREPARED_EXPORT_TTL + Duration::from_secs(1);
         registry.insert(
             prepared_context(
                 "diagnostic-export-context-ffffffffffffffffffffffffffffffff",
-                now - PREPARED_EXPORT_TTL - Duration::from_secs(1),
+                now,
             ),
-            now,
+            expired_at,
         );
+        assert!(registry.entries.is_empty());
         assert!(registry
             .take(
                 "diagnostic-export-context-ffffffffffffffffffffffffffffffff",
-                now,
+                expired_at,
             )
             .is_none());
     }
