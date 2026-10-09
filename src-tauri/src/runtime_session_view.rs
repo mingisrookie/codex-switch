@@ -24,18 +24,19 @@ use crate::{
         bounded_file::{read_regular_file_bounded, same_regular_file_identity},
         write_barrier::{
             recover_handle_create, recover_handle_hardlink_create, recover_handle_replace,
-            regular_file_identity_at_path, same_persisted_regular_file_identity,
-            DestructiveFileGuard, HandleCreateIdentityBindings, HandleCreatePaths,
-            HandleCreateRecoveryDecision, HandleReplaceIdentityBindings, HandleReplacePaths,
-            HandleReplaceRecoveryDecision, HardlinkSourceGuard, PublishedHandleCreate,
-            RegularFileIdentity, ResolvedHandleCreate, ResolvedHandleReplace, WriteExclusionGuard,
+            same_persisted_regular_file_identity, DestructiveFileGuard,
+            HandleCreateIdentityBindings, HandleCreatePaths, HandleCreateRecoveryDecision,
+            HandleReplaceIdentityBindings, HandleReplacePaths, HandleReplaceRecoveryDecision,
+            HardlinkSourceGuard, PublishedHandleCreate, RegularFileIdentity, ResolvedHandleCreate,
+            ResolvedHandleReplace, WriteExclusionGuard,
         },
     },
 };
 
 #[cfg(not(target_os = "macos"))]
 use crate::session_storage::write_barrier::{
-    parent_directory_identity_at_path, stage_handle_hardlink_create, PublishedHandleReplace,
+    parent_directory_identity_at_path, regular_file_identity_at_path, stage_handle_hardlink_create,
+    PublishedHandleReplace,
 };
 
 const STATE_VERSION: u32 = 2;
