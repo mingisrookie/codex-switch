@@ -196,6 +196,7 @@ const MAX_MUTATION_CORRELATION_ID_BYTES: usize = 160;
 struct MutationCoordinator {
     process_lock: Mutex<()>,
     shutdown_pending: AtomicBool,
+    shutdown_final: AtomicBool,
     shutdown_lock_file: Mutex<Option<File>>,
 }
 
@@ -204,6 +205,7 @@ impl MutationCoordinator {
         Self {
             process_lock: Mutex::new(()),
             shutdown_pending: AtomicBool::new(false),
+            shutdown_final: AtomicBool::new(false),
             shutdown_lock_file: Mutex::new(None),
         }
     }
@@ -240,6 +242,11 @@ impl MutationCoordinator {
             .shutdown_lock_file
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // AppKit has accepted a native quit. A timeout from an earlier UI exit
+        // request must not reopen the mutation gate before the process exits.
+        if self.shutdown_final.load(Ordering::Acquire) {
+            return;
+        }
         shutdown_lock_file.take();
         self.shutdown_pending.store(false, Ordering::Release);
     }
@@ -253,7 +260,11 @@ struct MutationGuard<'a> {
 }
 
 impl MutationGuard<'_> {
-    fn hold_until_process_exit(mut self) {
+    fn hold_until_process_exit(self) {
+        self.hold_until_exit(false);
+    }
+
+    fn hold_until_exit(mut self, final_exit: bool) {
         let lock_file = self
             .lock_file
             .take()
@@ -264,6 +275,9 @@ impl MutationGuard<'_> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         *shutdown_lock_file = Some(lock_file);
+        self.coordinator
+            .shutdown_final
+            .store(final_exit, Ordering::Release);
         self.coordinator
             .shutdown_pending
             .store(true, Ordering::Release);
@@ -696,6 +710,12 @@ fn record_background_result_to<T>(
 
 pub(crate) fn mutation_blocks_shutdown() -> bool {
     MUTATION_COORDINATOR.blocks_shutdown()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn reserve_native_app_exit() -> Result<bool, String> {
+    let lock_path = appdata_root()?.join("codex-switch").join("mutation.lock");
+    prepare_native_app_exit_at(&MUTATION_COORDINATOR, &lock_path)
 }
 
 #[derive(Debug, Clone)]
@@ -7626,6 +7646,37 @@ fn acquire_mutation_lock_at(lock_path: &Path) -> Result<MutationGuard<'static>, 
     MUTATION_COORDINATOR.acquire(lock_path)
 }
 
+#[cfg(target_os = "macos")]
+fn prepare_native_app_exit_at(
+    coordinator: &MutationCoordinator,
+    lock_path: &Path,
+) -> Result<bool, String> {
+    {
+        // This mutex also serializes the UI exit timeout. Promotion to a final
+        // reservation and its eventual release cannot cross one another.
+        let shutdown_lock_file = coordinator
+            .shutdown_lock_file
+            .lock()
+            .map_err(|_| "native exit reservation is unavailable".to_string())?;
+        let pending = coordinator.shutdown_pending.load(Ordering::Acquire);
+        if pending != shutdown_lock_file.is_some() {
+            return Err("native exit reservation is inconsistent".to_string());
+        }
+        if pending {
+            coordinator.shutdown_final.store(true, Ordering::Release);
+            return Ok(true);
+        }
+    }
+    match coordinator.acquire(lock_path) {
+        Ok(guard) => {
+            guard.hold_until_exit(true);
+            Ok(true)
+        }
+        Err(error) if error == mutation_busy_error() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn prepare_app_exit_at(
     coordinator: &MutationCoordinator,
     lock_path: &Path,
@@ -10407,6 +10458,66 @@ mod tests {
         assert!(prepare_app_exit_at(&coordinator, &lock_path).unwrap());
         assert!(!coordinator.blocks_shutdown());
         assert!(coordinator.acquire(&lock_path).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_exit_rejects_active_mutation_then_reserves_final_shutdown() {
+        use super::prepare_native_app_exit_at;
+
+        let root = tempdir().unwrap();
+        let lock_path = root.path().canonicalize().unwrap().join("mutation.lock");
+        {
+            let coordinator = MutationCoordinator::new();
+            let mutation = coordinator.acquire(&lock_path).unwrap();
+            assert!(!prepare_native_app_exit_at(&coordinator, &lock_path).unwrap());
+            assert!(coordinator.blocks_shutdown());
+            drop(mutation);
+
+            assert!(prepare_native_app_exit_at(&coordinator, &lock_path).unwrap());
+            assert!(prepare_native_app_exit_at(&coordinator, &lock_path).unwrap());
+            assert!(!coordinator.blocks_shutdown());
+            assert!(coordinator.acquire(&lock_path).is_err());
+            coordinator.release_shutdown_reservation();
+            assert!(coordinator.acquire(&lock_path).is_err());
+            let other = MutationCoordinator::new();
+            assert!(other.acquire(&lock_path).is_err());
+        }
+        // The fixture owns the coordinator, so dropping it also drops the final
+        // lock, unlike the production static that retains it until process exit.
+        assert!(MutationCoordinator::new().acquire(&lock_path).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_exit_promotes_ui_reservation_past_its_timeout() {
+        use super::prepare_native_app_exit_at;
+
+        let root = tempdir().unwrap();
+        let lock_path = root.path().canonicalize().unwrap().join("mutation.lock");
+        let coordinator = MutationCoordinator::new();
+        assert!(prepare_app_exit_at(&coordinator, &lock_path).unwrap());
+        assert!(prepare_native_app_exit_at(&coordinator, &lock_path).unwrap());
+        // This is the exact cleanup method called by the old UI exit timer.
+        coordinator.release_shutdown_reservation();
+        assert!(prepare_native_app_exit_at(&coordinator, &lock_path).unwrap());
+        assert!(coordinator.acquire(&lock_path).is_err());
+        assert!(MutationCoordinator::new().acquire(&lock_path).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_exit_rejects_inconsistent_reservation() {
+        use super::prepare_native_app_exit_at;
+        use std::sync::atomic::Ordering;
+
+        let root = tempdir().unwrap();
+        let coordinator = MutationCoordinator::new();
+        coordinator.shutdown_pending.store(true, Ordering::Release);
+        assert!(
+            prepare_native_app_exit_at(&coordinator, &root.path().join("mutation.lock")).is_err()
+        );
+        assert!(!root.path().join("mutation.lock").exists());
     }
 
     #[test]

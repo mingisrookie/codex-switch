@@ -23,6 +23,8 @@
 
 Windows 正式版继续执行现有 EXE、PE、UPX、旧版更新和回滚合同。macOS 预览版通过独立原生双架构 App/DMG 合同验证：相同 tag 源码、Mac 专项事务/凭据/进程/权限测试、最终 App 隔离启动与正常退出、DMG 内容及 Mach-O/版本/签名完整性、Windows 回归和供应链门禁。Mac 预发布不得进入 Windows Latest；必须准确标记 ad-hoc 签名、尚未公证、未支持功能和未验证真实账号的边界。任何平台的测试、签名、实际客户端或外部服务证据均不可相互冒充。
 
+Switch 自身的 macOS 系统退出必须经过 `applicationShouldTerminate:` 的同步退出预留，复用现有 mutation coordinator 和文件锁；不得只依赖 Tauri 的 `ExitRequested` 或退出时的只读 busy 快照。已转为原生最终退出的预留不能被界面退出的延迟清理释放。原生入口必须在 `appReady` 前完成受限安装，失败时阻止 Ready。最终 DMG 启动门除完整生命周期、正常退出和 Windows updater 拒绝证明外，还必须验证自有 PID 的 `nativeQuit` 原生入口记录。
+
 ## 0. AI 协作执行协议
 
 ### 0.1 开发前必须实际阅读

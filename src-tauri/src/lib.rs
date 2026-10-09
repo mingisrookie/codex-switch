@@ -14,6 +14,8 @@ pub mod crypto;
 mod diagnostic_commands;
 pub mod diagnostics;
 pub mod file_ops;
+#[cfg(target_os = "macos")]
+mod macos_lifecycle;
 pub mod managed_client;
 pub mod mobile_continuity;
 pub mod operation_log;
@@ -109,6 +111,16 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build ChatGPT Switch");
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_lifecycle::install() {
+        if let Some(runtime) = diagnostics::global_runtime() {
+            let _ = runtime
+                .lifecycle()
+                .record_startup_failure("lifecycle.native_quit_hook_failed", error);
+        }
+        eprintln!("failed to install native macOS quit protection: {error}");
+        std::process::exit(1);
+    }
     app.run(|app_handle, event| {
         let lifecycle = diagnostics::global_runtime().map(|runtime| runtime.lifecycle());
         match event {

@@ -151,6 +151,10 @@ export function validateAssets(directory, commit) {
       && startup.isolatedHome === true && startup.realClientStarted === false
       && startup.isolatedKeychainVerified === true,
     'native startup evidence is missing or belongs to different application bytes');
+    requireCondition(startup.nativeQuit?.method === 'NSRunningApplication.terminate'
+      && startup.nativeQuit.reason === 'nativeQuit' && startup.nativeQuit.prevented === false
+      && startup.nativeQuit.ownedIdentityVerified === true,
+    'native startup must prove the AppKit quit passed the native shutdown reservation');
     const rejected = startup.windowsUpdaterRejected;
     requireCondition(rejected?.argument === '--codex-switch-apply-update'
       && rejected.exitCode === 1 && rejected.deadlineSeconds === 15

@@ -304,9 +304,30 @@ def main():
             required = ["sessionStarted", "appReady", "exitRequested", "sessionEnded"]
             cursor = -1
             for kind in required:
-                cursor = kinds.index(kind, cursor + 1)
+                try:
+                    cursor = kinds.index(kind, cursor + 1)
+                except ValueError as error:
+                    observed = [event_kind for event_kind in kinds if event_kind in required]
+                    raise RuntimeError(
+                        f"packaged app lifecycle is missing {kind} in order; "
+                        f"observed lifecycle={json.dumps(observed)}"
+                    ) from error
             if any(codex.iterdir()):
                 raise RuntimeError("fresh-home smoke unexpectedly changed Codex user state")
+            native_quit_events = [
+                event for event in events
+                if event.get("eventKind") == "exitRequested"
+                and event.get("safeContext", {}).get("reason") == "nativeQuit"
+            ]
+            if (len(native_quit_events) != 1
+                    or native_quit_events[0].get("safeContext", {}).get("prevented") is not False):
+                raise RuntimeError("normal AppKit quit did not pass the native shutdown reservation")
+            native_quit = {
+                "method": "NSRunningApplication.terminate",
+                "reason": native_quit_events[0]["safeContext"]["reason"],
+                "prevented": native_quit_events[0]["safeContext"]["prevented"],
+                "ownedIdentityVerified": True,
+            }
             updater_rejection = reject_windows_updater(
                 executable, root, home, codex, appdata, env
             )
@@ -320,6 +341,7 @@ def main():
                 "executableSha256": digest(executable),
                 "lifecycle": required,
                 "normalQuit": True,
+                "nativeQuit": native_quit,
                 "exitCode": 0,
                 "codexHomeUnchanged": True,
                 "isolatedHome": True,

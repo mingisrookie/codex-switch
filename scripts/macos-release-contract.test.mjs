@@ -41,6 +41,8 @@ function fixture(run) {
       });
       writeJson(name + '.startup.json', {
         ...identity, lifecycle, normalQuit: true, exitCode: 0, codexHomeUnchanged: true,
+        nativeQuit: { method: 'NSRunningApplication.terminate', reason: 'nativeQuit',
+          prevented: false, ownedIdentityVerified: true },
         isolatedHome: true, realClientStarted: false,
         isolatedKeychainVerified: true,
         windowsUpdaterRejected: {
@@ -181,6 +183,21 @@ test('startup evidence must prove normal app exit for the exact executable diges
     evidence.lifecycle = ['sessionStarted', 'appReady'];
     fs.writeFileSync(filename, JSON.stringify(evidence));
     assert.throws(() => validateAssets(root, commit), /startup evidence/);
+  });
+});
+
+test('publication requires the verified AppKit native shutdown branch', () => {
+  fixture((root) => {
+    const filename = path.join(root, 'codex-switch_' + VERSION + '_x64.dmg.startup.json');
+    const evidence = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    const valid = evidence.nativeQuit;
+    for (const changed of [undefined, { ...valid, method: 'signal' },
+      { ...valid, reason: 'programmaticExit' }, { ...valid, prevented: true },
+      { ...valid, ownedIdentityVerified: false }]) {
+      evidence.nativeQuit = changed;
+      fs.writeFileSync(filename, JSON.stringify(evidence));
+      assert.throws(() => validateAssets(root, commit), /native shutdown reservation/);
+    }
   });
 });
 
