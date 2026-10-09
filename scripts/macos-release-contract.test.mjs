@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { checkVersions, requirePublishContext, validateAssets, validateMacVersionPlist,
+import { checkVersions, readDraftRelease, requirePublishContext, validateAssets, validateMacVersionPlist,
   BUNDLE_VERSION, VERSION, TAG, SUBTLE_LICENSE_SHA256 } from './publish-macos-release.mjs';
 
 const commit = 'a'.repeat(40);
@@ -131,6 +131,117 @@ test('publisher only permits the exact matching tag push in the upstream reposit
     assert.throws(() => requirePublishContext({ ...env, ...change }, commit, commit));
   }
   assert.throws(() => requirePublishContext(env, commit, 'b'.repeat(40)), /commit/);
+});
+
+function draftFixture() {
+  const id = 407513082;
+  const endpoint = 'repos/mingisrookie/codex-switch/releases/' + id;
+  const view = { apiUrl: 'https://api.github.com/' + endpoint,
+    isDraft: true, isPrerelease: true, tagName: TAG };
+  const expected = [{ name: 'fixture.dmg', bytes: 2048, sha256: 'a'.repeat(64) }];
+  const draft = { id, url: view.apiUrl, tag_name: TAG, draft: true, prerelease: true,
+    assets: expected.map((asset) => ({ name: asset.name, size: asset.bytes,
+      digest: 'sha256:' + asset.sha256, state: 'uploaded' })) };
+  const calls = [];
+  const run = (program, args) => {
+    assert.equal(program, 'gh');
+    calls.push(args);
+    if (args[0] === 'release') {
+      assert.deepEqual(args, ['release', 'view', TAG, '--repo', 'mingisrookie/codex-switch',
+        '--json', 'apiUrl,isDraft,isPrerelease,tagName']);
+      return JSON.stringify(view);
+    }
+    if (args[1] === 'repos/mingisrookie/codex-switch/releases/tags/' + TAG) {
+      throw new Error('HTTP 404: draft is not published');
+    }
+    assert.deepEqual(args, ['api', endpoint]);
+    return JSON.stringify(draft);
+  };
+  return { view, draft, expected, calls, run };
+}
+
+test('authenticated draft lookup uses its numeric ID when the tag REST endpoint returns 404', () => {
+  const { view, draft, expected, calls, run } = draftFixture();
+  assert.throws(() => run('gh', ['api',
+    'repos/mingisrookie/codex-switch/releases/tags/' + TAG]), /HTTP 404/);
+  calls.length = 0;
+  assert.deepEqual(readDraftRelease(expected, run), draft);
+  assert.equal(calls.length, 2);
+  assert.equal('https://api.github.com/' + calls[1][1], view.apiUrl);
+});
+
+test('draft discovery rejects foreign or noncanonical API paths before any metadata GET', () => {
+  const prefix = 'https://api.github.com/repos/mingisrookie/codex-switch/releases/';
+  for (const apiUrl of [
+    undefined, null, 407513082,
+    'https://api.github.com/repos/foreign/codex-switch/releases/407513082',
+    'https://api.github.com/repos/mingisrookie/other/releases/407513082',
+    'https://example.com/repos/mingisrookie/codex-switch/releases/407513082',
+    prefix + 'tags/' + TAG, prefix + '../407513082', prefix + '0', prefix + '-1',
+    prefix + '0407513082', prefix + '407513082?x=1', prefix + '407513082/extra',
+    prefix + '407513082#fragment', prefix + '407513082%2fassets',
+    prefix + '9007199254740992',
+  ]) {
+    const state = draftFixture();
+    state.view.apiUrl = apiUrl;
+    assert.throws(() => readDraftRelease(state.expected, state.run), /numeric repository endpoint/);
+    assert.equal(state.calls.length, 1);
+  }
+});
+
+test('draft discovery requires the exact tag and both draft and prerelease flags', () => {
+  for (const changed of [
+    { tagName: 'v0.4.0' }, { isDraft: false }, { isDraft: 'true' },
+    { isPrerelease: false }, { isPrerelease: undefined },
+  ]) {
+    const state = draftFixture();
+    Object.assign(state.view, changed);
+    assert.throws(() => readDraftRelease(state.expected, state.run), /discovery identity/);
+    assert.equal(state.calls.length, 1);
+  }
+});
+
+test('numeric draft metadata must retain the discovered ID, URL, tag and private preview state', () => {
+  for (const changed of [
+    { id: 407513083 }, { id: '407513082' },
+    { url: 'https://api.github.com/repos/foreign/codex-switch/releases/407513082' },
+    { tag_name: 'v0.4.0' }, { draft: false }, { prerelease: false },
+  ]) {
+    const state = draftFixture();
+    Object.assign(state.draft, changed);
+    assert.throws(() => readDraftRelease(state.expected, state.run), /identity/);
+    assert.equal(state.calls.length, 2);
+  }
+});
+
+test('draft metadata still enforces the exact uploaded asset names, bytes, state and digests', () => {
+  for (const changed of [
+    [], [{ name: 'foreign.dmg' }], [{ size: 2049 }],
+    [{ state: 'new' }], [{ digest: 'sha256:' + 'b'.repeat(64) }],
+  ]) {
+    const state = draftFixture();
+    state.draft.assets = changed.map((asset) => ({ ...state.draft.assets[0], ...asset }));
+    assert.throws(() => readDraftRelease(state.expected, state.run), /remote release asset/);
+  }
+});
+
+test('draft read failures identify the stage without exposing child errors or response bodies', () => {
+  for (const failedCall of [1, 2]) {
+    for (const malformed of [false, true]) {
+      const state = draftFixture();
+      let calls = 0;
+      const run = (program, args) => {
+        calls += 1;
+        if (calls !== failedCall) return state.run(program, args);
+        if (malformed) return 'PRIVATE_RESPONSE_NOT_JSON';
+        throw new Error('PRIVATE_CHILD_STDERR');
+      };
+      const message = failedCall === 1 ? 'draft release discovery failed'
+        : 'draft release metadata read failed';
+      assert.throws(() => readDraftRelease(state.expected, run), { message });
+      assert.equal(calls, failedCall);
+    }
+  }
 });
 
 test('both architecture bundles require complete matching native evidence and SBOMs', () => {

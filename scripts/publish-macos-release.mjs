@@ -215,6 +215,35 @@ function validateRemote(release, expected, draft) {
   }
 }
 
+export function readDraftRelease(expected, run = execute) {
+  const read = (args, stage) => {
+    try {
+      return JSON.parse(run('gh', args));
+    } catch {
+      // Child stderr or malformed response bodies can contain private release data.
+      throw new Error(stage + ' failed');
+    }
+  };
+  // The tag REST endpoint only returns published releases. Resolve the authenticated
+  // draft through gh, then bind its numeric API endpoint before reading asset metadata.
+  const view = read(['release', 'view', TAG, '--repo', REPOSITORY,
+    '--json', 'apiUrl,isDraft,isPrerelease,tagName'], 'draft release discovery');
+  requireCondition(view?.tagName === TAG && view.isDraft === true && view.isPrerelease === true,
+    'draft release discovery identity is incorrect');
+  const prefix = 'https://api.github.com/repos/' + REPOSITORY + '/releases/';
+  const suffix = typeof view.apiUrl === 'string' && view.apiUrl.startsWith(prefix)
+    ? view.apiUrl.slice(prefix.length) : '';
+  const id = Number(suffix);
+  requireCondition(/^[1-9][0-9]*$/.test(suffix) && Number.isSafeInteger(id)
+    && view.apiUrl === prefix + id, 'draft release API URL is not the expected numeric repository endpoint');
+  const draft = read(['api', 'repos/' + REPOSITORY + '/releases/' + id],
+    'draft release metadata read');
+  requireCondition(draft?.id === id && draft.url === view.apiUrl,
+    'draft release metadata identity does not match discovery');
+  validateRemote(draft, expected, true);
+  return draft;
+}
+
 async function verifyPublicDownloads(release, expected) {
   for (const asset of expected) {
     const remote = release.assets.find((entry) => entry.name === asset.name);
@@ -249,8 +278,7 @@ async function publish(directory) {
     ...assets.map((asset) => path.resolve(directory, asset.name)),
     '--repo', REPOSITORY, '--verify-tag', '--draft', '--prerelease', '--latest=false',
     '--title', 'ChatGPT Switch ' + TAG, '--notes-file', versions.notes]);
-  const draft = JSON.parse(execute('gh', ['api', 'repos/' + REPOSITORY + '/releases/tags/' + TAG]));
-  validateRemote(draft, assets, true);
+  readDraftRelease(assets);
   const downloaded = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-switch-draft-'));
   try {
     execute('gh', ['release', 'download', TAG, '--repo', REPOSITORY,
