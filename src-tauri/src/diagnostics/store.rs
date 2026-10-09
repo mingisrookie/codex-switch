@@ -1451,9 +1451,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_diagnostic_simultaneous_first_locks_use_the_same_file() {
+        use super::{MacRootOperationGuard, STORE_LOCK_TIMEOUT};
         use std::{
+            fs::File,
             os::unix::fs::MetadataExt,
-            sync::atomic::{AtomicUsize, Ordering},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
         };
 
         fn identity(metadata: std::io::Result<fs::Metadata>) -> Result<(u64, u64, u64), String> {
