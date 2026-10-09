@@ -716,21 +716,28 @@ struct MacRootOperationGuard {
 #[cfg(target_os = "macos")]
 impl MacRootOperationGuard {
     fn acquire(directory: &File, timeout: Duration) -> Result<Self, String> {
-        let file = crate::platform_paths::open_private_lock_file(
-            directory,
-            std::ffi::OsStr::new("store.lock"),
-        )
-        .map_err(|_| "diagnostic store lock is unavailable or unsafe".to_string())?;
         let started = std::time::Instant::now();
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock)
-                    if !timeout.is_zero() && started.elapsed() < timeout =>
+            match crate::platform_paths::try_acquire_private_lock_file(
+                directory,
+                std::ffi::OsStr::new("store.lock"),
+            ) {
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
                 {
-                    std::thread::sleep(Duration::from_millis(5));
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err("diagnostic store lock timed out".to_string());
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
                 }
-                Err(_) => return Err("diagnostic store is busy or unavailable".to_string()),
+                Err(error) => {
+                    return Err(format!(
+                        "failed to acquire diagnostic store lock: {:?}: {error}",
+                        error.kind()
+                    ));
+                }
             }
         }
     }
@@ -1341,7 +1348,14 @@ mod tests {
         let store = store(&nested, DiagnosticStoreConfig::default());
 
         let error = store.append(&event(1, "blocked")).unwrap_err();
-        assert!(error.contains("symlinks or reparse points"), "{error}");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                error,
+                "private application directory ancestors must be directories without symlinks"
+            );
+        } else {
+            assert!(error.contains("symlinks or reparse points"), "{error}");
+        }
         assert!(!actual.join("nested").exists());
     }
 
@@ -1422,5 +1436,85 @@ mod tests {
         drop(guard);
         assert!(second.try_append_best_effort(&event(2, "released fixture")));
         assert_eq!(first.read_events().unwrap().len(), 1);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_append_waits_for_another_store_then_persists() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("diagnostics");
+        let first = store(&root, DiagnosticStoreConfig::default());
+        let second = store(&root, DiagnosticStoreConfig::default());
+        let guard = first.acquire_root_lock(Duration::ZERO).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(second.append(&event(1, "waited fixture")))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let while_held = result_rx.recv_timeout(Duration::from_millis(50));
+        drop(guard);
+        let completed = result_rx.recv_timeout(Duration::from_secs(5));
+        contender.join().unwrap();
+
+        assert!(matches!(while_held, Err(mpsc::RecvTimeoutError::Timeout)));
+        completed.unwrap().unwrap();
+        assert_eq!(first.read_events().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_lock_timeout_preserves_the_holder_and_can_retry() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("diagnostics");
+        let first = store(&root, DiagnosticStoreConfig::default());
+        let second = store(&root, DiagnosticStoreConfig::default());
+        let guard = first.acquire_root_lock(Duration::ZERO).unwrap();
+        let error = second
+            .acquire_root_lock(Duration::from_millis(25))
+            .unwrap_err();
+        assert_eq!(error, "diagnostic store lock timed out");
+        assert!(!second.try_append_best_effort(&event(1, "still held fixture")));
+        drop(guard);
+        second.append(&event(2, "retry fixture")).unwrap();
+        assert_eq!(first.read_events().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diagnostic_unsafe_lock_files_fail_without_changing_the_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let target = parent.join("unrelated.txt");
+        fs::write(&target, b"unchanged fixture").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        for (name, hardlink) in [("symlink", false), ("hardlink", true)] {
+            let root = parent.join(name);
+            fs::create_dir(&root).unwrap();
+            let lock = root.join("store.lock");
+            if hardlink {
+                fs::hard_link(&target, &lock).unwrap();
+            } else {
+                symlink(&target, &lock).unwrap();
+            }
+            let contender = store(&root, DiagnosticStoreConfig::default());
+            let error = contender
+                .acquire_root_lock(Duration::from_secs(5))
+                .unwrap_err();
+            assert!(
+                error.starts_with("failed to acquire diagnostic store lock:"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"unchanged fixture");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
     }
 }

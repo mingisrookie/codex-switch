@@ -35,7 +35,9 @@ pub fn store_root() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos_private::{ensure_private_directory, open_private_lock_file};
+pub(crate) use macos_private::{
+    ensure_private_directory, open_private_lock_file, try_acquire_private_lock_file,
+};
 
 #[cfg(target_os = "macos")]
 mod macos_private {
@@ -134,13 +136,38 @@ mod macos_private {
     /// Open a regular, singly linked lock file relative to an already safe directory.
     /// Existing contents are preserved; only the owned file's permissions are secured.
     pub(crate) fn open_private_lock_file(directory: &File, name: &OsStr) -> Result<File, String> {
+        open_private_lock_file_with_flags(directory, name, 0).map_err(|error| error.to_string())
+    }
+
+    /// Acquire a Darwin advisory lock as part of opening the file. A contender
+    /// receives WouldBlock before inspecting or changing the lock file's mode.
+    pub(crate) fn try_acquire_private_lock_file(
+        directory: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        open_private_lock_file_with_flags(directory, name, libc::O_EXLOCK)
+    }
+
+    fn open_private_lock_file_with_flags(
+        directory: &File,
+        name: &OsStr,
+        lock_flags: libc::c_int,
+    ) -> io::Result<File> {
         let mut components = Path::new(name).components();
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err("private lock file must have a single filename".into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lock file must have a single filename",
+            ));
         }
-        let name = CString::new(name.as_bytes())
-            .map_err(|_| "private lock file has an invalid name".to_string())?;
-        // O_NONBLOCK avoids waiting on a substituted FIFO before the regular-file check.
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lock file has an invalid name",
+            )
+        })?;
+        // O_NONBLOCK bounds both advisory-lock contention and substituted FIFOs.
+        // O_EXLOCK, when requested, holds the lock throughout fstat and fchmod.
         let descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -149,28 +176,38 @@ mod macos_private {
                     | libc::O_CREAT
                     | libc::O_NOFOLLOW
                     | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
+                    | libc::O_NONBLOCK
+                    | lock_flags,
                 0o600,
             )
         };
         if descriptor < 0 {
-            return Err("private lock file is unavailable or unsafe".into());
+            return Err(io::Error::last_os_error());
         }
         // The descriptor is owned by this call and transferred exactly once.
         let file = unsafe { File::from_raw_fd(descriptor) };
-        let metadata = file
-            .metadata()
-            .map_err(|_| "failed to inspect private lock file".to_string())?;
+        let metadata = file.metadata().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to inspect private lock file: {error}"),
+            )
+        })?;
         if !metadata.is_file()
             || metadata.nlink() != 1
             || metadata.uid() != unsafe { libc::geteuid() }
         {
-            return Err(
-                "private lock file must be a regular file owned only by the current user".into(),
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lock file must be a regular file owned only by the current user",
+            ));
         }
         file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| "failed to secure private lock file".to_string())?;
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to secure private lock file: {error}"),
+                )
+            })?;
         Ok(file)
     }
 }
