@@ -58,7 +58,7 @@ fn unprotect_in(keychain: &SecKeychain, ciphertext: &[u8]) -> Result<Vec<u8>, St
     open(ciphertext, &key, CONTEXT)
 }
 
-fn keychain_error(error: security_framework::Error) -> String {
+fn keychain_error(error: security_framework::base::Error) -> String {
     format!(
         "macOS Keychain access failed (status {}); unlock the Keychain and allow this application access",
         error.code()

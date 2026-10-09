@@ -6245,6 +6245,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
+    #[cfg(windows)]
+    use super::WriteExclusionGuard;
     use super::{
         build_restore_import_replacement, build_restore_import_replacements,
         cleanup_committed_restore_import_ownership_witnesses, create_safe_directory,
@@ -6253,7 +6255,7 @@ mod tests {
         rollback_restore_import_replacement, write_work_marker, HandleReplacePaths,
         RestoreImportRecoveryStatus, RestoreImportReplacementKind, RestoreImportReplacementPhase,
         RestoreImportReplacementPhaseEntry, RestoreImportReplacementPhaseRecord,
-        RestoreImportReplacementPlan, RestoreImportSessionAction, WriteExclusionGuard,
+        RestoreImportReplacementPlan, RestoreImportSessionAction,
     };
     use crate::file_ops::ownership_witness_path;
     use crate::session_storage::bounded_file::same_regular_file_identity;

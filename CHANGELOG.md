@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0-macos.1 - 2026-10-08
+## v0.5.0-macos.1 - 2026-10-09
 
 ### macOS preview
 

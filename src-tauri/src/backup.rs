@@ -6023,20 +6023,22 @@ mod tests {
 
     use crate::operation_log::{OperationAction, OperationPhase, OperationRecord, OperationStatus};
 
+    #[cfg(windows)]
+    use super::{available_backup_bytes, ensure_roots_disjoint, existing_capacity_ancestor};
+
     use super::{
-        add_capacity_file, available_backup_bytes, cleanup_automatic_checkpoints,
+        add_capacity_file, cleanup_automatic_checkpoints,
         cleanup_automatic_checkpoints_with_remove, cleanup_transient_checkpoints,
         collect_backup_capacity_metadata, create_backup, create_local_backup,
         create_runtime_backup, create_runtime_backup_with_paths,
         create_runtime_state_backup_with_paths, create_runtime_state_checkpoint_with_paths,
         create_session_backup, create_session_backup_with_paths, create_state_backup,
         create_state_checkpoint_with_paths, delete_verified_full_backup,
-        ensure_encryptable_payload_size, ensure_roots_disjoint, estimate_backup_peak,
-        estimate_backup_peak_with_source_count, existing_capacity_ancestor,
-        extract_verified_backup_file, finish_backup_creation_with_cleanup,
-        finish_capacity_preflight, inspect_checkpoint_storage, list_recent_backups,
-        load_process_state_checkpoint, migrate_legacy_plaintext_auth, percentage_ceil,
-        preflight_backup_capacity, preflight_backup_capacity_for_sources,
+        ensure_encryptable_payload_size, estimate_backup_peak,
+        estimate_backup_peak_with_source_count, extract_verified_backup_file,
+        finish_backup_creation_with_cleanup, finish_capacity_preflight, inspect_checkpoint_storage,
+        list_recent_backups, load_process_state_checkpoint, migrate_legacy_plaintext_auth,
+        percentage_ceil, preflight_backup_capacity, preflight_backup_capacity_for_sources,
         preflight_backup_capacity_with_paths, prepare_backup_restore_plan, restore_backup,
         restore_staged_backup, restore_verified_backup, sqlite_logical_bytes,
         stage_backup_payloads, stage_backup_restore_witnesses,

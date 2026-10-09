@@ -91,6 +91,68 @@ def session_events(appdata, pid):
     return selected
 
 
+def codex_state_digest(codex):
+    records = []
+    for item in sorted(codex.rglob("*")):
+        relative = item.relative_to(codex).as_posix()
+        if item.is_symlink():
+            raise RuntimeError("updater rejection fixture contains an unexpected symbolic link")
+        if item.is_file():
+            records.append([relative, "file", digest(item)])
+        elif item.is_dir():
+            records.append([relative, "directory"])
+        else:
+            raise RuntimeError("updater rejection fixture contains an unexpected special file")
+    return hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest()
+
+
+def reject_windows_updater(executable, root, home, codex, appdata, env):
+    fixture = codex / "updater-rejection-fixture"
+    fixture.mkdir()
+    (fixture / "preserved.bin").write_bytes(b"owned macOS updater rejection fixture\x00\xff\n")
+    before = codex_state_digest(codex)
+    manifest = root / "missing-update-manifest.json"
+    if manifest.exists():
+        raise RuntimeError("updater rejection manifest must be absent")
+    started = time.monotonic()
+    helper = subprocess.Popen(
+        [str(executable), "--codex-switch-apply-update", str(manifest)], cwd=home, env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        exit_code = helper.wait(timeout=15)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if exit_code != 1 or elapsed_ms >= 15000:
+            raise RuntimeError("macOS Windows-updater helper was not promptly rejected with exit 1")
+        # main initializes diagnostics before rejecting this flag. Those files belong
+        # to isolated appdata; they are not mutations of the seeded CODEX_HOME.
+        events = session_events(appdata, helper.pid)
+        kinds = [event.get("eventKind") for event in events]
+        if kinds != ["sessionStarted", "sessionEnded"]:
+            raise RuntimeError("Windows-updater rejection did not stay in the pre-GUI helper branch")
+        ended = events[-1].get("safeContext", {})
+        if ended.get("reason") != "updateStartupHelper" or ended.get("exitCode") != 1:
+            raise RuntimeError("Windows-updater rejection did not record the expected early exit")
+        after = codex_state_digest(codex)
+        if before != after:
+            raise RuntimeError("Windows-updater rejection changed the seeded Codex user state")
+        return {
+            "argument": "--codex-switch-apply-update", "exitCode": exit_code,
+            "deadlineSeconds": 15, "elapsedMilliseconds": elapsed_ms,
+            "lifecycle": kinds, "endReason": "updateStartupHelper",
+            "appReadyObserved": False, "codexHomeUnchanged": True,
+            "codexHomeBeforeSha256": before, "codexHomeAfterSha256": after,
+        }
+    finally:
+        if helper.poll() is None:
+            helper.terminate()
+            try:
+                helper.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                helper.kill()
+                helper.wait(timeout=5)
+
+
 def capture_owned_window(helper, child, app, executable, architecture):
     output = Path("macos-ui-evidence")
     output.mkdir(parents=True, exist_ok=True)
@@ -245,6 +307,9 @@ def main():
                 cursor = kinds.index(kind, cursor + 1)
             if any(codex.iterdir()):
                 raise RuntimeError("fresh-home smoke unexpectedly changed Codex user state")
+            updater_rejection = reject_windows_updater(
+                executable, root, home, codex, appdata, env
+            )
             report = {
                 "schemaVersion": 1,
                 "releaseVersion": info["CodexSwitchReleaseVersion"],
@@ -261,7 +326,8 @@ def main():
                 "realClientStarted": False,
                 "isolatedKeychainVerified": True,
                 "windowScreenshot": screenshot,
-                "scope": "native app startup and normal exit; no real-client switch",
+                "windowsUpdaterRejected": updater_rejection,
+                "scope": "native app startup, normal exit and Windows updater rejection; no real-client switch",
             }
         finally:
             if child is not None and child.poll() is None:

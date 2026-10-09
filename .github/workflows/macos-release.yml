@@ -85,7 +85,7 @@ jobs:
         run: |
           npm run tauri -- build --target "${{ matrix.target }}" \
             --config src-tauri/tauri.macos.conf.json --bundles app,dmg
-          git diff --exit-code -- package.json package-lock.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json src-tauri/tauri.macos.conf.json src-tauri/Info.macos.plist
+          git diff --exit-code -- package.json package-lock.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json src-tauri/tauri.macos.conf.json src-tauri/Info.macos.plist src-tauri/resources/SUBTLE-LICENSE.txt
       - name: Verify final DMG and prove isolated startup of its mounted app
         run: |
           python3 scripts/macos-ci-keychain.py -- python3 scripts/check-macos-bundle.py \

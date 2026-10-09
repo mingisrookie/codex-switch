@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { checkVersions, requirePublishContext, validateAssets, validateMacVersionPlist,
-  BUNDLE_VERSION, VERSION, TAG } from './publish-macos-release.mjs';
+  BUNDLE_VERSION, VERSION, TAG, SUBTLE_LICENSE_SHA256 } from './publish-macos-release.mjs';
 
 const commit = 'a'.repeat(40);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
@@ -34,14 +34,22 @@ function fixture(run) {
       writeJson(name + '.verification.json', {
         ...identity, tag: TAG, commit, target,
         minimumSystemVersion: '12.0', signature: 'adhoc', notarized: false,
+        bundledLicenses: { 'SUBTLE-LICENSE.txt': SUBTLE_LICENSE_SHA256 },
         bundleTreeSha256: 'c'.repeat(64), dmg: { name, bytes: bytes.length, sha256 },
         checks: Object.fromEntries(['file', 'lipo', 'plist', 'codesign', 'hdiutilVerify',
-          'mountedBundleMatches', 'nativeStartup'].map((check) => [check, true])),
+          'mountedBundleMatches', 'nativeStartup', 'licenseResources'].map((check) => [check, true])),
       });
       writeJson(name + '.startup.json', {
         ...identity, lifecycle, normalQuit: true, exitCode: 0, codexHomeUnchanged: true,
         isolatedHome: true, realClientStarted: false,
         isolatedKeychainVerified: true,
+        windowsUpdaterRejected: {
+          argument: '--codex-switch-apply-update', exitCode: 1,
+          deadlineSeconds: 15, elapsedMilliseconds: 100,
+          lifecycle: ['sessionStarted', 'sessionEnded'], endReason: 'updateStartupHelper',
+          appReadyObserved: false, codexHomeUnchanged: true,
+          codexHomeBeforeSha256: 'e'.repeat(64), codexHomeAfterSha256: 'e'.repeat(64),
+        },
       });
       const ref = 'pkg:cargo/codex-switch@' + VERSION;
       writeJson('codex-switch_macos_' + architecture + '.cdx.json', {
@@ -85,7 +93,8 @@ test('source gate rejects an unreviewed plist path and changed effective Apple v
   try {
     for (const filename of ['package.json', 'package-lock.json', 'src-tauri/Cargo.toml',
       'src-tauri/Cargo.lock', 'src-tauri/tauri.conf.json', 'src-tauri/tauri.macos.conf.json',
-      'src-tauri/Info.macos.plist', 'docs/releases/' + TAG + '.md']) {
+      'src-tauri/Info.macos.plist', 'src-tauri/resources/SUBTLE-LICENSE.txt',
+      'docs/releases/' + TAG + '.md']) {
       const target = path.join(root, filename);
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.copyFileSync(filename, target);
@@ -134,6 +143,23 @@ test('mutated DMG bytes cannot pass publication validation', () => {
   });
 });
 
+test('publication requires the reviewed license bytes inside each final DMG', () => {
+  fixture((root) => {
+    const filename = path.join(root, 'codex-switch_' + VERSION + '_x64.dmg.verification.json');
+    const evidence = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    delete evidence.bundledLicenses;
+    fs.writeFileSync(filename, JSON.stringify(evidence));
+    assert.throws(() => validateAssets(root, commit), /license bytes/);
+    evidence.bundledLicenses = { 'SUBTLE-LICENSE.txt': 'f'.repeat(64) };
+    fs.writeFileSync(filename, JSON.stringify(evidence));
+    assert.throws(() => validateAssets(root, commit), /license bytes/);
+    evidence.bundledLicenses = { 'SUBTLE-LICENSE.txt': SUBTLE_LICENSE_SHA256 };
+    evidence.checks.licenseResources = false;
+    fs.writeFileSync(filename, JSON.stringify(evidence));
+    assert.throws(() => validateAssets(root, commit), /final-bundle gate/);
+  });
+});
+
 test('Windows assets and missing native architecture artifacts are rejected', () => {
   fixture((root) => {
     fs.writeFileSync(path.join(root, 'codex-switch.exe'), 'fixture');
@@ -155,6 +181,23 @@ test('startup evidence must prove normal app exit for the exact executable diges
     evidence.lifecycle = ['sessionStarted', 'appReady'];
     fs.writeFileSync(filename, JSON.stringify(evidence));
     assert.throws(() => validateAssets(root, commit), /startup evidence/);
+  });
+});
+
+test('publication requires prompt pre-GUI updater rejection with preserved Codex fixture bytes', () => {
+  fixture((root) => {
+    const filename = path.join(root, 'codex-switch_' + VERSION + '_x64.dmg.startup.json');
+    const evidence = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    const valid = evidence.windowsUpdaterRejected;
+    for (const changed of [undefined, { ...valid, exitCode: 0 },
+      { ...valid, elapsedMilliseconds: 15000 }, { ...valid, appReadyObserved: true },
+      { ...valid, lifecycle: ['sessionStarted', 'appReady', 'sessionEnded'] },
+      { ...valid, endReason: 'runEventExit' }, { ...valid, codexHomeUnchanged: false },
+      { ...valid, codexHomeAfterSha256: 'd'.repeat(64) }]) {
+      evidence.windowsUpdaterRejected = changed;
+      fs.writeFileSync(filename, JSON.stringify(evidence));
+      assert.throws(() => validateAssets(root, commit), /updater rejection evidence/);
+    }
   });
 });
 

@@ -1592,11 +1592,9 @@ fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        fs::{File, OpenOptions},
-        path::Path,
-    };
+    #[cfg(windows)]
+    use std::fs::{File, OpenOptions};
+    use std::{fs, path::Path};
 
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};

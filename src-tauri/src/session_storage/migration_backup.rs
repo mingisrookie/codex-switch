@@ -1187,13 +1187,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        create_migration_backup, quick_check_sqlite, restore_migration_backup_to_isolated,
-        snapshot_sqlite, verify_migration_backup, verify_migration_backup_with_runtime,
-        MigrationBackupEntryKind, MigrationBackupRuntimeVerifier, MigrationBackupSource,
-        MigrationBackupStatus, MigrationRuntimeBinaryIdentity,
-        MigrationRuntimeCapabilityConflictProof, MigrationRuntimeVerification,
-        REQUIRED_RUNTIME_CATEGORIES,
+        create_migration_backup, restore_migration_backup_to_isolated, verify_migration_backup,
+        verify_migration_backup_with_runtime, MigrationBackupEntryKind,
+        MigrationBackupRuntimeVerifier, MigrationBackupSource, MigrationBackupStatus,
+        MigrationRuntimeBinaryIdentity, MigrationRuntimeCapabilityConflictProof,
+        MigrationRuntimeVerification, REQUIRED_RUNTIME_CATEGORIES,
     };
+    #[cfg(windows)]
+    use super::{quick_check_sqlite, snapshot_sqlite};
 
     struct PassingRuntimeVerifier;
 

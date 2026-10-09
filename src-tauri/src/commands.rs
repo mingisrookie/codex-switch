@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 use tauri::ipc::Channel;
+
+#[cfg(not(target_os = "macos"))]
+use std::fs::OpenOptions;
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;

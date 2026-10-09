@@ -10,6 +10,8 @@ Mac 安装包位于 [v0.5.0-macos.1 预发布](https://github.com/mingisrookie/c
 
 Mac 版本映射遵守 Apple bundle 元数据格式：Release tag 为 `v0.5.0-macos.1`，Cargo/npm、应用内显示与安装包文件名保留 `0.5.0-macos.1`；Info.plist 的 `CFBundleShortVersionString` 和 `CFBundleVersion` 使用数字版本 `0.5.0`。发布脚本同时校验完整发行版号及这个明确映射，不以 Finder 的数字版本代替预发布身份。
 
+Mac 安装包还必须携带 `subtle 2.6.1` 的完整 BSD-3-Clause 许可文件；源码、构建 App 和最终挂载 DMG 内的文件均核验固定摘要。生产启动验证另要求最终可执行文件在隔离目录中拒绝 Windows updater helper 参数，以退出码 1 结束且不改变 Codex Home；正常 GUI 生命周期与这个拒绝分支都必须通过。
+
 README 只提供下载入口。具体版本、文件大小、SHA-256、构建来源和更新验证证据应以对应 GitHub Release 为准，而不是长期固定在首页。
 
 ## 下载前确认

@@ -4475,13 +4475,14 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
+    #[cfg(windows)]
+    use super::{cleanup_committed_conflict_resolution_artifacts, typed_replacement_paths};
     use super::{
-        cleanup_committed_conflict_resolution_artifacts, cleanup_conflict_resolution_staging,
-        conflict_replacement_phase_path, execute_conflict_resolution, prepare_conflict_resolution,
+        cleanup_conflict_resolution_staging, conflict_replacement_phase_path,
+        execute_conflict_resolution, prepare_conflict_resolution,
         recover_interrupted_conflict_resolution, transition_conflict_replacement_phase,
-        typed_replacement_paths, validate_conflict_resolution, ConflictReplacementKind,
-        ConflictReplacementPhase, ConflictReplacementPlan, ConflictResolutionFailure,
-        ConflictResolutionRecoveryStatus,
+        validate_conflict_resolution, ConflictReplacementKind, ConflictReplacementPhase,
+        ConflictReplacementPlan, ConflictResolutionFailure, ConflictResolutionRecoveryStatus,
     };
     #[cfg(windows)]
     use crate::session_storage::write_barrier::{DestructiveFileGuard, WriteExclusionGuard};

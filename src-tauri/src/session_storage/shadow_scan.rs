@@ -786,9 +786,10 @@ mod tests {
     use super::{
         classify_external_file, cleanup_stale_shadow_staging, drain_pending_scans,
         load_last_shadow_report, request_background_shadow_scan, run_shadow_scan,
-        try_acquire_shadow_scan_lease, ShadowScanLeaseError, SHADOW_SCAN_RUNNING,
-        STALE_STAGING_MIN_AGE_MS,
+        SHADOW_SCAN_RUNNING, STALE_STAGING_MIN_AGE_MS,
     };
+    #[cfg(windows)]
+    use super::{try_acquire_shadow_scan_lease, ShadowScanLeaseError};
     use crate::session_storage::{
         migration::{persist_migration_preflight, run_migration_preflight},
         model::{FileOrigin, ShadowScanIssueCode, StorageScanStatus},

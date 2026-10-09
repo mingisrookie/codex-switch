@@ -36,6 +36,10 @@ pub mod session_storage;
 pub mod session_sync;
 pub mod skill_manager;
 pub mod update_check;
+#[cfg(target_os = "macos")]
+#[path = "update_install_macos.rs"]
+pub mod update_install;
+#[cfg(not(target_os = "macos"))]
 pub mod update_install;
 
 pub fn run() {

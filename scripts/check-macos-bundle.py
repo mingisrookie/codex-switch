@@ -17,6 +17,7 @@ import tempfile
 VERSION = "0.5.0-macos.1"
 BUNDLE_VERSION = "0.5.0"
 BUNDLE_ID = "local.codexswitch.desktop"
+SUBTLE_LICENSE_SHA256 = "cc0332a88c2ea21d5f3c1298f966120f4c95196871c3f6bb4fcf615508b93fa1"
 ARCHES = {
     "aarch64": ("aarch64-apple-darwin", "arm64"),
     "x64": ("x86_64-apple-darwin", "x86_64"),
@@ -87,6 +88,14 @@ def check_app(app, architecture, version):
     }
     for key, value in expected.items():
         require(info.get(key) == value, f"bundle {key} does not match its locked value")
+    source_license = Path(__file__).resolve().parent.parent / "src-tauri/resources/SUBTLE-LICENSE.txt"
+    bundled_license = app / "Contents/Resources/SUBTLE-LICENSE.txt"
+    for license_file in (source_license, bundled_license):
+        require(license_file.is_file() and not license_file.is_symlink()
+                and license_file.stat().st_size == 1581,
+                "required subtle copyright and license text is missing or invalid")
+        require(sha256(license_file) == SUBTLE_LICENSE_SHA256,
+                "subtle copyright and license text differs from its reviewed distribution bytes")
     executable = app / "Contents/MacOS/codex-switch"
     require(executable.is_file() and not executable.is_symlink()
             and bool(executable.stat().st_mode & 0o111), "invalid bundle executable")
@@ -126,6 +135,7 @@ def check_app(app, architecture, version):
         "minimumSystemVersion": "12.0",
         "signature": "adhoc",
         "notarized": False,
+        "bundledLicenses": {"SUBTLE-LICENSE.txt": sha256(bundled_license)},
         "executableSha256": sha256(executable),
         "bundleTreeSha256": tree_digest(app),
         "machoFormat": file_type.strip(),
@@ -195,6 +205,7 @@ def main():
         "checks": {
             "file": True, "lipo": True, "plist": True, "codesign": True,
             "hdiutilVerify": True, "mountedBundleMatches": True, "nativeStartup": True,
+            "licenseResources": True,
         },
     }
     with (args.output / f"{asset_name}.verification.json").open("x", encoding="utf-8") as stream:

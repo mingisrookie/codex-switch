@@ -9,6 +9,9 @@
       "icons/icon.icns",
       "icons/icon.png"
     ],
+    "resources": {
+      "resources/SUBTLE-LICENSE.txt": "SUBTLE-LICENSE.txt"
+    },
     "macOS": {
       "bundleVersion": "0.5.0",
       "infoPlist": "Info.macos.plist",

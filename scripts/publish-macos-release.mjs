@@ -8,12 +8,13 @@ import { validateSbom } from './check-sbom.mjs';
 
 export const VERSION = '0.5.0-macos.1';
 export const BUNDLE_VERSION = '0.5.0';
+export const SUBTLE_LICENSE_SHA256 = 'cc0332a88c2ea21d5f3c1298f966120f4c95196871c3f6bb4fcf615508b93fa1';
 export const TAG = 'v' + VERSION;
 const REPOSITORY = 'mingisrookie/codex-switch';
 const BUNDLE_ID = 'local.codexswitch.desktop';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ARCHITECTURES = { aarch64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' };
-const CHECKS = ['file', 'lipo', 'plist', 'codesign', 'hdiutilVerify', 'mountedBundleMatches', 'nativeStartup'];
+const CHECKS = ['file', 'lipo', 'plist', 'codesign', 'hdiutilVerify', 'mountedBundleMatches', 'nativeStartup', 'licenseResources'];
 const LIFECYCLE = ['sessionStarted', 'appReady', 'exitRequested', 'sessionEnded'];
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const requireCondition = (condition, message) => { if (!condition) throw new Error(message); };
@@ -69,6 +70,14 @@ export function checkVersions(root = ROOT) {
     && overlay.bundle.macOS?.bundleVersion === BUNDLE_VERSION
     && overlay.bundle.macOS?.infoPlist === 'Info.macos.plist',
   'macOS bundle overlay does not match the reviewed ad-hoc preview');
+  requireCondition(sameList(overlay.bundle.resources,
+    { 'resources/SUBTLE-LICENSE.txt': 'SUBTLE-LICENSE.txt' }),
+  'macOS bundle must embed the reviewed subtle copyright and license text');
+  const licensePath = path.join(root, 'src-tauri/resources/SUBTLE-LICENSE.txt');
+  const licenseStat = fs.lstatSync(licensePath);
+  requireCondition(licenseStat.isFile() && !licenseStat.isSymbolicLink() && licenseStat.size === 1581
+    && sha(fs.readFileSync(licensePath)) === SUBTLE_LICENSE_SHA256,
+  'subtle copyright and license text differs from its reviewed distribution bytes');
   const plistPath = path.join(root, 'src-tauri/Info.macos.plist');
   const plistStat = fs.lstatSync(plistPath);
   requireCondition(plistStat.isFile() && !plistStat.isSymbolicLink() && plistStat.size <= 8192,
@@ -125,6 +134,9 @@ export function validateAssets(directory, commit) {
     'bundle verification identity does not match the release source');
     requireCondition(CHECKS.every((name) => evidence.checks?.[name] === true),
       'a required final-bundle gate did not pass');
+    requireCondition(sameList(evidence.bundledLicenses,
+      { 'SUBTLE-LICENSE.txt': SUBTLE_LICENSE_SHA256 }),
+    'required subtle copyright and license bytes were not verified in the final DMG');
     requireCondition(evidence.dmg?.name === name && evidence.dmg.bytes === dmg.bytes
       && evidence.dmg.sha256 === dmg.sha256, 'verified DMG bytes changed');
     requireCondition(/^[a-f0-9]{64}$/.test(evidence.executableSha256 ?? '')
@@ -139,6 +151,17 @@ export function validateAssets(directory, commit) {
       && startup.isolatedHome === true && startup.realClientStarted === false
       && startup.isolatedKeychainVerified === true,
     'native startup evidence is missing or belongs to different application bytes');
+    const rejected = startup.windowsUpdaterRejected;
+    requireCondition(rejected?.argument === '--codex-switch-apply-update'
+      && rejected.exitCode === 1 && rejected.deadlineSeconds === 15
+      && Number.isInteger(rejected.elapsedMilliseconds)
+      && rejected.elapsedMilliseconds >= 0 && rejected.elapsedMilliseconds < 15000
+      && sameList(rejected.lifecycle, ['sessionStarted', 'sessionEnded'])
+      && rejected.endReason === 'updateStartupHelper' && rejected.appReadyObserved === false
+      && rejected.codexHomeUnchanged === true
+      && /^[a-f0-9]{64}$/.test(rejected.codexHomeBeforeSha256 ?? '')
+      && rejected.codexHomeAfterSha256 === rejected.codexHomeBeforeSha256,
+    'native Windows updater rejection evidence is missing or invalid');
     validateSbom(readJson(path.join(directory, 'codex-switch_macos_' + architecture + '.cdx.json')), VERSION);
   }
   return [...assets.values()];

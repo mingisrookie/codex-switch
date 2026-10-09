@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+#[cfg(any(windows, test))]
+use serde::Deserialize;
+use serde::Serialize;
 #[cfg(any(windows, test))]
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
@@ -6,16 +8,13 @@ use std::{
     ffi::OsString,
     mem::size_of,
     os::windows::{ffi::OsStringExt, fs::MetadataExt, process::CommandExt},
+    path::PathBuf,
     process::Command,
     thread,
     time::Duration,
 };
 #[cfg(any(windows, test))]
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::{fs, path::Path, sync::Mutex};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{

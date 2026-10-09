@@ -389,10 +389,10 @@ mod tests {
 
     use std::io::Write;
 
-    use super::{
-        atomic_create, atomic_create_with_witness, atomic_publish_new, atomic_write,
-        walk_jsonl_files,
-    };
+    #[cfg(windows)]
+    use super::atomic_write;
+
+    use super::{atomic_create, atomic_create_with_witness, atomic_publish_new, walk_jsonl_files};
     use crate::session_storage::bounded_file::same_regular_file_identity;
 
     #[test]
